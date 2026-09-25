@@ -132,7 +132,7 @@ impl AudioView {
     }
 
     fn load_meta(&mut self, path: &Path) {
-        self.tags = read_tags(path).unwrap_or_default();
+        self.tags = read_tags(path, true).unwrap_or_default();
         let embedded = self.tags.cover.take().and_then(|bytes| image_cache::decode_picture(&bytes)).map(Arc::new);
         self.cover = embedded.or_else(|| folder_cover(path));
         self.file_stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
@@ -286,8 +286,8 @@ impl AudioView {
     fn text_lines(&self) -> Vec<(String, LineKind)> {
         let t = &self.tags;
         let mut lines = vec![(t.title.clone().unwrap_or_else(|| self.file_stem.clone()), LineKind::Title)];
-        if let Some(artist) = &t.artist {
-            lines.push((artist.clone(), LineKind::Text));
+        if let Some(artist) = t.any_artist() {
+            lines.push((artist.to_string(), LineKind::Text));
         }
         let album = match (&t.album, t.year) {
             (Some(a), Some(y)) => Some(format!("{} ({})", a, y)),

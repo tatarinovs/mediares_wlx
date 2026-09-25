@@ -3,6 +3,8 @@
 
 #[cfg(feature = "audio-decode")]
 pub mod audio_decode;
+#[cfg(feature = "audio-decode")]
+pub mod audio_fingerprint;
 #[cfg(feature = "tags")]
 pub mod audio_tags;
 pub mod cache;
@@ -10,6 +12,7 @@ pub mod exif;
 pub mod ffi;
 pub mod hashing;
 pub mod image_decode;
+#[cfg(any(feature = "raw-preview", feature = "psd-preview"))]
 mod jpeg;
 pub mod mf_init;
 pub mod probe;

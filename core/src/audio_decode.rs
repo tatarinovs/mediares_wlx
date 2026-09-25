@@ -2,13 +2,14 @@
 //! installed in the system. Used by the player in `combo` (and later for waveforms).
 
 use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use symphonia::core::codecs::audio::{AudioDecoder as CodecDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
-use symphonia::core::io::MediaSourceStream;
+use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
 
@@ -41,12 +42,23 @@ pub struct Chunk<'a> {
 impl AudioDecoder {
     /// Opens the file; `None` if the container or codec is not supported.
     pub fn open(path: &Path) -> Option<Self> {
-        let file = File::open(path).ok()?;
-        let mss = MediaSourceStream::new(Box::new(file), Default::default());
+        let mut file = File::open(path).ok()?;
         let mut hint = Hint::new();
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            hint.with_extension(ext);
-        }
+        // MP3 wrapped in a WAV header (format tag 0x55): symphonia's WAV reader only takes PCM,
+        // so the MPEG stream inside the `data` chunk is handed over directly.
+        let source: Box<dyn MediaSource> = match riff_mp3_data(&mut file) {
+            Some((start, len)) => {
+                hint.with_extension("mp3");
+                Box::new(SubFile::new(file, start, len).ok()?)
+            }
+            None => {
+                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                    hint.with_extension(ext);
+                }
+                Box::new(file)
+            }
+        };
+        let mss = MediaSourceStream::new(source, Default::default());
         let format = symphonia::default::get_probe()
             .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
             .ok()?;
@@ -148,6 +160,100 @@ impl AudioDecoder {
         self.decoder.reset();
         self.skip_until = Some(seeked.required_ts);
         Some(self.seconds(seeked.required_ts))
+    }
+}
+
+/// Offset and length of the `data` chunk of a RIFF/WAVE file whose format is MPEG Layer III.
+fn riff_mp3_data(file: &mut File) -> Option<(u64, u64)> {
+    let mut header = [0u8; 12];
+    file.read_exact(&mut header).ok()?;
+    let _ = file.seek(SeekFrom::Start(0));
+    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+        return None;
+    }
+    let file_len = file.metadata().ok()?.len();
+    let mut pos = 12u64;
+    let mut is_mp3 = false;
+    let result = loop {
+        let mut chunk = [0u8; 8];
+        file.seek(SeekFrom::Start(pos)).ok()?;
+        if file.read_exact(&mut chunk).is_err() {
+            break None;
+        }
+        let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
+        match &chunk[0..4] {
+            b"fmt " => {
+                let mut tag = [0u8; 2];
+                file.read_exact(&mut tag).ok()?;
+                is_mp3 = u16::from_le_bytes(tag) == 0x55;
+                if !is_mp3 {
+                    break None;
+                }
+            }
+            // Some writers leave the size at 0 or too large: the data runs to the end of the file.
+            b"data" if is_mp3 => {
+                let available = file_len.saturating_sub(pos + 8);
+                break Some((pos + 8, if size == 0 || size > available { available } else { size }));
+            }
+            _ => {}
+        }
+        pos += 8 + size + (size & 1);
+        if pos >= file_len {
+            break None;
+        }
+    };
+    let _ = file.seek(SeekFrom::Start(0));
+    result
+}
+
+/// A byte range of a file as a seekable media source.
+struct SubFile {
+    file: File,
+    start: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl SubFile {
+    fn new(mut file: File, start: u64, len: u64) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(start))?;
+        Ok(Self { file, start, len, pos: 0 })
+    }
+}
+
+impl Read for SubFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.len.saturating_sub(self.pos) as usize;
+        let take = buf.len().min(left);
+        let n = self.file.read(&mut buf[..take])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SubFile {
+    fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
+        let target = match to {
+            SeekFrom::Start(p) => p as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => self.len as i64 + d,
+        };
+        if target < 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+        }
+        self.pos = (target as u64).min(self.len);
+        self.file.seek(SeekFrom::Start(self.start + self.pos))?;
+        Ok(self.pos)
+    }
+}
+
+impl MediaSource for SubFile {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        Some(self.len)
     }
 }
 

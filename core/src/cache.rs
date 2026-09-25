@@ -1,4 +1,4 @@
-//! MediaCache: in-memory LRU cache of image and video analysis results.
+//! MediaCache: in-memory LRU cache of image, video and audio analysis results.
 
 use std::fs;
 use std::num::NonZeroUsize;
@@ -19,7 +19,18 @@ const CAPACITY: usize = 1024;
 pub enum CachedMedia {
     Image(Arc<ImageAnalysis>),
     Video(Arc<VideoAnalysis>),
+    Audio(Arc<AudioAnalysis>),
     Unsupported,
+}
+
+/// Duplicate-detection fields of an audio file (see `audio_fingerprint`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioAnalysis {
+    pub duration_sec: u32,
+    /// Hash of the decoded samples (hex).
+    pub pcm_hash: String,
+    /// `None` for (nearly) silent files.
+    pub fingerprint: Option<String>,
 }
 
 /// Identifies a specific version of a file: edits change size or mtime and miss the cache.
@@ -69,6 +80,12 @@ impl MediaCache {
                 Err(VideoError::Cancelled) => return CachedMedia::Unsupported,
                 Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
             },
+            #[cfg(feature = "audio-decode")]
+            MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
+                Ok(a) => CachedMedia::Audio(Arc::new(a)),
+                Err(crate::audio_fingerprint::AudioError::Cancelled) => return CachedMedia::Unsupported,
+                Err(crate::audio_fingerprint::AudioError::Unsupported) => CachedMedia::Unsupported,
+            },
             _ => CachedMedia::Unsupported,
         };
 
@@ -83,6 +100,22 @@ impl MediaCache {
     pub fn clear(&self) {
         self.lock().clear();
     }
+}
+
+/// Tags of recently queried audio files: TC asks for every column separately, and the tags are
+/// read once per file version. Pictures are not kept.
+#[cfg(feature = "tags")]
+pub fn get_tags(path: &Path) -> Option<Arc<crate::audio_tags::AudioTags>> {
+    type TagCache = Mutex<LruCache<FileKey, Option<Arc<crate::audio_tags::AudioTags>>>>;
+    static TAGS: OnceLock<TagCache> = OnceLock::new();
+    let cache = TAGS.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero capacity"))));
+    let key = FileKey::for_path(path)?;
+    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return hit.clone();
+    }
+    let tags = crate::audio_tags::read_tags(path, false).map(Arc::new);
+    cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, tags.clone());
+    tags
 }
 
 pub fn get_cache() -> &'static MediaCache {

@@ -56,7 +56,7 @@ impl MediaType {
 
     /// Kinds that are expensive to analyze and should be deferred with `FT_DELAYED`.
     pub fn is_slow_kind(self) -> bool {
-        matches!(self, MediaType::Video | MediaType::RawImage | MediaType::PsdImage)
+        matches!(self, MediaType::Video | MediaType::Audio | MediaType::RawImage | MediaType::PsdImage)
     }
 }
 

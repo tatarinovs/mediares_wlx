@@ -8,5 +8,5 @@ name = "mediares_wdx"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mediares_core = { path = "../core", default-features = false, features = ["raw-preview", "psd-preview"] }
+mediares_core = { path = "../core", default-features = false, features = ["raw-preview", "psd-preview", "audio-decode", "tags"] }
 

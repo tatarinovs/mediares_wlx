@@ -32,9 +32,22 @@ fn test_supported_fields_enumeration() {
     let name10 = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
     assert_eq!(name10, "Plugin_Version");
 
-    // Field 11: out of bounds
-    let f11 = unsafe { ContentGetSupportedField(11, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f11, FT_NOMOREFIELDS);
+    // Fields 11..14: audio, appended after the original ones (indices are stored by TC).
+    for (index, name, kind) in [
+        (11, "Audio_Fingerprint", FT_STRINGW),
+        (12, "Audio_PCM_Hash", FT_STRINGW),
+        (13, "Audio_Duration_Sec", FT_NUMERIC_32),
+        (14, "Audio_Artist_Title", FT_STRINGW),
+    ] {
+        let f = unsafe { ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+        assert_eq!(f, kind);
+        let got = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+        assert_eq!(got, name);
+    }
+
+    // Field 30: out of bounds
+    let f15 = unsafe { ContentGetSupportedField(30, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    assert_eq!(f15, FT_NOMOREFIELDS);
 }
 
 #[test]
@@ -53,7 +66,9 @@ fn test_detect_string() {
     // Every RAW/PSD extension the core can decode must be advertised.
     assert!(detect.contains(r#"EXT="CR3""#));
     assert!(detect.contains(r#"EXT="PSB""#));
-    assert!(!detect.contains(r#"EXT="MP3""#), "audio is not analyzed by the WDX");
+    assert!(detect.contains(r#"EXT="MP3""#));
+    assert!(detect.contains(r#"EXT="FLAC""#));
+    assert!(!detect.contains(r#"EXT="M3U""#), "playlists have no content fields");
 }
 
 #[test]
@@ -195,4 +210,136 @@ fn test_corrupt_and_invalid_files_safety() {
         unsafe { ContentGetValueW(wide.as_ptr(), 0, 0, buf.as_mut_ptr() as *mut c_void, 256, 0) };
 
     assert!(res == FT_FIELDEMPTY || res == FT_FILEERROR);
+}
+
+/// 16-bit PCM WAV: a chord whose pitch changes every second, after `lead_silence` seconds.
+fn write_wav(path: &std::path::Path, rate: u32, seconds: u32, lead_silence: u32, pitch_shift: f32) {
+    write_wav_tagged(path, rate, seconds, lead_silence, pitch_shift, &[]);
+}
+
+/// Same, with a RIFF `LIST/INFO` chunk of (id, text) tags.
+fn write_wav_tagged(path: &std::path::Path, rate: u32, seconds: u32, lead_silence: u32, pitch_shift: f32, info: &[(&[u8; 4], &str)]) {
+    let total = rate * (seconds + lead_silence);
+    let mut data = Vec::with_capacity(total as usize * 2);
+    for i in 0..total {
+        let v = if i < lead_silence * rate {
+            0.0
+        } else {
+            // Time from the start of the sound (exact), so padding doesn't change the samples.
+            let t = (i - lead_silence * rate) as f32 / rate as f32;
+            let f = (220.0 + 55.0 * (t as u32 % 7) as f32) * pitch_shift;
+            0.3 * (2.0 * std::f32::consts::PI * f * t).sin() + 0.2 * (2.0 * std::f32::consts::PI * f * 2.5 * t).sin()
+        };
+        data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
+    }
+    let mut b = Vec::new();
+    b.extend_from_slice(b"RIFF");
+    b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+    b.extend_from_slice(b"WAVEfmt ");
+    for v in [16u32.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec()] {
+        b.extend_from_slice(&v);
+    }
+    b.extend_from_slice(&rate.to_le_bytes());
+    b.extend_from_slice(&(rate * 2).to_le_bytes());
+    b.extend_from_slice(&2u16.to_le_bytes());
+    b.extend_from_slice(&16u16.to_le_bytes());
+    b.extend_from_slice(b"data");
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&data);
+    if !info.is_empty() {
+        let mut list = b"INFO".to_vec();
+        for (id, text) in info {
+            let mut value = text.as_bytes().to_vec();
+            value.push(0);
+            list.extend_from_slice(*id);
+            list.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            if value.len() % 2 == 1 {
+                value.push(0);
+            }
+            list.extend_from_slice(&value);
+        }
+        b.extend_from_slice(b"LIST");
+        b.extend_from_slice(&(list.len() as u32).to_le_bytes());
+        b.extend_from_slice(&list);
+    }
+    let riff_len = (b.len() - 8) as u32;
+    b[4..8].copy_from_slice(&riff_len.to_le_bytes());
+    std::fs::write(path, b).unwrap();
+}
+
+#[test]
+fn test_audio_fields() {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
+    let _ = std::fs::create_dir_all(&dir);
+    let (a, padded, other) = (dir.join("a.wav"), dir.join("a_padded.wav"), dir.join("other.wav"));
+    write_wav(&a, 22050, 40, 0, 1.0);
+    write_wav(&padded, 22050, 40, 1, 1.0);
+    write_wav(&other, 22050, 40, 0, 1.5);
+
+    let read = |path: &std::path::Path, field: i32| -> (i32, String) {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut buf = [0u16; 256];
+        let res = unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 512, 0) };
+        if res == FT_NUMERIC_32 {
+            return (res, i32::from_le_bytes([buf[0] as u8, (buf[0] >> 8) as u8, buf[1] as u8, (buf[1] >> 8) as u8]).to_string());
+        }
+        (res, String::from_utf16_lossy(&buf).trim_matches('\0').to_string())
+    };
+
+    let (res, fp) = read(&a, 11);
+    assert_eq!(res, FT_STRINGW);
+    assert!(fp.starts_with("40s_"), "{}", fp);
+    assert_eq!(read(&a, 13), (FT_NUMERIC_32, "40".to_string()));
+    assert_eq!(read(&a, 9).1, "Audio");
+    // Leading silence changes neither the PCM hash nor the fingerprint windows' content.
+    assert_eq!(read(&a, 12), read(&padded, 12));
+    assert_ne!(read(&a, 12), read(&other, 12));
+    assert_ne!(fp, read(&other, 11).1);
+    // Untagged: no artist/title.
+    assert_eq!(read(&a, 14).0, FT_FIELDEMPTY);
+}
+
+#[test]
+fn test_audio_tag_fields() {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("tagged.wav");
+    let info: &[(&[u8; 4], &str)] = &[(b"IART", "Пикник"), (b"INAM", "Остров"), (b"IPRD", "Иероглиф"), (b"IGNR", "Rock"), (b"ICRD", "1986")];
+    write_wav_tagged(&path, 22050, 75, 0, 1.0, info);
+
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let raw = |field: i32, flags: i32| -> (i32, [u16; 256]) {
+        let mut buf = [0u16; 256];
+        let res = unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 512, flags) };
+        (res, buf)
+    };
+    let text = |field: i32| {
+        let (res, buf) = raw(field, 0);
+        (res, String::from_utf16_lossy(&buf).trim_matches(' ').to_string())
+    };
+    // Tag fields are never delayed, unlike the decoding-based ones.
+    assert_eq!(raw(15, CONTENT_DELAYIFSLOW).0, FT_STRINGW);
+    assert_eq!(raw(11, CONTENT_DELAYIFSLOW).0, FT_DELAYED);
+
+    assert_eq!(text(15), (FT_STRINGW, "Пикник".to_string()));
+    assert_eq!(text(16), (FT_STRINGW, "Остров".to_string()));
+    assert_eq!(text(17), (FT_STRINGW, "Иероглиф".to_string()));
+    assert_eq!(text(22), (FT_STRINGW, "Rock".to_string()));
+    assert_eq!(text(14), (FT_STRINGW, "пикник - остров".to_string()));
+    let (res, buf) = raw(19, 0);
+    assert_eq!((res, buf[0] as u32 | (buf[1] as u32) << 16), (FT_NUMERIC_32, 1986));
+    // Length 75 s as ttimeformat (h, m, s).
+    let (res, buf) = raw(24, 0);
+    assert_eq!((res, &buf[..3]), (FT_TIME, &[0u16, 1, 15][..]));
+    let (res, buf) = raw(26, 0);
+    assert_eq!((res, buf[0] as u32 | (buf[1] as u32) << 16), (FT_NUMERIC_32, 22050));
+    assert_eq!(raw(29, 0).0, FT_BOOLEAN);
+    assert_eq!(raw(29, 0).1[0], 0, "no cover");
+    assert_eq!(raw(20, 0).0, FT_FIELDEMPTY, "no track number");
+    // Not audio: tag fields are empty.
+    let img: Vec<u16> = std::path::Path::new("Cargo.toml").as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut buf = [0u16; 64];
+    assert_eq!(unsafe { ContentGetValueW(img.as_ptr(), 15, 0, buf.as_mut_ptr() as *mut c_void, 128, 0) }, FT_FIELDEMPTY);
 }
