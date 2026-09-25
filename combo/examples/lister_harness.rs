@@ -214,8 +214,9 @@ fn main() {
             host
         };
 
+        let started = Instant::now();
         let viewer = ListLoadW(parent, wide(&file).as_ptr(), 0);
-        println!("ListLoadW -> {:?}", viewer);
+        println!("ListLoadW -> {:?} in {} ms", viewer, started.elapsed().as_millis());
         if viewer.is_invalid() {
             let _ = DestroyWindow(host);
             return;

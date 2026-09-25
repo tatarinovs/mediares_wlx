@@ -49,6 +49,20 @@ pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
     }
 }
 
+/// Cheap pre-check reading only the header: whether a standard image is likely decodable within
+/// the limits. RAW/PSD are accepted as is (their previews are found only by a full parse).
+pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
+    match kind {
+        MediaType::StandardImage => ImageReader::open(path)
+            .ok()
+            .and_then(|r| r.with_guessed_format().ok())
+            .and_then(|r| r.into_dimensions().ok())
+            .is_some_and(|(w, h)| w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS),
+        MediaType::RawImage | MediaType::PsdImage => path.is_file(),
+        _ => false,
+    }
+}
+
 /// Applies an EXIF orientation code (1..=8); other values leave the image untouched.
 pub fn apply_exif_orientation(img: &mut DynamicImage, orientation: u16) {
     if let Some(o) = u8::try_from(orientation).ok().and_then(Orientation::from_exif) {

@@ -315,9 +315,7 @@ pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool
     let u = (7.0 * dpi_scale).round() as i32;
     let bar = (2.0 * dpi_scale).round().max(1.0) as i32;
     let block = |l: i32, t: i32, r: i32, b: i32| {
-        let brush = CreateSolidBrush(COLORREF(ICON));
-        FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, brush);
-        let _ = DeleteObject(brush.into());
+        FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, icon);
     };
     let (_, buttons) = photo_layout(dpi_scale);
     for (button, r) in buttons {

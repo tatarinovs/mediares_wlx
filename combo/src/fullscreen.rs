@@ -63,7 +63,7 @@ pub unsafe fn sync_overlay(state: &mut ViewerState) {
     let kind = match &state.media {
         Some(media) if media.is_video() && config.overlay_video => Some(PanelKind::Video),
         Some(_) => None,
-        None if state.image.is_some() && config.overlay_photo => Some(PanelKind::Photo),
+        None if state.shows_photo() && config.overlay_photo => Some(PanelKind::Photo),
         None => None,
     };
     let autohide = config.overlay_autohide;

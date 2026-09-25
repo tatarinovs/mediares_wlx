@@ -3,12 +3,13 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use mediares_core::image_decode::header_looks_decodable;
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 
 use crate::config::ViewerConfig;
-use crate::image_cache::{self, DecodedImage};
+use crate::image_cache::{self, DecodedImage, Request, Ticket};
 use crate::media_view::MediaView;
 use crate::overlay::Fullscreen;
 use crate::playlist::{self, EndAction};
@@ -40,6 +41,12 @@ pub struct ViewerState {
     pub file_path: PathBuf,
     pub file_size: u64,
     pub image: Option<Arc<DecodedImage>>,
+    /// The photo being decoded in the background (then `image` is `None`).
+    pub pending: Option<Ticket>,
+    /// The last photo shown, drawn while `pending` so switching doesn't flash an empty window.
+    pub previous: Option<Arc<DecodedImage>>,
+    /// The current photo could not be decoded.
+    pub load_failed: bool,
     /// Present while a video or audio file is shown (then `image` is `None`).
     pub media: Option<MediaView>,
     pub zoom: ZoomMode,
@@ -50,6 +57,8 @@ pub struct ViewerState {
     /// The files navigated through: the folder's viewable files, or an M3U playlist's entries.
     pub dir_files: Vec<PathBuf>,
     pub current_idx: usize,
+    /// Direction of the last move through the list (prefetching looks further that way).
+    forward: bool,
     /// The M3U file `dir_files` came from.
     pub playlist: Option<PathBuf>,
     /// Monitor rectangle while fullscreen; the window is pinned to it.
@@ -74,6 +83,9 @@ impl ViewerState {
             file_path: PathBuf::new(),
             file_size: 0,
             image: None,
+            pending: None,
+            previous: None,
+            load_failed: false,
             media: None,
             zoom: ZoomMode::Fit,
             offset: (0.0, 0.0),
@@ -81,6 +93,7 @@ impl ViewerState {
             loupe: None,
             dir_files: Vec::new(),
             current_idx: 0,
+            forward: true,
             playlist: None,
             fullscreen: None,
             overlay: None,
@@ -124,7 +137,24 @@ impl ViewerState {
     }
 
     pub fn has_content(&self) -> bool {
-        self.image.is_some() || self.media.is_some()
+        self.shows_photo() || self.media.is_some()
+    }
+
+    /// A photo is shown or on its way.
+    pub fn shows_photo(&self) -> bool {
+        self.image.is_some() || self.pending.is_some()
+    }
+
+    /// Takes the background decode result if it has arrived. Returns whether the view changed.
+    pub fn image_ready(&mut self) -> bool {
+        let Some(result) = self.pending.as_ref().and_then(Ticket::result) else { return false };
+        self.pending = None;
+        self.previous = None;
+        match result {
+            Some(img) => self.image = Some(img),
+            None => self.load_failed = true,
+        }
+        true
     }
 
     /// Shows the file at `idx` of the list; false if it can't be displayed.
@@ -141,7 +171,10 @@ impl ViewerState {
             .map(|k| (self.current_idx + k) % n)
             .find(|&i| probe_file(&self.dir_files[i]).is_image_kind());
         match next {
-            Some(idx) => self.go_to(idx),
+            Some(idx) => {
+                self.forward = true;
+                self.go_to(idx)
+            }
             None => false,
         }
     }
@@ -175,6 +208,7 @@ impl ViewerState {
             return false;
         }
         let idx = if forward { (self.current_idx + 1) % total } else { (self.current_idx + total - 1) % total };
+        self.forward = forward;
         self.go_to(idx);
         true
     }
@@ -183,7 +217,7 @@ impl ViewerState {
         let reload = config.auto_rotate_exif != self.config.auto_rotate_exif;
         self.config = config;
         self.drop_osd_font();
-        if reload && self.image.is_some() {
+        if reload && self.shows_photo() {
             self.load_media();
         }
     }
@@ -201,8 +235,11 @@ impl ViewerState {
         let kind = probe_file(&self.file_path);
         self.file_size = std::fs::metadata(&self.file_path).map(|m| m.len()).unwrap_or(0);
 
+        let shown = self.image.take();
+        self.pending = None;
+        self.load_failed = false;
         if kind.is_playable() {
-            self.image = None;
+            self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
             self.media = unsafe { MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind) };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
@@ -211,19 +248,45 @@ impl ViewerState {
             }
         } else {
             self.media = None;
-            self.image = if kind.is_image_kind() { image_cache::load(&self.file_path, kind, rotate) } else { None };
+            if kind.is_image_kind() {
+                match image_cache::request(&self.file_path, kind, rotate, self.hwnd) {
+                    Some(Request::Ready(img)) => {
+                        self.image = Some(img);
+                        self.previous = None;
+                    }
+                    Some(Request::Pending(ticket)) if header_looks_decodable(&self.file_path, kind) => {
+                        self.pending = Some(ticket);
+                        self.previous = shown.or(self.previous.take());
+                    }
+                    _ => {
+                        self.load_failed = true;
+                        self.previous = None;
+                    }
+                }
+            } else {
+                self.previous = None;
+            }
         }
 
-        // Warm up neighbouring images for instant next/previous.
+        image_cache::prefetch(self.prefetch_candidates(), rotate);
+    }
+
+    /// Neighbouring photos to warm up, most likely next first: two ahead in the direction of the
+    /// last move, one behind.
+    fn prefetch_candidates(&self) -> Vec<PathBuf> {
         let total = self.dir_files.len();
-        if total > 1 {
-            let mut neighbours = vec![self.dir_files[(self.current_idx + 1) % total].clone()];
-            if total > 2 {
-                neighbours.push(self.dir_files[(self.current_idx + total - 1) % total].clone());
-            }
-            neighbours.retain(|p| probe_file(p).is_image_kind());
-            image_cache::prefetch(neighbours, rotate);
+        if total <= 1 {
+            return Vec::new();
         }
+        let at = |step: isize| (self.current_idx as isize + step).rem_euclid(total as isize) as usize;
+        let dir = if self.forward { 1 } else { -1 };
+        let mut indices = Vec::new();
+        for i in [at(dir), at(-dir), at(2 * dir)] {
+            if i != self.current_idx && !indices.contains(&i) {
+                indices.push(i);
+            }
+        }
+        indices.into_iter().map(|i| self.dir_files[i].clone()).filter(|p| probe_file(p).is_image_kind()).collect()
     }
 }
 

@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS};
 
 use crate::config::ViewerConfig;
+use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, client_size, point_from_lparam};
 use crate::media_view::EventEffect;
 use crate::playback_video::WM_MEDIA_EVENT;
@@ -457,7 +458,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             // Switches the OSD for the kind of content shown (audio has none).
             let osd = state.config.osd;
             let video = state.media.as_ref().is_some_and(|m| m.is_video());
-            state.config.osd = match (video, state.image.is_some()) {
+            state.config.osd = match (video, state.shows_photo()) {
                 (true, _) => osd.with(osd.photo(), !osd.video()),
                 (false, true) => osd.with(!osd.photo(), osd.video()),
                 (false, false) => return,
@@ -513,7 +514,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             media.show_status(text);
         }
         Command::ToggleSlideshow => {
-            let run = !state.slideshow && state.image.is_some();
+            let run = !state.slideshow && state.shows_photo();
             set_slideshow(state, run);
             update_title(state);
         }
@@ -721,9 +722,19 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 execute(hwnd, cmd);
             }
         }
+        WM_IMAGE_READY => {
+            if state.image_ready() {
+                if state.slideshow {
+                    set_slideshow(state, true);
+                }
+                refresh(state);
+            }
+        }
+        // A photo still decoding gets its full slideshow interval once it is shown.
+        WM_TIMER if wparam.0 == SLIDESHOW_TIMER_ID && state.pending.is_some() => {}
         WM_TIMER if wparam.0 == SLIDESHOW_TIMER_ID => {
             // Stops by itself when a video / audio file was opened or there's no other photo.
-            if state.image.is_some() && state.next_photo() && state.image.is_some() {
+            if state.shows_photo() && state.next_photo() && state.shows_photo() {
                 refresh(state);
             } else {
                 set_slideshow(state, false);

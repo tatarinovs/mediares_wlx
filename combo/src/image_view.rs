@@ -6,7 +6,8 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, ExtTextOutW, FillRect, GetDeviceCaps, SelectObject, SetBkMode, SetBrushOrgEx,
+    DeleteObject, DrawTextW, ExtTextOutW, FillRect, GetDeviceCaps, GetStockObject, DEFAULT_GUI_FONT,
+    DT_CENTER, DT_SINGLELINE, DT_VCENTER, SelectObject, SetBkMode, SetBrushOrgEx,
     SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CLIP_DEFAULT_PRECIS, COLORONCOLOR, DEFAULT_CHARSET, DEFAULT_QUALITY, DIB_RGB_COLORS,
     ETO_OPTIONS, FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
@@ -167,6 +168,10 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     if let Some(state) = state {
         if let Some(img) = state.image.clone() {
             draw_image(mem_dc, state, &img, (win_w as f32, win_h as f32));
+        } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
+            draw_fitted(mem_dc, &prev, RECT { left: 0, top: 0, right: win_w, bottom: win_h });
+        } else if state.load_failed {
+            draw_centered_text(mem_dc, "Не удалось открыть изображение", win_w, win_h);
         }
         if state.config.osd.photo() {
             draw_osd(mem_dc, state);
@@ -177,6 +182,16 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     SelectObject(mem_dc, old_bmp);
     let _ = DeleteObject(mem_bmp.into());
     let _ = DeleteDC(mem_dc);
+}
+
+unsafe fn draw_centered_text(dc: HDC, text: &str, win_w: i32, win_h: i32) {
+    let mut text: Vec<u16> = text.encode_utf16().collect();
+    let mut rc = RECT { left: 0, top: 0, right: win_w, bottom: win_h };
+    let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, COLORREF(0x00A0A0A0));
+    DrawTextW(dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SelectObject(dc, old_font);
 }
 
 /// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio.

@@ -17,7 +17,7 @@ pub enum MediaType {
 const STANDARD_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "ico"];
 const RAW_EXTS: &[&str] = &["cr2", "cr3", "nef", "arw", "orf", "rw2", "dng", "raf", "pef"];
 const PSD_EXTS: &[&str] = &["psd", "psb"];
-const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "ts", "mts"];
+const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "ts", "mts", "mpg", "mpeg", "vob"];
 const AUDIO_EXTS: &[&str] = &[
     "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff", "caf", "mka",
 ];
