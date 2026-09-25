@@ -125,6 +125,10 @@ pub struct ViewerConfig {
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
     pub resume_video: bool,
+    /// Programs for "Открыть в редакторе"; empty = the file type's Edit verb or default program.
+    pub photo_editor: String,
+    pub video_editor: String,
+    pub audio_editor: String,
 }
 
 impl Default for ViewerConfig {
@@ -145,6 +149,9 @@ impl Default for ViewerConfig {
             photo_background: crate::image_cache::BACKGROUND,
             confirm_delete: true,
             resume_video: true,
+            photo_editor: String::new(),
+            video_editor: String::new(),
+            audio_editor: String::new(),
         }
     }
 }
@@ -155,7 +162,7 @@ impl ViewerConfig {
         let d = Self::default();
         let int = |key: PCWSTR, default: i32| unsafe { GetPrivateProfileIntW(SECTION, key, default, &ini) };
         let string = |key: PCWSTR, default: &str| {
-            let mut buf = [0u16; 256];
+            let mut buf = [0u16; 1024];
             let len = unsafe { GetPrivateProfileStringW(SECTION, key, &HSTRING::from(default), Some(&mut buf), &ini) };
             String::from_utf16_lossy(&buf[..len as usize])
         };
@@ -188,6 +195,9 @@ impl ViewerConfig {
             photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32 & 0x00FF_FFFF,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
+            photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
+            video_editor: string(w!("VideoEditor"), "").trim().to_string(),
+            audio_editor: string(w!("AudioEditor"), "").trim().to_string(),
         }
     }
 
@@ -217,6 +227,9 @@ impl ViewerConfig {
             write(w!("PhotoBackground"), self.photo_background.to_string()),
             write(w!("ConfirmDelete"), flag(self.confirm_delete)),
             write(w!("ResumeVideo"), flag(self.resume_video)),
+            write(w!("PhotoEditor"), self.photo_editor.clone()),
+            write(w!("VideoEditor"), self.video_editor.clone()),
+            write(w!("AudioEditor"), self.audio_editor.clone()),
         ]
         .iter()
         .all(|&ok| ok)

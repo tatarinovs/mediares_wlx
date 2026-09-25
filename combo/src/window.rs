@@ -561,13 +561,26 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         }
         Command::Delete => delete_current(hwnd),
         Command::OpenInEditor => {
+            leave_fullscreen(hwnd);
+            let Some(state) = get_state(hwnd) else { return };
+            let editor = match &state.media {
+                None => state.config.photo_editor.clone(),
+                Some(media) if media.is_video() => state.config.video_editor.clone(),
+                Some(_) => state.config.audio_editor.clone(),
+            };
             let path = state.file_path.clone();
-            if !file_actions::open_in_editor(hwnd, &path) {
-                file_actions::show_error(dialog::modal_owner(hwnd), "Не удалось открыть файл во внешней программе.");
+            if !file_actions::open_in_editor(hwnd, &path, &editor) {
+                let text = if editor.is_empty() {
+                    "Не удалось открыть файл во внешней программе.".to_string()
+                } else {
+                    format!("Не удалось запустить редактор:\n{}\n\nПуть задаётся в настройках (S).", editor)
+                };
+                file_actions::show_error(dialog::modal_owner(hwnd), &text);
             }
         }
         Command::ShowInFolder => {
             let path = state.file_path.clone();
+            leave_fullscreen(hwnd);
             file_actions::show_in_folder(hwnd, &path);
         }
         Command::SetWallpaper => set_wallpaper(hwnd),
@@ -638,6 +651,13 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             }
             media.invalidate_bar();
         }
+    }
+}
+
+/// Another program is about to open: fullscreen (topmost) would keep it hidden.
+unsafe fn leave_fullscreen(hwnd: HWND) {
+    if get_state(hwnd).is_some_and(|s| s.fullscreen.is_some()) {
+        execute(hwnd, Command::ToggleFullscreen);
     }
 }
 

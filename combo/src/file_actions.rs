@@ -46,8 +46,14 @@ unsafe fn shell_execute(owner: HWND, verb: PCWSTR, file: &HSTRING, params: Optio
     ShellExecuteW(Some(owner), verb, file, params, PCWSTR::null(), SW_SHOWNORMAL).0 as isize > 32
 }
 
-/// The "Edit" program registered for the file type, or its default program if there is none.
-pub unsafe fn open_in_editor(owner: HWND, path: &Path) -> bool {
+/// Opens `path` in `editor` (a program path; quotes around it are fine). Without one: the file
+/// type's "Edit" program, or its default program if there is none.
+pub unsafe fn open_in_editor(owner: HWND, path: &Path, editor: &str) -> bool {
+    let editor = editor.trim().trim_matches('"');
+    if !editor.is_empty() {
+        let params = HSTRING::from(format!("\"{}\"", path.display()));
+        return shell_execute(owner, w!("open"), &HSTRING::from(editor), Some(&params));
+    }
     let file = HSTRING::from(path.as_os_str());
     shell_execute(owner, w!("edit"), &file, None) || shell_execute(owner, w!("open"), &file, None)
 }

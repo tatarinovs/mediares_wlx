@@ -2,12 +2,16 @@
 
 use std::sync::Mutex;
 
-use windows::core::{w, HSTRING, PCWSTR};
+use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{CreateSolidBrush, InvalidateRect, SetBkColor, SetBkMode, SetTextColor, HDC, OPAQUE};
-use windows::Win32::UI::Controls::Dialogs::{ChooseColorW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW};
+use windows::Win32::UI::Controls::Dialogs::{
+    ChooseColorW, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
+    OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, SendDlgItemMessageW,
+    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SetDlgItemTextW,
+    WS_BORDER,
     SetWindowLongPtrW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
     BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, GWLP_USERDATA,
     IDCANCEL, IDOK, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_NCDESTROY, WS_TABSTOP, WS_VSCROLL,
@@ -37,6 +41,16 @@ const IDC_CHOOSE_BACKGROUND: i32 = 115;
 const IDC_BACKGROUND_PREVIEW: i32 = 116;
 const IDC_CONFIRM_DELETE: i32 = 117;
 const IDC_RESUME_VIDEO: i32 = 118;
+const IDC_PHOTO_EDITOR: i32 = 119;
+const IDC_BROWSE_PHOTO_EDITOR: i32 = 120;
+const IDC_VIDEO_EDITOR: i32 = 121;
+const IDC_BROWSE_VIDEO_EDITOR: i32 = 122;
+const IDC_AUDIO_EDITOR: i32 = 123;
+const IDC_BROWSE_AUDIO_EDITOR: i32 = 124;
+
+const ES_AUTOHSCROLL: i32 = 0x0080;
+/// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
+const EM_SETCUEBANNER: u32 = 0x1501;
 
 const BST_CHECKED: usize = 1;
 const SS_LEFT: u32 = 0x0000;
@@ -69,7 +83,7 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 730)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 850, 540)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
@@ -119,7 +133,16 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
         }
         SendDlgItemMessageW(dlg, id, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
     };
+    // "<label> [path] [Обзор...]" at label baseline `y` in the right column; empty = the system's choice.
+    let program_row = |y: i32, label: &str, path: &str, edit_id: i32, browse_id: i32| {
+        control(w!("STATIC"), label, SS_LEFT, (438, y, 55, 20), 0);
+        control(w!("EDIT"), path, tab | WS_BORDER.0 | ES_AUTOHSCROLL as u32, (495, y - 3, 235, 24), edit_id);
+        control(w!("BUTTON"), "Обзор...", tab | BS_PUSHBUTTON as u32, (738, y - 4, 72, 26), browse_id);
+        let hint = w!("программа, назначенная в Windows");
+        SendDlgItemMessageW(dlg, edit_id, EM_SETCUEBANNER, WPARAM(1), LPARAM(hint.as_ptr() as isize));
+    };
 
+    // Left column: photos, OSD, fullscreen.
     checkbox("Запускать в полноэкранном режиме", (20, 15, 380, 22), IDC_START_FULLSCREEN, cfg.start_fullscreen);
     checkbox("Автоповорот по ориентации EXIF", (20, 42, 380, 22), IDC_AUTO_ROTATE_EXIF, cfg.auto_rotate_exif);
 
@@ -146,25 +169,31 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 297, 130, 26), IDC_CHOOSE_COLOR);
     control(w!("STATIC"), "Aa", SS_CENTER | SS_CENTERIMAGE, (320, 297, 45, 26), IDC_COLOR_PREVIEW);
 
-    control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (15, 349, 395, 140), 0);
-    checkbox("Автопереход к следующему файлу", (28, 374, 365, 22), IDC_AUTO_ADVANCE, cfg.queue.auto_advance);
-    control(w!("STATIC"), "Повтор:", SS_LEFT, (28, 406, 140, 20), 0);
-    let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
-    combo((175, 403, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
-    checkbox("Случайный порядок", (28, 434, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
-    checkbox("Продолжать видео длиннее 5 мин с места остановки", (28, 459, 375, 22), IDC_RESUME_VIDEO, cfg.resume_video);
-
-    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 499, 395, 140), 0);
-    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 522, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
-    checkbox("Панель управления поверх видео", (28, 547, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
-    checkbox("Скрывать панель при бездействии", (28, 572, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
-    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 605, 170, 20), 0);
+    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 349, 395, 140), 0);
+    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 372, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
+    checkbox("Панель управления поверх видео", (28, 397, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
+    checkbox("Скрывать панель при бездействии", (28, 422, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
+    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 455, 170, 20), 0);
     let slide_labels = ctx.slideshow_seconds.iter().map(|s| format!("{} с", s)).collect();
     let slide_sel = ctx.slideshow_seconds.iter().position(|&s| s == cfg.slideshow_seconds).unwrap_or(0);
-    combo((205, 602, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
+    combo((205, 452, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
 
-    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 651, 95, 28), IDOK.0);
-    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 651, 95, 28), IDCANCEL.0);
+    // Right column: audio / video, external editors.
+    control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (425, 15, 395, 140), 0);
+    checkbox("Автопереход к следующему файлу", (438, 40, 365, 22), IDC_AUTO_ADVANCE, cfg.queue.auto_advance);
+    control(w!("STATIC"), "Повтор:", SS_LEFT, (438, 72, 140, 20), 0);
+    let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
+    combo((585, 69, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
+    checkbox("Случайный порядок", (438, 100, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
+    checkbox("Продолжать видео длиннее 5 мин с места остановки", (438, 125, 375, 22), IDC_RESUME_VIDEO, cfg.resume_video);
+
+    control(w!("BUTTON"), "Внешние редакторы («Открыть в редакторе»)", BS_GROUPBOX as u32, (425, 165, 395, 125), 0);
+    program_row(193, "Фото:", &cfg.photo_editor, IDC_PHOTO_EDITOR, IDC_BROWSE_PHOTO_EDITOR);
+    program_row(225, "Видео:", &cfg.video_editor, IDC_VIDEO_EDITOR, IDC_BROWSE_VIDEO_EDITOR);
+    program_row(257, "Аудио:", &cfg.audio_editor, IDC_AUDIO_EDITOR, IDC_BROWSE_AUDIO_EDITOR);
+
+    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (615, 461, 95, 28), IDOK.0);
+    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (725, 461, 95, 28), IDCANCEL.0);
     ok
 }
 
@@ -195,6 +224,9 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.photo_background = ctx.background;
     cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
+    cfg.photo_editor = edit_text(dlg, IDC_PHOTO_EDITOR);
+    cfg.video_editor = edit_text(dlg, IDC_VIDEO_EDITOR);
+    cfg.audio_editor = edit_text(dlg, IDC_AUDIO_EDITOR);
     cfg.save();
     ctx.result = Some(cfg.clone());
 }
@@ -226,6 +258,33 @@ unsafe fn repaint_previews(dlg: HWND) {
         if let Ok(preview) = GetDlgItem(Some(dlg), id) {
             let _ = InvalidateRect(Some(preview), None, true);
         }
+    }
+}
+
+unsafe fn edit_text(dlg: HWND, id: i32) -> String {
+    let mut buf = [0u16; 1024];
+    let len = GetDlgItemTextW(dlg, id, &mut buf) as usize;
+    String::from_utf16_lossy(&buf[..len]).trim().to_string()
+}
+
+/// "Обзор...": picks a program and puts its path into the edit box `edit_id`.
+unsafe fn browse_program(dlg: HWND, edit_id: i32) {
+    // The dialog opens at the current program (surrounding quotes dropped).
+    let mut file = [0u16; 1024];
+    let current: Vec<u16> = edit_text(dlg, edit_id).trim_matches('"').encode_utf16().take(file.len() - 1).collect();
+    file[..current.len()].copy_from_slice(&current);
+    let mut ofn = OPENFILENAMEW {
+        lStructSize: size_of::<OPENFILENAMEW>() as u32,
+        hwndOwner: dlg,
+        lpstrFilter: w!("Программы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0"),
+        lpstrFile: PWSTR(file.as_mut_ptr()),
+        nMaxFile: file.len() as u32,
+        lpstrTitle: w!("Выберите редактор"),
+        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
+        ..Default::default()
+    };
+    if GetOpenFileNameW(&mut ofn).as_bool() {
+        let _ = SetDlgItemTextW(dlg, edit_id, PCWSTR(file.as_ptr()));
     }
 }
 
@@ -265,6 +324,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 match dialog::loword(wparam) as i32 {
                     IDC_CHOOSE_COLOR => choose_color(hwnd, ctx),
                     IDC_CHOOSE_BACKGROUND => choose_background(hwnd, ctx),
+                    IDC_BROWSE_PHOTO_EDITOR => browse_program(hwnd, IDC_PHOTO_EDITOR),
+                    IDC_BROWSE_VIDEO_EDITOR => browse_program(hwnd, IDC_VIDEO_EDITOR),
+                    IDC_BROWSE_AUDIO_EDITOR => browse_program(hwnd, IDC_AUDIO_EDITOR),
                     id if id == IDOK.0 => {
                         accept(hwnd, ctx);
                         dialog::close(hwnd);
