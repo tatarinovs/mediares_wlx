@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::UNIX_EPOCH;
 
-use crate::hashing::{analyze_image, analyze_image_from_memory, ImageAnalysis};
+use crate::hashing::{analyze_dynamic_image, analyze_image, analyze_image_from_memory, ImageAnalysis};
 use crate::probe::{probe_file, MediaType};
 use crate::video::{analyze_video, VideoAnalysis};
 
@@ -89,12 +89,9 @@ impl MediaCache {
             MediaType::PsdImage => {
                 #[cfg(feature = "psd-preview")]
                 {
-                    if let Some(bytes) = crate::psd_preview::extract_psd_preview(path) {
-                        if let Ok(a) = analyze_image_from_memory(&bytes) {
-                            CachedMedia::Image(Arc::new(a))
-                        } else {
-                            CachedMedia::Unsupported
-                        }
+                    if let Some(img) = crate::psd_preview::load_psd_image(path) {
+                        let a = analyze_dynamic_image(&img);
+                        CachedMedia::Image(Arc::new(a))
                     } else {
                         CachedMedia::Unsupported
                     }

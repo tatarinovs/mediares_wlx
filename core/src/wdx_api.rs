@@ -36,8 +36,13 @@ const FIELDS: &[(&str, c_int)] = &[
     ("Plugin_Version", FT_STRINGW),
 ];
 
-pub const WDX_DETECT_STRING: &str =
-    r#"EXT="JPG" | EXT="JPEG" | EXT="PNG" | EXT="GIF" | EXT="WEBP" | EXT="BMP" | EXT="TIFF" | EXT="TIF" | EXT="ICO" | EXT="CR2" | EXT="NEF" | EXT="ARW" | EXT="DNG" | EXT="ORF" | EXT="RW2" | EXT="PSD" | EXT="MP4" | EXT="MKV" | EXT="AVI" | EXT="MOV" | EXT="WMV" | EXT="WEBM" | EXT="M4V" | EXT="FLV" | EXT="TS""#;
+pub const WDX_DETECT_STRING: &str = concat!(
+    "EXT=\"JPG\" | EXT=\"JPEG\" | EXT=\"PNG\" | EXT=\"GIF\" | EXT=\"WEBP\" | ",
+    "EXT=\"BMP\" | EXT=\"TIFF\" | EXT=\"TIF\" | EXT=\"ICO\" | EXT=\"CR2\" | EXT=\"NEF\" | ",
+    "EXT=\"ARW\" | EXT=\"DNG\" | EXT=\"ORF\" | EXT=\"RW2\" | EXT=\"PSD\" | EXT=\"MP4\" | ",
+    "EXT=\"MKV\" | EXT=\"AVI\" | EXT=\"MOV\" | EXT=\"WMV\" | EXT=\"WEBM\" | EXT=\"M4V\" | ",
+    "EXT=\"FLV\" | EXT=\"TS\""
+);
 
 pub unsafe fn content_get_supported_field(
     field_index: c_int,

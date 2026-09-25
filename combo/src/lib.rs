@@ -92,8 +92,14 @@ pub unsafe extern "system" fn ContentPluginUnloading() {
 // Total Commander WLX (Lister Plugin) API
 // ==========================================
 
-const WLX_DETECT_STRING: &str =
-    r#"EXT="JPG" | EXT="JPEG" | EXT="PNG" | EXT="GIF" | EXT="WEBP" | EXT="BMP" | EXT="TIFF" | EXT="TIF" | EXT="ICO" | EXT="CR2" | EXT="NEF" | EXT="ARW" | EXT="DNG" | EXT="ORF" | EXT="RW2" | EXT="PSD" | EXT="MP4" | EXT="MKV" | EXT="AVI" | EXT="MOV" | EXT="WMV" | EXT="WEBM" | EXT="M4V" | EXT="FLV" | EXT="TS" | EXT="MP3" | EXT="FLAC" | EXT="WAV" | EXT="OGG""#;
+const WLX_DETECT_STRING: &str = concat!(
+    "MULTIMEDIA & ext=\"JPG\"|ext=\"JPEG\"|ext=\"PNG\"|ext=\"GIF\"|ext=\"WEBP\"|",
+    "ext=\"BMP\"|ext=\"TIFF\"|ext=\"TIF\"|ext=\"ICO\"|ext=\"CR2\"|ext=\"NEF\"|",
+    "ext=\"ARW\"|ext=\"DNG\"|ext=\"ORF\"|ext=\"RW2\"|ext=\"PSD\"|ext=\"CR3\"|",
+    "ext=\"RAF\"|ext=\"PEF\"|ext=\"MP4\"|ext=\"MKV\"|ext=\"AVI\"|ext=\"MOV\"|",
+    "ext=\"WMV\"|ext=\"WEBM\"|ext=\"M4V\"|ext=\"FLV\"|ext=\"TS\"|ext=\"MP3\"|",
+    "ext=\"FLAC\"|ext=\"WAV\"|ext=\"OGG\""
+);
 
 #[no_mangle]
 pub unsafe extern "system" fn ListGetDetectString(detect_string: *mut c_char, max_len: c_int) {
