@@ -164,7 +164,7 @@ pub unsafe extern "system" fn ListLoadNextW(
             state.set_file(&path);
             if state.image.is_some() {
                 update_lister_title(parent_win, state);
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, false);
                 LISTPLUGIN_OK
             } else {
                 LISTPLUGIN_ERROR
@@ -194,7 +194,7 @@ pub unsafe extern "system" fn ListLoadNext(
             state.set_file(&path);
             if state.image.is_some() {
                 update_lister_title(parent_win, state);
-                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, false);
                 LISTPLUGIN_OK
             } else {
                 LISTPLUGIN_ERROR

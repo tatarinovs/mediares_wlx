@@ -5,6 +5,7 @@ use std::path::Path;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
+    UpdateWindow,
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
     DeleteObject, EndPaint, FillRect, SelectObject, SetStretchBltMode, StretchDIBits,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HDC,
@@ -13,9 +14,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetClientRect, GetParent, GetWindowLongPtrW,
+    CreateWindowExW, DefWindowProcW, GetAncestor, GetClientRect, GetParent, GetWindowLongPtrW,
     PostMessageW, RegisterClassExW, SetWindowLongPtrW, SetWindowTextW,
-    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    CS_DBLCLKS, GA_ROOT, GWL_STYLE, GWLP_USERDATA,
     WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_XBUTTONDOWN, WNDCLASSEXW,
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
@@ -28,12 +29,15 @@ const WINDOW_CLASS_NAME: PCWSTR = w!("MediaresViewerClass");
 pub unsafe fn ensure_window_class_registered() {
     let hinstance = GetModuleHandleW(None).unwrap_or_default();
 
+    // Dark sleek background brush (0x181818) so OS never paints white
+    let bg_brush = CreateSolidBrush(COLORREF(0x00181818));
+
     let mut wc = WNDCLASSEXW::default();
     wc.cbSize = size_of::<WNDCLASSEXW>() as u32;
-    wc.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    wc.style = CS_DBLCLKS; // Omit CS_HREDRAW | CS_VREDRAW to prevent erase-flicker
     wc.lpfnWndProc = Some(wlx_wnd_proc);
     wc.hInstance = hinstance.into();
-    wc.hbrBackground = windows::Win32::Graphics::Gdi::HBRUSH(std::ptr::null_mut());
+    wc.hbrBackground = bg_brush;
     wc.lpszClassName = WINDOW_CLASS_NAME;
 
     let _ = RegisterClassExW(&wc);
@@ -41,6 +45,21 @@ pub unsafe fn ensure_window_class_registered() {
 
 pub unsafe fn create_viewer_window(parent: HWND, file_path: &Path) -> Option<HWND> {
     ensure_window_class_registered();
+
+    // Fix Total Commander Delphi TForm white background flicker:
+    // Ensure parent and top-level Lister windows have WS_CLIPCHILDREN enabled
+    // so TC's default white background brush is NEVER drawn over our viewer rect!
+    let p_style = GetWindowLongPtrW(parent, GWL_STYLE) as u32;
+    if (p_style & WS_CLIPCHILDREN.0) == 0 {
+        let _ = SetWindowLongPtrW(parent, GWL_STYLE, (p_style | WS_CLIPCHILDREN.0) as isize);
+    }
+    let top_win = GetAncestor(parent, GA_ROOT);
+    if !top_win.is_invalid() && top_win != parent {
+        let t_style = GetWindowLongPtrW(top_win, GWL_STYLE) as u32;
+        if (t_style & WS_CLIPCHILDREN.0) == 0 {
+            let _ = SetWindowLongPtrW(top_win, GWL_STYLE, (t_style | WS_CLIPCHILDREN.0) as isize);
+        }
+    }
 
     let mut rect = RECT::default();
     GetClientRect(parent, &mut rect).ok()?;
@@ -126,8 +145,12 @@ pub unsafe fn navigate_viewer(hwnd: HWND, next: bool) {
     let next_path = state.dir_files[new_idx].clone();
     state.set_file(&next_path);
 
+    // Immediately repaint synchronously with bErase=false to eliminate any white flash
+    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+    let _ = UpdateWindow(hwnd);
+
+    // Update Lister title after image is already on screen
     update_lister_title(state.parent_hwnd, state);
-    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
 }
 
 unsafe extern "system" fn wlx_wnd_proc(
@@ -138,6 +161,7 @@ unsafe extern "system" fn wlx_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => {
+            // Signal that background is fully handled inside double-buffered paint
             LRESULT(1)
         }
         WM_PAINT => {
@@ -150,6 +174,7 @@ unsafe extern "system" fn wlx_wnd_proc(
             LRESULT(0)
         }
         WM_SIZE => {
+            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
@@ -157,7 +182,6 @@ unsafe extern "system" fn wlx_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONDBLCLK => {
-            // Forward double click to parent Lister to toggle full screen
             if let Ok(parent) = GetParent(hwnd) {
                 if !parent.is_invalid() {
                     let _ = PostMessageW(Some(parent), WM_LBUTTONDBLCLK, wparam, lparam);
@@ -254,7 +278,6 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
 
     if let Some(state) = get_viewer_state(hwnd) {
         if let Some(ref img) = state.image {
-            // Letterbox fit calculation
             let (dst_x, dst_y, dst_w, dst_h) = calculate_letterbox(
                 img.width, img.height, win_w as u32, win_h as u32,
             );
@@ -287,7 +310,7 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
         }
     }
 
-    // Blit to screen in one single operation
+    // Blit to screen in one atomic operation
     let _ = BitBlt(hdc, 0, 0, win_w, win_h, Some(mem_dc), 0, 0, SRCCOPY);
 
     SelectObject(mem_dc, old_bmp);
