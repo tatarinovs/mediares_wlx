@@ -36,6 +36,10 @@ pub struct ContentDefaultParamStruct {
     pub default_ini_name: [c_char; 260],
 }
 
+// WLX Return codes for ListLoadNext / ListLoadNextW
+pub const LISTPLUGIN_OK: c_int = 0;
+pub const LISTPLUGIN_ERROR: c_int = 1;
+
 // WLX ShowFlags
 pub const LCS_WHOLEEMBEDDED: c_int = 1;
 pub const LCS_FITTOOPTIONS: c_int = 2;

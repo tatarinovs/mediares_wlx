@@ -156,20 +156,30 @@ pub unsafe extern "system" fn ListLoadNextW(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let path = match pwstr_to_path(file_to_load) {
             Some(p) => p,
-            None => return 0,
+            None => return LISTPLUGIN_ERROR,
         };
 
         if let Some(state) = get_viewer_state(list_win) {
             state.file_path = path;
             state.media_type = mediares_core::probe::probe_file(&state.file_path);
+            if !state.media_type.is_image_kind() {
+                return LISTPLUGIN_ERROR;
+            }
             state.load_media();
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
-            1
+            if state.image.is_some() {
+                state.zoom_factor = 1.0;
+                state.pan_x = 0;
+                state.pan_y = 0;
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
+                LISTPLUGIN_OK
+            } else {
+                LISTPLUGIN_ERROR
+            }
         } else {
-            0
+            LISTPLUGIN_ERROR
         }
     }))
-    .unwrap_or(0)
+    .unwrap_or(LISTPLUGIN_ERROR)
 }
 
 #[no_mangle]
@@ -182,20 +192,30 @@ pub unsafe extern "system" fn ListLoadNext(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let path = match pstr_to_path(file_to_load) {
             Some(p) => p,
-            None => return 0,
+            None => return LISTPLUGIN_ERROR,
         };
 
         if let Some(state) = get_viewer_state(list_win) {
             state.file_path = path;
             state.media_type = mediares_core::probe::probe_file(&state.file_path);
+            if !state.media_type.is_image_kind() {
+                return LISTPLUGIN_ERROR;
+            }
             state.load_media();
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
-            1
+            if state.image.is_some() {
+                state.zoom_factor = 1.0;
+                state.pan_x = 0;
+                state.pan_y = 0;
+                let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
+                LISTPLUGIN_OK
+            } else {
+                LISTPLUGIN_ERROR
+            }
         } else {
-            0
+            LISTPLUGIN_ERROR
         }
     }))
-    .unwrap_or(0)
+    .unwrap_or(LISTPLUGIN_ERROR)
 }
 
 #[no_mangle]
