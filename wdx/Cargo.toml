@@ -1,0 +1,17 @@
+[package]
+name = "mediares_wdx"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mediares_wdx"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mediares_core = { path = "../core", default-features = false, features = ["raw-preview", "psd-preview"] }
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winres = "0.1"

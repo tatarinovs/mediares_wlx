@@ -1,0 +1,5 @@
+[plugininstall]
+description=Mediares - Media Perceptual Hash Duplicate Finder (WDX)
+type=wdx
+file=mediares.wdx64
+defaultdir=mediares

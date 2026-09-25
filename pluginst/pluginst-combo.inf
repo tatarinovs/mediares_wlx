@@ -1,0 +1,5 @@
+[plugininstall]
+description=Mediares - Media Viewer & Duplicate Finder 2-in-1 (WLX+WDX)
+type=wlx
+file=mediares.wlx64
+defaultdir=mediares

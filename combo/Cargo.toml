@@ -1,0 +1,21 @@
+[package]
+name = "mediares_combo"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "mediares_combo"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+image = { version = "0.25.10", default-features = false }
+mediares_core = { path = "../core", features = ["raw-preview", "psd-preview"] }
+windows = { version = "0.62.2", features = [
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+
+[build-dependencies]
+winres = "0.1"
