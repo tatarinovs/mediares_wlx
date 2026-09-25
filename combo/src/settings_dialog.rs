@@ -33,40 +33,52 @@ const IDC_OVERLAY_PHOTO: i32 = 111;
 const IDC_OVERLAY_VIDEO: i32 = 112;
 const IDC_OVERLAY_AUTOHIDE: i32 = 113;
 const IDC_SLIDESHOW: i32 = 114;
+const IDC_CHOOSE_BACKGROUND: i32 = 115;
+const IDC_BACKGROUND_PREVIEW: i32 = 116;
+const IDC_CONFIRM_DELETE: i32 = 117;
+const IDC_RESUME_VIDEO: i32 = 118;
 
 const BST_CHECKED: usize = 1;
 const SS_LEFT: u32 = 0x0000;
 const SS_CENTER: u32 = 0x0001;
+const SS_CENTERIMAGE: u32 = 0x0200;
+const SS_SUNKEN: u32 = 0x1000;
 
 const LOUPE_SCALES: &[f32] = &[1.0, 1.5, 2.0, 2.5, 3.0];
 const FONT_SIZES: &[i32] = &[10, 12, 14, 16, 18, 20, 24, 28, 32];
 const SLIDESHOW_SECONDS: &[u32] = &[2, 3, 4, 5, 7, 10, 15, 30, 60];
 
-/// Custom colors of the color picker, kept for the session.
-static CUSTOM_COLORS: Mutex<[COLORREF; 16]> = Mutex::new([COLORREF(0); 16]);
+/// Custom colors of the color picker, kept for the session; `None` until first used.
+static CUSTOM_COLORS: Mutex<Option<[COLORREF; 16]>> = Mutex::new(None);
+
+/// Offered in the picker's custom colors: black, the default dark, grays, white.
+const PRESET_COLORS: [u32; 6] = [0x0000_0000, 0x0018_1818, 0x0040_4040, 0x0080_8080, 0x00C0_C0C0, 0x00FF_FFFF];
 
 struct Context {
     config: ViewerConfig,
     color: u32,
+    background: u32,
     loupe_scales: Vec<f32>,
     font_sizes: Vec<i32>,
     slideshow_seconds: Vec<u32>,
-    preview_brush: Brush,
+    /// Fills both previews: the background swatch and the OSD "Aa" (shown on that background).
+    background_brush: Brush,
     result: Option<ViewerConfig>,
 }
 
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 675)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 730)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
         color: current.osd_font_color,
+        background: current.photo_background,
         loupe_scales: with_current(LOUPE_SCALES, current.loupe_scale, |a, b| (a - b).abs() < 0.05),
         font_sizes: with_current(FONT_SIZES, current.osd_font_size, |a, b| a == b),
         slideshow_seconds: with_current(SLIDESHOW_SECONDS, current.slideshow_seconds, |a, b| a == b),
-        preview_brush: GdiObject(CreateSolidBrush(COLORREF(0))),
+        background_brush: GdiObject(CreateSolidBrush(COLORREF(current.photo_background))),
         result: None,
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
@@ -111,43 +123,48 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     checkbox("Запускать в полноэкранном режиме", (20, 15, 380, 22), IDC_START_FULLSCREEN, cfg.start_fullscreen);
     checkbox("Автоповорот по ориентации EXIF", (20, 42, 380, 22), IDC_AUTO_ROTATE_EXIF, cfg.auto_rotate_exif);
 
-    control(w!("BUTTON"), "Лупа (удержание ЛКМ)", BS_GROUPBOX as u32, (15, 72, 395, 62), 0);
-    control(w!("STATIC"), "Масштаб лупы:", SS_LEFT, (28, 98, 140, 20), 0);
+    control(w!("BUTTON"), "Просмотр фото", BS_GROUPBOX as u32, (15, 72, 395, 122), 0);
+    control(w!("STATIC"), "Масштаб лупы (ЛКМ):", SS_LEFT, (28, 98, 145, 20), 0);
     let loupe_labels = ctx.loupe_scales.iter().map(|s| format!("{}:1", s).replace('.', ",")).collect();
     let loupe_sel = ctx.loupe_scales.iter().position(|s| (s - cfg.loupe_scale).abs() < 0.05).unwrap_or(0);
     combo((175, 95, 90, 160), IDC_LOUPE_SCALE, loupe_labels, loupe_sel);
+    control(w!("STATIC"), "Цвет фона:", SS_LEFT, (28, 133, 140, 20), 0);
+    control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 130, 130, 26), IDC_CHOOSE_BACKGROUND);
+    control(w!("STATIC"), "", SS_SUNKEN, (320, 130, 45, 26), IDC_BACKGROUND_PREVIEW);
+    checkbox("Спрашивать перед удалением в корзину (Del)", (28, 163, 365, 22), IDC_CONFIRM_DELETE, cfg.confirm_delete);
 
-    control(w!("BUTTON"), "Информационная строка (OSD)", BS_GROUPBOX as u32, (15, 145, 395, 165), 0);
-    control(w!("STATIC"), "Показывать OSD:", SS_LEFT, (28, 175, 140, 20), 0);
+    control(w!("BUTTON"), "Информационная строка (OSD)", BS_GROUPBOX as u32, (15, 204, 395, 135), 0);
+    control(w!("STATIC"), "Показывать OSD:", SS_LEFT, (28, 232, 140, 20), 0);
     let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
-    combo((175, 172, 190, 150), IDC_SHOW_OSD, osd_labels, cfg.osd.index() as usize);
-    control(w!("STATIC"), "Размер шрифта:", SS_LEFT, (28, 207, 140, 20), 0);
+    combo((175, 229, 190, 150), IDC_SHOW_OSD, osd_labels, cfg.osd.index() as usize);
+    control(w!("STATIC"), "Размер шрифта:", SS_LEFT, (28, 264, 140, 20), 0);
     let size_labels = ctx.font_sizes.iter().map(|s| format!("{} pt", s)).collect();
     let size_sel = ctx.font_sizes.iter().position(|&s| s == cfg.osd_font_size).unwrap_or(0);
-    combo((175, 204, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
+    combo((175, 261, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
 
-    control(w!("STATIC"), "Цвет шрифта:", SS_LEFT, (28, 245, 140, 20), 0);
-    control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 242, 130, 26), IDC_CHOOSE_COLOR);
-    control(w!("STATIC"), "Aa", SS_CENTER, (320, 242, 45, 26), IDC_COLOR_PREVIEW);
+    control(w!("STATIC"), "Цвет шрифта:", SS_LEFT, (28, 300, 140, 20), 0);
+    control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 297, 130, 26), IDC_CHOOSE_COLOR);
+    control(w!("STATIC"), "Aa", SS_CENTER | SS_CENTERIMAGE, (320, 297, 45, 26), IDC_COLOR_PREVIEW);
 
-    control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (15, 320, 395, 115), 0);
-    checkbox("Автопереход к следующему файлу", (28, 345, 365, 22), IDC_AUTO_ADVANCE, cfg.queue.auto_advance);
-    control(w!("STATIC"), "Повтор:", SS_LEFT, (28, 377, 140, 20), 0);
+    control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (15, 349, 395, 140), 0);
+    checkbox("Автопереход к следующему файлу", (28, 374, 365, 22), IDC_AUTO_ADVANCE, cfg.queue.auto_advance);
+    control(w!("STATIC"), "Повтор:", SS_LEFT, (28, 406, 140, 20), 0);
     let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
-    combo((175, 374, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
-    checkbox("Случайный порядок", (28, 405, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
+    combo((175, 403, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
+    checkbox("Случайный порядок", (28, 434, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
+    checkbox("Продолжать видео длиннее 5 мин с места остановки", (28, 459, 375, 22), IDC_RESUME_VIDEO, cfg.resume_video);
 
-    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 445, 395, 140), 0);
-    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 468, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
-    checkbox("Панель управления поверх видео", (28, 493, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
-    checkbox("Скрывать панель при бездействии", (28, 518, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
-    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 551, 170, 20), 0);
+    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 499, 395, 140), 0);
+    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 522, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
+    checkbox("Панель управления поверх видео", (28, 547, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
+    checkbox("Скрывать панель при бездействии", (28, 572, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
+    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 605, 170, 20), 0);
     let slide_labels = ctx.slideshow_seconds.iter().map(|s| format!("{} с", s)).collect();
     let slide_sel = ctx.slideshow_seconds.iter().position(|&s| s == cfg.slideshow_seconds).unwrap_or(0);
-    combo((205, 548, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
+    combo((205, 602, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
 
-    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 597, 95, 28), IDOK.0);
-    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 597, 95, 28), IDCANCEL.0);
+    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 651, 95, 28), IDOK.0);
+    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 651, 95, 28), IDCANCEL.0);
     ok
 }
 
@@ -175,27 +192,56 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.overlay_video = is_checked(dlg, IDC_OVERLAY_VIDEO);
     cfg.overlay_autohide = is_checked(dlg, IDC_OVERLAY_AUTOHIDE);
     cfg.slideshow_seconds = selected(dlg, IDC_SLIDESHOW, &ctx.slideshow_seconds).unwrap_or(cfg.slideshow_seconds);
+    cfg.photo_background = ctx.background;
+    cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
+    cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
     cfg.save();
     ctx.result = Some(cfg.clone());
 }
 
-unsafe fn choose_color(dlg: HWND, ctx: &mut Context) {
-    let mut custom = *CUSTOM_COLORS.lock().unwrap_or_else(|e| e.into_inner());
+/// The system color picker starting at `initial`; `None` if cancelled.
+unsafe fn pick_color(dlg: HWND, initial: u32) -> Option<u32> {
+    let mut custom = CUSTOM_COLORS.lock().unwrap_or_else(|e| e.into_inner()).unwrap_or_else(|| {
+        let mut colors = [COLORREF(0x00FF_FFFF); 16];
+        for (slot, &c) in colors.iter_mut().zip(&PRESET_COLORS) {
+            *slot = COLORREF(c);
+        }
+        colors
+    });
     let mut cc = CHOOSECOLORW {
         lStructSize: size_of::<CHOOSECOLORW>() as u32,
         hwndOwner: dlg,
-        rgbResult: COLORREF(ctx.color),
+        rgbResult: COLORREF(initial),
         lpCustColors: custom.as_mut_ptr(),
         Flags: CC_RGBINIT | CC_FULLOPEN,
         ..Default::default()
     };
-    if ChooseColorW(&mut cc).as_bool() {
-        ctx.color = cc.rgbResult.0;
-        if let Ok(preview) = GetDlgItem(Some(dlg), IDC_COLOR_PREVIEW) {
+    let picked = ChooseColorW(&mut cc).as_bool().then_some(cc.rgbResult.0);
+    *CUSTOM_COLORS.lock().unwrap_or_else(|e| e.into_inner()) = Some(custom);
+    picked
+}
+
+unsafe fn repaint_previews(dlg: HWND) {
+    for id in [IDC_COLOR_PREVIEW, IDC_BACKGROUND_PREVIEW] {
+        if let Ok(preview) = GetDlgItem(Some(dlg), id) {
             let _ = InvalidateRect(Some(preview), None, true);
         }
     }
-    *CUSTOM_COLORS.lock().unwrap_or_else(|e| e.into_inner()) = custom;
+}
+
+unsafe fn choose_color(dlg: HWND, ctx: &mut Context) {
+    if let Some(color) = pick_color(dlg, ctx.color) {
+        ctx.color = color;
+        repaint_previews(dlg);
+    }
+}
+
+unsafe fn choose_background(dlg: HWND, ctx: &mut Context) {
+    if let Some(color) = pick_color(dlg, ctx.background) {
+        ctx.background = color;
+        ctx.background_brush = GdiObject(CreateSolidBrush(COLORREF(color)));
+        repaint_previews(dlg);
+    }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -206,16 +252,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         };
 
         match msg {
-            WM_CTLCOLORSTATIC if GetDlgCtrlID(HWND(lparam.0 as *mut _)) == IDC_COLOR_PREVIEW => {
+            WM_CTLCOLORSTATIC
+                if matches!(GetDlgCtrlID(HWND(lparam.0 as *mut _)), IDC_COLOR_PREVIEW | IDC_BACKGROUND_PREVIEW) =>
+            {
                 let hdc = HDC(wparam.0 as *mut _);
                 SetBkMode(hdc, OPAQUE);
-                SetBkColor(hdc, COLORREF(0));
+                SetBkColor(hdc, COLORREF(ctx.background));
                 SetTextColor(hdc, COLORREF(ctx.color));
-                LRESULT(ctx.preview_brush.0 .0 as isize)
+                LRESULT(ctx.background_brush.0 .0 as isize)
             }
             WM_COMMAND => {
                 match dialog::loword(wparam) as i32 {
                     IDC_CHOOSE_COLOR => choose_color(hwnd, ctx),
+                    IDC_CHOOSE_BACKGROUND => choose_background(hwnd, ctx),
                     id if id == IDOK.0 => {
                         accept(hwnd, ctx);
                         dialog::close(hwnd);

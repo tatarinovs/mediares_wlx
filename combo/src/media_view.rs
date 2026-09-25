@@ -59,10 +59,10 @@ pub struct MediaView {
 impl MediaView {
     /// Opens `path` (`kind` must be playable), reusing `previous` when it shows the same kind of
     /// content. `None` if the file can't be played.
-    pub unsafe fn open(viewer: HWND, previous: Option<MediaView>, path: &Path, kind: MediaType) -> Option<MediaView> {
+    pub unsafe fn open(viewer: HWND, previous: Option<MediaView>, path: &Path, kind: MediaType, resume: bool) -> Option<MediaView> {
         if let Some(mut view) = previous {
             let reused = match &mut view.content {
-                Content::Video(v) if kind == MediaType::Video => v.open(path),
+                Content::Video(v) if kind == MediaType::Video => v.open(path, resume),
                 Content::Audio(a) if kind == MediaType::Audio => a.open(path),
                 _ => false,
             };
@@ -75,7 +75,7 @@ impl MediaView {
             drop(view);
         }
         let content = match kind {
-            MediaType::Video => Content::Video(Box::new(VideoView::new(viewer, path)?)),
+            MediaType::Video => Content::Video(Box::new(VideoView::new(viewer, path, resume)?)),
             MediaType::Audio => Content::Audio(Box::new(AudioView::new(viewer, path)?)),
             _ => return None,
         };
@@ -348,6 +348,21 @@ impl MediaView {
         }
     }
 
+    /// Video speed one step slower / faster, or normal (`None`); the bar shows the new speed.
+    pub unsafe fn change_rate(&mut self, faster: Option<bool>) {
+        let Content::Video(v) = &mut self.content else { return };
+        let rate = v.change_rate(faster);
+        self.show_status(format!("Скорость {}×", rate.to_string().replace('.', ",")));
+    }
+
+    pub unsafe fn frame_step(&mut self, forward: bool) {
+        if let Content::Video(v) = &mut self.content {
+            if !v.frame_step(forward) {
+                self.show_status("Шаг назад недоступен для этого файла (неточная перемотка)".to_string());
+            }
+        }
+    }
+
     pub fn change_volume(&self, up: bool) {
         transport_bar::change_volume(self.transport(), up);
     }
@@ -359,7 +374,13 @@ impl MediaView {
     /// `WM_MEDIA_EVENT` from a Media Foundation engine.
     pub unsafe fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
         match &mut self.content {
-            Content::Video(v) => v.on_event(event, param1),
+            Content::Video(v) => {
+                let effect = v.on_event(event, param1);
+                if let Some(t) = v.take_resumed() {
+                    self.show_status(format!("Продолжение с {}", transport_bar::format_time(t)));
+                }
+                effect
+            }
             Content::Audio(a) => a.on_event(event, param1),
         }
     }

@@ -8,7 +8,7 @@ use windows::core::{Interface, GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSourceReader, MF2DBuffer_LockFlags_Read,
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
-    MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
+    MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE, MFSampleExtension_CleanPoint, MF_SOURCE_READERF_ENDOFSTREAM,
@@ -43,6 +43,8 @@ pub struct VideoInfo {
     pub width: u32,
     pub height: u32,
     pub duration_sec: f64,
+    /// Frames per second (0 if the stream doesn't say).
+    pub frame_rate: f64,
 }
 
 #[derive(Debug)]
@@ -97,10 +99,14 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
         let reader = open_reader(path, false).ok()?;
         let native = reader.GetNativeMediaType(STREAM, 0).ok()?;
         let frame_size = native.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        // Packed as numerator << 32 | denominator.
+        let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
+        let (num, den) = ((rate >> 32) as u32, rate as u32);
         Some(VideoInfo {
             width: (frame_size >> 32) as u32,
             height: frame_size as u32,
             duration_sec: duration_hns(&reader) as f64 / 10_000_000.0,
+            frame_rate: if den > 0 { num as f64 / den as f64 } else { 0.0 },
         })
     }
 }

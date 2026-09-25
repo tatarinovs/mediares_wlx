@@ -132,6 +132,8 @@ unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
     Ok(device)
 }
 
+const FALLBACK_FRAME_SEC: f64 = 0.04;
+
 /// Field order matters: the engine is released before the output, MF and COM.
 pub struct VideoPlayer {
     engine: IMFMediaEngine,
@@ -263,6 +265,36 @@ impl VideoPlayer {
         // The alpha channel is undefined for video: make it opaque.
         pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
         Some((width, height, pixels))
+    }
+
+    /// The speed for this and following files.
+    pub unsafe fn set_rate(&self, rate: f64) {
+        let _ = self.engine.SetDefaultPlaybackRate(rate);
+        self.set_current_rate(rate);
+    }
+
+    /// The speed until the next file (or the next `set_rate`).
+    pub unsafe fn set_current_rate(&self, rate: f64) {
+        let _ = self.engine.SetPlaybackRate(rate);
+    }
+
+    pub unsafe fn is_paused(&self) -> bool {
+        self.engine.IsPaused().as_bool() || self.engine.IsEnded().as_bool()
+    }
+
+    /// Timestamp of the frame last put on screen.
+    pub fn presented_pts(&self) -> Option<i64> {
+        self.output.try_borrow().ok()?.last_pts
+    }
+
+    /// Pauses and seeks exactly one frame (`frame_rate` fps; 25 if unknown) back. Returns the
+    /// target (sources without accurate seeking land elsewhere).
+    pub unsafe fn step_back(&self, frame_rate: f64) -> f64 {
+        let _ = self.engine.Pause();
+        let frame = if frame_rate > 0.0 { 1.0 / frame_rate } else { FALLBACK_FRAME_SEC };
+        let target = (self.position() - frame).max(0.0);
+        self.seek(target, false);
+        target
     }
 
     /// Engine error code (`MF_MEDIA_ENGINE_ERR`), if playback failed.

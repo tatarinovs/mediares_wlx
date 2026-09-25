@@ -27,7 +27,7 @@ const CF_HDROP: u32 = 15;
 /// Thumbnails of videos show the frame here (the very first ones are often black).
 const THUMBNAIL_AT: f64 = 0.1;
 /// TC shows thumbnails on the window background: transparency is flattened onto white.
-const THUMBNAIL_BACKGROUND: u8 = 0xFF;
+const THUMBNAIL_BACKGROUND: u32 = 0x00FF_FFFF;
 
 fn header(width: u32, height: i32) -> BITMAPINFOHEADER {
     BITMAPINFOHEADER {

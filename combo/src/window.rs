@@ -33,7 +33,8 @@ use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
-use crate::{dialog, exif_dialog, fullscreen, module, settings_dialog, snapshot};
+use crate::{config, dialog, exif_dialog, file_actions, fullscreen, module, settings_dialog, snapshot};
+use mediares_core::exif::read_orientation;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 
@@ -67,6 +68,18 @@ enum Command {
     Copy,
     SaveFrame,
     ToggleSlideshow,
+    RotateLeft,
+    RotateRight,
+    Delete,
+    OpenInEditor,
+    ShowInFolder,
+    SetWallpaper,
+    Print,
+    Slower,
+    Faster,
+    NormalSpeed,
+    FrameBack,
+    FrameForward,
 }
 
 impl Command {
@@ -78,6 +91,14 @@ impl Command {
         Some((Command::SaveFrame, "Сохранить кадр рядом с видео\tShift+S")),
         Some((Command::ToggleOsd, "Отображать OSD\tO")),
         Some((Command::ToggleSlideshow, "Слайд-шоу\tF5")),
+        Some((Command::RotateLeft, "Повернуть влево\tL")),
+        Some((Command::RotateRight, "Повернуть вправо\tR")),
+        None,
+        Some((Command::Slower, "Медленнее\t[")),
+        Some((Command::Faster, "Быстрее\t]")),
+        Some((Command::NormalSpeed, "Обычная скорость\t\\")),
+        Some((Command::FrameBack, "Кадр назад\t,")),
+        Some((Command::FrameForward, "Кадр вперёд\t.")),
         None,
         Some((Command::ToggleAutoAdvance, "Автопереход к следующему файлу")),
         Some((Command::RepeatOff, "Без повтора")),
@@ -86,6 +107,12 @@ impl Command {
         Some((Command::ToggleShuffle, "Случайный порядок")),
         None,
         Some((Command::ShowExif, "Просмотр EXIF...\tE")),
+        Some((Command::OpenInEditor, "Открыть в редакторе")),
+        Some((Command::ShowInFolder, "Показать в папке")),
+        Some((Command::SetWallpaper, "Сделать обоями рабочего стола")),
+        Some((Command::Print, "Печать...\tCtrl+P")),
+        Some((Command::Delete, "Удалить в корзину\tDel")),
+        None,
         Some((Command::ShowSettings, "Настройки...\tS")),
         None,
         Some((Command::Next, "Следующий файл\tПробел / Right")),
@@ -96,10 +123,10 @@ impl Command {
     fn available(self, media: bool, video: bool) -> bool {
         use Command::*;
         match self {
-            SaveFrame => video,
+            SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward => video,
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne | ToggleShuffle => media,
-            ShowExif | ToggleSlideshow => !media,
-            ToggleOsd => !media || video,
+            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SetWallpaper => !media,
+            ToggleOsd | Print => !media || video,
             _ => true,
         }
     }
@@ -120,7 +147,8 @@ impl Command {
             ToggleFullscreen, ToggleOsd, ShowExif, ShowSettings, Next, Previous, ZoomIn, ZoomOut, ZoomActualSize, ZoomFit,
             TogglePlay, ToggleMute, SeekBack, SeekForward, KeyframeBack, KeyframeForward, VolumeUp, VolumeDown,
             PreviousTrack, NextTrack, ToggleAutoAdvance, RepeatOff, RepeatAll, RepeatOne, ToggleShuffle, Copy, SaveFrame,
-            ToggleSlideshow,
+            ToggleSlideshow, RotateLeft, RotateRight, Delete, OpenInEditor, ShowInFolder, SetWallpaper, Print, Slower,
+            Faster, NormalSpeed, FrameBack, FrameForward,
         ]
         .into_iter()
         .find(|&c| c as usize == value)
@@ -161,6 +189,11 @@ impl Command {
                 0xBB | 0x6B => Some(VolumeUp),   // '+' / numpad +
                 0xBD | 0x6D => Some(VolumeDown), // '-' / numpad -
                 0x4D => Some(ToggleMute),        // M
+                0xDB => Some(Slower),            // [
+                0xDD => Some(Faster),            // ]
+                0xDC => Some(NormalSpeed),       // \
+                0xBC => Some(FrameBack),         // ,
+                0xBE => Some(FrameForward),      // .
                 _ => None,
             };
             if player.is_some() {
@@ -183,6 +216,9 @@ impl Command {
             0x45 => Some(ShowExif),                                  // E
             0x53 => Some(ShowSettings),                              // S
             0x31 | 0x61 => Some(ZoomActualSize),                     // '1' / numpad 1
+            0x4C => Some(RotateLeft),                                // L
+            0x52 => Some(RotateRight),                               // R
+            0x2E => Some(Delete),                                    // Del
             0x6A | 0x6F => Some(ZoomFit),                            // numpad * and /
             0x4E | 0x20 | 0x27 | 0x22 | 0x28 => Some(Next),          // N, Space, Right, PgDn, Down
             0x50 | 0x08 | 0x25 | 0x21 | 0x26 => Some(Previous),      // P, Backspace, Left, PgUp, Up
@@ -518,6 +554,41 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             set_slideshow(state, run);
             update_title(state);
         }
+        Command::RotateLeft | Command::RotateRight => {
+            if state.rotate(command == Command::RotateRight) {
+                refresh(state);
+            }
+        }
+        Command::Delete => delete_current(hwnd),
+        Command::OpenInEditor => {
+            let path = state.file_path.clone();
+            if !file_actions::open_in_editor(hwnd, &path) {
+                file_actions::show_error(dialog::modal_owner(hwnd), "Не удалось открыть файл во внешней программе.");
+            }
+        }
+        Command::ShowInFolder => {
+            let path = state.file_path.clone();
+            file_actions::show_in_folder(hwnd, &path);
+        }
+        Command::SetWallpaper => set_wallpaper(hwnd),
+        Command::Print => {
+            print(hwnd, None);
+        }
+        Command::Slower | Command::Faster | Command::NormalSpeed => {
+            if let Some(media) = state.media.as_mut() {
+                media.change_rate(match command {
+                    Command::Slower => Some(false),
+                    Command::Faster => Some(true),
+                    _ => None,
+                });
+            }
+        }
+        Command::FrameBack | Command::FrameForward => {
+            if let Some(media) = state.media.as_mut() {
+                media.frame_step(command == Command::FrameForward);
+                media.invalidate_bar();
+            }
+        }
         Command::NextTrack | Command::PreviousTrack => {
             if state.skip_track(command == Command::NextTrack) {
                 refresh(state);
@@ -568,6 +639,70 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             media.invalidate_bar();
         }
     }
+}
+
+/// Del: the file goes to the Recycle Bin and the next one is shown (the Lister closes when none
+/// is left). State is re-fetched after each call that may show a dialog.
+unsafe fn delete_current(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else { return };
+    let (path, confirm) = (state.file_path.clone(), state.config.confirm_delete);
+    if !path.is_file() {
+        return;
+    }
+    let owner = dialog::modal_owner(hwnd);
+    if confirm && !file_actions::confirm_delete(owner, &path) {
+        return;
+    }
+    let Some(state) = get_live_state(hwnd) else { return };
+    // A player keeps its file open: close it first.
+    let had_player = state.media.take().is_some();
+    let deleted = file_actions::recycle(owner, &path);
+    let Some(state) = get_live_state(hwnd) else { return };
+    if !deleted {
+        if had_player {
+            state.reload();
+            refresh(state);
+        }
+        return;
+    }
+    if state.remove_current() {
+        refresh(state);
+    } else if !state.lister.is_invalid() {
+        let _ = PostMessageW(Some(state.lister), WM_KEYDOWN, WPARAM(VK_ESCAPE as usize), LPARAM(0));
+    }
+}
+
+/// The photo as the desktop wallpaper: the file itself when Windows can show it as is, otherwise
+/// (RAW, PSD, turned with R / L, EXIF-rotated) the picture on screen saved as PNG.
+unsafe fn set_wallpaper(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else { return };
+    let Some(img) = state.image.clone() else { return };
+    let path = state.file_path.clone();
+    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let as_is = !state.turned
+        && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp")
+        && read_orientation(&path).is_none_or(|o| o == 1);
+    let source = if as_is {
+        Some(path)
+    } else {
+        let target = config::data_file("mediares_wallpaper.png");
+        snapshot::save_png(&img, &target).then_some(target)
+    };
+    if !source.is_some_and(|s| file_actions::set_wallpaper(&s)) {
+        file_actions::show_error(dialog::modal_owner(hwnd), "Не удалось установить обои.");
+    }
+}
+
+/// Prints the photo, or the video frame / album art. `margins` in 1/100 mm.
+pub unsafe fn print(hwnd: HWND, margins: Option<RECT>) -> bool {
+    let Some(state) = get_state(hwnd) else { return false };
+    let picture = match &state.media {
+        Some(media) => media.current_picture(),
+        None => state.image.clone(),
+    };
+    let Some(picture) = picture else { return false };
+    let name = state.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    crate::print::print(dialog::modal_owner(hwnd), &picture, &name, margins)
 }
 
 /// Viewer timer of the slideshow.
@@ -974,6 +1109,24 @@ mod tests {
         assert_eq!(Command::from_key(0xB0, false, false, true), Some(Command::NextTrack)); // media key
         assert_eq!(Command::from_key(0xB3, true, false, true), Some(Command::TogglePlay));
         assert_eq!(Command::from_key(0xB0, false, false, false), None); // photos: to the Lister
+    }
+
+    #[test]
+    fn photo_and_video_tool_keys() {
+        assert_eq!(Command::from_key(0x52, false, false, false), Some(Command::RotateRight)); // R
+        assert_eq!(Command::from_key(0x4C, false, false, false), Some(Command::RotateLeft)); // L
+        assert_eq!(Command::from_key(0x2E, false, false, false), Some(Command::Delete)); // Del
+        assert_eq!(Command::from_key(0x2E, false, false, true), Some(Command::Delete));
+        assert_eq!(Command::from_key(0xDD, false, false, true), Some(Command::Faster)); // ]
+        assert_eq!(Command::from_key(0xBC, false, false, true), Some(Command::FrameBack)); // ,
+        assert_eq!(Command::from_key(0xBE, false, false, false), None); // '.' on a photo: to the Lister
+    }
+
+    #[test]
+    fn every_command_round_trips_through_posted_messages() {
+        for (cmd, _) in Command::MENU.iter().flatten() {
+            assert_eq!(Command::from_raw(*cmd as usize), Some(*cmd));
+        }
     }
 
     #[test]

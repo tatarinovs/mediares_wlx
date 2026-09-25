@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
-use crate::image_cache::{DecodedImage, BACKGROUND_GRAY};
+use crate::image_cache::{DecodedImage, BACKGROUND};
 use crate::state::{Loupe, ViewerState, ZoomMode};
 
 const MIN_ZOOM: f32 = 0.05;
@@ -160,8 +160,8 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     }
     let old_bmp = SelectObject(mem_dc, mem_bmp.into());
 
-    let bg = BACKGROUND_GRAY as u32;
-    let bg_brush = CreateSolidBrush(COLORREF(bg | bg << 8 | bg << 16));
+    let bg = state.as_ref().map_or(BACKGROUND, |s| s.config.photo_background);
+    let bg_brush = CreateSolidBrush(COLORREF(bg));
     FillRect(mem_dc, &RECT { left: 0, top: 0, right: win_w, bottom: win_h }, bg_brush);
     let _ = DeleteObject(bg_brush.into());
 
@@ -171,7 +171,7 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
         } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
             draw_fitted(mem_dc, &prev, RECT { left: 0, top: 0, right: win_w, bottom: win_h });
         } else if state.load_failed {
-            draw_centered_text(mem_dc, "Не удалось открыть изображение", win_w, win_h);
+            draw_centered_text(mem_dc, "Не удалось открыть изображение", win_w, win_h, muted_text_color(bg));
         }
         if state.config.osd.photo() {
             draw_osd(mem_dc, state);
@@ -184,12 +184,19 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     let _ = DeleteDC(mem_dc);
 }
 
-unsafe fn draw_centered_text(dc: HDC, text: &str, win_w: i32, win_h: i32) {
+/// Gray text that stays readable on the COLORREF `background`.
+fn muted_text_color(background: u32) -> u32 {
+    let [r, g, b] = [background & 0xFF, (background >> 8) & 0xFF, (background >> 16) & 0xFF];
+    let luma = (r * 299 + g * 587 + b * 114) / 1000;
+    if luma > 140 { 0x0040_4040 } else { 0x00A0_A0A0 }
+}
+
+unsafe fn draw_centered_text(dc: HDC, text: &str, win_w: i32, win_h: i32, color: u32) {
     let mut text: Vec<u16> = text.encode_utf16().collect();
     let mut rc = RECT { left: 0, top: 0, right: win_w, bottom: win_h };
     let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, COLORREF(0x00A0A0A0));
+    SetTextColor(dc, COLORREF(color));
     DrawTextW(dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
     SelectObject(dc, old_font);
 }

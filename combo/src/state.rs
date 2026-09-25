@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 
 use crate::config::ViewerConfig;
-use crate::image_cache::{self, DecodedImage, Request, Ticket};
+use crate::image_cache::{self, DecodeOptions, DecodedImage, Request, Ticket};
 use crate::media_view::MediaView;
 use crate::overlay::Fullscreen;
 use crate::playlist::{self, EndAction};
@@ -47,6 +47,8 @@ pub struct ViewerState {
     pub previous: Option<Arc<DecodedImage>>,
     /// The current photo could not be decoded.
     pub load_failed: bool,
+    /// The photo was turned with R / L (the picture on screen differs from the file).
+    pub turned: bool,
     /// Present while a video or audio file is shown (then `image` is `None`).
     pub media: Option<MediaView>,
     pub zoom: ZoomMode,
@@ -86,6 +88,7 @@ impl ViewerState {
             pending: None,
             previous: None,
             load_failed: false,
+            turned: false,
             media: None,
             zoom: ZoomMode::Fit,
             offset: (0.0, 0.0),
@@ -132,6 +135,7 @@ impl ViewerState {
         self.offset = (0.0, 0.0);
         self.drag = None;
         self.loupe = None;
+        self.turned = false;
         self.load_media();
         self.has_content()
     }
@@ -214,12 +218,49 @@ impl ViewerState {
     }
 
     pub fn apply_config(&mut self, config: ViewerConfig) {
-        let reload = config.auto_rotate_exif != self.config.auto_rotate_exif;
+        let old = self.decode_options();
         self.config = config;
         self.drop_osd_font();
-        if reload && self.shows_photo() {
+        if old != self.decode_options() && self.shows_photo() {
             self.load_media();
         }
+    }
+
+    fn decode_options(&self) -> DecodeOptions {
+        DecodeOptions { auto_rotate: self.config.auto_rotate_exif, background: self.config.photo_background }
+    }
+
+    /// Turns the photo on screen by a quarter (for viewing only; the file is untouched).
+    pub fn rotate(&mut self, clockwise: bool) -> bool {
+        let Some(img) = &self.image else { return false };
+        self.image = Some(Arc::new(image_cache::rotated(img, clockwise)));
+        self.turned = true;
+        self.zoom = ZoomMode::Fit;
+        self.loupe = None;
+        self.drag = None;
+        true
+    }
+
+    /// The current file was deleted: drops it from the list and shows the one that took its
+    /// place (or the new last one). False if nothing is left.
+    pub fn remove_current(&mut self) -> bool {
+        if self.current_idx < self.dir_files.len() {
+            self.dir_files.remove(self.current_idx);
+        }
+        self.image = None;
+        self.previous = None;
+        if self.dir_files.is_empty() {
+            self.pending = None;
+            self.media = None;
+            return false;
+        }
+        self.go_to(self.current_idx.min(self.dir_files.len() - 1))
+    }
+
+    /// Shows the current file again (e.g. after its player was closed to free the file).
+    pub fn reload(&mut self) {
+        let path = self.file_path.clone();
+        self.show(&path);
     }
 
     pub fn drop_osd_font(&mut self) {
@@ -231,7 +272,7 @@ impl ViewerState {
     }
 
     fn load_media(&mut self) {
-        let rotate = self.config.auto_rotate_exif;
+        let options = self.decode_options();
         let kind = probe_file(&self.file_path);
         self.file_size = std::fs::metadata(&self.file_path).map(|m| m.len()).unwrap_or(0);
 
@@ -241,7 +282,8 @@ impl ViewerState {
         if kind.is_playable() {
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
-            self.media = unsafe { MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind) };
+            let resume = self.config.resume_video;
+            self.media = unsafe { MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, resume) };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
             if let Some(media) = self.media.as_mut() {
                 media.set_skip(can_skip);
@@ -249,7 +291,7 @@ impl ViewerState {
         } else {
             self.media = None;
             if kind.is_image_kind() {
-                match image_cache::request(&self.file_path, kind, rotate, self.hwnd) {
+                match image_cache::request(&self.file_path, kind, options, self.hwnd) {
                     Some(Request::Ready(img)) => {
                         self.image = Some(img);
                         self.previous = None;
@@ -268,7 +310,7 @@ impl ViewerState {
             }
         }
 
-        image_cache::prefetch(self.prefetch_candidates(), rotate);
+        image_cache::prefetch(self.prefetch_candidates(), options);
     }
 
     /// Neighbouring photos to warm up, most likely next first: two ahead in the direction of the

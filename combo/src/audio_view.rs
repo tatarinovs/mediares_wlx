@@ -22,7 +22,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 use crate::dialog::{self, Font};
-use crate::image_cache::{self, DecodedImage, BACKGROUND_GRAY};
+use crate::image_cache::{self, DecodeOptions, DecodedImage, BACKGROUND};
 use crate::image_view::draw_fitted;
 use crate::media_view::EventEffect;
 use crate::playback_audio::AudioPlayer;
@@ -226,8 +226,7 @@ impl AudioView {
 
     /// Paints art and tags into `area`: side by side in a wide window, stacked in a tall one.
     pub unsafe fn paint(&mut self, dc: HDC, area: RECT, scale: f32) {
-        let bg = BACKGROUND_GRAY as u32;
-        fill(dc, area, bg | bg << 8 | bg << 16);
+        fill(dc, area, BACKGROUND);
         let s = |v: f32| (v * scale).round() as i32;
         let m = s(24.0);
         let inner = RECT { left: area.left + m, top: area.top + m, right: area.right - m, bottom: area.bottom - m };
@@ -336,7 +335,7 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
         COVER_STEMS.iter().position(|s| *s == stem)
     };
     let best = entries.flatten().map(|e| e.path()).filter_map(|p| Some((rank(&p)?, p))).min_by_key(|(r, _)| *r)?;
-    image_cache::load(&best.1, MediaType::StandardImage, false)
+    image_cache::load(&best.1, MediaType::StandardImage, DecodeOptions { auto_rotate: false, background: BACKGROUND })
 }
 
 unsafe fn fill(dc: HDC, r: RECT, color: u32) {

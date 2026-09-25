@@ -36,6 +36,11 @@ fn ini_path() -> PathBuf {
     tc_dir.map(|d| d.join(INI_NAME)).or(portable).unwrap_or_else(|| PathBuf::from(INI_NAME))
 }
 
+/// A data file kept next to `mediares.ini`.
+pub fn data_file(name: &str) -> PathBuf {
+    ini_path().with_file_name(name)
+}
+
 fn dll_dir() -> Option<PathBuf> {
     let mut buf = [0u16; 1024];
     let len = unsafe { GetModuleFileNameW(Some(crate::module().into()), &mut buf) } as usize;
@@ -114,6 +119,12 @@ pub struct ViewerConfig {
     /// Fullscreen: those panels hide when idle and reappear when the mouse nears the bottom.
     pub overlay_autohide: bool,
     pub slideshow_seconds: u32,
+    /// COLORREF around photos (and under their transparency).
+    pub photo_background: u32,
+    /// Ask before Del moves the file to the Recycle Bin.
+    pub confirm_delete: bool,
+    /// Long videos continue where they were left.
+    pub resume_video: bool,
 }
 
 impl Default for ViewerConfig {
@@ -131,6 +142,9 @@ impl Default for ViewerConfig {
             overlay_video: true,
             overlay_autohide: true,
             slideshow_seconds: 4,
+            photo_background: crate::image_cache::BACKGROUND,
+            confirm_delete: true,
+            resume_video: true,
         }
     }
 }
@@ -171,6 +185,9 @@ impl ViewerConfig {
             overlay_video: int(w!("OverlayVideo"), d.overlay_video as i32) != 0,
             overlay_autohide: int(w!("OverlayAutoHide"), d.overlay_autohide as i32) != 0,
             slideshow_seconds: int(w!("SlideshowSeconds"), d.slideshow_seconds as i32).clamp(1, 3600) as u32,
+            photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32 & 0x00FF_FFFF,
+            confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
+            resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
         }
     }
 
@@ -197,6 +214,9 @@ impl ViewerConfig {
             write(w!("OverlayVideo"), flag(self.overlay_video)),
             write(w!("OverlayAutoHide"), flag(self.overlay_autohide)),
             write(w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
+            write(w!("PhotoBackground"), self.photo_background.to_string()),
+            write(w!("ConfirmDelete"), flag(self.confirm_delete)),
+            write(w!("ResumeVideo"), flag(self.resume_video)),
         ]
         .iter()
         .all(|&ok| ok)

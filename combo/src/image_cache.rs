@@ -23,8 +23,8 @@ const MAX_WORKERS: usize = 3;
 /// Posted to the requesting window when its [`Ticket`] has a result.
 pub const WM_IMAGE_READY: u32 = WM_APP + 0x12;
 
-/// Viewer background, used to flatten transparency (GDI ignores alpha): 0x181818.
-pub const BACKGROUND_GRAY: u8 = 0x18;
+/// Default viewer background (COLORREF), also used to flatten transparency (GDI ignores alpha).
+pub const BACKGROUND: u32 = 0x0018_1818;
 
 pub struct DecodedImage {
     pub width: u32,
@@ -35,10 +35,18 @@ pub struct DecodedImage {
     pub is_preview: bool,
 }
 
+/// How a photo is prepared for display; part of the cache key.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DecodeOptions {
+    pub auto_rotate: bool,
+    /// COLORREF that transparency is flattened onto.
+    pub background: u32,
+}
+
 #[derive(Clone, PartialEq, Eq)]
 struct Key {
     file: FileKey,
-    auto_rotate: bool,
+    options: DecodeOptions,
 }
 
 struct Cache {
@@ -75,12 +83,12 @@ fn cache() -> MutexGuard<'static, Cache> {
 }
 
 /// Returns the image for display, decoding it on the calling thread on a cache miss.
-pub fn load(path: &Path, kind: MediaType, auto_rotate: bool) -> Option<Arc<DecodedImage>> {
-    let key = Key { file: FileKey::for_path(path)?, auto_rotate };
+pub fn load(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Arc<DecodedImage>> {
+    let key = Key { file: FileKey::for_path(path)?, options };
     if let Some(img) = cache().get(&key) {
         return Some(img);
     }
-    let img = Arc::new(decode(path, kind, auto_rotate)?);
+    let img = Arc::new(decode(path, kind, options)?);
     cache().insert(key, img.clone());
     Some(img)
 }
@@ -93,8 +101,8 @@ pub enum Request {
 
 /// Returns a cached image right away, otherwise schedules it ahead of any prefetching.
 /// `None` if the file is gone.
-pub fn request(path: &Path, kind: MediaType, auto_rotate: bool, notify: HWND) -> Option<Request> {
-    let key = Key { file: FileKey::for_path(path)?, auto_rotate };
+pub fn request(path: &Path, kind: MediaType, options: DecodeOptions, notify: HWND) -> Option<Request> {
+    let key = Key { file: FileKey::for_path(path)?, options };
     if let Some(img) = cache().get(&key) {
         return Some(Request::Ready(img));
     }
@@ -124,10 +132,10 @@ pub fn request(path: &Path, kind: MediaType, auto_rotate: bool, notify: HWND) ->
 
 /// Replaces the prefetch queue with `paths` (most wanted first); stale requests from earlier
 /// navigation are dropped.
-pub fn prefetch(paths: Vec<PathBuf>, auto_rotate: bool) {
+pub fn prefetch(paths: Vec<PathBuf>, options: DecodeOptions) {
     let pool = pool();
     let mut q = pool.lock();
-    q.prefetch = paths.into_iter().map(|p| (p, auto_rotate)).collect();
+    q.prefetch = paths.into_iter().map(|p| (p, options)).collect();
     pool.wake.notify_all();
 }
 
@@ -175,7 +183,7 @@ impl Job {
 #[derive(Default)]
 struct Queue {
     foreground: VecDeque<Arc<Job>>,
-    prefetch: VecDeque<(PathBuf, bool)>,
+    prefetch: VecDeque<(PathBuf, DecodeOptions)>,
     in_flight: Vec<Arc<Job>>,
 }
 
@@ -185,9 +193,9 @@ impl Queue {
         if let Some(job) = self.foreground.pop_front() {
             return Some(job);
         }
-        while let Some((path, auto_rotate)) = self.prefetch.pop_front() {
+        while let Some((path, options)) = self.prefetch.pop_front() {
             let Some(file) = FileKey::for_path(&path) else { continue };
-            let key = Key { file, auto_rotate };
+            let key = Key { file, options };
             if self.in_flight.iter().any(|job| job.key == key) || cache().contains(&key) {
                 continue;
             }
@@ -237,7 +245,7 @@ fn worker_loop() {
 
         let cached = cache().get(&job.key);
         let result = cached.or_else(|| {
-            let decoded = std::panic::catch_unwind(|| decode(&job.path, job.kind, job.key.auto_rotate));
+            let decoded = std::panic::catch_unwind(|| decode(&job.path, job.kind, job.key.options));
             let img = decoded.ok().flatten().map(Arc::new)?;
             cache().insert(job.key.clone(), img.clone());
             Some(img)
@@ -257,39 +265,49 @@ fn worker_loop() {
     }
 }
 
-fn decode(path: &Path, kind: MediaType, auto_rotate: bool) -> Option<DecodedImage> {
+fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<DecodedImage> {
     let mut img = decode_file(path, kind)?;
-    if auto_rotate {
+    if options.auto_rotate {
         if let Some(orientation) = read_orientation(path) {
             apply_exif_orientation(&mut img, orientation);
         }
     }
-    Some(to_display(img, kind == MediaType::RawImage))
+    Some(to_bgra(img, options.background, kind == MediaType::RawImage))
 }
 
 /// Decodes an in-memory picture (e.g. embedded album art) for display; not cached.
 pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
-    Some(to_display(decode_bytes(bytes)?, false))
+    Some(to_bgra(decode_bytes(bytes)?, BACKGROUND, false))
 }
 
-/// Converts to BGRA in place, compositing alpha over the viewer background.
-fn to_display(img: DynamicImage, is_preview: bool) -> DecodedImage {
-    to_bgra(img, BACKGROUND_GRAY, is_preview)
-}
-
-/// Converts to BGRA in place, compositing alpha over a gray level `background`.
-pub fn to_bgra(img: DynamicImage, background: u8, is_preview: bool) -> DecodedImage {
+/// Converts to BGRA in place, compositing alpha over the COLORREF `background`.
+pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedImage {
     let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
-    let bg = background as u32;
+    let bg = [background & 0xFF, (background >> 8) & 0xFF, (background >> 16) & 0xFF];
     for px in bgra.chunks_exact_mut(4) {
         let a = px[3] as u32;
-        let blend = |c: u8| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
-        let (r, g, b) = if a == 255 { (px[0], px[1], px[2]) } else { (blend(px[0]), blend(px[1]), blend(px[2])) };
+        let blend = |c: u8, bg: u32| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
+        let (r, g, b) = if a == 255 { (px[0], px[1], px[2]) } else { (blend(px[0], bg[0]), blend(px[1], bg[1]), blend(px[2], bg[2])) };
         px.copy_from_slice(&[b, g, r, 255]);
     }
     DecodedImage { width, height, bgra, is_preview }
+}
+
+/// The picture turned by a quarter, clockwise or counter-clockwise.
+pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
+    let (w, h) = (img.width as usize, img.height as usize);
+    let mut dst = Vec::with_capacity(img.bgra.len());
+    // Output row `y` (of `w` rows, each `h` pixels wide) reads a source column.
+    for y in 0..w {
+        for x in 0..h {
+            let (sx, sy) = if clockwise { (y, h - 1 - x) } else { (w - 1 - y, x) };
+            let i = (sy * w + sx) * 4;
+            dst.extend_from_slice(&img.bgra[i..i + 4]);
+        }
+    }
+    DecodedImage { width: img.height, height: img.width, bgra: dst, is_preview: img.is_preview }
 }
 
 /// Back to an `image` buffer (e.g. to scale a cached picture).
@@ -306,9 +324,23 @@ mod tests {
     #[test]
     fn converts_to_bgra_over_background() {
         let img = RgbaImage::from_fn(2, 1, |x, _| if x == 0 { Rgba([255, 0, 10, 255]) } else { Rgba([255, 255, 255, 0]) });
-        let out = to_display(DynamicImage::ImageRgba8(img), false);
+        let out = to_bgra(DynamicImage::ImageRgba8(img), 0x0030_2010, false);
         assert_eq!(&out.bgra[0..4], &[10, 0, 255, 255]);
-        assert_eq!(&out.bgra[4..8], &[BACKGROUND_GRAY, BACKGROUND_GRAY, BACKGROUND_GRAY, 255]);
+        assert_eq!(&out.bgra[4..8], &[0x30, 0x20, 0x10, 255]);
+    }
+
+    #[test]
+    fn rotates_by_quarter_turns() {
+        // 2x1: red, green  ->  clockwise 1x2: red above green; counter-clockwise: green above red.
+        let img = DecodedImage { width: 2, height: 1, bgra: vec![0, 0, 255, 255, 0, 255, 0, 255], is_preview: false };
+        let cw = rotated(&img, true);
+        assert_eq!((cw.width, cw.height), (1, 2));
+        assert_eq!(cw.bgra, vec![0, 0, 255, 255, 0, 255, 0, 255]);
+        assert_eq!(rotated(&img, false).bgra, vec![0, 255, 0, 255, 0, 0, 255, 255]);
+        // 2x2 turned four times is the original.
+        let square = DecodedImage { width: 2, height: 2, bgra: (0..16).collect(), is_preview: false };
+        let back = (0..4).fold(square, |img, _| rotated(&img, true));
+        assert_eq!(back.bgra, (0..16).collect::<Vec<u8>>());
     }
 
     #[test]
@@ -316,7 +348,7 @@ mod tests {
         let big = |n: usize| Arc::new(DecodedImage { width: 1, height: 1, bgra: vec![0; n], is_preview: false });
         let key = |name: &str| Key {
             file: FileKey::for_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(name).as_path()).expect("file exists"),
-            auto_rotate: true,
+            options: DecodeOptions { auto_rotate: true, background: BACKGROUND },
         };
         let (a, b, c) = (key("Cargo.toml"), key("src/lib.rs"), key("src/config.rs"));
         let mut cache = Cache { entries: Vec::new() };

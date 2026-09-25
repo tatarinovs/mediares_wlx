@@ -7,6 +7,7 @@ mod audio_view;
 mod config;
 mod dialog;
 mod exif_dialog;
+mod file_actions;
 mod fullscreen;
 mod image_cache;
 mod image_view;
@@ -15,6 +16,8 @@ mod overlay;
 mod playback_audio;
 mod playback_video;
 mod playlist;
+mod print;
+mod resume;
 mod settings_dialog;
 mod snapshot;
 mod state;
@@ -31,7 +34,7 @@ use mediares_core::ffi::{guard, pstr_to_path, pwstr_to_path, write_ansi};
 use mediares_core::probe::{detect_extensions, MediaType};
 use mediares_core::tc_api::*;
 use windows::core::BOOL;
-use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND};
+use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::HBITMAP;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
@@ -137,6 +140,33 @@ pub unsafe extern "system" fn ListSendCommand(list_win: HWND, command: c_int, pa
     guard(LISTPLUGIN_ERROR, || unsafe {
         if window::send_command(list_win, command, parameter) { LISTPLUGIN_OK } else { LISTPLUGIN_ERROR }
     })
+}
+
+/// Lister's File > Print (Ctrl+P): the picture on screen, with the margins TC passes.
+#[no_mangle]
+pub unsafe extern "system" fn ListPrintW(
+    list_win: HWND,
+    _file_to_print: *const u16,
+    _def_printer: *const u16,
+    _print_flags: c_int,
+    margins: *const RECT,
+) -> c_int {
+    guard(LISTPLUGIN_ERROR, || unsafe { print_result(window::print(list_win, margins.as_ref().copied())) })
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ListPrint(
+    list_win: HWND,
+    _file_to_print: *const c_char,
+    _def_printer: *const c_char,
+    _print_flags: c_int,
+    margins: *const RECT,
+) -> c_int {
+    guard(LISTPLUGIN_ERROR, || unsafe { print_result(window::print(list_win, margins.as_ref().copied())) })
+}
+
+fn print_result(printed: bool) -> c_int {
+    if printed { LISTPLUGIN_OK } else { LISTPLUGIN_ERROR }
 }
 
 /// Thumbnail view of TC: a picture for the file fitted into `width` x `height` (the photo, a video
