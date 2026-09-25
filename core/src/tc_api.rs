@@ -43,3 +43,18 @@ pub type ListDefaultParamStruct = DefaultParamStruct;
 // WLX Return codes for ListLoadNext / ListLoadNextW
 pub const LISTPLUGIN_OK: c_int = 0;
 pub const LISTPLUGIN_ERROR: c_int = 1;
+
+// WLX ListSendCommand commands
+pub const LC_COPY: c_int = 1;
+pub const LC_NEWPARAMS: c_int = 2;
+pub const LC_SELECTALL: c_int = 3;
+pub const LC_SETPERCENT: c_int = 4;
+
+// WLX show flags (ListLoad / ListLoadNext / LC_NEWPARAMS parameter)
+pub const LCP_WRAPTEXT: c_int = 1;
+pub const LCP_FITTOWINDOW: c_int = 2;
+pub const LCP_ANSI: c_int = 4;
+pub const LCP_ASCII: c_int = 8;
+pub const LCP_FORCESHOW: c_int = 16;
+pub const LCP_FITLARGERONLY: c_int = 32;
+pub const LCP_CENTER: c_int = 64;

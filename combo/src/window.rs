@@ -18,8 +18,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     MF_UNCHECKED, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
     WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_XBUTTONDOWN,
-    WNDCLASSEXW, WS_CHILD, WS_VISIBLE,
+    WM_WINDOWPOSCHANGING, WINDOWPOS, WNDCLASSEXW, WS_CHILD, WS_VISIBLE,
 };
+
+use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_NEWPARAMS};
 
 use crate::config::ViewerConfig;
 use crate::image_view::{self, client_size, point_from_lparam};
@@ -105,8 +107,9 @@ unsafe fn register_class() {
 
 /// Creates the viewer for `path`, or returns `None` (so TC tries other plugins) if it isn't a
 /// displayable image.
-pub unsafe fn create_viewer(lister: HWND, path: &Path) -> Option<HWND> {
+pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Option<HWND> {
     let mut state = Box::new(ViewerState::new(lister, path, ViewerConfig::load())?);
+    state.show_flags = show_flags;
     register_class();
 
     let mut rc = RECT::default();
@@ -144,13 +147,29 @@ pub unsafe fn close_viewer(hwnd: HWND) {
 }
 
 /// `ListLoadNext`: shows `path` in the existing window. False if it can't be displayed.
-pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path) -> bool {
+pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) -> bool {
     let Some(state) = get_state(hwnd) else { return false };
     state.lister = lister;
+    state.show_flags = show_flags;
     if !state.set_file(path) {
         return false;
     }
     refresh(state);
+    true
+}
+
+/// `ListSendCommand`. A toggled `LCP_FITTOWINDOW` means the user pressed TC's `F` hotkey,
+/// which we map to fullscreen (the viewer always fits the window anyway).
+pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
+    let Some(state) = get_state(hwnd) else { return false };
+    if command != LC_NEWPARAMS {
+        return false;
+    }
+    let fit_toggled = (state.show_flags ^ parameter) & LCP_FITTOWINDOW != 0;
+    state.show_flags = parameter;
+    if fit_toggled {
+        execute(hwnd, Command::ToggleFullscreen);
+    }
     true
 }
 
@@ -265,7 +284,7 @@ unsafe fn zoom_at(state: &mut ViewerState, view: (f32, f32), zoom_in: bool, anch
 unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     let Some(state) = get_state(hwnd) else { return };
     let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-    let (fullscreen, osd) = (state.fullscreen, state.config.show_osd);
+    let (fullscreen, osd) = (state.fullscreen.is_some(), state.config.show_osd);
 
     let Ok(menu) = CreatePopupMenu() else { return };
     for item in Command::MENU {
@@ -325,6 +344,11 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
     };
 
     match msg {
+        WM_WINDOWPOSCHANGING => {
+            if let Some(pos) = (lparam.0 as *mut WINDOWPOS).as_mut() {
+                fullscreen::pin(state, pos);
+            }
+        }
         WM_SIZE => {
             if let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) {
                 image_view::clamp_offset(state, &img, view);
@@ -415,7 +439,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
-            if vk == VK_ESCAPE && state.fullscreen {
+            if vk == VK_ESCAPE && state.fullscreen.is_some() {
                 execute(hwnd, Command::ToggleFullscreen);
             } else if let Some(cmd) = Command::from_key(vk, ctrl_down()) {
                 execute(hwnd, cmd);

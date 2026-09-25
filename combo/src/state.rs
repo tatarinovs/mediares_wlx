@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use mediares_core::probe::probe_file;
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 
 use crate::config::ViewerConfig;
@@ -44,8 +44,11 @@ pub struct ViewerState {
     pub loupe: Option<Loupe>,
     pub dir_files: Vec<PathBuf>,
     pub current_idx: usize,
-    pub fullscreen: bool,
+    /// Monitor rectangle while fullscreen; the window is pinned to it.
+    pub fullscreen: Option<RECT>,
     pub config: ViewerConfig,
+    /// Last TC show flags (`LCP_*`), to detect which option a `LC_NEWPARAMS` toggled.
+    pub show_flags: i32,
     /// Lazily created OSD font; dropped whenever the config changes.
     pub osd_font: Option<HFONT>,
 }
@@ -65,8 +68,9 @@ impl ViewerState {
             loupe: None,
             dir_files: Vec::new(),
             current_idx: 0,
-            fullscreen: false,
+            fullscreen: None,
             config,
+            show_flags: 0,
             osd_font: None,
         };
         state.set_file(path).then_some(state)

@@ -79,13 +79,13 @@ pub unsafe extern "system" fn ListSetDefaultParams(dps: *mut ListDefaultParamStr
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn ListLoadW(parent_win: HWND, file_to_load: *const u16, _show_flags: c_int) -> HWND {
-    guard(HWND::default(), || unsafe { load(parent_win, pwstr_to_path(file_to_load)) })
+pub unsafe extern "system" fn ListLoadW(parent_win: HWND, file_to_load: *const u16, show_flags: c_int) -> HWND {
+    guard(HWND::default(), || unsafe { load(parent_win, pwstr_to_path(file_to_load), show_flags) })
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn ListLoad(parent_win: HWND, file_to_load: *const c_char, _show_flags: c_int) -> HWND {
-    guard(HWND::default(), || unsafe { load(parent_win, pstr_to_path(file_to_load)) })
+pub unsafe extern "system" fn ListLoad(parent_win: HWND, file_to_load: *const c_char, show_flags: c_int) -> HWND {
+    guard(HWND::default(), || unsafe { load(parent_win, pstr_to_path(file_to_load), show_flags) })
 }
 
 #[no_mangle]
@@ -93,9 +93,9 @@ pub unsafe extern "system" fn ListLoadNextW(
     parent_win: HWND,
     list_win: HWND,
     file_to_load: *const u16,
-    _show_flags: c_int,
+    show_flags: c_int,
 ) -> c_int {
-    guard(LISTPLUGIN_ERROR, || unsafe { load_next(parent_win, list_win, pwstr_to_path(file_to_load)) })
+    guard(LISTPLUGIN_ERROR, || unsafe { load_next(parent_win, list_win, pwstr_to_path(file_to_load), show_flags) })
 }
 
 #[no_mangle]
@@ -103,9 +103,9 @@ pub unsafe extern "system" fn ListLoadNext(
     parent_win: HWND,
     list_win: HWND,
     file_to_load: *const c_char,
-    _show_flags: c_int,
+    show_flags: c_int,
 ) -> c_int {
-    guard(LISTPLUGIN_ERROR, || unsafe { load_next(parent_win, list_win, pstr_to_path(file_to_load)) })
+    guard(LISTPLUGIN_ERROR, || unsafe { load_next(parent_win, list_win, pstr_to_path(file_to_load), show_flags) })
 }
 
 #[no_mangle]
@@ -113,13 +113,22 @@ pub unsafe extern "system" fn ListCloseWindow(list_win: HWND) {
     guard((), || unsafe { window::close_viewer(list_win) })
 }
 
-unsafe fn load(parent: HWND, path: Option<PathBuf>) -> HWND {
-    path.and_then(|p| window::create_viewer(parent, &p)).unwrap_or_default()
+/// TC consumes some Lister hotkeys itself (e.g. `F` = "fit image to window") and reports them
+/// here as `LC_NEWPARAMS` instead of passing the key to the plugin window.
+#[no_mangle]
+pub unsafe extern "system" fn ListSendCommand(list_win: HWND, command: c_int, parameter: c_int) -> c_int {
+    guard(LISTPLUGIN_ERROR, || unsafe {
+        if window::send_command(list_win, command, parameter) { LISTPLUGIN_OK } else { LISTPLUGIN_ERROR }
+    })
 }
 
-unsafe fn load_next(parent: HWND, list_win: HWND, path: Option<PathBuf>) -> c_int {
+unsafe fn load(parent: HWND, path: Option<PathBuf>, show_flags: c_int) -> HWND {
+    path.and_then(|p| window::create_viewer(parent, &p, show_flags)).unwrap_or_default()
+}
+
+unsafe fn load_next(parent: HWND, list_win: HWND, path: Option<PathBuf>, show_flags: c_int) -> c_int {
     match path {
-        Some(p) if window::load_next(parent, list_win, &p) => LISTPLUGIN_OK,
+        Some(p) if window::load_next(parent, list_win, &p, show_flags) => LISTPLUGIN_OK,
         _ => LISTPLUGIN_ERROR,
     }
 }
