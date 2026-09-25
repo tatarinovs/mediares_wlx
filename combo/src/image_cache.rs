@@ -139,10 +139,15 @@ pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
 
 /// Converts to BGRA in place, compositing alpha over the viewer background.
 fn to_display(img: DynamicImage, is_preview: bool) -> DecodedImage {
+    to_bgra(img, BACKGROUND_GRAY, is_preview)
+}
+
+/// Converts to BGRA in place, compositing alpha over a gray level `background`.
+pub fn to_bgra(img: DynamicImage, background: u8, is_preview: bool) -> DecodedImage {
     let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
-    let bg = BACKGROUND_GRAY as u32;
+    let bg = background as u32;
     for px in bgra.chunks_exact_mut(4) {
         let a = px[3] as u32;
         let blend = |c: u8| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
@@ -150,6 +155,12 @@ fn to_display(img: DynamicImage, is_preview: bool) -> DecodedImage {
         px.copy_from_slice(&[b, g, r, 255]);
     }
     DecodedImage { width, height, bgra, is_preview }
+}
+
+/// Back to an `image` buffer (e.g. to scale a cached picture).
+pub fn to_dynamic(img: &DecodedImage) -> Option<DynamicImage> {
+    let rgba: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], px[3]]).collect();
+    mediares_core::image::RgbaImage::from_raw(img.width, img.height, rgba).map(DynamicImage::ImageRgba8)
 }
 
 #[cfg(test)]

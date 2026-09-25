@@ -25,7 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::media_view::EventEffect;
 use crate::module;
-use crate::playback_video::VideoPlayer;
+use crate::playback_video::{Osd, VideoPlayer};
 use crate::transport_bar::{self, format_time, Transport};
 
 const SURFACE_CLASS: PCWSTR = w!("MediaresVideoSurface");
@@ -93,6 +93,22 @@ pub struct VideoView {
     keyframes: Option<KeyframeIndex>,
     pub info: VideoInfo,
     error: Option<String>,
+    osd: Option<VideoOsd>,
+}
+
+/// Font and colour of the OSD (the viewer config's OSD settings).
+#[derive(Clone, PartialEq)]
+pub struct OsdStyle {
+    pub face: String,
+    pub size_pt: i32,
+    pub color: u32,
+}
+
+struct VideoOsd {
+    style: OsdStyle,
+    font: crate::dialog::Font,
+    /// "name ( 1920 x 1080 , 45.3 MB ) [ 3 / 12 ]"; the time is appended per frame.
+    label: String,
 }
 
 impl VideoView {
@@ -106,7 +122,7 @@ impl VideoView {
         player.open(path).ok()?;
 
         SetTimer(Some(viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
-        Some(Self { player, surface, viewer, path: path.to_path_buf(), keyframes: None, info, error: None })
+        Some(Self { player, surface, viewer, path: path.to_path_buf(), keyframes: None, info, error: None, osd: None })
     }
 
     /// Switches to another file, reusing the engine.
@@ -132,7 +148,32 @@ impl VideoView {
 
     /// `WM_TIMER` with [`RENDER_TIMER_ID`].
     pub unsafe fn render(&self) {
-        self.player.render();
+        match &self.osd {
+            Some(osd) => {
+                let time = format!("{} / {}", format_time(self.player.position()), format_time(self.player.duration().max(self.info.duration_sec)));
+                let text = format!("{}   {}", osd.label, time);
+                self.player.render(Some(Osd { text: &text, font: osd.font.0, color: osd.style.color }));
+            }
+            None => self.player.render(None),
+        }
+    }
+
+    /// Shows (`Some`) or hides the OSD; `label` describes the file.
+    pub unsafe fn set_osd(&mut self, style: Option<OsdStyle>, label: String) {
+        self.osd = match style {
+            None => None,
+            Some(style) => match self.osd.take() {
+                Some(osd) if osd.style == style => Some(VideoOsd { label, ..osd }),
+                _ => {
+                    let dpi = match windows::Win32::UI::HiDpi::GetDpiForWindow(self.viewer) {
+                        0 => 96,
+                        dpi => dpi as i32,
+                    };
+                    let font = crate::dialog::GdiObject(crate::image_view::create_osd_font(&style.face, style.size_pt, dpi));
+                    Some(VideoOsd { style, font, label })
+                }
+            },
+        };
     }
 
     /// Letterboxes the surface into `area` (viewer client coordinates).
@@ -160,6 +201,12 @@ impl VideoView {
         if let Some(t) = target {
             self.player.seek(t, false);
         }
+    }
+
+    /// The frame on screen, at its native size.
+    pub unsafe fn capture_frame(&self) -> Option<crate::image_cache::DecodedImage> {
+        let (width, height, bgra) = self.player.capture_frame()?;
+        Some(crate::image_cache::DecodedImage { width, height, bgra, is_preview: false })
     }
 
     /// "1920x1080, 1:23:45"

@@ -9,7 +9,7 @@ use std::sync::Once;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, PAINTSTRUCT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL};
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT};
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, GWL_STYLE, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClassNameW, GetClientRect, GetWindowLongPtrW, LoadCursorW, PostMessageW, RegisterClassExW,
@@ -17,12 +17,12 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDC_ARROW, IDC_HAND, IDC_SIZEALL, MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING,
     MF_UNCHECKED, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_DESTROY,
     WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    WM_APPCOMMAND, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_XBUTTONDOWN,
+    KillTimer, SetTimer, WM_APP, WM_APPCOMMAND, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_XBUTTONDOWN,
     ShowWindow, SW_PARENTCLOSING, SW_SHOW, WM_SHOWWINDOW, WM_TIMER, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDCLASSEXW, WS_CHILD,
     WS_CLIPCHILDREN,
 };
 
-use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_NEWPARAMS};
+use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS};
 
 use crate::config::ViewerConfig;
 use crate::image_view::{self, client_size, point_from_lparam};
@@ -31,7 +31,8 @@ use crate::playback_video::WM_MEDIA_EVENT;
 use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
-use crate::{dialog, exif_dialog, fullscreen, module, settings_dialog};
+use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
+use crate::{dialog, exif_dialog, fullscreen, module, settings_dialog, snapshot};
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 
@@ -62,6 +63,9 @@ enum Command {
     RepeatAll,
     RepeatOne,
     ToggleShuffle,
+    Copy,
+    SaveFrame,
+    ToggleSlideshow,
 }
 
 impl Command {
@@ -69,7 +73,10 @@ impl Command {
         Some((Command::TogglePlay, "Воспроизведение / пауза\tПробел")),
         Some((Command::ToggleMute, "Без звука\tM")),
         Some((Command::ToggleFullscreen, "Полноэкранный режим\tEnter / F")),
+        Some((Command::Copy, "Копировать изображение\tCtrl+C")),
+        Some((Command::SaveFrame, "Сохранить кадр рядом с видео\tShift+S")),
         Some((Command::ToggleOsd, "Отображать OSD\tO")),
+        Some((Command::ToggleSlideshow, "Слайд-шоу\tF5")),
         None,
         Some((Command::ToggleAutoAdvance, "Автопереход к следующему файлу")),
         Some((Command::RepeatOff, "Без повтора")),
@@ -85,11 +92,13 @@ impl Command {
     ];
 
     /// Whether the item applies to the current content (photo, or audio/video).
-    fn available(self, media: bool) -> bool {
+    fn available(self, media: bool, video: bool) -> bool {
         use Command::*;
         match self {
+            SaveFrame => video,
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne | ToggleShuffle => media,
-            ToggleOsd | ShowExif => !media,
+            ShowExif | ToggleSlideshow => !media,
+            ToggleOsd => !media || video,
             _ => true,
         }
     }
@@ -103,14 +112,33 @@ impl Command {
         }
     }
 
+    /// Any command by its numeric value (posted messages).
+    fn from_raw(value: usize) -> Option<Command> {
+        use Command::*;
+        [
+            ToggleFullscreen, ToggleOsd, ShowExif, ShowSettings, Next, Previous, ZoomIn, ZoomOut, ZoomActualSize, ZoomFit,
+            TogglePlay, ToggleMute, SeekBack, SeekForward, KeyframeBack, KeyframeForward, VolumeUp, VolumeDown,
+            PreviousTrack, NextTrack, ToggleAutoAdvance, RepeatOff, RepeatAll, RepeatOne, ToggleShuffle, Copy, SaveFrame,
+            ToggleSlideshow,
+        ]
+        .into_iter()
+        .find(|&c| c as usize == value)
+    }
+
     fn from_id(id: i32) -> Option<Command> {
         Command::MENU.iter().flatten().map(|&(c, _)| c).find(|&c| c as i32 == id)
     }
 
     /// Hotkeys. With Ctrl held only zoom keys are ours; everything else goes to the Lister
     /// (Ctrl+P print, Ctrl+C copy, ...). For audio/video, player keys take precedence.
-    fn from_key(vk: u16, ctrl: bool, media: bool) -> Option<Command> {
+    fn from_key(vk: u16, ctrl: bool, shift: bool, media: bool) -> Option<Command> {
         use Command::*;
+        if ctrl && !shift && vk == 0x43 {
+            return Some(Copy); // Ctrl+C: the picture, not the file (TC copies files in its panels)
+        }
+        if media && shift && !ctrl && vk == 0x53 {
+            return Some(SaveFrame); // Shift+S, as in VLC
+        }
         if media {
             let keyboard_media = match vk {
                 0xB0 => Some(NextTrack),     // VK_MEDIA_NEXT_TRACK
@@ -150,6 +178,7 @@ impl Command {
         zoom.or(match vk {
             0x0D | 0x46 | 0x7A => Some(ToggleFullscreen),            // Enter, F, F11
             0x4F | 0x49 => Some(ToggleOsd),                          // O, I
+            0x74 => Some(ToggleSlideshow),                           // F5
             0x45 => Some(ShowExif),                                  // E
             0x53 => Some(ShowSettings),                              // S
             0x31 | 0x61 => Some(ZoomActualSize),                     // '1' / numpad 1
@@ -242,8 +271,12 @@ pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) 
 /// which we map to fullscreen (the viewer always fits the window anyway).
 pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
     let Some(state) = get_state(hwnd) else { return false };
-    if command != LC_NEWPARAMS {
+    if command != LC_NEWPARAMS && command != LC_COPY {
         return false;
+    }
+    if command == LC_COPY {
+        execute(hwnd, Command::Copy);
+        return true;
     }
     let fit_toggled = (state.show_flags ^ parameter) & LCP_FITTOWINDOW != 0;
     state.show_flags = parameter;
@@ -277,8 +310,10 @@ unsafe fn redraw(hwnd: HWND) {
     let _ = UpdateWindow(hwnd);
 }
 
-/// Repaints synchronously and updates the Lister caption.
-unsafe fn refresh(state: &ViewerState) {
+/// Repaints synchronously and updates the Lister caption (and the fullscreen panel).
+unsafe fn refresh(state: &mut ViewerState) {
+    fullscreen::sync_overlay(state);
+    sync_video_osd(state);
     redraw(state.hwnd);
     update_title(state);
 }
@@ -287,6 +322,34 @@ unsafe fn update_title(state: &ViewerState) {
     if state.lister.is_invalid() {
         return;
     }
+    let title = caption(state) + " - Mediares Lister";
+    let _ = SetWindowTextW(state.lister, &HSTRING::from(title));
+}
+
+/// Video OSD per the config: file name, resolution, size, position in the list (+ time).
+unsafe fn sync_video_osd(state: &mut ViewerState) {
+    let Some(media) = state.media.as_mut() else { return };
+    if !media.is_video() {
+        return;
+    }
+    let config = &state.config;
+    let style = config.osd.video().then(|| crate::video_view::OsdStyle {
+        face: config.osd_font_name.clone(),
+        size_pt: config.osd_font_size,
+        color: config.osd_font_color,
+    });
+    let name = state.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let size = image_view::format_size(state.file_size);
+    let (w, h) = media.video_size();
+    let position = match state.dir_files.len() {
+        0 => String::new(),
+        n => format!(" [ {} / {} ]", state.current_idx + 1, n),
+    };
+    media.set_video_osd(style, format!("{} ( {} x {} , {} ){}", name, w, h, size, position));
+}
+
+/// "name - [details] [3/12]" for the Lister caption.
+unsafe fn caption(state: &ViewerState) -> String {
     let name = state.file_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
     let mut title = name.into_owned();
     if let Some(img) = &state.image {
@@ -305,8 +368,74 @@ unsafe fn update_title(state: &ViewerState) {
         let list = state.playlist.as_ref().and_then(|p| p.file_name()).map(|n| format!(" · {}", n.to_string_lossy()));
         title += &format!(" [{}/{}{}]", state.current_idx + 1, state.dir_files.len(), list.unwrap_or_default());
     }
-    title += " - Mediares Lister";
-    let _ = SetWindowTextW(state.lister, &HSTRING::from(title));
+    if state.slideshow {
+        title += " [слайд-шоу]";
+    }
+    title
+}
+
+/// Posted by the fullscreen panel's buttons, so that the command (which may replace the panel) runs
+/// outside the panel's own window procedure. `wparam` = command id.
+const WM_OVERLAY_COMMAND: u32 = WM_APP + 0x11;
+
+/// Messages of the fullscreen panel window (see `overlay.rs`); `None` = default handling.
+pub unsafe fn overlay_message(viewer: HWND, window: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+    let state = get_live_state(viewer)?;
+    let fs = state.overlay.as_mut()?;
+    let kind = fs.panel.as_ref().filter(|p| p.hwnd == window)?.kind;
+    let pt = point_from_lparam(lparam.0);
+    if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+        fs.panel_used(viewer);
+    }
+    match (msg, kind) {
+        (WM_PAINT, PanelKind::Video) => state.media.as_mut()?.paint_bar_host(window),
+        (WM_PAINT, PanelKind::Photo) => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(window, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(window, &mut rc);
+            let scale = overlay::dpi_scale(window);
+            let playing = state.slideshow;
+            overlay::with_buffer(hdc, rc, |dc| unsafe { overlay::paint_photo_panel(dc, rc, scale, playing) });
+            let _ = EndPaint(window, &ps);
+        }
+        (WM_MOUSEMOVE, PanelKind::Video) => state.media.as_mut()?.mouse_move(pt.x),
+        (WM_LBUTTONDOWN, PanelKind::Video) => {
+            let media = state.media.as_mut()?;
+            match media.bar_mouse_down(pt.x, pt.y) {
+                Click::Bar if media.is_dragging() => {
+                    let _ = SetCapture(window);
+                }
+                Click::Skip(forward) => {
+                    let cmd = if forward { Command::NextTrack } else { Command::PreviousTrack };
+                    let _ = PostMessageW(Some(viewer), WM_OVERLAY_COMMAND, WPARAM(cmd as usize), LPARAM(0));
+                }
+                _ => {}
+            }
+        }
+        (WM_LBUTTONDOWN, PanelKind::Photo) => {
+            let command = overlay::hit_photo(overlay::dpi_scale(window), pt.x, pt.y).map(|b| match b {
+                PhotoButton::Previous => Command::Previous,
+                PhotoButton::Slideshow => Command::ToggleSlideshow,
+                PhotoButton::Next => Command::Next,
+            });
+            if let Some(cmd) = command {
+                let _ = PostMessageW(Some(viewer), WM_OVERLAY_COMMAND, WPARAM(cmd as usize), LPARAM(0));
+            }
+        }
+        (WM_LBUTTONUP, _) => {
+            let _ = ReleaseCapture();
+            if kind == PanelKind::Video {
+                let media = state.media.as_mut()?;
+                if media.is_dragging() {
+                    media.mouse_up(pt.x);
+                }
+            }
+        }
+        (WM_MOUSEMOVE, _) => {}
+        _ => return None,
+    }
+    Some(LRESULT(0))
 }
 
 unsafe fn forward_to_lister(state: &ViewerState, wparam: WPARAM, lparam: LPARAM) {
@@ -325,9 +454,16 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             refresh(state);
         }
         Command::ToggleOsd => {
-            state.config.show_osd = !state.config.show_osd;
+            // Switches the OSD for the kind of content shown (audio has none).
+            let osd = state.config.osd;
+            let video = state.media.as_ref().is_some_and(|m| m.is_video());
+            state.config.osd = match (video, state.image.is_some()) {
+                (true, _) => osd.with(osd.photo(), !osd.video()),
+                (false, true) => osd.with(!osd.photo(), osd.video()),
+                (false, false) => return,
+            };
             state.config.save();
-            redraw(hwnd);
+            refresh(state);
         }
         Command::ShowExif => {
             let path = state.file_path.clone();
@@ -345,6 +481,41 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             if state.navigate(command == Command::Next) {
                 refresh(state);
             }
+        }
+        Command::Copy => {
+            // The picture for editors, plus a file for pasting into a folder: the photo itself,
+            // or the frame / album art saved as a temporary PNG.
+            let (picture, file) = match &state.media {
+                Some(media) => {
+                    let picture = media.current_picture();
+                    let file = picture.as_ref().and_then(|img| snapshot::save_temp_png(img, &state.file_path, media.is_video().then(|| media.position())));
+                    (picture, file)
+                }
+                None => (state.image.clone(), Some(state.file_path.clone())),
+            };
+            let copied = picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
+            if let Some(media) = state.media.as_mut() {
+                let text = if copied { "Изображение скопировано в буфер обмена" } else { "Нечего копировать" };
+                media.show_status(text.to_string());
+            }
+        }
+        Command::SaveFrame => {
+            let path = state.file_path.clone();
+            let Some(media) = state.media.as_mut().filter(|m| m.is_video()) else { return };
+            let saved = media.current_picture().and_then(|frame| {
+                let target = snapshot::frame_file_name(&path, media.position());
+                snapshot::save_png(&frame, &target).then_some(target)
+            });
+            let text = match saved {
+                Some(target) => format!("Кадр сохранён: {}", target.file_name().unwrap_or_default().to_string_lossy()),
+                None => "Не удалось сохранить кадр".to_string(),
+            };
+            media.show_status(text);
+        }
+        Command::ToggleSlideshow => {
+            let run = !state.slideshow && state.image.is_some();
+            set_slideshow(state, run);
+            update_title(state);
         }
         Command::NextTrack | Command::PreviousTrack => {
             if state.skip_track(command == Command::NextTrack) {
@@ -398,6 +569,21 @@ unsafe fn execute(hwnd: HWND, command: Command) {
     }
 }
 
+/// Viewer timer of the slideshow.
+const SLIDESHOW_TIMER_ID: usize = 0x4D56;
+
+unsafe fn set_slideshow(state: &mut ViewerState, run: bool) {
+    state.slideshow = run;
+    if run {
+        SetTimer(Some(state.hwnd), SLIDESHOW_TIMER_ID, state.config.slideshow_seconds.max(1) * 1000, None);
+    } else {
+        let _ = KillTimer(Some(state.hwnd), SLIDESHOW_TIMER_ID);
+    }
+    if let Some(fs) = &state.overlay {
+        fs.invalidate_panel();
+    }
+}
+
 /// Reacts to an engine event or a player timer tick.
 unsafe fn apply_effect(hwnd: HWND, effect: EventEffect) {
     let Some(state) = get_state(hwnd) else { return };
@@ -434,10 +620,16 @@ unsafe fn zoom_at(state: &mut ViewerState, view: (f32, f32), zoom_in: bool, anch
 unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     let Some(state) = get_state(hwnd) else { return };
     let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-    let (fullscreen, osd, media, queue) = (state.fullscreen.is_some(), state.config.show_osd, state.media.is_some(), state.config.queue);
+    let (fullscreen, media, queue) = (state.fullscreen.is_some(), state.media.is_some(), state.config.queue);
+    let video = state.media.as_ref().is_some_and(|m| m.is_video());
+    let osd = if video { state.config.osd.video() } else { state.config.osd.photo() };
 
     let Ok(menu) = CreatePopupMenu() else { return };
-    let items = Command::MENU.iter().filter(|item| item.is_none_or(|(cmd, _)| cmd.available(media)));
+    // Fullscreen hides the idle cursor: the menu needs it.
+    if let Some(fs) = state.overlay.as_mut() {
+        fs.reveal_cursor(hwnd);
+    }
+    let items = Command::MENU.iter().filter(|item| item.is_none_or(|(cmd, _)| cmd.available(media, video)));
     let mut previous_was_separator = true;
     for item in items {
         // Skip separators that would end up leading or doubled after filtering.
@@ -524,6 +716,26 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 apply_effect(hwnd, effect);
             }
         }
+        WM_OVERLAY_COMMAND => {
+            if let Some(cmd) = Command::from_raw(wparam.0) {
+                execute(hwnd, cmd);
+            }
+        }
+        WM_TIMER if wparam.0 == SLIDESHOW_TIMER_ID => {
+            // Stops by itself when a video / audio file was opened or there's no other photo.
+            if state.image.is_some() && state.next_photo() && state.image.is_some() {
+                refresh(state);
+            } else {
+                set_slideshow(state, false);
+                update_title(state);
+            }
+        }
+        WM_TIMER if wparam.0 == OVERLAY_TIMER_ID => {
+            let busy = state.media.as_ref().is_some_and(|m| m.is_dragging());
+            if let Some(fs) = state.overlay.as_mut() {
+                fs.idle(hwnd, busy);
+            }
+        }
         WM_TIMER => {
             match state.media.as_mut().and_then(|media| media.on_timer(wparam.0)) {
                 Some(effect) => apply_effect(hwnd, effect),
@@ -601,6 +813,9 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_MOUSEMOVE => {
             let pt = point_from_lparam(lparam.0);
+            if let Some(fs) = state.overlay.as_mut() {
+                fs.mouse_moved(hwnd);
+            }
             if let Some(media) = state.media.as_mut() {
                 media.mouse_move(pt.x);
                 return LRESULT(0);
@@ -654,6 +869,11 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             execute(hwnd, Command::ToggleFullscreen);
         }
         WM_SETCURSOR => {
+            // Fullscreen and idle: no cursor over the picture.
+            if state.overlay.as_ref().is_some_and(|fs| fs.cursor_hidden()) {
+                SetCursor(None);
+                return LRESULT(1);
+            }
             let cursor = if state.drag.is_some() {
                 IDC_SIZEALL
             } else if state.zoom != ZoomMode::Fit {
@@ -696,7 +916,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let vk = wparam.0 as u16;
             if vk == VK_ESCAPE && state.fullscreen.is_some() {
                 execute(hwnd, Command::ToggleFullscreen);
-            } else if let Some(cmd) = Command::from_key(vk, ctrl_down(), state.media.is_some()) {
+            } else if let Some(cmd) = Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some()) {
                 execute(hwnd, cmd);
             } else {
                 forward_to_lister(state, wparam, lparam);
@@ -711,32 +931,38 @@ unsafe fn ctrl_down() -> bool {
     GetKeyState(VK_CONTROL.0 as i32) < 0
 }
 
+unsafe fn shift_down() -> bool {
+    GetKeyState(VK_SHIFT.0 as i32) < 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn ctrl_combinations_go_to_lister() {
-        assert_eq!(Command::from_key(0x50, false, false), Some(Command::Previous)); // P
-        assert_eq!(Command::from_key(0x50, true, false), None); // Ctrl+P: print in Lister
-        assert_eq!(Command::from_key(0x43, true, false), None); // Ctrl+C
-        assert_eq!(Command::from_key(0xBB, true, false), Some(Command::ZoomIn));
+        assert_eq!(Command::from_key(0x50, false, false, false), Some(Command::Previous)); // P
+        assert_eq!(Command::from_key(0x50, true, false, false), None); // Ctrl+P: print in Lister
+        assert_eq!(Command::from_key(0x43, true, false, false), Some(Command::Copy)); // Ctrl+C: the picture
+        assert_eq!(Command::from_key(0x53, false, true, true), Some(Command::SaveFrame)); // Shift+S
+        assert_eq!(Command::from_key(0x53, false, false, true), Some(Command::ShowSettings)); // S
+        assert_eq!(Command::from_key(0xBB, true, false, false), Some(Command::ZoomIn));
     }
 
     #[test]
     fn video_keys_override_navigation() {
-        assert_eq!(Command::from_key(0x20, false, true), Some(Command::TogglePlay)); // Space
-        assert_eq!(Command::from_key(0x20, false, false), Some(Command::Next));
-        assert_eq!(Command::from_key(0x27, false, true), Some(Command::SeekForward)); // Right
-        assert_eq!(Command::from_key(0x26, false, true), Some(Command::KeyframeForward)); // Up
-        assert_eq!(Command::from_key(0x28, false, true), Some(Command::KeyframeBack)); // Down
-        assert_eq!(Command::from_key(0xBB, false, true), Some(Command::VolumeUp)); // '+'
-        assert_eq!(Command::from_key(0xBB, false, false), Some(Command::ZoomIn)); // '+' on a photo
-        assert_eq!(Command::from_key(0x22, false, true), Some(Command::Next)); // PgDn still navigates
-        assert_eq!(Command::from_key(0x4E, false, true), Some(Command::Next)); // N
-        assert_eq!(Command::from_key(0xB0, false, true), Some(Command::NextTrack)); // media key
-        assert_eq!(Command::from_key(0xB3, true, true), Some(Command::TogglePlay));
-        assert_eq!(Command::from_key(0xB0, false, false), None); // photos: to the Lister
+        assert_eq!(Command::from_key(0x20, false, false, true), Some(Command::TogglePlay)); // Space
+        assert_eq!(Command::from_key(0x20, false, false, false), Some(Command::Next));
+        assert_eq!(Command::from_key(0x27, false, false, true), Some(Command::SeekForward)); // Right
+        assert_eq!(Command::from_key(0x26, false, false, true), Some(Command::KeyframeForward)); // Up
+        assert_eq!(Command::from_key(0x28, false, false, true), Some(Command::KeyframeBack)); // Down
+        assert_eq!(Command::from_key(0xBB, false, false, true), Some(Command::VolumeUp)); // '+'
+        assert_eq!(Command::from_key(0xBB, false, false, false), Some(Command::ZoomIn)); // '+' on a photo
+        assert_eq!(Command::from_key(0x22, false, false, true), Some(Command::Next)); // PgDn still navigates
+        assert_eq!(Command::from_key(0x4E, false, false, true), Some(Command::Next)); // N
+        assert_eq!(Command::from_key(0xB0, false, false, true), Some(Command::NextTrack)); // media key
+        assert_eq!(Command::from_key(0xB3, true, false, true), Some(Command::TogglePlay));
+        assert_eq!(Command::from_key(0xB0, false, false, false), None); // photos: to the Lister
     }
 
     #[test]

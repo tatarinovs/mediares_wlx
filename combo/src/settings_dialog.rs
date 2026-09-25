@@ -13,7 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     IDCANCEL, IDOK, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_NCDESTROY, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::config::ViewerConfig;
+use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog::{self, Brush, GdiObject};
 use crate::playlist::Repeat;
 
@@ -29,6 +29,10 @@ const IDC_COLOR_PREVIEW: i32 = 107;
 const IDC_AUTO_ADVANCE: i32 = 108;
 const IDC_REPEAT: i32 = 109;
 const IDC_SHUFFLE: i32 = 110;
+const IDC_OVERLAY_PHOTO: i32 = 111;
+const IDC_OVERLAY_VIDEO: i32 = 112;
+const IDC_OVERLAY_AUTOHIDE: i32 = 113;
+const IDC_SLIDESHOW: i32 = 114;
 
 const BST_CHECKED: usize = 1;
 const SS_LEFT: u32 = 0x0000;
@@ -36,6 +40,7 @@ const SS_CENTER: u32 = 0x0001;
 
 const LOUPE_SCALES: &[f32] = &[1.0, 1.5, 2.0, 2.5, 3.0];
 const FONT_SIZES: &[i32] = &[10, 12, 14, 16, 18, 20, 24, 28, 32];
+const SLIDESHOW_SECONDS: &[u32] = &[2, 3, 4, 5, 7, 10, 15, 30, 60];
 
 /// Custom colors of the color picker, kept for the session.
 static CUSTOM_COLORS: Mutex<[COLORREF; 16]> = Mutex::new([COLORREF(0); 16]);
@@ -45,6 +50,7 @@ struct Context {
     color: u32,
     loupe_scales: Vec<f32>,
     font_sizes: Vec<i32>,
+    slideshow_seconds: Vec<u32>,
     preview_brush: Brush,
     result: Option<ViewerConfig>,
 }
@@ -52,13 +58,14 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 530)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 675)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
         color: current.osd_font_color,
         loupe_scales: with_current(LOUPE_SCALES, current.loupe_scale, |a, b| (a - b).abs() < 0.05),
         font_sizes: with_current(FONT_SIZES, current.osd_font_size, |a, b| a == b),
+        slideshow_seconds: with_current(SLIDESHOW_SECONDS, current.slideshow_seconds, |a, b| a == b),
         preview_brush: GdiObject(CreateSolidBrush(COLORREF(0))),
         result: None,
     }));
@@ -111,7 +118,9 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     combo((175, 95, 90, 160), IDC_LOUPE_SCALE, loupe_labels, loupe_sel);
 
     control(w!("BUTTON"), "Информационная строка (OSD)", BS_GROUPBOX as u32, (15, 145, 395, 165), 0);
-    checkbox("Отображать OSD (разрешение, масштаб, размер)", (28, 172, 365, 22), IDC_SHOW_OSD, cfg.show_osd);
+    control(w!("STATIC"), "Показывать OSD:", SS_LEFT, (28, 175, 140, 20), 0);
+    let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
+    combo((175, 172, 190, 150), IDC_SHOW_OSD, osd_labels, cfg.osd.index() as usize);
     control(w!("STATIC"), "Размер шрифта:", SS_LEFT, (28, 207, 140, 20), 0);
     let size_labels = ctx.font_sizes.iter().map(|s| format!("{} pt", s)).collect();
     let size_sel = ctx.font_sizes.iter().position(|&s| s == cfg.osd_font_size).unwrap_or(0);
@@ -128,8 +137,17 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     combo((175, 374, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
     checkbox("Случайный порядок", (28, 405, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
 
-    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 448, 95, 28), IDOK.0);
-    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 448, 95, 28), IDCANCEL.0);
+    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 445, 395, 140), 0);
+    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 468, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
+    checkbox("Панель управления поверх видео", (28, 493, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
+    checkbox("Скрывать панель при бездействии", (28, 518, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
+    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 551, 170, 20), 0);
+    let slide_labels = ctx.slideshow_seconds.iter().map(|s| format!("{} с", s)).collect();
+    let slide_sel = ctx.slideshow_seconds.iter().position(|&s| s == cfg.slideshow_seconds).unwrap_or(0);
+    combo((205, 548, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
+
+    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 597, 95, 28), IDOK.0);
+    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 597, 95, 28), IDCANCEL.0);
     ok
 }
 
@@ -146,13 +164,17 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     let cfg = &mut ctx.config;
     cfg.start_fullscreen = is_checked(dlg, IDC_START_FULLSCREEN);
     cfg.auto_rotate_exif = is_checked(dlg, IDC_AUTO_ROTATE_EXIF);
-    cfg.show_osd = is_checked(dlg, IDC_SHOW_OSD);
+    cfg.osd = selected(dlg, IDC_SHOW_OSD, &OsdMode::ALL).unwrap_or(cfg.osd);
     cfg.loupe_scale = selected(dlg, IDC_LOUPE_SCALE, &ctx.loupe_scales).unwrap_or(cfg.loupe_scale);
     cfg.osd_font_size = selected(dlg, IDC_FONT_SIZE, &ctx.font_sizes).unwrap_or(cfg.osd_font_size);
     cfg.osd_font_color = ctx.color;
     cfg.queue.auto_advance = is_checked(dlg, IDC_AUTO_ADVANCE);
     cfg.queue.repeat = selected(dlg, IDC_REPEAT, &Repeat::ALL).unwrap_or(cfg.queue.repeat);
     cfg.queue.shuffle = is_checked(dlg, IDC_SHUFFLE);
+    cfg.overlay_photo = is_checked(dlg, IDC_OVERLAY_PHOTO);
+    cfg.overlay_video = is_checked(dlg, IDC_OVERLAY_VIDEO);
+    cfg.overlay_autohide = is_checked(dlg, IDC_OVERLAY_AUTOHIDE);
+    cfg.slideshow_seconds = selected(dlg, IDC_SLIDESHOW, &ctx.slideshow_seconds).unwrap_or(cfg.slideshow_seconds);
     cfg.save();
     ctx.result = Some(cfg.clone());
 }

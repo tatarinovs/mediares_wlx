@@ -309,8 +309,14 @@ unsafe fn text(dc: HDC, r: RECT, s: &str, color: u32, flags: windows::Win32::Gra
     DrawTextW(dc, &mut wide, &mut rc, flags | DT_SINGLELINE | DT_VCENTER);
 }
 
-/// Paints the bar. `message` (e.g. a playback error) replaces the timeline when present.
-pub unsafe fn paint(dc: HDC, l: &Layout, state: &BarState, font: HFONT, message: Option<&str>, dpi_scale: f32) {
+/// A text shown instead of the timeline.
+pub enum Message<'a> {
+    Error(&'a str),
+    Info(&'a str),
+}
+
+/// Paints the bar. `message` (a playback error, "frame saved") replaces the timeline when present.
+pub unsafe fn paint(dc: HDC, l: &Layout, state: &BarState, font: HFONT, message: Option<Message<'_>>, dpi_scale: f32) {
     let s = |v: f32| (v * dpi_scale).round() as i32;
     fill(dc, l.bar, BG);
     let old_font = SelectObject(dc, font.into());
@@ -345,7 +351,8 @@ pub unsafe fn paint(dc: HDC, l: &Layout, state: &BarState, font: HFONT, message:
     text(dc, l.time, &time, TEXT, DT_LEFT);
 
     match message {
-        Some(msg) => text(dc, l.timeline, msg, ERROR_TEXT, DT_LEFT | DT_END_ELLIPSIS),
+        Some(Message::Error(msg)) => text(dc, l.timeline, msg, ERROR_TEXT, DT_LEFT | DT_END_ELLIPSIS),
+        Some(Message::Info(msg)) => text(dc, l.timeline, msg, TEXT, DT_LEFT | DT_END_ELLIPSIS),
         None => {
             let progress = if state.duration > 0.0 { state.position / state.duration } else { 0.0 };
             slider(dc, l.timeline, progress, s(4.0));

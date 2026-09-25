@@ -167,6 +167,11 @@ impl AudioView {
         parts.join(", ")
     }
 
+    /// The album art shown (embedded or from the folder).
+    pub fn cover(&self) -> Option<Arc<DecodedImage>> {
+        self.cover.clone()
+    }
+
     /// "Artist — Title" for the window caption, if tagged.
     pub fn display_title(&self) -> Option<String> {
         self.tags.display_title()
@@ -320,7 +325,7 @@ enum LineKind {
 }
 
 /// cover.jpg, folder.jpg... in the track's folder.
-fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
+pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
     let entries = std::fs::read_dir(track.parent()?).ok()?;
     let rank = |p: &Path| -> Option<usize> {
         let stem = p.file_stem()?.to_str()?.to_ascii_lowercase();

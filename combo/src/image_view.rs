@@ -168,7 +168,7 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
         if let Some(img) = state.image.clone() {
             draw_image(mem_dc, state, &img, (win_w as f32, win_h as f32));
         }
-        if state.config.show_osd {
+        if state.config.osd.photo() {
             draw_osd(mem_dc, state);
         }
     }
@@ -241,6 +241,16 @@ unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f3
     StretchDIBits(dc, dx, dy, dw, dh, sx, 0, sw, sh, Some(rows.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
 }
 
+/// "812 KB", "45.3 MB", "1.27 GB".
+pub fn format_size(bytes: u64) -> String {
+    const MB: f64 = 1024.0 * 1024.0;
+    match bytes as f64 {
+        b if b >= 1024.0 * MB => format!("{:.2} GB", b / (1024.0 * MB)),
+        b if b >= MB => format!("{:.1} MB", b / MB),
+        _ => format!("{} KB", format_thousands(bytes.div_ceil(1024))),
+    }
+}
+
 pub fn format_thousands(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);
@@ -273,33 +283,38 @@ unsafe fn osd_font(dc: HDC, state: &mut ViewerState) -> HFONT {
     if let Some(font) = state.osd_font {
         return font;
     }
-    let dpi = GetDeviceCaps(Some(dc), LOGPIXELSY);
-    let height = -((state.config.osd_font_size * dpi + 36) / 72);
-    let face: Vec<u16> = state.config.osd_font_name.encode_utf16().chain(Some(0)).collect();
-    let font = CreateFontW(
-        height, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0,
-        PCWSTR(face.as_ptr()),
-    );
+    let font = create_osd_font(&state.config.osd_font_name, state.config.osd_font_size, GetDeviceCaps(Some(dc), LOGPIXELSY));
     state.osd_font = Some(font);
     font
 }
 
-unsafe fn draw_osd(dc: HDC, state: &mut ViewerState) {
-    let text: Vec<u16> = osd_text(state, zoom_percent(state)).encode_utf16().collect();
-    let font = osd_font(dc, state);
+/// The OSD font (bold, `size_pt` points at `dpi`); shared by the photo and video OSD.
+pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> HFONT {
+    let height = -((size_pt * dpi + 36) / 72);
+    let face: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
+    CreateFontW(
+        height, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0,
+        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0,
+        PCWSTR(face.as_ptr()),
+    )
+}
+
+/// OSD text with a 1px black drop shadow, readable over any picture.
+pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
+    let text: Vec<u16> = text.encode_utf16().collect();
     let old_font = SelectObject(dc, font.into());
     SetBkMode(dc, TRANSPARENT);
-
-    // 1px black drop shadow keeps the text readable over any image.
-    let pass = |offset: i32, color: u32| {
+    for (offset, color) in [(1, 0), (0, color)] {
         SetTextColor(dc, COLORREF(color));
         let _ = ExtTextOutW(dc, OSD_MARGIN + offset, OSD_MARGIN + offset, ETO_OPTIONS(0), None, PCWSTR(text.as_ptr()), text.len() as u32, None);
-    };
-    pass(1, 0);
-    pass(0, state.config.osd_font_color);
-
+    }
     SelectObject(dc, old_font);
+}
+
+unsafe fn draw_osd(dc: HDC, state: &mut ViewerState) {
+    let text = osd_text(state, zoom_percent(state));
+    let font = osd_font(dc, state);
+    draw_osd_text(dc, &text, font, state.config.osd_font_color);
 }
 
 /// Client-relative cursor from a mouse message `LPARAM`.

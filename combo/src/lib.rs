@@ -11,10 +11,12 @@ mod fullscreen;
 mod image_cache;
 mod image_view;
 mod media_view;
+mod overlay;
 mod playback_audio;
 mod playback_video;
 mod playlist;
 mod settings_dialog;
+mod snapshot;
 mod state;
 mod transport_bar;
 mod video_view;
@@ -30,6 +32,7 @@ use mediares_core::probe::{detect_extensions, MediaType};
 use mediares_core::tc_api::*;
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND};
+use windows::Win32::Graphics::Gdi::HBITMAP;
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -134,6 +137,37 @@ pub unsafe extern "system" fn ListSendCommand(list_win: HWND, command: c_int, pa
     guard(LISTPLUGIN_ERROR, || unsafe {
         if window::send_command(list_win, command, parameter) { LISTPLUGIN_OK } else { LISTPLUGIN_ERROR }
     })
+}
+
+/// Thumbnail view of TC: a picture for the file fitted into `width` x `height` (the photo, a video
+/// frame, the album art). Called on a background thread; TC takes ownership of the bitmap.
+#[no_mangle]
+pub unsafe extern "system" fn ListGetPreviewBitmapW(
+    file_to_load: *const u16,
+    width: c_int,
+    height: c_int,
+    _content_buf: *const c_char,
+    _content_buf_len: c_int,
+) -> HBITMAP {
+    guard(HBITMAP::default(), || unsafe { preview_bitmap(pwstr_to_path(file_to_load), width, height) })
+}
+
+#[no_mangle]
+pub unsafe extern "system" fn ListGetPreviewBitmap(
+    file_to_load: *const c_char,
+    width: c_int,
+    height: c_int,
+    _content_buf: *const c_char,
+    _content_buf_len: c_int,
+) -> HBITMAP {
+    guard(HBITMAP::default(), || unsafe { preview_bitmap(pstr_to_path(file_to_load), width, height) })
+}
+
+unsafe fn preview_bitmap(path: Option<PathBuf>, width: c_int, height: c_int) -> HBITMAP {
+    let (Some(path), Ok(w), Ok(h)) = (path, u32::try_from(width), u32::try_from(height)) else {
+        return HBITMAP::default();
+    };
+    snapshot::thumbnail(&path, w, h).and_then(|img| snapshot::to_hbitmap(&img)).unwrap_or_default()
 }
 
 unsafe fn load(parent: HWND, path: Option<PathBuf>, show_flags: c_int) -> HWND {

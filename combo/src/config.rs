@@ -45,13 +45,61 @@ fn dll_dir() -> Option<PathBuf> {
     PathBuf::from(String::from_utf16_lossy(&buf[..len])).parent().map(Path::to_path_buf)
 }
 
+/// Where the on-screen info line is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OsdMode {
+    Off,
+    Photo,
+    Video,
+    Both,
+}
+
+impl OsdMode {
+    pub const ALL: [OsdMode; 4] = [OsdMode::Off, OsdMode::Photo, OsdMode::Video, OsdMode::Both];
+
+    pub fn from_index(i: i32) -> Option<Self> {
+        Self::ALL.get(usize::try_from(i).ok()?).copied()
+    }
+
+    pub fn index(self) -> i32 {
+        self as i32
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            OsdMode::Off => "Не показывать",
+            OsdMode::Photo => "На фото",
+            OsdMode::Video => "На видео",
+            OsdMode::Both => "На фото и видео",
+        }
+    }
+
+    pub fn photo(self) -> bool {
+        matches!(self, OsdMode::Photo | OsdMode::Both)
+    }
+
+    pub fn video(self) -> bool {
+        matches!(self, OsdMode::Video | OsdMode::Both)
+    }
+
+    /// Mode with the photo / video part switched on or off.
+    pub fn with(self, photo: bool, video: bool) -> Self {
+        match (photo, video) {
+            (false, false) => OsdMode::Off,
+            (true, false) => OsdMode::Photo,
+            (false, true) => OsdMode::Video,
+            (true, true) => OsdMode::Both,
+        }
+    }
+}
+
 pub const LOUPE_SCALE_RANGE: (f32, f32) = (1.0, 5.0);
 pub const FONT_SIZE_RANGE: (i32, i32) = (8, 72);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerConfig {
     pub start_fullscreen: bool,
-    pub show_osd: bool,
+    pub osd: OsdMode,
     pub osd_font_size: i32,
     /// COLORREF (0x00BBGGRR)
     pub osd_font_color: u32,
@@ -59,19 +107,30 @@ pub struct ViewerConfig {
     pub auto_rotate_exif: bool,
     pub loupe_scale: f32,
     pub queue: QueueOptions,
+    /// Fullscreen: ◀ ▶ buttons floating over photos.
+    pub overlay_photo: bool,
+    /// Fullscreen: the transport bar floats over the video (otherwise it stays below it).
+    pub overlay_video: bool,
+    /// Fullscreen: those panels hide when idle and reappear when the mouse nears the bottom.
+    pub overlay_autohide: bool,
+    pub slideshow_seconds: u32,
 }
 
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
             start_fullscreen: false,
-            show_osd: true,
+            osd: OsdMode::Photo,
             osd_font_size: 14,
             osd_font_color: 0x0000FF00,
             osd_font_name: "Segoe UI".to_string(),
             auto_rotate_exif: true,
             loupe_scale: 1.0,
             queue: QueueOptions::default(),
+            overlay_photo: true,
+            overlay_video: true,
+            overlay_autohide: true,
+            slideshow_seconds: 4,
         }
     }
 }
@@ -92,7 +151,12 @@ impl ViewerConfig {
 
         Self {
             start_fullscreen: int(w!("StartFullscreen"), d.start_fullscreen as i32) != 0,
-            show_osd: int(w!("ShowOSD"), d.show_osd as i32) != 0,
+            // Older configs only had ShowOSD (photos).
+            osd: OsdMode::from_index(int(w!("OSDMode"), -1)).unwrap_or(if int(w!("ShowOSD"), 1) != 0 {
+                OsdMode::Photo
+            } else {
+                OsdMode::Off
+            }),
             osd_font_size: int(w!("OSDFontSize"), d.osd_font_size).clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1),
             osd_font_color: int(w!("OSDFontColor"), d.osd_font_color as i32) as u32 & 0x00FF_FFFF,
             osd_font_name: if font_name.trim().is_empty() { d.osd_font_name } else { font_name },
@@ -103,6 +167,10 @@ impl ViewerConfig {
                 repeat: Repeat::from_index(int(w!("Repeat"), d.queue.repeat.index())),
                 shuffle: int(w!("Shuffle"), d.queue.shuffle as i32) != 0,
             },
+            overlay_photo: int(w!("OverlayPhoto"), d.overlay_photo as i32) != 0,
+            overlay_video: int(w!("OverlayVideo"), d.overlay_video as i32) != 0,
+            overlay_autohide: int(w!("OverlayAutoHide"), d.overlay_autohide as i32) != 0,
+            slideshow_seconds: int(w!("SlideshowSeconds"), d.slideshow_seconds as i32).clamp(1, 3600) as u32,
         }
     }
 
@@ -116,7 +184,7 @@ impl ViewerConfig {
 
         [
             write(w!("StartFullscreen"), flag(self.start_fullscreen)),
-            write(w!("ShowOSD"), flag(self.show_osd)),
+            write(w!("OSDMode"), self.osd.index().to_string()),
             write(w!("OSDFontSize"), self.osd_font_size.to_string()),
             write(w!("OSDFontColor"), self.osd_font_color.to_string()),
             write(w!("OSDFontName"), self.osd_font_name.clone()),
@@ -125,6 +193,10 @@ impl ViewerConfig {
             write(w!("AutoAdvance"), flag(self.queue.auto_advance)),
             write(w!("Repeat"), self.queue.repeat.index().to_string()),
             write(w!("Shuffle"), flag(self.queue.shuffle)),
+            write(w!("OverlayPhoto"), flag(self.overlay_photo)),
+            write(w!("OverlayVideo"), flag(self.overlay_video)),
+            write(w!("OverlayAutoHide"), flag(self.overlay_autohide)),
+            write(w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
         ]
         .iter()
         .all(|&ok| ok)

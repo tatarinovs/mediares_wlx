@@ -75,7 +75,6 @@ mkdir "%STAGING_DIR%"
 :: Copy standalone binaries to dist/
 echo [INFO] Copying standalone binaries to dist...
 copy /y "%COMBO_DLL%" "%DIST_DIR%\mediares.wlx64" >nul
-copy /y "%COMBO_DLL%" "%DIST_DIR%\mediares.wdx64" >nul
 copy /y "%WDX_DLL%" "%DIST_DIR%\mediares_wdx_only.wdx64" >nul
 
 if exist "pluginst\pluginst-combo.inf" (
@@ -100,12 +99,12 @@ if not exist "%DIST_DIR%\mediares.ini" (
 echo:
 echo [4/4] Packaging Total Commander plugin zip archives...
 
-:: Package 1: Mediares Combo (WLX + WDX 2-in-1)
+:: Package 1: Mediares Combo (WLX + WDX 2-in-1): one binary, installed as the Lister plugin;
+:: its content-plugin functions are registered manually (see README)
 echo   - Packaging mediares-combo-v!VERSION!.zip ...
 set "STAGE_COMBO=%STAGING_DIR%\combo"
 mkdir "%STAGE_COMBO%"
 copy /y "%COMBO_DLL%" "%STAGE_COMBO%\mediares.wlx64" >nul
-copy /y "%COMBO_DLL%" "%STAGE_COMBO%\mediares.wdx64" >nul
 copy /y "%DIST_DIR%\mediares.ini" "%STAGE_COMBO%\mediares.ini" >nul
 copy /y "pluginst\pluginst-combo.inf" "%STAGE_COMBO%\pluginst.inf" >nul
 

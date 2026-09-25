@@ -16,13 +16,16 @@ use windows::core::{implement, Interface, BSTR};
 use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
-    D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D, D3D11_CREATE_DEVICE_BGRA_SUPPORT,
-    D3D11_CREATE_DEVICE_VIDEO_SUPPORT, D3D11_SDK_VERSION,
+    D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
+    D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
+    D3D11_USAGE_STAGING,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISwapChain1, DXGI_MWA_NO_ALT_ENTER, DXGI_MWA_NO_WINDOW_CHANGES,
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG,
+    IDXGIDevice, IDXGIFactory2, IDXGISurface1, IDXGISwapChain1, DXGI_MWA_NO_ALT_ENTER, DXGI_MWA_NO_WINDOW_CHANGES,
+    DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE,
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
     DXGI_SWAP_EFFECT, DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_FLIP_DISCARD,
     DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
@@ -68,6 +71,15 @@ struct Output {
     last_pts: Option<i64>,
     /// Redraw even without a new frame (after a resize).
     dirty: bool,
+    /// OSD text on the last presented frame.
+    last_osd: Option<String>,
+}
+
+/// Info line drawn into the video frame (GDI on the swap chain's back buffer).
+pub struct Osd<'a> {
+    pub text: &'a str,
+    pub font: windows::Win32::Graphics::Gdi::HFONT,
+    pub color: u32,
 }
 
 impl Output {
@@ -84,6 +96,8 @@ impl Output {
                 BufferCount: buffers,
                 Scaling: DXGI_SCALING_STRETCH,
                 SwapEffect: effect,
+                // Lets GDI draw the OSD onto the back buffer.
+                Flags: DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE.0 as u32,
                 ..Default::default()
             };
             factory.CreateSwapChainForHwnd(&device, surface, &desc, None, None)
@@ -91,8 +105,16 @@ impl Output {
         // Flip model is preferred; the legacy blt model is a fallback for old drivers.
         let swap_chain = make(DXGI_SWAP_EFFECT_FLIP_DISCARD, 2).or_else(|_| make(DXGI_SWAP_EFFECT_DISCARD, 1))?;
         let _ = factory.MakeWindowAssociation(surface, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
-        Ok(Self { device, swap_chain, size: (1, 1), last_pts: None, dirty: true })
+        Ok(Self { device, swap_chain, size: (1, 1), last_pts: None, dirty: true, last_osd: None })
     }
+}
+
+unsafe fn draw_osd(swap_chain: &IDXGISwapChain1, osd: &Osd<'_>) {
+    let Ok(surface) = swap_chain.GetBuffer::<IDXGISurface1>(0) else { return };
+    // `false`: keep the frame that was just transferred.
+    let Ok(dc) = surface.GetDC(false) else { return };
+    crate::image_view::draw_osd_text(dc, osd.text, osd.font, osd.color);
+    let _ = surface.ReleaseDC(None);
 }
 
 unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
@@ -155,11 +177,13 @@ impl VideoPlayer {
         self.engine.Play()
     }
 
-    /// Render tick: presents a frame if the engine has a new one (or a redraw is pending).
-    pub unsafe fn render(&self) {
+    /// Render tick: presents a frame if the engine has a new one (or a redraw is pending, or the
+    /// OSD text changed).
+    pub unsafe fn render(&self, osd: Option<Osd<'_>>) {
         let Ok(mut out) = self.output.try_borrow_mut() else { return };
         let Ok(pts) = self.engine.OnVideoStreamTick() else { return };
-        if out.last_pts == Some(pts) && !out.dirty {
+        let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
+        if out.last_pts == Some(pts) && !out.dirty && !osd_changed {
             return;
         }
         let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else { return };
@@ -167,9 +191,13 @@ impl VideoPlayer {
         let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
         if self.engine.TransferVideoFrame(&back_buffer, None, &dst, Some(&black)).is_ok() {
             drop(back_buffer);
+            if let Some(osd) = &osd {
+                draw_osd(&out.swap_chain, osd);
+            }
             let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
             out.last_pts = Some(pts);
             out.dirty = false;
+            out.last_osd = osd.map(|o| o.text.to_string());
         }
     }
 
@@ -178,7 +206,7 @@ impl VideoPlayer {
         let mut out = self.output.borrow_mut();
         let size = (width.max(1) as u32, height.max(1) as u32);
         if size != out.size
-            && out.swap_chain.ResizeBuffers(0, size.0, size.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG(0)).is_ok()
+            && out.swap_chain.ResizeBuffers(0, size.0, size.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE).is_ok()
         {
             out.size = size;
         }
@@ -190,6 +218,51 @@ impl VideoPlayer {
         let (mut w, mut h) = (0u32, 0u32);
         self.engine.GetNativeVideoSize(Some(&mut w), Some(&mut h)).ok()?;
         (w > 0 && h > 0).then_some((w, h))
+    }
+
+    /// The current frame at its native size, as top-down BGRA rows.
+    pub unsafe fn capture_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
+        let (width, height) = self.native_size()?;
+        let out = self.output.try_borrow().ok()?;
+        let device = &out.device;
+        let mut desc = D3D11_TEXTURE2D_DESC {
+            Width: width,
+            Height: height,
+            MipLevels: 1,
+            ArraySize: 1,
+            Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Usage: D3D11_USAGE_DEFAULT,
+            BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
+            ..Default::default()
+        };
+        let mut target: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&desc, None, Some(&mut target)).ok()?;
+        let target = target?;
+        let dst = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
+        let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
+        self.engine.TransferVideoFrame(&target, None, &dst, Some(&black)).ok()?;
+
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
+        let mut staging: Option<ID3D11Texture2D> = None;
+        device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+        let staging = staging?;
+        let context = device.GetImmediateContext().ok()?;
+        context.CopyResource(&staging, &target);
+        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+        let row = width as usize * 4;
+        let mut pixels = Vec::with_capacity(row * height as usize);
+        for y in 0..height as usize {
+            let line = std::slice::from_raw_parts((mapped.pData as *const u8).add(y * mapped.RowPitch as usize), row);
+            pixels.extend_from_slice(line);
+        }
+        context.Unmap(&staging, 0);
+        // The alpha channel is undefined for video: make it opaque.
+        pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+        Some((width, height, pixels))
     }
 
     /// Engine error code (`MF_MEDIA_ENGINE_ERR`), if playback failed.

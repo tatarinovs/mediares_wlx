@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD, WS_POPUP,
 };
 
+use crate::overlay::{Fullscreen, PanelKind};
 use crate::state::ViewerState;
 
 pub unsafe fn toggle(state: &mut ViewerState) {
@@ -50,10 +51,35 @@ unsafe fn enter(state: &mut ViewerState) {
     );
     let _ = SetForegroundWindow(hwnd);
     let _ = SetFocus(Some(hwnd));
+    state.overlay = Some(Fullscreen::new(hwnd, rc));
+    sync_overlay(state);
+}
+
+/// After entering/leaving fullscreen, switching files or changing options: which panel floats
+/// over the picture. Video: the transport bar (unless disabled — then it stays below the
+/// picture); audio: none, its bar stays pinned; photos: ◀ ▶ buttons.
+pub unsafe fn sync_overlay(state: &mut ViewerState) {
+    let config = &state.config;
+    let kind = match &state.media {
+        Some(media) if media.is_video() && config.overlay_video => Some(PanelKind::Video),
+        Some(_) => None,
+        None if state.image.is_some() && config.overlay_photo => Some(PanelKind::Photo),
+        None => None,
+    };
+    let autohide = config.overlay_autohide;
+    let panel = state.overlay.as_mut().and_then(|fs| fs.set_panel(state.hwnd, kind, autohide));
+    let bar_host = if kind == Some(PanelKind::Video) { panel } else { None };
+    if let Some(media) = state.media.as_mut() {
+        media.set_bar_host(bar_host);
+    }
 }
 
 unsafe fn exit(state: &mut ViewerState) {
     let hwnd = state.hwnd;
+    if let Some(fs) = state.overlay.take() {
+        fs.stop(hwnd);
+    }
+    sync_overlay(state);
     // Unpin first so the moves below are not overridden.
     state.fullscreen = None;
     let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);

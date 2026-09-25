@@ -10,6 +10,7 @@ use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 use crate::config::ViewerConfig;
 use crate::image_cache::{self, DecodedImage};
 use crate::media_view::MediaView;
+use crate::overlay::Fullscreen;
 use crate::playlist::{self, EndAction};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -53,6 +54,10 @@ pub struct ViewerState {
     pub playlist: Option<PathBuf>,
     /// Monitor rectangle while fullscreen; the window is pinned to it.
     pub fullscreen: Option<RECT>,
+    /// Fullscreen extras (floating panel, idle cursor); present while fullscreen.
+    pub overlay: Option<Fullscreen>,
+    /// Photos advance on a timer.
+    pub slideshow: bool,
     pub config: ViewerConfig,
     /// Last TC show flags (`LCP_*`), to detect which option a `LC_NEWPARAMS` toggled.
     pub show_flags: i32,
@@ -78,6 +83,8 @@ impl ViewerState {
             current_idx: 0,
             playlist: None,
             fullscreen: None,
+            overlay: None,
+            slideshow: false,
             config,
             show_flags: 0,
             osd_font: None,
@@ -125,6 +132,18 @@ impl ViewerState {
         let Some(path) = self.dir_files.get(idx).cloned() else { return false };
         self.current_idx = idx;
         self.show(&path)
+    }
+
+    /// Slideshow step: the next photo in the list (wrapping). False if there is no other photo.
+    pub fn next_photo(&mut self) -> bool {
+        let n = self.dir_files.len();
+        let next = (1..n)
+            .map(|k| (self.current_idx + k) % n)
+            .find(|&i| probe_file(&self.dir_files[i]).is_image_kind());
+        match next {
+            Some(idx) => self.go_to(idx),
+            None => false,
+        }
     }
 
     /// The bar's previous / next track and media keys: the adjacent audio/video file.
@@ -211,6 +230,7 @@ impl ViewerState {
 impl Drop for ViewerState {
     fn drop(&mut self) {
         // Stop playback before the surface window goes away.
+        self.overlay = None;
         self.media = None;
         self.drop_osd_font();
     }

@@ -168,6 +168,58 @@ pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoA
     }
 }
 
+/// Decodes the frame at `fraction` (0..1) of the duration as RGBA — for thumbnails. The source
+/// reader lands on the key frame before that position, which is fine for a preview.
+pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> {
+    let _com = ComScope::new();
+    if !ensure_mf_started() {
+        return None;
+    }
+    unsafe {
+        let reader = open_reader(path, true).ok()?;
+        set_output_format(&reader, &MFVideoFormat_RGB32).ok()?;
+        let current = reader.GetCurrentMediaType(STREAM).ok()?;
+        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+        let (width, height) = ((frame_size >> 32) as u32, frame_size as u32);
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(width as i32 * 4);
+        let at = (duration_hns(&reader) as f64 * fraction.clamp(0.0, 1.0)) as i64;
+        set_position(&reader, at).ok()?;
+
+        // The first reads after a seek may carry no sample (stream tick, format change).
+        let sample = (0..16).find_map(|_| {
+            let (mut flags, mut sample) = (0u32, None);
+            reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)).ok()?;
+            if sample.is_none() && flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+                return Some(None);
+            }
+            sample.map(Some)
+        })??;
+        let buffer = sample.ConvertToContiguousBuffer().ok()?;
+        let mut ptr = std::ptr::null_mut();
+        let mut len = 0u32;
+        buffer.Lock(&mut ptr, None, Some(&mut len)).ok()?;
+        let image = (!ptr.is_null()).then(|| {
+            let data = std::slice::from_raw_parts(ptr, len as usize);
+            let row = width as usize * 4;
+            let pitch = if stride == 0 { row as isize } else { stride as isize };
+            // Bottom-up frames start with the last row.
+            let top = if pitch < 0 { (height as usize - 1) * pitch.unsigned_abs() } else { 0 };
+            let mut rgba = Vec::with_capacity(row * height as usize);
+            for y in 0..height as isize {
+                let start = top as isize + y * pitch;
+                let line = usize::try_from(start).ok().and_then(|s| data.get(s..s + row))?;
+                rgba.extend(line.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], 255]));
+            }
+            image::RgbaImage::from_raw(width, height, rgba)
+        });
+        let _ = buffer.Unlock();
+        image.flatten()
+    }
+}
+
 unsafe fn set_output_format(reader: &IMFSourceReader, subtype: &GUID) -> windows::core::Result<()> {
     let media_type = MFCreateMediaType()?;
     media_type.SetGUID(&MF_MT_MAJOR_TYPE, &MFMediaType_Video)?;
