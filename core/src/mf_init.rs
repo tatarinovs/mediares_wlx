@@ -35,6 +35,23 @@ impl Drop for ComScope {
     }
 }
 
+/// Keeps Media Foundation started for the lifetime of the value (MFStartup is reference-counted),
+/// e.g. for a player that outlives a single call.
+pub struct MfSession(());
+
+impl MfSession {
+    pub fn start() -> Option<Self> {
+        unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }.ok()?;
+        Some(MfSession(()))
+    }
+}
+
+impl Drop for MfSession {
+    fn drop(&mut self) {
+        let _ = unsafe { MFShutdown() };
+    }
+}
+
 static MF_STARTED: Mutex<bool> = Mutex::new(false);
 
 /// Starts Media Foundation once per process. Returns false if it cannot be started.

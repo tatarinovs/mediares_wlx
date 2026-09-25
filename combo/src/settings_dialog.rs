@@ -15,6 +15,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::ViewerConfig;
 use crate::dialog::{self, Brush, GdiObject};
+use crate::playlist::Repeat;
 
 const CLASS_NAME: PCWSTR = w!("MediaresSettingsDialogClass");
 
@@ -25,6 +26,9 @@ const IDC_SHOW_OSD: i32 = 104;
 const IDC_FONT_SIZE: i32 = 105;
 const IDC_CHOOSE_COLOR: i32 = 106;
 const IDC_COLOR_PREVIEW: i32 = 107;
+const IDC_AUTO_ADVANCE: i32 = 108;
+const IDC_REPEAT: i32 = 109;
+const IDC_SHUFFLE: i32 = 110;
 
 const BST_CHECKED: usize = 1;
 const SS_LEFT: u32 = 0x0000;
@@ -48,7 +52,7 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 410)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 440, 530)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
@@ -117,8 +121,15 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 242, 130, 26), IDC_CHOOSE_COLOR);
     control(w!("STATIC"), "Aa", SS_CENTER, (320, 242, 45, 26), IDC_COLOR_PREVIEW);
 
-    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 325, 95, 28), IDOK.0);
-    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 325, 95, 28), IDCANCEL.0);
+    control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (15, 320, 395, 115), 0);
+    checkbox("Автопереход к следующему файлу", (28, 345, 365, 22), IDC_AUTO_ADVANCE, cfg.queue.auto_advance);
+    control(w!("STATIC"), "Повтор:", SS_LEFT, (28, 377, 140, 20), 0);
+    let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
+    combo((175, 374, 190, 120), IDC_REPEAT, repeat_labels, cfg.queue.repeat.index() as usize);
+    checkbox("Случайный порядок", (28, 405, 365, 22), IDC_SHUFFLE, cfg.queue.shuffle);
+
+    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (205, 448, 95, 28), IDOK.0);
+    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (315, 448, 95, 28), IDCANCEL.0);
     ok
 }
 
@@ -139,6 +150,9 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.loupe_scale = selected(dlg, IDC_LOUPE_SCALE, &ctx.loupe_scales).unwrap_or(cfg.loupe_scale);
     cfg.osd_font_size = selected(dlg, IDC_FONT_SIZE, &ctx.font_sizes).unwrap_or(cfg.osd_font_size);
     cfg.osd_font_color = ctx.color;
+    cfg.queue.auto_advance = is_checked(dlg, IDC_AUTO_ADVANCE);
+    cfg.queue.repeat = selected(dlg, IDC_REPEAT, &Repeat::ALL).unwrap_or(cfg.queue.repeat);
+    cfg.queue.shuffle = is_checked(dlg, IDC_SHUFFLE);
     cfg.save();
     ctx.result = Some(cfg.clone());
 }

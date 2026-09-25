@@ -9,7 +9,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use mediares_core::cache::FileKey;
 use mediares_core::exif::read_orientation;
 use mediares_core::image::DynamicImage;
-use mediares_core::image_decode::{apply_exif_orientation, decode_file};
+use mediares_core::image_decode::{apply_exif_orientation, decode_bytes, decode_file};
 use mediares_core::probe::{probe_file, MediaType};
 
 /// Upper bound for decoded pixels kept in memory (the image on screen is always kept).
@@ -130,6 +130,11 @@ fn decode(path: &Path, kind: MediaType, auto_rotate: bool) -> Option<DecodedImag
         }
     }
     Some(to_display(img, kind == MediaType::RawImage))
+}
+
+/// Decodes an in-memory picture (e.g. embedded album art) for display; not cached.
+pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
+    Some(to_display(decode_bytes(bytes)?, false))
 }
 
 /// Converts to BGRA in place, compositing alpha over the viewer background.

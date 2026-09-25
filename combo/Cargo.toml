@@ -8,10 +8,19 @@ name = "mediares_combo"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-mediares_core = { path = "../core", features = ["raw-preview", "psd-preview"] }
+mediares_core = { path = "../core", features = ["raw-preview", "psd-preview", "audio-decode", "tags"] }
+rodio = { version = "0.22.2", default-features = false, features = ["playback"] }
+windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Media_MediaFoundation",
+    "Win32_System_Com",
+    "Win32_UI_HiDpi",
     "Win32_System_LibraryLoader",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Controls_Dialogs",

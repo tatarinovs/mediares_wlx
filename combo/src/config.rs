@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use windows::core::{w, HSTRING, PCWSTR};
+
+use crate::playlist::{QueueOptions, Repeat};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::WindowsProgramming::{
     GetPrivateProfileIntW, GetPrivateProfileStringW, WritePrivateProfileStringW,
@@ -56,6 +58,7 @@ pub struct ViewerConfig {
     pub osd_font_name: String,
     pub auto_rotate_exif: bool,
     pub loupe_scale: f32,
+    pub queue: QueueOptions,
 }
 
 impl Default for ViewerConfig {
@@ -68,6 +71,7 @@ impl Default for ViewerConfig {
             osd_font_name: "Segoe UI".to_string(),
             auto_rotate_exif: true,
             loupe_scale: 1.0,
+            queue: QueueOptions::default(),
         }
     }
 }
@@ -94,6 +98,11 @@ impl ViewerConfig {
             osd_font_name: if font_name.trim().is_empty() { d.osd_font_name } else { font_name },
             auto_rotate_exif: int(w!("AutoRotateExif"), d.auto_rotate_exif as i32) != 0,
             loupe_scale: loupe.map_or(d.loupe_scale, |v| v.clamp(LOUPE_SCALE_RANGE.0, LOUPE_SCALE_RANGE.1)),
+            queue: QueueOptions {
+                auto_advance: int(w!("AutoAdvance"), d.queue.auto_advance as i32) != 0,
+                repeat: Repeat::from_index(int(w!("Repeat"), d.queue.repeat.index())),
+                shuffle: int(w!("Shuffle"), d.queue.shuffle as i32) != 0,
+            },
         }
     }
 
@@ -113,6 +122,9 @@ impl ViewerConfig {
             write(w!("OSDFontName"), self.osd_font_name.clone()),
             write(w!("AutoRotateExif"), flag(self.auto_rotate_exif)),
             write(w!("LoupeScale"), format!("{:.1}", self.loupe_scale)),
+            write(w!("AutoAdvance"), flag(self.queue.auto_advance)),
+            write(w!("Repeat"), self.queue.repeat.index().to_string()),
+            write(w!("Shuffle"), flag(self.queue.shuffle)),
         ]
         .iter()
         .all(|&ok| ok)

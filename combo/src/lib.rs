@@ -3,14 +3,21 @@
 // Exported `unsafe extern` functions follow the TC plugin API contract (valid pointers/handles from TC).
 #![allow(clippy::missing_safety_doc)]
 
+mod audio_view;
 mod config;
 mod dialog;
 mod exif_dialog;
 mod fullscreen;
 mod image_cache;
 mod image_view;
+mod media_view;
+mod playback_audio;
+mod playback_video;
+mod playlist;
 mod settings_dialog;
 mod state;
+mod transport_bar;
+mod video_view;
 mod window;
 
 use std::os::raw::{c_char, c_int, c_void};
@@ -51,11 +58,18 @@ mediares_core::export_content_plugin!();
 // Total Commander WLX (Lister Plugin) API
 // ==========================================
 
-/// The viewer only renders photos; video/audio are left to other plugins.
+/// Photos, video, audio and M3U playlists.
 fn wlx_detect_string() -> &'static str {
     static S: OnceLock<String> = OnceLock::new();
     S.get_or_init(|| {
-        let exts = detect_extensions(&[MediaType::StandardImage, MediaType::RawImage, MediaType::PsdImage]);
+        let exts = detect_extensions(&[
+            MediaType::StandardImage,
+            MediaType::RawImage,
+            MediaType::PsdImage,
+            MediaType::Video,
+            MediaType::Audio,
+            MediaType::Playlist,
+        ]);
         format!("MULTIMEDIA & ({})", exts)
     })
 }

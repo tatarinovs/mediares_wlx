@@ -38,19 +38,26 @@ pub unsafe fn pstr_to_path(ptr: *const c_char) -> Option<PathBuf> {
     if len == 0 {
         return None;
     }
-    let ansi = std::slice::from_raw_parts(ptr as *const u8, len);
+    ansi_to_os_string(std::slice::from_raw_parts(ptr as *const u8, len)).map(PathBuf::from)
+}
+
+/// Converts text in the system ANSI code page (legacy INI/M3U files, `char*` APIs).
+pub fn ansi_to_os_string(ansi: &[u8]) -> Option<OsString> {
+    if ansi.is_empty() {
+        return Some(OsString::new());
+    }
     let flags = MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0);
-    let wide_len = MultiByteToWideChar(CP_ACP, flags, ansi, None);
+    let wide_len = unsafe { MultiByteToWideChar(CP_ACP, flags, ansi, None) };
     if wide_len <= 0 {
         return None;
     }
     let mut wide = vec![0u16; wide_len as usize];
-    let written = MultiByteToWideChar(CP_ACP, flags, ansi, Some(&mut wide));
+    let written = unsafe { MultiByteToWideChar(CP_ACP, flags, ansi, Some(&mut wide)) };
     if written <= 0 {
         return None;
     }
     wide.truncate(written as usize);
-    Some(PathBuf::from(OsString::from_wide(&wide)))
+    Some(OsString::from_wide(&wide))
 }
 
 /// Writes `text` as a NUL-terminated byte string, truncating to `max_bytes` (including the NUL).

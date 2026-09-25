@@ -3,12 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mediares_core::probe::probe_file;
+use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 
 use crate::config::ViewerConfig;
 use crate::image_cache::{self, DecodedImage};
+use crate::media_view::MediaView;
+use crate::playlist::{self, EndAction};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZoomMode {
@@ -37,13 +39,18 @@ pub struct ViewerState {
     pub file_path: PathBuf,
     pub file_size: u64,
     pub image: Option<Arc<DecodedImage>>,
+    /// Present while a video or audio file is shown (then `image` is `None`).
+    pub media: Option<MediaView>,
     pub zoom: ZoomMode,
     /// Top-left corner of the image in client coordinates (Custom zoom only).
     pub offset: (f32, f32),
     pub drag: Option<Drag>,
     pub loupe: Option<Loupe>,
+    /// The files navigated through: the folder's viewable files, or an M3U playlist's entries.
     pub dir_files: Vec<PathBuf>,
     pub current_idx: usize,
+    /// The M3U file `dir_files` came from.
+    pub playlist: Option<PathBuf>,
     /// Monitor rectangle while fullscreen; the window is pinned to it.
     pub fullscreen: Option<RECT>,
     pub config: ViewerConfig,
@@ -54,20 +61,22 @@ pub struct ViewerState {
 }
 
 impl ViewerState {
-    /// Loads `path`; returns `None` if it is not a displayable image.
-    pub fn new(lister: HWND, path: &Path, config: ViewerConfig) -> Option<Self> {
+    /// Loads `path` into the viewer window `hwnd`; `None` if it cannot be displayed.
+    pub fn new(hwnd: HWND, lister: HWND, path: &Path, config: ViewerConfig) -> Option<Self> {
         let mut state = Self {
-            hwnd: HWND::default(),
+            hwnd,
             lister,
             file_path: PathBuf::new(),
             file_size: 0,
             image: None,
+            media: None,
             zoom: ZoomMode::Fit,
             offset: (0.0, 0.0),
             drag: None,
             loupe: None,
             dir_files: Vec::new(),
             current_idx: 0,
+            playlist: None,
             fullscreen: None,
             config,
             show_flags: 0,
@@ -76,31 +85,78 @@ impl ViewerState {
         state.set_file(path).then_some(state)
     }
 
-    /// Switches to `path`, resetting the view. Returns whether an image could be displayed.
+    /// Switches to `path`, resetting the view. Returns whether it could be displayed. An M3U
+    /// playlist replaces the file list with its entries and shows the first one.
     pub fn set_file(&mut self, path: &Path) -> bool {
+        if probe_file(path) == MediaType::Playlist {
+            let entries: Vec<PathBuf> = playlist::read_m3u(path).into_iter().filter(|p| is_viewable(probe_file(p))).collect();
+            let Some(first) = entries.first().cloned() else { return false };
+            self.dir_files = entries;
+            self.current_idx = 0;
+            self.playlist = Some(path.to_path_buf());
+            return self.show(&first);
+        }
+        match self.dir_files.iter().position(|p| same_path(p, path)) {
+            Some(pos) => self.current_idx = pos,
+            None => {
+                (self.dir_files, self.current_idx) = scan_directory_media(path);
+                self.playlist = None;
+            }
+        }
+        self.show(path)
+    }
+
+    fn show(&mut self, path: &Path) -> bool {
         self.file_path = path.to_path_buf();
         self.zoom = ZoomMode::Fit;
         self.offset = (0.0, 0.0);
         self.drag = None;
         self.loupe = None;
-
-        match self.dir_files.iter().position(|p| same_path(p, path)) {
-            Some(pos) => self.current_idx = pos,
-            None => (self.dir_files, self.current_idx) = scan_directory_media(path),
-        }
         self.load_media();
-        self.image.is_some()
+        self.has_content()
     }
 
-    /// Moves to the next/previous image in the directory (wrapping around).
+    pub fn has_content(&self) -> bool {
+        self.image.is_some() || self.media.is_some()
+    }
+
+    /// Shows the file at `idx` of the list; false if it can't be displayed.
+    fn go_to(&mut self, idx: usize) -> bool {
+        let Some(path) = self.dir_files.get(idx).cloned() else { return false };
+        self.current_idx = idx;
+        self.show(&path)
+    }
+
+    /// The bar's previous / next track and media keys: the adjacent audio/video file.
+    pub fn skip_track(&mut self, forward: bool) -> bool {
+        match playlist::skip(&self.dir_files, self.current_idx, forward, &self.config.queue) {
+            Some(idx) => self.go_to(idx),
+            None => false,
+        }
+    }
+
+    /// The current file played to its end. Returns whether another file is now shown.
+    pub fn playback_ended(&mut self) -> bool {
+        match playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue) {
+            EndAction::Replay => {
+                if let Some(media) = &self.media {
+                    media.replay();
+                }
+                false
+            }
+            EndAction::Play(idx) => self.go_to(idx),
+            EndAction::Stop => false,
+        }
+    }
+
+    /// Moves to the next/previous file in the directory (wrapping around).
     pub fn navigate(&mut self, forward: bool) -> bool {
         let total = self.dir_files.len();
         if total <= 1 {
             return false;
         }
         let idx = if forward { (self.current_idx + 1) % total } else { (self.current_idx + total - 1) % total };
-        let path = self.dir_files[idx].clone();
-        self.set_file(&path);
+        self.go_to(idx);
         true
     }
 
@@ -108,7 +164,7 @@ impl ViewerState {
         let reload = config.auto_rotate_exif != self.config.auto_rotate_exif;
         self.config = config;
         self.drop_osd_font();
-        if reload {
+        if reload && self.image.is_some() {
             self.load_media();
         }
     }
@@ -125,33 +181,54 @@ impl ViewerState {
         let rotate = self.config.auto_rotate_exif;
         let kind = probe_file(&self.file_path);
         self.file_size = std::fs::metadata(&self.file_path).map(|m| m.len()).unwrap_or(0);
-        self.image = if kind.is_image_kind() { image_cache::load(&self.file_path, kind, rotate) } else { None };
 
-        // Warm up the neighbours for instant next/previous.
+        if kind.is_playable() {
+            self.image = None;
+            // The player is reused when going from one file of the same kind to the next.
+            self.media = unsafe { MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind) };
+            let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
+            if let Some(media) = self.media.as_mut() {
+                media.set_skip(can_skip);
+            }
+        } else {
+            self.media = None;
+            self.image = if kind.is_image_kind() { image_cache::load(&self.file_path, kind, rotate) } else { None };
+        }
+
+        // Warm up neighbouring images for instant next/previous.
         let total = self.dir_files.len();
         if total > 1 {
-            let next = self.dir_files[(self.current_idx + 1) % total].clone();
-            let prev = self.dir_files[(self.current_idx + total - 1) % total].clone();
-            let mut queue = vec![next];
+            let mut neighbours = vec![self.dir_files[(self.current_idx + 1) % total].clone()];
             if total > 2 {
-                queue.push(prev);
+                neighbours.push(self.dir_files[(self.current_idx + total - 1) % total].clone());
             }
-            image_cache::prefetch(queue, rotate);
+            neighbours.retain(|p| probe_file(p).is_image_kind());
+            image_cache::prefetch(neighbours, rotate);
         }
     }
 }
 
 impl Drop for ViewerState {
     fn drop(&mut self) {
+        // Stop playback before the surface window goes away.
+        self.media = None;
         self.drop_osd_font();
     }
 }
 
+/// Case-insensitive, separator-agnostic (`/` vs `\`) path equality, as on NTFS.
 fn same_path(a: &Path, b: &Path) -> bool {
-    a.as_os_str().eq_ignore_ascii_case(b.as_os_str())
+    let (mut x, mut y) = (a.components(), b.components());
+    loop {
+        match (x.next(), y.next()) {
+            (None, None) => return true,
+            (Some(p), Some(q)) if p.as_os_str().eq_ignore_ascii_case(q.as_os_str()) => {}
+            _ => return false,
+        }
+    }
 }
 
-/// Lists the images in the file's directory in natural ("file2" < "file10") order.
+/// Lists the viewable files (images, videos, audio) in the file's directory in natural ("file2" < "file10") order.
 pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
     let single = || (vec![current_file.to_path_buf()], 0);
     let Some(entries) = current_file.parent().and_then(|p| std::fs::read_dir(p).ok()) else {
@@ -162,7 +239,7 @@ pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
-        .filter(|p| probe_file(p).is_image_kind())
+        .filter(|p| is_viewable(probe_file(p)))
         .collect();
     if files.is_empty() {
         return single();
@@ -171,6 +248,10 @@ pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
     files.sort_by_cached_key(|p| natural_key(&p.file_name().unwrap_or_default().to_string_lossy()));
     let idx = files.iter().position(|p| same_path(p, current_file)).unwrap_or(0);
     (files, idx)
+}
+
+fn is_viewable(kind: MediaType) -> bool {
+    kind.is_image_kind() || kind.is_playable()
 }
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
@@ -203,6 +284,13 @@ fn natural_key(name: &str) -> Vec<Chunk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paths_compare_like_the_file_system() {
+        assert!(same_path(Path::new(r"C:\Media\Clip.MP4"), Path::new("c:/media/clip.mp4")));
+        assert!(!same_path(Path::new(r"C:\Media\a.mp4"), Path::new(r"C:\Media\b.mp4")));
+        assert!(!same_path(Path::new(r"C:\Media"), Path::new(r"C:\Media\a.mp4")));
+    }
 
     #[test]
     fn natural_order() {

@@ -1,4 +1,5 @@
-//! Video metadata and keyframe hashing via Windows Media Foundation (IMFSourceReader).
+//! Video metadata and keyframe hashing via Windows Media Foundation (IMFSourceReader); also the
+//! playability check for audio that only Media Foundation can decode.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -9,8 +10,8 @@ use windows::Win32::Media::MediaFoundation::{
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
     MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_SIZE,
     MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE, MFSampleExtension_CleanPoint, MF_SOURCE_READERF_ENDOFSTREAM,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
@@ -36,6 +37,14 @@ impl VideoAnalysis {
     }
 }
 
+/// Basic stream properties, cheap to obtain (no decoding).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration_sec: f64,
+}
+
 #[derive(Debug)]
 pub enum VideoError {
     /// The host asked to stop (`ContentStopGetValue`); the result must not be cached.
@@ -51,6 +60,66 @@ impl From<windows::core::Error> for VideoError {
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
+/// Opens a source reader restricted to the first video stream.
+unsafe fn open_reader(path: &Path, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
+    open_reader_for(path, STREAM, video_processing)
+}
+
+unsafe fn open_reader_for(path: &Path, stream: u32, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
+    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut attributes: Option<IMFAttributes> = None;
+    MFCreateAttributes(&mut attributes, 1)?;
+    let attributes = attributes.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+    if video_processing {
+        attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
+    }
+    let reader = MFCreateSourceReaderFromURL(PCWSTR(path_wide.as_ptr()), Some(&attributes))?;
+    let _ = reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false);
+    reader.SetStreamSelection(stream, true)?;
+    Ok(reader)
+}
+
+unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
+    reader
+        .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
+        .ok()
+        .and_then(|v| propvariant_u64(&v))
+        .unwrap_or(0)
+}
+
+/// Checks that Media Foundation can open the file and has a video stream; returns its properties.
+pub fn probe_video(path: &Path) -> Option<VideoInfo> {
+    let _com = ComScope::new();
+    if !ensure_mf_started() {
+        return None;
+    }
+    unsafe {
+        let reader = open_reader(path, false).ok()?;
+        let native = reader.GetNativeMediaType(STREAM, 0).ok()?;
+        let frame_size = native.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        Some(VideoInfo {
+            width: (frame_size >> 32) as u32,
+            height: frame_size as u32,
+            duration_sec: duration_hns(&reader) as f64 / 10_000_000.0,
+        })
+    }
+}
+
+/// Checks that Media Foundation can open the file and has an audio stream; returns the duration
+/// in seconds.
+pub fn probe_audio(path: &Path) -> Option<f64> {
+    let _com = ComScope::new();
+    if !ensure_mf_started() {
+        return None;
+    }
+    unsafe {
+        let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
+        let reader = open_reader_for(path, stream, false).ok()?;
+        reader.GetNativeMediaType(stream, 0).ok()?;
+        Some(duration_hns(&reader) as f64 / 10_000_000.0)
+    }
+}
+
 pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoAnalysis, VideoError> {
     let _com = ComScope::new();
     if !ensure_mf_started() {
@@ -59,17 +128,8 @@ pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoA
     let check = || if cancelled() { Err(VideoError::Cancelled) } else { Ok(()) };
     check()?;
 
-    let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
-
     unsafe {
-        let mut attributes: Option<IMFAttributes> = None;
-        MFCreateAttributes(&mut attributes, 1)?;
-        let attributes = attributes.ok_or_else(|| VideoError::Failed("no attributes".into()))?;
-        attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
-
-        let reader = MFCreateSourceReaderFromURL(PCWSTR(path_wide.as_ptr()), Some(&attributes))?;
-        let _ = reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false);
-        reader.SetStreamSelection(STREAM, true)?;
+        let reader = open_reader(path, true)?;
 
         let format = if set_output_format(&reader, &MFVideoFormat_RGB32).is_ok() {
             PixelFormat::Rgb32
@@ -88,8 +148,7 @@ pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoA
             format,
         };
 
-        let duration_var = reader.GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)?;
-        let duration_hns = propvariant_u64(&duration_var).unwrap_or(0);
+        let duration_hns = duration_hns(&reader);
         let duration_sec = (duration_hns / 10_000_000) as u32;
 
         let mut hashes = [0u64; 3];
@@ -144,13 +203,7 @@ unsafe fn grab_frame_dhash(reader: &IMFSourceReader, timestamp_hns: u64, geo: &F
         return None;
     }
 
-    let mut position = PROPVARIANT::default();
-    {
-        let inner = &mut *position.Anonymous.Anonymous;
-        inner.vt = VT_I8;
-        inner.Anonymous.hVal = timestamp_hns as i64;
-    }
-    reader.SetCurrentPosition(&GUID::zeroed(), &position).ok()?;
+    set_position(reader, timestamp_hns as i64).ok()?;
 
     let mut sample = None;
     reader.ReadSample(STREAM, 0, None, None, None, Some(&mut sample)).ok()?;
@@ -228,6 +281,91 @@ impl FrameView<'_> {
             }
         }
         Some(grid.iter().flat_map(|row| row.windows(2)).fold(0u64, |hash, pair| (hash << 1) | (pair[0] > pair[1]) as u64))
+    }
+}
+
+unsafe fn set_position(reader: &IMFSourceReader, hns: i64) -> windows::core::Result<()> {
+    let mut position = PROPVARIANT::default();
+    {
+        let inner = &mut *position.Anonymous.Anonymous;
+        inner.vt = VT_I8;
+        inner.Anonymous.hVal = hns.max(0);
+    }
+    reader.SetCurrentPosition(&GUID::zeroed(), &position)
+}
+
+const HNS_PER_SEC: f64 = 10_000_000.0;
+/// Upper bound of compressed samples scanned for one step (a very long GOP at high fps).
+const MAX_SCAN_SAMPLES: usize = 3000;
+
+/// Locates key frames (clean points) of the first video stream by reading compressed samples —
+/// nothing is decoded, so a step costs a few milliseconds.
+pub struct KeyframeIndex {
+    reader: IMFSourceReader,
+    _com: ComScope,
+}
+
+impl KeyframeIndex {
+    pub fn open(path: &Path) -> Option<Self> {
+        let com = ComScope::new();
+        if !ensure_mf_started() {
+            return None;
+        }
+        // No output type is set, so samples stay compressed.
+        let reader = unsafe { open_reader(path, false) }.ok()?;
+        Some(Self { reader, _com: com })
+    }
+
+    /// Next sample; `None` at the end of the stream. Returns (time in seconds, is key frame).
+    unsafe fn read(&self) -> Option<(f64, bool)> {
+        let mut flags = 0u32;
+        let mut sample = None;
+        self.reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)).ok()?;
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            return None;
+        }
+        let sample = sample?;
+        let time = sample.GetSampleTime().ok()? as f64 / HNS_PER_SEC;
+        let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
+        Some((time, key))
+    }
+
+    /// Seeks the reader to `seconds` and returns the first key frame at or after where it landed.
+    /// Sources position on the key frame preceding the requested time.
+    unsafe fn key_frame_from(&self, seconds: f64) -> Option<f64> {
+        set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
+        (0..MAX_SCAN_SAMPLES).map_while(|_| self.read()).find(|&(_, key)| key).map(|(t, _)| t)
+    }
+
+    /// First key frame strictly after `seconds`.
+    pub fn next_after(&self, seconds: f64) -> Option<f64> {
+        unsafe {
+            set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
+            (0..MAX_SCAN_SAMPLES)
+                .map_while(|_| self.read())
+                .find(|&(t, key)| key && t > seconds)
+                .map(|(t, _)| t)
+        }
+    }
+
+    /// Last key frame strictly before `seconds` (0 if there is none).
+    pub fn previous_before(&self, seconds: f64) -> Option<f64> {
+        let mut probe = seconds;
+        // Probing just before the key frame we landed on normally yields the preceding one; the
+        // step only grows if the source keeps returning the same frame.
+        let mut back = 0.001;
+        for _ in 0..16 {
+            if probe <= 0.0 {
+                return Some(0.0);
+            }
+            let found = unsafe { self.key_frame_from(probe) }?;
+            if found < seconds {
+                return Some(found);
+            }
+            probe = probe.min(found) - back;
+            back = (back * 4.0).max(0.25);
+        }
+        None
     }
 }
 

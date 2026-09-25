@@ -9,6 +9,8 @@ pub enum MediaType {
     PsdImage,
     Video,
     Audio,
+    /// M3U / M3U8 list of media files (opened by the viewer as a play queue).
+    Playlist,
     Unsupported,
 }
 
@@ -16,15 +18,19 @@ const STANDARD_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp
 const RAW_EXTS: &[&str] = &["cr2", "cr3", "nef", "arw", "orf", "rw2", "dng", "raf", "pef"];
 const PSD_EXTS: &[&str] = &["psd", "psb"];
 const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "ts", "mts"];
-const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma"];
+const AUDIO_EXTS: &[&str] = &[
+    "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff", "caf", "mka",
+];
+const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
 
 impl MediaType {
-    const ALL: [MediaType; 5] = [
+    const ALL: [MediaType; 6] = [
         MediaType::StandardImage,
         MediaType::RawImage,
         MediaType::PsdImage,
         MediaType::Video,
         MediaType::Audio,
+        MediaType::Playlist,
     ];
 
     pub fn extensions(self) -> &'static [&'static str] {
@@ -34,12 +40,18 @@ impl MediaType {
             MediaType::PsdImage => PSD_EXTS,
             MediaType::Video => VIDEO_EXTS,
             MediaType::Audio => AUDIO_EXTS,
+            MediaType::Playlist => PLAYLIST_EXTS,
             MediaType::Unsupported => &[],
         }
     }
 
     pub fn is_image_kind(self) -> bool {
         matches!(self, MediaType::StandardImage | MediaType::RawImage | MediaType::PsdImage)
+    }
+
+    /// Audio or video: something with a timeline that can be played through.
+    pub fn is_playable(self) -> bool {
+        matches!(self, MediaType::Audio | MediaType::Video)
     }
 
     /// Kinds that are expensive to analyze and should be deferred with `FT_DELAYED`.
@@ -78,6 +90,8 @@ mod tests {
         assert_eq!(probe_file(Path::new("x.PSB")), MediaType::PsdImage);
         assert_eq!(probe_file(Path::new("x.cr3")), MediaType::RawImage);
         assert_eq!(probe_file(Path::new("noext")), MediaType::Unsupported);
+        assert_eq!(probe_file(Path::new("x.FLAC")), MediaType::Audio);
+        assert_eq!(probe_file(Path::new("list.m3u8")), MediaType::Playlist);
     }
 
     #[test]

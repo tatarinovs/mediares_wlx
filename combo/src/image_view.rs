@@ -179,6 +179,33 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     let _ = DeleteDC(mem_dc);
 }
 
+/// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio.
+pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
+    let (rw, rh) = ((rect.right - rect.left) as f32, (rect.bottom - rect.top) as f32);
+    if rw <= 0.0 || rh <= 0.0 || img.width == 0 || img.height == 0 {
+        return;
+    }
+    let s = (rw / img.width as f32).min(rh / img.height as f32);
+    let (dw, dh) = (((img.width as f32 * s).round() as i32).max(1), ((img.height as f32 * s).round() as i32).max(1));
+    let (dx, dy) = (rect.left + (rw as i32 - dw) / 2, rect.top + (rh as i32 - dh) / 2);
+    let bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: img.width as i32,
+            biHeight: -(img.height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    SetStretchBltMode(dc, if s < 1.0 { HALFTONE } else { COLORONCOLOR });
+    let _ = SetBrushOrgEx(dc, 0, 0, None);
+    let (w, h) = (img.width as i32, img.height as i32);
+    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, w, h, Some(img.bgra.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
+}
+
 unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
     let s = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
