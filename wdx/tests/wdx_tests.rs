@@ -50,11 +50,15 @@ fn test_detect_string() {
     assert!(detect.contains(r#"EXT="MKV""#));
     assert!(detect.contains(r#"EXT="CR2""#));
     assert!(detect.contains(r#"EXT="PSD""#));
+    // Every RAW/PSD extension the core can decode must be advertised.
+    assert!(detect.contains(r#"EXT="CR3""#));
+    assert!(detect.contains(r#"EXT="PSB""#));
+    assert!(!detect.contains(r#"EXT="MP3""#), "audio is not analyzed by the WDX");
 }
 
 #[test]
 fn test_image_hashes_and_duplicate_matching() {
-    use image::{DynamicImage, Rgb, RgbImage};
+    use mediares_core::image::{self, DynamicImage, Rgb, RgbImage};
     use std::fs;
 
     let test_dir = PathBuf::from("target/test_images");
@@ -135,31 +139,33 @@ fn test_image_hashes_and_duplicate_matching() {
 }
 
 #[test]
-fn test_delay_if_slow_for_uncached_video() {
+fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
     use std::os::windows::ffi::OsStrExt;
-    let video_path = PathBuf::from("target/test_dummy_uncached.mp4");
-    let wide: Vec<u16> = video_path
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect();
+    for filename in &["target/test_dummy.mp4", "target/test_dummy.cr2", "target/test_dummy.psd"] {
+        let path = PathBuf::from(filename);
+        let wide: Vec<u16> = path
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
 
-    let mut buf = [0u16; 128];
-    let res = unsafe {
-        ContentGetValueW(
-            wide.as_ptr(),
-            5, // Video_Fingerprint
-            0,
-            buf.as_mut_ptr() as *mut c_void,
-            256,
-            CONTENT_DELAYIFSLOW,
-        )
-    };
+        let mut buf = [0u16; 128];
+        let res = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                0, // dHash
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                256,
+                CONTENT_DELAYIFSLOW,
+            )
+        };
 
-    assert_eq!(
-        res, FT_DELAYED,
-        "Uncached video with CONTENT_DELAYIFSLOW must return FT_DELAYED"
-    );
+        assert_eq!(
+            res, FT_DELAYED,
+            "Uncached file {} with CONTENT_DELAYIFSLOW must return FT_DELAYED", filename
+        );
+    }
 }
 
 #[test]

@@ -28,26 +28,18 @@ pub const FT_DELAYED: c_int = 0;
 pub const CONTENT_DELAYIFSLOW: c_int = 1;
 pub const CONTENT_PASSTHROUGH: c_int = 2;
 
+/// `ContentDefaultParamStruct` / `ListDefaultParamStruct` — both have the same layout.
 #[repr(C)]
-pub struct ContentDefaultParamStruct {
+pub struct DefaultParamStruct {
     pub size: c_int,
     pub plugin_interface_version_low: u32,
     pub plugin_interface_version_hi: u32,
     pub default_ini_name: [c_char; 260],
 }
 
+pub type ContentDefaultParamStruct = DefaultParamStruct;
+pub type ListDefaultParamStruct = DefaultParamStruct;
+
 // WLX Return codes for ListLoadNext / ListLoadNextW
 pub const LISTPLUGIN_OK: c_int = 0;
 pub const LISTPLUGIN_ERROR: c_int = 1;
-
-// WLX ShowFlags
-pub const LCS_WHOLEEMBEDDED: c_int = 1;
-pub const LCS_FITTOOPTIONS: c_int = 2;
-
-// WLX ListNotificationReceived messages
-pub const LC_NEWPARAMS: c_int = 1;
-pub const LC_VISIBILITY: c_int = 2;
-
-// WLX ListSendCommand commands
-pub const LC_COPY: c_int = 1;
-pub const LC_SELECTALL: c_int = 2;

@@ -1,0 +1,5 @@
+[plugininstall]
+description=Mediares - Fast Media Viewer (WLX)
+type=wlx
+file=mediares.wlx64
+defaultdir=mediares

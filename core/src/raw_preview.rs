@@ -1,172 +1,169 @@
-//! Extraction of embedded JPEG previews from RAW camera images (CR2, NEF, ARW, DNG, etc.)
+//! Extraction of embedded JPEG previews from RAW camera images (CR2, NEF, ARW, DNG, ...).
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// Extract embedded JPEG preview bytes from a RAW file.
+use crate::jpeg;
+
+const MIN_PREVIEW_LEN: usize = 32 * 1024;
+const MAX_IFDS: usize = 32;
+const MAX_IFD_ENTRIES: usize = 1000;
+const MAX_SUB_IFDS: usize = 16;
+/// Enough to reach the SOF marker past large APP segments when validating a candidate.
+const HEADER_PROBE_LEN: usize = 256 * 1024;
+const SIGNATURE_SCAN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Extract the largest decodable embedded JPEG preview from a RAW file.
 pub fn extract_raw_preview(path: &Path) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
-    let file_len = file.metadata().ok()?.len() as usize;
+    let file_len = file.metadata().ok()?.len();
     if file_len < 1024 {
         return None;
     }
-
-    // Try TIFF-based IFD parsing first (CR2, NEF, ARW, DNG, ORF, RW2, PEF)
-    if let Some(jpeg) = extract_tiff_ifd_jpeg(&mut file, file_len) {
-        return Some(jpeg);
-    }
-
-    // Fallback: search for largest JPEG stream (FF D8 FF ... FF D9)
-    extract_largest_jpeg_stream(&mut file, file_len)
+    tiff_preview(&mut file, file_len).or_else(|| signature_preview(&mut file))
 }
 
-fn extract_tiff_ifd_jpeg(file: &mut File, file_len: usize) -> Option<Vec<u8>> {
-    let _ = file.seek(SeekFrom::Start(0));
+/// Structured path: walk IFD0, its chain and SubIFDs collecting JPEG candidates
+/// (`JPEGInterchangeFormat` or single-strip JPEG-compressed images as in CR2).
+fn tiff_preview(file: &mut File, file_len: u64) -> Option<Vec<u8>> {
     let mut header = [0u8; 8];
-    if file.read_exact(&mut header).is_err() {
-        return None;
-    }
-
-    let is_le = match &header[0..4] {
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.read_exact(&mut header).ok()?;
+    let le = match &header[0..4] {
         [b'I', b'I', 42, 0] => true,
         [b'M', b'M', 0, 42] => false,
         _ => return None,
     };
+    let rd = Endian(le);
 
-    let read_u16 = |buf: &[u8]| -> u16 {
-        if is_le {
-            u16::from_le_bytes([buf[0], buf[1]])
-        } else {
-            u16::from_be_bytes([buf[0], buf[1]])
+    let mut candidates: Vec<(u64, u64)> = Vec::new();
+    let mut queue = VecDeque::from([rd.u32(&header[4..8]) as u64]);
+    let mut visited = Vec::new();
+
+    while let Some(offset) = queue.pop_front() {
+        if offset == 0 || offset + 2 > file_len || visited.contains(&offset) || visited.len() >= MAX_IFDS {
+            continue;
         }
-    };
+        visited.push(offset);
 
-    let read_u32 = |buf: &[u8]| -> u32 {
-        if is_le {
-            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
-        } else {
-            u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]])
+        let Some(ifd) = read_ifd(file, offset, rd) else { continue };
+        let pair = |a: Option<u64>, b: Option<u64>| a.zip(b).filter(|&(o, l)| l > 0 && o + l <= file_len);
+
+        if let Some(c) = pair(ifd.jpeg_offset, ifd.jpeg_length) {
+            candidates.push(c);
         }
-    };
-
-    let mut ifd_offset = read_u32(&header[4..8]) as u64;
-    let mut best_jpeg: Option<(u64, u32)> = None;
-
-    // Traverse up to 8 IFDs
-    for _ in 0..8 {
-        if ifd_offset == 0 || ifd_offset + 2 >= file_len as u64 {
-            break;
-        }
-
-        if file.seek(SeekFrom::Start(ifd_offset)).is_err() {
-            break;
-        }
-
-        let mut num_entries_buf = [0u8; 2];
-        if file.read_exact(&mut num_entries_buf).is_err() {
-            break;
-        }
-        let num_entries = read_u16(&num_entries_buf) as usize;
-        if num_entries > 500 {
-            break;
-        }
-
-        let mut entries_data = vec![0u8; num_entries * 12];
-        if file.read_exact(&mut entries_data).is_err() {
-            break;
-        }
-
-        let mut jpeg_offset: Option<u32> = None;
-        let mut jpeg_len: Option<u32> = None;
-        let mut sub_ifd_offset: Option<u32> = None;
-
-        for chunk in entries_data.chunks_exact(12) {
-            let tag = read_u16(&chunk[0..2]);
-            let value_offset = read_u32(&chunk[8..12]);
-
-            match tag {
-                0x0201 => jpeg_offset = Some(value_offset), // JPEGInterchangeFormat
-                0x0202 => jpeg_len = Some(value_offset),    // JPEGInterchangeFormatLength
-                0x014A => sub_ifd_offset = Some(value_offset), // SubIFDs
-                _ => {}
+        if matches!(ifd.compression, Some(6 | 7)) {
+            if let Some(c) = pair(ifd.strip_offset, ifd.strip_length) {
+                candidates.push(c);
             }
         }
-
-        if let (Some(off), Some(len)) = (jpeg_offset, jpeg_len) {
-            if off as usize + len as usize <= file_len && len > 50_000 {
-                if let Some((_, best_len)) = best_jpeg {
-                    if len > best_len {
-                        best_jpeg = Some((off as u64, len));
-                    }
-                } else {
-                    best_jpeg = Some((off as u64, len));
-                }
-            }
-        }
-
-        // Read next IFD offset
-        let mut next_ifd_buf = [0u8; 4];
-        if file.read_exact(&mut next_ifd_buf).is_err() {
-            break;
-        }
-        let next_ifd = read_u32(&next_ifd_buf) as u64;
-
-        if next_ifd != 0 {
-            ifd_offset = next_ifd;
-        } else if let Some(sub_off) = sub_ifd_offset.take() {
-            ifd_offset = sub_off as u64;
-        } else {
-            break;
-        }
+        queue.extend(ifd.sub_ifds);
+        queue.push_back(ifd.next);
     }
 
-    if let Some((off, len)) = best_jpeg {
-        let mut buf = vec![0u8; len as usize];
-        if file.seek(SeekFrom::Start(off)).is_ok() && file.read_exact(&mut buf).is_ok() {
-            if buf.starts_with(&[0xFF, 0xD8, 0xFF]) {
-                return Some(buf);
-            }
-        }
-    }
-
-    None
+    candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
+    candidates.dedup();
+    candidates
+        .into_iter()
+        .filter(|&(_, len)| len as usize >= MIN_PREVIEW_LEN)
+        .find_map(|(off, len)| read_candidate(file, off, len as usize))
 }
 
-fn extract_largest_jpeg_stream(file: &mut File, file_len: usize) -> Option<Vec<u8>> {
-    // Read up to 16MB from file
-    let max_read = file_len.min(16 * 1024 * 1024);
-    let mut data = vec![0u8; max_read];
-    let _ = file.seek(SeekFrom::Start(0));
-    file.read_exact(&mut data).ok()?;
+fn read_candidate(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut buf = vec![0u8; len.min(HEADER_PROBE_LEN)];
+    file.read_exact(&mut buf).ok()?;
+    if !jpeg::is_decodable(&buf) {
+        return None;
+    }
+    buf.resize(len, 0);
+    file.read_exact(&mut buf[HEADER_PROBE_LEN.min(len)..]).ok()?;
+    Some(buf)
+}
 
-    let mut largest: Option<(usize, usize)> = None;
-    let mut start_idx = 0;
+/// Fallback: scan the head of the file for the largest complete JPEG stream (e.g. CR3, RAF).
+fn signature_preview(file: &mut File) -> Option<Vec<u8>> {
+    let mut data = Vec::new();
+    file.seek(SeekFrom::Start(0)).ok()?;
+    file.take(SIGNATURE_SCAN_BYTES).read_to_end(&mut data).ok()?;
+    jpeg::find_largest(&data, MIN_PREVIEW_LEN).map(<[u8]>::to_vec)
+}
 
-    while let Some(soi) = memchr::memmem::find(&data[start_idx..], &[0xFF, 0xD8, 0xFF]) {
-        let abs_soi = start_idx + soi;
-        // Search for EOI (FF D9) after SOI
-        if let Some(eoi) = memchr::memmem::find(&data[abs_soi + 2..], &[0xFF, 0xD9]) {
-            let abs_eoi = abs_soi + 2 + eoi + 2;
-            let len = abs_eoi - abs_soi;
-            if len > 32_768 {
-                if let Some((_, best_len)) = largest {
-                    if len > best_len {
-                        largest = Some((abs_soi, len));
-                    }
-                } else {
-                    largest = Some((abs_soi, len));
-                }
-            }
-            start_idx = abs_eoi;
-        } else {
-            break;
+#[derive(Clone, Copy)]
+struct Endian(bool);
+
+impl Endian {
+    fn u16(self, b: &[u8]) -> u16 {
+        let v = [b[0], b[1]];
+        if self.0 { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
+    }
+
+    fn u32(self, b: &[u8]) -> u32 {
+        let v = [b[0], b[1], b[2], b[3]];
+        if self.0 { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
+    }
+
+    /// First value of a SHORT/LONG entry stored inline in the 4-byte value field.
+    fn inline_uint(self, typ: u16, value: &[u8]) -> Option<u64> {
+        match typ {
+            3 => Some(self.u16(value) as u64),
+            4 | 13 => Some(self.u32(value) as u64),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Ifd {
+    jpeg_offset: Option<u64>,
+    jpeg_length: Option<u64>,
+    strip_offset: Option<u64>,
+    strip_length: Option<u64>,
+    compression: Option<u64>,
+    sub_ifds: Vec<u64>,
+    next: u64,
+}
+
+fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut count_buf = [0u8; 2];
+    file.read_exact(&mut count_buf).ok()?;
+    let count = rd.u16(&count_buf) as usize;
+    if count > MAX_IFD_ENTRIES {
+        return None;
+    }
+    let mut entries = vec![0u8; count * 12 + 4];
+    file.read_exact(&mut entries).ok()?;
+
+    let mut ifd = Ifd { next: rd.u32(&entries[count * 12..]) as u64, ..Ifd::default() };
+    let mut sub_ifd_array = None;
+
+    for e in entries[..count * 12].chunks_exact(12) {
+        let tag = rd.u16(&e[0..2]);
+        let typ = rd.u16(&e[2..4]);
+        let n = rd.u32(&e[4..8]);
+        let value = &e[8..12];
+        // Multi-valued strip tables mean a tiled/multi-strip image, not a single JPEG.
+        let single = || if n == 1 { rd.inline_uint(typ, value) } else { None };
+        match tag {
+            0x0103 => ifd.compression = single(),
+            0x0111 => ifd.strip_offset = single(),
+            0x0117 => ifd.strip_length = single(),
+            0x0201 => ifd.jpeg_offset = single(),
+            0x0202 => ifd.jpeg_length = single(),
+            0x014A if n == 1 => ifd.sub_ifds.extend(rd.inline_uint(typ, value)),
+            0x014A if n > 1 => sub_ifd_array = Some((rd.u32(value) as u64, (n as usize).min(MAX_SUB_IFDS))),
+            _ => {}
         }
     }
 
-    if let Some((offset, length)) = largest {
-        Some(data[offset..offset + length].to_vec())
-    } else {
-        None
+    if let Some((array_offset, n)) = sub_ifd_array {
+        let mut buf = vec![0u8; n * 4];
+        if file.seek(SeekFrom::Start(array_offset)).is_ok() && file.read_exact(&mut buf).is_ok() {
+            ifd.sub_ifds.extend(buf.chunks_exact(4).map(|c| rd.u32(c) as u64));
+        }
     }
+    Some(ifd)
 }

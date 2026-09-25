@@ -1,13 +1,15 @@
-//! Centralized Total Commander WDX implementation shared by `wdx` and `combo` crates.
+//! Total Commander Content Plugin (WDX) implementation shared by the `wdx` and `combo` crates.
+//!
+//! Both crates expose it through [`export_content_plugin!`], so the FFI surface is defined once.
 
-use std::ffi::OsString;
 use std::os::raw::{c_char, c_int, c_void};
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 
 use crate::cache::{get_cache, CachedMedia};
-use crate::probe::probe_file;
+use crate::ffi::{pstr_to_path, pwstr_to_path, write_ansi, write_wide};
+use crate::probe::{detect_extensions, probe_file, MediaType};
 use crate::tc_api::*;
 
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -22,288 +24,254 @@ pub fn reset_stop_flag() {
     STOP_REQUESTED.store(false, Ordering::Relaxed);
 }
 
-const FIELDS: &[(&str, c_int)] = &[
-    ("Image_dHash", FT_STRINGW),
-    ("Image_pHash", FT_STRINGW),
-    ("Image_CoarseHash", FT_STRINGW),
-    ("Image_Dimensions", FT_STRINGW),
-    ("Image_AspectRatio", FT_STRINGW),
-    ("Video_Fingerprint", FT_STRINGW),
-    ("Video_dHash_Mid", FT_STRINGW),
-    ("Video_Duration_Sec", FT_NUMERIC_32),
-    ("Video_Dimensions", FT_STRINGW),
-    ("Media_Type", FT_STRINGW),
-    ("Plugin_Version", FT_STRINGW),
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Field {
+    ImageDHash,
+    ImagePHash,
+    ImageCoarseHash,
+    ImageDimensions,
+    ImageAspectRatio,
+    VideoFingerprint,
+    VideoDHashMid,
+    VideoDurationSec,
+    VideoDimensions,
+    MediaTypeName,
+    PluginVersion,
+}
+
+/// Field order is the public WDX index TC stores in user configurations — append only.
+const FIELDS: &[(Field, &str, c_int)] = &[
+    (Field::ImageDHash, "Image_dHash", FT_STRINGW),
+    (Field::ImagePHash, "Image_pHash", FT_STRINGW),
+    (Field::ImageCoarseHash, "Image_CoarseHash", FT_STRINGW),
+    (Field::ImageDimensions, "Image_Dimensions", FT_STRINGW),
+    (Field::ImageAspectRatio, "Image_AspectRatio", FT_STRINGW),
+    (Field::VideoFingerprint, "Video_Fingerprint", FT_STRINGW),
+    (Field::VideoDHashMid, "Video_dHash_Mid", FT_STRINGW),
+    (Field::VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32),
+    (Field::VideoDimensions, "Video_Dimensions", FT_STRINGW),
+    (Field::MediaTypeName, "Media_Type", FT_STRINGW),
+    (Field::PluginVersion, "Plugin_Version", FT_STRINGW),
 ];
 
-pub const WDX_DETECT_STRING: &str = concat!(
-    "EXT=\"JPG\" | EXT=\"JPEG\" | EXT=\"PNG\" | EXT=\"GIF\" | EXT=\"WEBP\" | ",
-    "EXT=\"BMP\" | EXT=\"TIFF\" | EXT=\"TIF\" | EXT=\"ICO\" | EXT=\"CR2\" | EXT=\"NEF\" | ",
-    "EXT=\"ARW\" | EXT=\"DNG\" | EXT=\"ORF\" | EXT=\"RW2\" | EXT=\"PSD\" | EXT=\"MP4\" | ",
-    "EXT=\"MKV\" | EXT=\"AVI\" | EXT=\"MOV\" | EXT=\"WMV\" | EXT=\"WEBM\" | EXT=\"M4V\" | ",
-    "EXT=\"FLV\" | EXT=\"TS\""
-);
+fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int)> {
+    FIELDS.get(usize::try_from(index).ok()?)
+}
 
+/// Kinds the WDX analyzes (everything except audio).
+pub fn wdx_detect_string() -> &'static str {
+    static S: OnceLock<String> = OnceLock::new();
+    S.get_or_init(|| {
+        detect_extensions(&[MediaType::StandardImage, MediaType::RawImage, MediaType::PsdImage, MediaType::Video])
+    })
+}
+
+/// # Safety
+/// `field_name` and `units` must be null or valid for `max_len` bytes.
 pub unsafe fn content_get_supported_field(
     field_index: c_int,
     field_name: *mut c_char,
     units: *mut c_char,
     max_len: c_int,
 ) -> c_int {
-    if field_index < 0 || field_index as usize >= FIELDS.len() {
+    let Some(&(_, name, field_type)) = field_at(field_index) else {
         return FT_NOMOREFIELDS;
-    }
-
-    let (name, field_type) = FIELDS[field_index as usize];
-
-    if !field_name.is_null() && max_len > 0 {
-        write_c_string(field_name, max_len as usize, name);
-    }
-
-    if !units.is_null() && max_len > 0 {
-        *units = 0;
-    }
-
+    };
+    let max_len = max_len.max(0) as usize;
+    write_ansi(field_name, max_len, name);
+    write_ansi(units, max_len, "");
     field_type
 }
 
+/// # Safety
+/// `file_name` must be null or NUL-terminated; `field_value` must be null or valid for `max_len` bytes.
 pub unsafe fn content_get_value_w(
     file_name: *const u16,
     field_index: c_int,
-    _unit_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
     flags: c_int,
 ) -> c_int {
-    reset_stop_flag();
-
-    let path = match pwstr_to_path(file_name) {
-        Some(p) => p,
-        None => return FT_FILEERROR,
-    };
-
-    if (flags & CONTENT_DELAYIFSLOW) != 0
-        && !get_cache().is_cached(&path)
-        && probe_file(&path).is_video_kind()
-    {
-        return FT_DELAYED;
-    }
-
-    get_field_value_internal(&path, field_index, field_value, max_len, true)
+    get_value(pwstr_to_path(file_name), field_index, field_value, max_len, flags, true)
 }
 
+/// # Safety
+/// `file_name` must be null or NUL-terminated; `field_value` must be null or valid for `max_len` bytes.
 pub unsafe fn content_get_value_a(
     file_name: *const c_char,
     field_index: c_int,
-    _unit_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
     flags: c_int,
 ) -> c_int {
-    reset_stop_flag();
-
-    let path = match pstr_to_path(file_name) {
-        Some(p) => p,
-        None => return FT_FILEERROR,
-    };
-
-    if (flags & CONTENT_DELAYIFSLOW) != 0
-        && !get_cache().is_cached(&path)
-        && probe_file(&path).is_video_kind()
-    {
-        return FT_DELAYED;
-    }
-
-    get_field_value_internal(&path, field_index, field_value, max_len, false)
+    get_value(pstr_to_path(file_name), field_index, field_value, max_len, flags, false)
 }
 
-pub unsafe fn content_stop_get_value() {
+pub fn content_stop_get_value() {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
 }
 
+/// # Safety
+/// `detect_string` must be null or valid for `max_len` bytes.
 pub unsafe fn content_get_detect_string(detect_string: *mut c_char, max_len: c_int) {
-    if !detect_string.is_null() && max_len > 0 {
-        write_c_string(detect_string, max_len as usize, WDX_DETECT_STRING);
-    }
+    write_ansi(detect_string, max_len.max(0) as usize, wdx_detect_string());
 }
 
-pub unsafe fn content_plugin_unloading() {
+pub fn content_plugin_unloading() {
     get_cache().clear();
+    crate::mf_init::shutdown_mf();
 }
 
-unsafe fn get_field_value_internal(
-    path: &Path,
+unsafe fn get_value(
+    path: Option<PathBuf>,
     field_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
-    is_unicode: bool,
+    flags: c_int,
+    unicode: bool,
 ) -> c_int {
-    if field_index < 0 || field_index as usize >= FIELDS.len() || field_value.is_null() {
+    reset_stop_flag();
+    let Some(path) = path else { return FT_FILEERROR };
+    let Some(&(field, _, _)) = field_at(field_index) else { return FT_FIELDEMPTY };
+    if field_value.is_null() {
         return FT_FIELDEMPTY;
     }
 
-    if field_index == 10 {
-        return write_string_val(field_value, max_len, env!("CARGO_PKG_VERSION"), is_unicode);
+    if (flags & CONTENT_DELAYIFSLOW) != 0 && probe_file(&path).is_slow_kind() && !get_cache().is_cached(&path) {
+        return FT_DELAYED;
     }
 
-    let cached = get_cache().get_or_analyze(path);
-
-    match (field_index, cached) {
-        (0, CachedMedia::Image(img)) => {
-            write_string_val(field_value, max_len, &img.dhash_hex(), is_unicode)
-        }
-        (1, CachedMedia::Image(img)) => {
-            write_string_val(field_value, max_len, &img.phash_hex(), is_unicode)
-        }
-        (2, CachedMedia::Image(img)) => {
-            write_string_val(field_value, max_len, &img.coarse_hash_hex(), is_unicode)
-        }
-        (3, CachedMedia::Image(img)) => {
-            write_string_val(field_value, max_len, &img.dimensions_str(), is_unicode)
-        }
-        (4, CachedMedia::Image(img)) => {
-            write_string_val(field_value, max_len, &img.aspect_ratio, is_unicode)
-        }
-
-        (5, CachedMedia::Video(vid)) => {
-            write_string_val(field_value, max_len, &vid.fingerprint, is_unicode)
-        }
-        (6, CachedMedia::Video(vid)) => {
-            write_string_val(field_value, max_len, &vid.dhash_mid_hex(), is_unicode)
-        }
-        (7, CachedMedia::Video(vid)) => {
-            if max_len >= 4 {
-                *(field_value as *mut i32) = vid.duration_sec as i32;
-                FT_NUMERIC_32
-            } else {
-                FT_FIELDEMPTY
-            }
-        }
-        (8, CachedMedia::Video(vid)) => {
-            write_string_val(field_value, max_len, &vid.dimensions_str(), is_unicode)
-        }
-
-        (9, CachedMedia::Image(_)) => write_string_val(field_value, max_len, "Image", is_unicode),
-        (9, CachedMedia::Video(_)) => write_string_val(field_value, max_len, "Video", is_unicode),
-
-        _ => FT_FIELDEMPTY,
+    let out = Output { dest: field_value, max_bytes: max_len.max(0) as usize, unicode };
+    match compute(&path, field) {
+        Some(Value::Text(text)) => out.text(&text),
+        Some(Value::Int(n)) => out.int(n),
+        None => FT_FIELDEMPTY,
     }
 }
 
-unsafe fn write_string_val(
+enum Value {
+    Text(String),
+    Int(i32),
+}
+
+fn compute(path: &Path, field: Field) -> Option<Value> {
+    use Field::*;
+    if field == PluginVersion {
+        return Some(Value::Text(env!("CARGO_PKG_VERSION").to_string()));
+    }
+    let text = |s: String| Some(Value::Text(s));
+    match (field, get_cache().get_or_analyze(path, &is_stop_requested)) {
+        (ImageDHash, CachedMedia::Image(img)) => text(img.dhash_hex()),
+        (ImagePHash, CachedMedia::Image(img)) => text(img.phash_hex()),
+        (ImageCoarseHash, CachedMedia::Image(img)) => text(img.coarse_hash_hex()),
+        (ImageDimensions, CachedMedia::Image(img)) => text(img.dimensions_str()),
+        (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio.clone()),
+        (VideoFingerprint, CachedMedia::Video(vid)) => text(vid.fingerprint.clone()),
+        (VideoDHashMid, CachedMedia::Video(vid)) => text(vid.dhash_mid_hex()),
+        (VideoDurationSec, CachedMedia::Video(vid)) => Some(Value::Int(vid.duration_sec.min(i32::MAX as u32) as i32)),
+        (VideoDimensions, CachedMedia::Video(vid)) => text(vid.dimensions_str()),
+        (MediaTypeName, CachedMedia::Image(_)) => text("Image".into()),
+        (MediaTypeName, CachedMedia::Video(_)) => text("Video".into()),
+        _ => None,
+    }
+}
+
+struct Output {
     dest: *mut c_void,
-    max_bytes: c_int,
-    text: &str,
-    is_unicode: bool,
-) -> c_int {
-    if is_unicode {
-        write_string_w(dest, max_bytes, text)
-    } else {
-        write_string_a(dest, max_bytes, text)
-    }
+    max_bytes: usize,
+    unicode: bool,
 }
 
-unsafe fn write_string_w(dest: *mut c_void, max_bytes: c_int, text: &str) -> c_int {
-    if dest.is_null() || max_bytes < 2 {
-        return FT_FIELDEMPTY;
-    }
-    let dest_u16 = dest as *mut u16;
-    let max_chars = (max_bytes as usize) / 2;
-    let mut i = 0;
-    for ch in text.encode_utf16() {
-        if i + 1 >= max_chars {
-            break;
+impl Output {
+    unsafe fn text(&self, text: &str) -> c_int {
+        if self.unicode {
+            if write_wide(self.dest as *mut u16, self.max_bytes, text) { FT_STRINGW } else { FT_FIELDEMPTY }
+        } else if write_ansi(self.dest as *mut c_char, self.max_bytes, text) {
+            FT_STRING
+        } else {
+            FT_FIELDEMPTY
         }
-        *dest_u16.add(i) = ch;
-        i += 1;
     }
-    *dest_u16.add(i) = 0;
-    FT_STRINGW
-}
 
-unsafe fn write_string_a(dest: *mut c_void, max_bytes: c_int, text: &str) -> c_int {
-    if dest.is_null() || max_bytes < 1 {
-        return FT_FIELDEMPTY;
-    }
-    let dest_u8 = dest as *mut u8;
-    let max_chars = max_bytes as usize;
-    let mut i = 0;
-    for byte in text.bytes() {
-        if i + 1 >= max_chars {
-            break;
+    unsafe fn int(&self, n: i32) -> c_int {
+        if self.max_bytes < 4 {
+            return FT_FIELDEMPTY;
         }
-        *dest_u8.add(i) = byte;
-        i += 1;
+        (self.dest as *mut i32).write_unaligned(n);
+        FT_NUMERIC_32
     }
-    *dest_u8.add(i) = 0;
-    FT_STRING
 }
 
-unsafe fn write_c_string(dest: *mut c_char, max_bytes: usize, text: &str) {
-    let dest_u8 = dest as *mut u8;
-    let mut i = 0;
-    for byte in text.bytes() {
-        if i + 1 >= max_bytes {
-            break;
+/// Defines the `#[no_mangle]` WDX exports in the calling cdylib crate, each wrapped in a panic guard.
+#[macro_export]
+macro_rules! export_content_plugin {
+    () => {
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentGetSupportedField(
+            field_index: ::std::os::raw::c_int,
+            field_name: *mut ::std::os::raw::c_char,
+            units: *mut ::std::os::raw::c_char,
+            max_len: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            $crate::ffi::guard($crate::tc_api::FT_NOMOREFIELDS, || unsafe {
+                $crate::wdx_api::content_get_supported_field(field_index, field_name, units, max_len)
+            })
         }
-        *dest_u8.add(i) = byte;
-        i += 1;
-    }
-    *dest_u8.add(i) = 0;
-}
 
-pub unsafe fn pwstr_to_path(ptr: *const u16) -> Option<PathBuf> {
-    if ptr.is_null() {
-        return None;
-    }
-    let mut len = 0;
-    while *ptr.add(len) != 0 {
-        len += 1;
-    }
-    let slice = std::slice::from_raw_parts(ptr, len);
-    let os_str = OsString::from_wide(slice);
-    Some(PathBuf::from(os_str))
-}
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentGetValueW(
+            file_name: *const u16,
+            field_index: ::std::os::raw::c_int,
+            _unit_index: ::std::os::raw::c_int,
+            field_value: *mut ::std::os::raw::c_void,
+            max_len: ::std::os::raw::c_int,
+            flags: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
+                $crate::wdx_api::content_get_value_w(file_name, field_index, field_value, max_len, flags)
+            })
+        }
 
-pub unsafe fn pstr_to_path(ptr: *const c_char) -> Option<PathBuf> {
-    if ptr.is_null() {
-        return None;
-    }
-    let mut len = 0;
-    while *ptr.add(len) != 0 {
-        len += 1;
-    }
-    if len == 0 {
-        return Some(PathBuf::new());
-    }
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentGetValue(
+            file_name: *const ::std::os::raw::c_char,
+            field_index: ::std::os::raw::c_int,
+            _unit_index: ::std::os::raw::c_int,
+            field_value: *mut ::std::os::raw::c_void,
+            max_len: ::std::os::raw::c_int,
+            flags: ::std::os::raw::c_int,
+        ) -> ::std::os::raw::c_int {
+            $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
+                $crate::wdx_api::content_get_value_a(file_name, field_index, field_value, max_len, flags)
+            })
+        }
 
-    use windows::Win32::Globalization::{
-        MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentStopGetValueW(_file_name: *const u16) {
+            $crate::ffi::guard((), $crate::wdx_api::content_stop_get_value)
+        }
+
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentStopGetValue(_file_name: *const ::std::os::raw::c_char) {
+            $crate::ffi::guard((), $crate::wdx_api::content_stop_get_value)
+        }
+
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentGetDetectString(
+            detect_string: *mut ::std::os::raw::c_char,
+            max_len: ::std::os::raw::c_int,
+        ) {
+            $crate::ffi::guard((), || unsafe {
+                $crate::wdx_api::content_get_detect_string(detect_string, max_len)
+            })
+        }
+
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentSetDefaultParams(_dps: *mut $crate::tc_api::ContentDefaultParamStruct) {}
+
+        #[no_mangle]
+        pub unsafe extern "system" fn ContentPluginUnloading() {
+            $crate::ffi::guard((), $crate::wdx_api::content_plugin_unloading)
+        }
     };
-
-    let wide_len = MultiByteToWideChar(
-        CP_ACP,
-        MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
-        std::slice::from_raw_parts(ptr as *const u8, len),
-        None,
-    );
-
-    if wide_len <= 0 {
-        return None;
-    }
-
-    let mut wide_buf = vec![0u16; wide_len as usize];
-    let written = MultiByteToWideChar(
-        CP_ACP,
-        MULTI_BYTE_TO_WIDE_CHAR_FLAGS(0),
-        std::slice::from_raw_parts(ptr as *const u8, len),
-        Some(&mut wide_buf),
-    );
-
-    if written <= 0 {
-        return None;
-    }
-
-    let os_str = OsString::from_wide(&wide_buf);
-    Some(PathBuf::from(os_str))
 }

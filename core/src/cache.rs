@@ -1,15 +1,19 @@
-//! MediaCache: in-memory LRU cache for image and video analysis results.
+//! MediaCache: in-memory LRU cache of image and video analysis results.
 
-use lru::LruCache;
 use std::fs;
 use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::UNIX_EPOCH;
+use std::time::SystemTime;
 
-use crate::hashing::{analyze_dynamic_image, analyze_image, analyze_image_from_memory, ImageAnalysis};
+use lru::LruCache;
+
+use crate::hashing::{analyze, ImageAnalysis};
+use crate::image_decode::decode_file;
 use crate::probe::{probe_file, MediaType};
-use crate::video::{analyze_video, VideoAnalysis};
+use crate::video_frame::{analyze_video, VideoAnalysis, VideoError};
+
+const CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub enum CachedMedia {
@@ -18,132 +22,70 @@ pub enum CachedMedia {
     Unsupported,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-struct CacheKey {
+/// Identifies a specific version of a file: edits change size or mtime and miss the cache.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub struct FileKey {
     path: PathBuf,
-    file_size: u64,
-    mtime_nanos: u128,
+    size: u64,
+    modified: Option<SystemTime>,
+}
+
+impl FileKey {
+    pub fn for_path(path: &Path) -> Option<Self> {
+        let meta = fs::metadata(path).ok()?;
+        Some(FileKey { path: path.to_path_buf(), size: meta.len(), modified: meta.modified().ok() })
+    }
 }
 
 pub struct MediaCache {
-    cache: Mutex<LruCache<CacheKey, CachedMedia>>,
+    cache: Mutex<LruCache<FileKey, CachedMedia>>,
 }
 
 impl MediaCache {
-    pub fn new(capacity: usize) -> Self {
-        let cap = NonZeroUsize::new(capacity).unwrap_or(NonZeroUsize::new(512).unwrap());
-        Self {
-            cache: Mutex::new(LruCache::new(cap)),
-        }
+    fn new(capacity: NonZeroUsize) -> Self {
+        Self { cache: Mutex::new(LruCache::new(capacity)) }
     }
 
-    pub fn get_or_analyze(&self, path: &Path) -> CachedMedia {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return CachedMedia::Unsupported,
+    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, CachedMedia>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Returns the cached analysis or computes it. A cancelled analysis is returned as
+    /// `Unsupported` but not cached, so the next request recomputes it.
+    pub fn get_or_analyze(&self, path: &Path, cancelled: &dyn Fn() -> bool) -> CachedMedia {
+        let Some(key) = FileKey::for_path(path) else {
+            return CachedMedia::Unsupported;
         };
-
-        let file_size = meta.len();
-        let mtime_nanos = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
-        let key = CacheKey {
-            path: path.to_path_buf(),
-            file_size,
-            mtime_nanos,
-        };
-
-        {
-            let mut lock = self.cache.lock().unwrap();
-            if let Some(val) = lock.get(&key) {
-                return val.clone();
-            }
+        if let Some(hit) = self.lock().get(&key) {
+            return hit.clone();
         }
 
-        let media_type = probe_file(path);
-        let result = match media_type {
-            MediaType::StandardImage => match analyze_image(path) {
-                Ok(a) => CachedMedia::Image(Arc::new(a)),
-                Err(_) => CachedMedia::Unsupported,
+        let result = match probe_file(path) {
+            kind if kind.is_image_kind() => decode_file(path, kind)
+                .map(|img| CachedMedia::Image(Arc::new(analyze(&img))))
+                .unwrap_or(CachedMedia::Unsupported),
+            MediaType::Video => match analyze_video(path, cancelled) {
+                Ok(v) => CachedMedia::Video(Arc::new(v)),
+                Err(VideoError::Cancelled) => return CachedMedia::Unsupported,
+                Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
             },
-            MediaType::RawImage => {
-                #[cfg(feature = "raw-preview")]
-                {
-                    if let Some(bytes) = crate::raw_preview::extract_raw_preview(path) {
-                        if let Ok(a) = analyze_image_from_memory(&bytes) {
-                            CachedMedia::Image(Arc::new(a))
-                        } else {
-                            CachedMedia::Unsupported
-                        }
-                    } else {
-                        CachedMedia::Unsupported
-                    }
-                }
-                #[cfg(not(feature = "raw-preview"))]
-                CachedMedia::Unsupported
-            }
-            MediaType::PsdImage => {
-                #[cfg(feature = "psd-preview")]
-                {
-                    if let Some(img) = crate::psd_preview::load_psd_image(path) {
-                        let a = analyze_dynamic_image(&img);
-                        CachedMedia::Image(Arc::new(a))
-                    } else {
-                        CachedMedia::Unsupported
-                    }
-                }
-                #[cfg(not(feature = "psd-preview"))]
-                CachedMedia::Unsupported
-            }
-            MediaType::Video => match analyze_video(path) {
-                Ok(a) => CachedMedia::Video(Arc::new(a)),
-                Err(_) => CachedMedia::Unsupported,
-            },
-            MediaType::Audio | MediaType::Unsupported => CachedMedia::Unsupported,
+            _ => CachedMedia::Unsupported,
         };
 
-        let mut lock = self.cache.lock().unwrap();
-        lock.put(key, result.clone());
+        self.lock().put(key, result.clone());
         result
     }
 
     pub fn is_cached(&self, path: &Path) -> bool {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => return false,
-        };
-
-        let file_size = meta.len();
-        let mtime_nanos = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-
-        let key = CacheKey {
-            path: path.to_path_buf(),
-            file_size,
-            mtime_nanos,
-        };
-
-        let lock = self.cache.lock().unwrap();
-        lock.contains(&key)
+        FileKey::for_path(path).is_some_and(|key| self.lock().contains(&key))
     }
 
     pub fn clear(&self) {
-        if let Ok(mut lock) = self.cache.lock() {
-            lock.clear();
-        }
+        self.lock().clear();
     }
 }
 
-static GLOBAL_CACHE: OnceLock<MediaCache> = OnceLock::new();
-
 pub fn get_cache() -> &'static MediaCache {
-    GLOBAL_CACHE.get_or_init(|| MediaCache::new(1024))
+    static GLOBAL_CACHE: OnceLock<MediaCache> = OnceLock::new();
+    GLOBAL_CACHE.get_or_init(|| MediaCache::new(NonZeroUsize::new(CAPACITY).expect("non-zero capacity")))
 }

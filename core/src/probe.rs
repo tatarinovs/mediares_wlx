@@ -1,4 +1,4 @@
-//! Media type detection by file extension and signatures.
+//! Media type detection by file extension — the single source of truth for supported formats.
 
 use std::path::Path;
 
@@ -12,39 +12,79 @@ pub enum MediaType {
     Unsupported,
 }
 
+const STANDARD_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "tif", "ico"];
+const RAW_EXTS: &[&str] = &["cr2", "cr3", "nef", "arw", "orf", "rw2", "dng", "raf", "pef"];
+const PSD_EXTS: &[&str] = &["psd", "psb"];
+const VIDEO_EXTS: &[&str] = &["mp4", "mkv", "avi", "mov", "wmv", "webm", "m4v", "flv", "ts", "mts"];
+const AUDIO_EXTS: &[&str] = &["mp3", "flac", "wav", "ogg", "opus", "m4a", "aac", "wma"];
+
 impl MediaType {
+    const ALL: [MediaType; 5] = [
+        MediaType::StandardImage,
+        MediaType::RawImage,
+        MediaType::PsdImage,
+        MediaType::Video,
+        MediaType::Audio,
+    ];
+
+    pub fn extensions(self) -> &'static [&'static str] {
+        match self {
+            MediaType::StandardImage => STANDARD_IMAGE_EXTS,
+            MediaType::RawImage => RAW_EXTS,
+            MediaType::PsdImage => PSD_EXTS,
+            MediaType::Video => VIDEO_EXTS,
+            MediaType::Audio => AUDIO_EXTS,
+            MediaType::Unsupported => &[],
+        }
+    }
+
     pub fn is_image_kind(self) -> bool {
         matches!(self, MediaType::StandardImage | MediaType::RawImage | MediaType::PsdImage)
     }
 
-    pub fn is_video_kind(self) -> bool {
-        matches!(self, MediaType::Video)
-    }
-
-    pub fn is_audio_kind(self) -> bool {
-        matches!(self, MediaType::Audio)
+    /// Kinds that are expensive to analyze and should be deferred with `FT_DELAYED`.
+    pub fn is_slow_kind(self) -> bool {
+        matches!(self, MediaType::Video | MediaType::RawImage | MediaType::PsdImage)
     }
 }
 
 pub fn probe_file(path: &Path) -> MediaType {
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return MediaType::Unsupported;
+    };
+    MediaType::ALL
+        .into_iter()
+        .find(|kind| kind.extensions().iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        .unwrap_or(MediaType::Unsupported)
+}
 
-    match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" => {
-            MediaType::StandardImage
+/// Builds a TC detect-string fragment `EXT="JPG" | EXT="JPEG" | ...` for the given kinds.
+pub fn detect_extensions(kinds: &[MediaType]) -> String {
+    kinds
+        .iter()
+        .flat_map(|k| k.extensions())
+        .map(|e| format!("EXT=\"{}\"", e.to_ascii_uppercase()))
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probe_is_case_insensitive() {
+        assert_eq!(probe_file(Path::new("a/B.JpG")), MediaType::StandardImage);
+        assert_eq!(probe_file(Path::new("x.PSB")), MediaType::PsdImage);
+        assert_eq!(probe_file(Path::new("x.cr3")), MediaType::RawImage);
+        assert_eq!(probe_file(Path::new("noext")), MediaType::Unsupported);
+    }
+
+    #[test]
+    fn detect_string_lists_every_extension() {
+        let s = detect_extensions(&[MediaType::RawImage, MediaType::PsdImage]);
+        for ext in RAW_EXTS.iter().chain(PSD_EXTS) {
+            assert!(s.contains(&format!("EXT=\"{}\"", ext.to_ascii_uppercase())));
         }
-        "cr2" | "cr3" | "nef" | "arw" | "orf" | "rw2" | "dng" | "raf" | "pef" => {
-            MediaType::RawImage
-        }
-        "psd" | "psb" => MediaType::PsdImage,
-        "mp4" | "mkv" | "avi" | "mov" | "wmv" | "webm" | "m4v" | "flv" | "ts" | "mts" => {
-            MediaType::Video
-        }
-        "mp3" | "flac" | "wav" | "ogg" | "opus" | "m4a" | "aac" | "wma" => MediaType::Audio,
-        _ => MediaType::Unsupported,
     }
 }

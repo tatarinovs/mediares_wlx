@@ -12,26 +12,40 @@
 mediares_wlx/
 ├── Cargo.toml                  # Workspace root
 ├── PLAN.md                     # Дорожная карта и архитектурный план
-├── core/                       # Общая библиотека (lib):
+├── core/                       # Общая библиотека (lib), без Win32-окон:
 │   ├── tc_api.rs               # WDX/WLX C ABI структуры и константы
+│   ├── ffi.rs                  # catch_unwind-обёртка и конвертация строк на границе с TC
+│   ├── probe.rs                # Тип медиа по расширению + единый источник строк детекта
+│   ├── image_decode.rs         # Декодирование фото (`image` + RAW/PSD превью) с лимитами памяти
+│   ├── exif.rs                 # Разбор EXIF (JPEG, TIFF/RAW)
+│   ├── jpeg.rs                 # Поиск/проверка встроенных JPEG-потоков
+│   ├── raw_preview.rs          # Встроенный JPEG из RAW (IFD/SubIFD/strip + сигнатурный fallback)
+│   ├── psd_preview.rs          # Композит PSD/PSB (8/16 бит) или миниатюра 0x0409/0x0410
 │   ├── hashing.rs              # dHash (64-bit), pHash (DCT 64-bit), CoarseHash (32-bit), пропорции
-│   ├── probe.rs                # Детектирование типа медиа (Image, Raw, PSD, Video, Audio)
-│   ├── raw_preview.rs          # Извлечение встроенного JPEG из RAW (CR2, NEF, ARW, DNG, etc.)
-│   ├── psd_preview.rs          # Извлечение превью и композита из PSD (ресурс 0x0410)
-│   ├── video.rs                # Windows Media Foundation: кадры на 25/50/75% и фингерпринт
-│   ├── cache.rs                # Потокобезопасный LRU-кэш анализа файлов
-│   └── wdx_api.rs              # Централизованная логика всех полей Total Commander
-├── wdx/                        # Облегчённый WDX-плагин (cdylib)
+│   ├── mf_init.rs              # Жизненный цикл COM / Media Foundation
+│   ├── video_frame.rs          # Кадры на 25/50/75% через IMFSourceReader и фингерпринт
+│   ├── cache.rs                # Потокобезопасный LRU-кэш анализа (ключ: путь + размер + mtime)
+│   └── wdx_api.rs              # Логика полей WDX + макрос export_content_plugin!
+├── wdx/                        # Облегчённый WDX-плагин (cdylib): одна строка — export_content_plugin!()
 ├── combo/                      # Полный 2-в-1 плагин WDX + WLX (cdylib)
-│   ├── wlx_state.rs            # Per-HWND состояние инстансов Lister
-│   ├── image_view.rs           # Декодирование и конвертация в BGRA DIB
-│   └── wlx_window.rs           # Окно Lister, двойная буферизация GDI, letterbox
+│   ├── window.rs               # Окно Lister, обработка сообщений, команды и горячие клавиши
+│   ├── state.rs                # Per-HWND состояние, список файлов папки (натуральная сортировка)
+│   ├── image_view.rs           # Масштаб/панорама/лупа, GDI double buffering, OSD
+│   ├── image_cache.rs          # BGRA-кэш (бюджет по байтам, LRU) + фоновая предзагрузка соседей
+│   ├── fullscreen.rs           # Полноэкранный режим: отдельное topmost-окно на мониторе Lister
+│   ├── config.rs               # Настройки mediares.ini
+│   ├── dialog.rs               # Общие хелперы модальных диалогов
+│   ├── exif_dialog.rs          # Окно EXIF-метаданных
+│   └── settings_dialog.rs      # Окно настроек
 └── pluginst/                   # Инсталляционные скрипты для TC
     ├── pluginst-wdx.inf
     └── pluginst-combo.inf
 ```
 
----
+### Настройки
+
+`mediares.ini` ищется рядом с DLL (портативная установка); если его там нет — используется папка
+плагинных настроек TC (путь из `ListSetDefaultParams`), т.к. папка плагина часто защищена от записи.
 
 ## Сборка и тестирование
 

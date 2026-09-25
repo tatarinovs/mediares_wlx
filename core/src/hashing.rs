@@ -1,7 +1,10 @@
 //! Perceptual hashing and aspect ratio calculation.
 
-use image::{image_dimensions, imageops::FilterType, DynamicImage, GenericImageView};
-use std::path::Path;
+use image::imageops::{self, FilterType};
+use image::{DynamicImage, GrayImage};
+
+/// Hashes only need a few dozen pixels; large images are pre-shrunk once to this size.
+const WORKING_SIZE: u32 = 256;
 
 #[derive(Debug, Clone)]
 pub struct ImageAnalysis {
@@ -31,124 +34,69 @@ impl ImageAnalysis {
     }
 }
 
-pub fn analyze_dynamic_image(img: &DynamicImage) -> ImageAnalysis {
-    let (width, height) = img.dimensions();
-    let aspect_ratio = compute_aspect_ratio(width, height);
-    let dhash = compute_dhash(img);
-    let coarse_hash = compute_coarse_hash(img);
-    let phash = compute_phash(img);
+pub fn analyze(img: &DynamicImage) -> ImageAnalysis {
+    let (width, height) = (img.width(), img.height());
+    let gray = if width.max(height) > WORKING_SIZE {
+        img.thumbnail(WORKING_SIZE, WORKING_SIZE).to_luma8()
+    } else {
+        img.to_luma8()
+    };
 
     ImageAnalysis {
         width,
         height,
-        aspect_ratio,
-        dhash,
-        phash,
-        coarse_hash,
+        aspect_ratio: compute_aspect_ratio(width, height),
+        dhash: gradient_hash(&gray, 8, 8),
+        coarse_hash: gradient_hash(&gray, 4, 8) as u32,
+        phash: compute_phash(&gray),
     }
 }
 
-pub fn analyze_image(path: &Path) -> Result<ImageAnalysis, String> {
-    let img = image::open(path).map_err(|e| format!("Failed to open image: {}", e))?;
-    Ok(analyze_dynamic_image(&img))
-}
-
-pub fn analyze_image_from_memory(bytes: &[u8]) -> Result<ImageAnalysis, String> {
-    let img = image::load_from_memory(bytes).map_err(|e| format!("Failed to decode image: {}", e))?;
-    Ok(analyze_dynamic_image(&img))
-}
-
-pub fn get_image_dimensions_fast(path: &Path) -> Option<(u32, u32, String)> {
-    if let Ok((w, h)) = image_dimensions(path) {
-        let aspect = compute_aspect_ratio(w, h);
-        Some((w, h, aspect))
-    } else {
-        None
-    }
-}
-
-pub fn compute_dhash(img: &DynamicImage) -> u64 {
-    let thumb = img.resize_exact(9, 8, FilterType::Triangle).to_luma8();
-    let mut hash: u64 = 0;
-
-    for y in 0..8 {
-        for x in 0..8 {
+/// Difference hash: resize to (cols+1) x rows and compare horizontally adjacent pixels.
+fn gradient_hash(gray: &GrayImage, cols: u32, rows: u32) -> u64 {
+    let thumb = imageops::resize(gray, cols + 1, rows, FilterType::Triangle);
+    let mut hash = 0u64;
+    for y in 0..rows {
+        for x in 0..cols {
             let left = thumb.get_pixel(x, y)[0];
             let right = thumb.get_pixel(x + 1, y)[0];
-            hash = (hash << 1) | (if left > right { 1 } else { 0 });
+            hash = (hash << 1) | (left > right) as u64;
         }
     }
-
     hash
 }
 
-pub fn compute_coarse_hash(img: &DynamicImage) -> u32 {
-    let thumb = img.resize_exact(5, 8, FilterType::Triangle).to_luma8();
-    let mut hash: u32 = 0;
+/// DCT hash: 8x8 low-frequency block of the 32x32 DCT-II, thresholded by the median of the AC terms.
+fn compute_phash(gray: &GrayImage) -> u64 {
+    const N: usize = 32;
+    let thumb = imageops::resize(gray, N as u32, N as u32, FilterType::Triangle);
 
-    for y in 0..8 {
-        for x in 0..4 {
-            let left = thumb.get_pixel(x, y)[0];
-            let right = thumb.get_pixel(x + 1, y)[0];
-            hash = (hash << 1) | (if left > right { 1 } else { 0 });
+    let mut cos = [[0.0f64; N]; 8];
+    for (k, row) in cos.iter_mut().enumerate() {
+        for (n, c) in row.iter_mut().enumerate() {
+            *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / (2 * N) as f64).cos();
         }
     }
+    let alpha = |k: usize| if k == 0 { (1.0 / N as f64).sqrt() } else { (2.0 / N as f64).sqrt() };
 
-    hash
-}
-
-pub fn compute_phash(img: &DynamicImage) -> u64 {
-    let thumb = img.resize_exact(32, 32, FilterType::Triangle).to_luma8();
-
-    let mut matrix = [[0.0f64; 32]; 32];
-    for (y, row) in matrix.iter_mut().enumerate() {
-        for (x, val) in row.iter_mut().enumerate() {
-            *val = thumb.get_pixel(x as u32, y as u32)[0] as f64;
-        }
-    }
-
-    let mut dct_8x8 = [0.0f64; 64];
-    let pi = std::f64::consts::PI;
-
+    let mut dct = [0.0f64; 64];
     for u in 0..8 {
         for v in 0..8 {
             let mut sum = 0.0;
-            for (x, row) in matrix.iter().enumerate().take(32) {
-                let cos_x = (((2 * x + 1) * u) as f64 * pi / 64.0).cos();
-                for (y, &val) in row.iter().enumerate().take(32) {
-                    let cos_y = (((2 * y + 1) * v) as f64 * pi / 64.0).cos();
-                    sum += val * cos_x * cos_y;
+            for (y, row) in thumb.rows().enumerate() {
+                for (x, px) in row.enumerate() {
+                    sum += px[0] as f64 * cos[u][y] * cos[v][x];
                 }
             }
-
-            let alpha_u = if u == 0 {
-                1.0 / 32.0f64.sqrt()
-            } else {
-                (2.0 / 32.0f64).sqrt()
-            };
-            let alpha_v = if v == 0 {
-                1.0 / 32.0f64.sqrt()
-            } else {
-                (2.0 / 32.0f64).sqrt()
-            };
-            dct_8x8[u * 8 + v] = sum * alpha_u * alpha_v;
+            dct[u * 8 + v] = sum * alpha(u) * alpha(v);
         }
     }
 
-    let mut non_dc: Vec<f64> = dct_8x8[1..].to_vec();
-    non_dc.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let median = if non_dc.len().is_multiple_of(2) {
-        (non_dc[non_dc.len() / 2 - 1] + non_dc[non_dc.len() / 2]) / 2.0
-    } else {
-        non_dc[non_dc.len() / 2]
-    };
+    let mut ac = dct[1..].to_vec();
+    ac.sort_by(f64::total_cmp);
+    let median = ac[ac.len() / 2];
 
-    let mut hash: u64 = 0;
-    for &coeff in &dct_8x8 {
-        hash = (hash << 1) | (if coeff > median { 1 } else { 0 });
-    }
-
-    hash
+    dct.iter().fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
 pub fn compute_aspect_ratio(w: u32, h: u32) -> String {
@@ -156,22 +104,22 @@ pub fn compute_aspect_ratio(w: u32, h: u32) -> String {
         return "Unknown".to_string();
     }
 
-    let gcd = gcd(w, h);
-    let rw = w / gcd;
-    let rh = h / gcd;
-
     let ratio = w as f64 / h as f64;
-    if (ratio - 16.0 / 9.0).abs() < 0.02 {
-        "16:9".to_string()
-    } else if (ratio - 4.0 / 3.0).abs() < 0.02 {
-        "4:3".to_string()
-    } else if (ratio - 1.0).abs() < 0.01 {
-        "1:1".to_string()
-    } else if (ratio - 64.0 / 27.0).abs() < 0.03 || (ratio - 21.0 / 9.0).abs() < 0.03 {
-        "21:9".to_string()
-    } else if (ratio - 3.0 / 2.0).abs() < 0.02 {
-        "3:2".to_string()
-    } else if rw <= 20 && rh <= 20 {
+    const NAMED: &[(f64, f64, &str)] = &[
+        (16.0 / 9.0, 0.02, "16:9"),
+        (4.0 / 3.0, 0.02, "4:3"),
+        (1.0, 0.01, "1:1"),
+        (64.0 / 27.0, 0.03, "21:9"),
+        (21.0 / 9.0, 0.03, "21:9"),
+        (3.0 / 2.0, 0.02, "3:2"),
+    ];
+    if let Some(&(_, _, name)) = NAMED.iter().find(|(r, tol, _)| (ratio - r).abs() < *tol) {
+        return name.to_string();
+    }
+
+    let g = gcd(w, h);
+    let (rw, rh) = (w / g, h / g);
+    if rw <= 20 && rh <= 20 {
         format!("{}:{}", rw, rh)
     } else {
         format!("{:.2}:1", ratio)
@@ -180,9 +128,35 @@ pub fn compute_aspect_ratio(w: u32, h: u32) -> String {
 
 fn gcd(mut a: u32, mut b: u32) -> u32 {
     while b != 0 {
-        let t = b;
-        b = a % b;
-        a = t;
+        (a, b) = (b, a % b);
     }
     a
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aspect_ratios() {
+        assert_eq!(compute_aspect_ratio(1920, 1080), "16:9");
+        assert_eq!(compute_aspect_ratio(100, 100), "1:1");
+        assert_eq!(compute_aspect_ratio(6000, 4000), "3:2");
+        assert_eq!(compute_aspect_ratio(500, 400), "5:4");
+        assert_eq!(compute_aspect_ratio(0, 10), "Unknown");
+    }
+
+    #[test]
+    fn large_and_downscaled_images_hash_alike() {
+        // Blocky pattern with real structure (smooth gradients make pHash bits arbitrary).
+        let img = DynamicImage::ImageRgb8(image::RgbImage::from_fn(1200, 800, |x, y| {
+            let v = ((x / 150) * 7 + (y / 100) * 13) * 37 % 256;
+            image::Rgb([v as u8, (255 - v) as u8, (v / 2) as u8])
+        }));
+        let small = img.resize_exact(300, 200, FilterType::Triangle);
+        let (a, b) = (analyze(&img), analyze(&small));
+        assert!((a.dhash ^ b.dhash).count_ones() <= 4, "dhash distance {}", (a.dhash ^ b.dhash).count_ones());
+        assert!((a.phash ^ b.phash).count_ones() <= 6, "phash distance {}", (a.phash ^ b.phash).count_ones());
+        assert_eq!((a.width, a.height), (1200, 800));
+    }
 }
