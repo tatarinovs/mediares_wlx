@@ -149,7 +149,9 @@ MPEG-2 PS), декодирование через системные кодек�
 Для колонок, подсказок и поиска по содержимому есть поля тегов (ID3, Vorbis comments, MP4, APE, RIFF INFO
 через `lofty`): `Audio_Artist`, `Audio_Title`, `Audio_Album`, `Audio_Album_Artist`, `Audio_Genre`,
 `Audio_Comment`, `Audio_Year`, `Audio_Track`, `Audio_Disc`, `Audio_Length` (ч:мм:сс), `Audio_Bitrate_kbps`,
-`Audio_Sample_Rate_Hz`, `Audio_Channels`, `Audio_Bit_Depth`, `Audio_Has_Cover`. Они читают только заголовки
+`Audio_Sample_Rate_Hz`, `Audio_Channels`, `Audio_Bit_Depth`, `Audio_Has_Cover`, `Audio_Composer`,
+`Audio_Track_Total`, `Audio_Disc_Total`, `Audio_Codec` (MP3, AAC, ALAC, FLAC, Opus, Vorbis, Monkey's Audio,
+WavPack, PCM...) и `Audio_Lossless` (да/нет — удобно искать lossless-версии треков). Они читают только заголовки
 и теги, поэтому не откладываются и не требуют декодирования; теги файла кэшируются, так что несколько
 колонок читают их один раз.
 
@@ -158,6 +160,43 @@ MPEG-2 PS), декодирование через системные кодек�
 значение, что оригинал; ложных совпадений на выборке из ~400 треков не было. Другой мастеринг, live-версия
 или обрезанная на несколько секунд запись не совпадут. Анализ декодирует файл целиком (~0,4 с на трек 3–5 мин),
 поэтому поля отложенные (`FT_DELAYED`) и кэшируются. WMA/Opus в WDX не анализируются (только symphonia).
+
+### Поля фото и видео (WDX, обе сборки)
+
+Для колонок, подсказок, поиска и группового переименования.
+
+**Фото** — из EXIF (JPEG, TIFF и TIFF-подобные RAW: CR2, NEF, ARW, DNG, ORF, RW2, PEF). Читается только
+блок метаданных, поэтому поля не откладываются:
+
+| Поле | Тип | Значение |
+|---|---|---|
+| `Image_Width`, `Image_Height` | число | Размер в пикселях, без учёта поворота по EXIF. Для JPG/PNG/... берётся из заголовка, для RAW/PSD — из анализа (отложенное) |
+| `Photo_Make`, `Photo_Model`, `Photo_Lens` | строка | Производитель, модель камеры, объектив |
+| `Photo_Date_Taken` | дата/время | `DateTimeOriginal` (если нет — `DateTime`), в том времени, что стояло на часах камеры |
+| `Photo_Exposure` | строка | Выдержка: `1/250`, `2.5` |
+| `Photo_FNumber` | дробное | Диафрагма (2.8) |
+| `Photo_ISO` | число | Светочувствительность |
+| `Photo_Focal_Length_mm` / `Photo_Focal_Length_35mm` | дробное / число | Фокусное расстояние и его эквивалент для 35 мм |
+| `Photo_Flash` | да/нет | Сработала ли вспышка |
+| `Photo_Orientation` | число | Код ориентации EXIF 1–8 |
+| `Photo_Software` | строка | Программа, записавшая файл |
+| `Photo_GPS_Latitude`, `Photo_GPS_Longitude` | дробное | Координаты в градусах (юг/запад — отрицательные) |
+| `Photo_Has_GPS` | да/нет | Есть ли координаты (для фото без EXIF — «нет») |
+
+**Видео** — свойства потоков через Media Foundation, без декодирования кадров. Открытие файла всё равно
+занимает заметное время, поэтому поля отложенные (`FT_DELAYED`) и кэшируются:
+
+| Поле | Тип | Значение |
+|---|---|---|
+| `Video_Width`, `Video_Height` | число | Размер кадра |
+| `Video_Length` | время | Длительность, ч:мм:сс |
+| `Video_Frame_Rate` | дробное | Кадров в секунду (29.97, 25) |
+| `Video_Codec` | строка | H.264, HEVC, AV1, VP9, MPEG-4, MPEG-2, VC-1... или FOURCC |
+| `Video_Bitrate_kbps` | число | Общий битрейт файла (размер / длительность) |
+| `Video_Audio_Codec` | строка | AAC, AC-3, E-AC-3, MP3, DTS, Opus, FLAC...; пусто, если нет звука |
+| `Video_Audio_Channels`, `Video_Audio_Sample_Rate_Hz` | число | Каналы и частота первой звуковой дорожки |
+
+`Media_Type` теперь определяется по расширению и не требует декодирования.
 
 ### Установка
 
@@ -185,6 +224,10 @@ MPEG-2 PS), декодирование через системные кодек�
 ```bash
 # поля аудио-дубликатов для набора файлов
 cargo run --release -p mediares_core --features audio-decode,tags --example audio_fp -- <файлы...>
+# поля тегов и кодека аудио
+cargo run -p mediares_core --features tags --example audio_tags -- <файлы...>
+# свойства видео для полей Video_* (из Git Bash передавайте пути как D:/..., а не /d/...)
+cargo run -p mediares_core --example video_meta -- <файлы...>
 cargo run -p mediares_combo --example lister_harness -- <файл> <папка_скриншотов> key:4D wait:1500 shot:a key:0D wait:1000 shot:fs
 ```
 

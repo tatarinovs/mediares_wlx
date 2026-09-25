@@ -63,6 +63,12 @@ pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
     }
 }
 
+/// Width and height of a standard image from its header, without decoding (EXIF rotation not
+/// applied — the same sizes the analysis reports).
+pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+}
+
 /// Applies an EXIF orientation code (1..=8); other values leave the image untouched.
 pub fn apply_exif_orientation(img: &mut DynamicImage, orientation: u16) {
     if let Some(o) = u8::try_from(orientation).ok().and_then(Orientation::from_exif) {

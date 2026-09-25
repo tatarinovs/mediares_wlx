@@ -9,7 +9,7 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSourceReader, MF2DBuffer_LockFlags_Read,
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
     MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS,
     MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE, MFSampleExtension_CleanPoint, MF_SOURCE_READERF_ENDOFSTREAM,
 };
@@ -45,6 +45,24 @@ pub struct VideoInfo {
     pub duration_sec: f64,
     /// Frames per second (0 if the stream doesn't say).
     pub frame_rate: f64,
+}
+
+/// Stream properties for WDX columns: codecs, frame rate, bitrate, the audio track. No decoding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct VideoMeta {
+    pub width: u32,
+    pub height: u32,
+    pub duration_sec: f64,
+    /// Frames per second (0 if the stream doesn't say).
+    pub frame_rate: f64,
+    /// Short codec name ("H.264", "HEVC", ...) or the FOURCC.
+    pub codec: Option<String>,
+    /// Whole file (size / duration), kbit/s.
+    pub bitrate_kbps: Option<u32>,
+    /// `None` when there is no audio track.
+    pub audio_codec: Option<String>,
+    pub audio_channels: Option<u32>,
+    pub audio_sample_rate: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -109,6 +127,107 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
             frame_rate: if den > 0 { num as f64 / den as f64 } else { 0.0 },
         })
     }
+}
+
+/// Reads [`VideoMeta`] from the native media types of the first video and audio streams.
+pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
+    let _com = ComScope::new();
+    if !ensure_mf_started() {
+        return None;
+    }
+    unsafe {
+        let reader = open_reader(path, false).ok()?;
+        let video = reader.GetNativeMediaType(STREAM, 0).ok()?;
+        let frame_size = video.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        let rate = video.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
+        let (num, den) = ((rate >> 32) as u32, rate as u32);
+        let duration_sec = duration_hns(&reader) as f64 / 10_000_000.0;
+        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let audio = reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0).ok();
+        let positive = |v: windows::core::Result<u32>| v.ok().filter(|&v| v > 0);
+        Some(VideoMeta {
+            width: (frame_size >> 32) as u32,
+            height: frame_size as u32,
+            duration_sec,
+            frame_rate: if den > 0 { num as f64 / den as f64 } else { 0.0 },
+            codec: video.GetGUID(&MF_MT_SUBTYPE).ok().and_then(|g| video_codec_name(&g)),
+            bitrate_kbps: (duration_sec >= 1.0 && file_size > 0)
+                .then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32),
+            audio_codec: audio.as_ref().and_then(|a| a.GetGUID(&MF_MT_SUBTYPE).ok()).and_then(|g| audio_codec_name(&g)),
+            audio_channels: audio.as_ref().and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS))),
+            audio_sample_rate: audio.as_ref().and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND))),
+        })
+    }
+}
+
+/// Most MF subtypes are `XXXXXXXX-0000-0010-8000-00AA00389B71`, with a FOURCC (video) or a WAVE
+/// format tag (audio) in the first field.
+fn fourcc_base(guid: &GUID) -> Option<u32> {
+    (guid.data2 == 0x0000 && guid.data3 == 0x0010 && guid.data4 == [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+        .then_some(guid.data1)
+}
+
+/// Subtypes outside the FOURCC family (MPEG-1/2 video and Dolby audio from DirectShow).
+const MPEG1_VIDEO: GUID = GUID::from_u128(0xe436eb81_524f_11ce_9f53_0020af0ba770);
+const MPEG2_VIDEO: GUID = GUID::from_u128(0xe06d8026_db46_11cf_b4d1_00805f6cbbea);
+const DOLBY_AC3: GUID = GUID::from_u128(0xe06d802c_db46_11cf_b4d1_00805f6cbbea);
+const DOLBY_DDPLUS: GUID = GUID::from_u128(0xa7fb87af_2d02_42fb_a4d4_05cd93843bdd);
+
+fn video_codec_name(guid: &GUID) -> Option<String> {
+    if *guid == MPEG2_VIDEO {
+        return Some("MPEG-2".into());
+    }
+    if *guid == MPEG1_VIDEO {
+        return Some("MPEG-1".into());
+    }
+    let fourcc = fourcc_base(guid)?.to_le_bytes();
+    let name = match &fourcc.map(|b| b.to_ascii_uppercase()) {
+        b"H264" | b"AVC1" | b"X264" => "H.264",
+        b"HEVC" | b"H265" | b"HVC1" | b"HEV1" => "HEVC",
+        b"AV01" => "AV1",
+        b"VP90" => "VP9",
+        b"VP80" => "VP8",
+        b"MP4V" | b"M4S2" | b"MP4S" => "MPEG-4",
+        b"XVID" => "Xvid",
+        b"DIVX" | b"DX50" | b"DIV3" => "DivX",
+        b"MPG1" => "MPEG-1",
+        b"MP2V" | b"MPG2" => "MPEG-2",
+        b"MJPG" => "MJPEG",
+        b"WMV1" | b"WMV2" | b"WMV3" => "WMV",
+        b"WVC1" => "VC-1",
+        b"H263" => "H.263",
+        b"DVSD" | b"DV25" | b"DV50" => "DV",
+        _ => return fourcc.iter().all(|b| b.is_ascii_graphic()).then(|| String::from_utf8_lossy(&fourcc).trim().to_string()),
+    };
+    Some(name.into())
+}
+
+fn audio_codec_name(guid: &GUID) -> Option<String> {
+    if *guid == DOLBY_AC3 {
+        return Some("AC-3".into());
+    }
+    if *guid == DOLBY_DDPLUS {
+        return Some("E-AC-3".into());
+    }
+    let tag = fourcc_base(guid)?;
+    let name = match tag {
+        0x0001 => "PCM",
+        0x0003 => "PCM float",
+        0x0050 => "MPEG Audio",
+        0x0055 => "MP3",
+        0x0092 | 0x2000 => "AC-3",
+        0x0160 | 0x0161 => "WMA",
+        0x0162 => "WMA Pro",
+        0x0163 => "WMA Lossless",
+        0x1600 | 0x1610 => "AAC",
+        0x2001 => "DTS",
+        0x6C61 => "ALAC",
+        0x704F => "Opus",
+        0xF1AC => "FLAC",
+        0x674F | 0x6750 | 0x6751 | 0x676F | 0x6770 | 0x6771 => "Vorbis",
+        _ => return Some(format!("0x{:04X}", tag)),
+    };
+    Some(name.into())
 }
 
 /// Checks that Media Foundation can open the file and has an audio stream; returns the duration
@@ -435,6 +554,19 @@ unsafe fn propvariant_u64(var: &PROPVARIANT) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codec_names() {
+        use windows::Win32::Media::MediaFoundation::{MFAudioFormat_AAC, MFVideoFormat_H264, MFVideoFormat_HEVC};
+        assert_eq!(video_codec_name(&MFVideoFormat_H264).as_deref(), Some("H.264"));
+        assert_eq!(video_codec_name(&MFVideoFormat_HEVC).as_deref(), Some("HEVC"));
+        assert_eq!(video_codec_name(&MPEG2_VIDEO).as_deref(), Some("MPEG-2"));
+        assert_eq!(video_codec_name(&GUID::from_u128(0x5a5a5a5a_0000_0010_8000_00aa00389b71)).as_deref(), Some("ZZZZ"));
+        assert_eq!(video_codec_name(&GUID::zeroed()), None);
+        assert_eq!(audio_codec_name(&MFAudioFormat_AAC).as_deref(), Some("AAC"));
+        assert_eq!(audio_codec_name(&DOLBY_AC3).as_deref(), Some("AC-3"));
+        assert_eq!(audio_codec_name(&GUID::from_u128(0x00001234_0000_0010_8000_00aa00389b71)).as_deref(), Some("0x1234"));
+    }
 
     fn geo(stride: i32) -> FrameGeometry {
         FrameGeometry { width: 18, height: 16, default_stride: stride, format: PixelFormat::Nv12 }

@@ -36,6 +36,55 @@ pub struct ExifInfo {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub software: Option<String>,
+    /// Decimal degrees, south negative.
+    pub gps_latitude: Option<f64>,
+    /// Decimal degrees, west negative.
+    pub gps_longitude: Option<f64>,
+}
+
+impl ExifInfo {
+    /// When the photo was taken (`DateTimeOriginal`), else when it was last written (`DateTime`).
+    pub fn taken(&self) -> Option<&str> {
+        self.date_time_original.as_deref().or(self.date_time.as_deref())
+    }
+}
+
+/// Camera clock time from an EXIF `YYYY:MM:DD HH:MM:SS` string (no time zone).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExifDateTime {
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub hour: u8,
+    pub minute: u8,
+    pub second: u8,
+}
+
+/// Parses `YYYY:MM:DD HH:MM:SS`; also accepts `-` as the date separator and a missing time part.
+/// Unset dates (`0000:00:00 00:00:00`, blanks) and out-of-range values yield `None`.
+pub fn parse_exif_datetime(s: &str) -> Option<ExifDateTime> {
+    let s = s.trim();
+    let (date, time) = s.split_once(' ').unwrap_or((s, "00:00:00"));
+    let num = |part: Option<&str>| part?.trim().parse::<u16>().ok();
+    let mut d = date.split([':', '-']);
+    let mut t = time.trim().split(':');
+    let (year, month, day) = (num(d.next())?, num(d.next())?, num(d.next())?);
+    let (hour, minute) = (num(t.next())?, num(t.next())?);
+    let second = num(t.next()).unwrap_or(0);
+    let valid = (1..=9999).contains(&year)
+        && (1..=12).contains(&month)
+        && (1..=31).contains(&day)
+        && hour < 24
+        && minute < 60
+        && second < 60;
+    valid.then_some(ExifDateTime {
+        year,
+        month: month as u8,
+        day: day as u8,
+        hour: hour as u8,
+        minute: minute as u8,
+        second: second as u8,
+    })
 }
 
 pub fn read_exif(path: &Path) -> Option<ExifInfo> {
@@ -108,12 +157,22 @@ fn parse_tiff(data: &[u8]) -> Option<ExifInfo> {
     let ifd0 = tiff.u32(4)? as usize;
 
     let mut info = ExifInfo::default();
-    let mut exif_ifd = None;
-    tiff.parse_ifd(ifd0, &mut info, &mut exif_ifd);
-    if let Some(offset) = exif_ifd {
-        tiff.parse_ifd(offset, &mut info, &mut None);
+    let mut subs = SubIfds::default();
+    tiff.parse_ifd(ifd0, &mut info, &mut subs);
+    if let Some(offset) = subs.exif {
+        tiff.parse_ifd(offset, &mut info, &mut SubIfds::default());
+    }
+    if let Some(offset) = subs.gps {
+        tiff.parse_gps_ifd(offset, &mut info);
     }
     Some(info)
+}
+
+/// Offsets of the Exif and GPS IFDs referenced from IFD0.
+#[derive(Default)]
+struct SubIfds {
+    exif: Option<usize>,
+    gps: Option<usize>,
 }
 
 struct Tiff<'a> {
@@ -179,10 +238,16 @@ impl<'a> Tiff<'a> {
     }
 
     fn rational(&self, e: &Entry) -> Option<(u32, u32)> {
-        if e.typ != TYPE_RATIONAL || e.value.len() < 8 {
+        self.rational_at(e, 0)
+    }
+
+    /// The `index`-th value of a RATIONAL array.
+    fn rational_at(&self, e: &Entry, index: usize) -> Option<(u32, u32)> {
+        if e.typ != TYPE_RATIONAL {
             return None;
         }
-        Some((self.u32_at(&e.value[0..4]), self.u32_at(&e.value[4..8])))
+        let v = e.value.get(index * 8..index * 8 + 8)?;
+        Some((self.u32_at(&v[0..4]), self.u32_at(&v[4..8])))
     }
 
     fn ascii(&self, e: &Entry) -> Option<String> {
@@ -195,7 +260,7 @@ impl<'a> Tiff<'a> {
         (!s.is_empty()).then(|| s.to_string())
     }
 
-    fn parse_ifd(&self, offset: usize, info: &mut ExifInfo, exif_ifd: &mut Option<usize>) {
+    fn parse_ifd(&self, offset: usize, info: &mut ExifInfo, subs: &mut SubIfds) {
         let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else { return };
         for i in 0..count as usize {
             let Some(e) = self.entry(offset + 2 + i * 12) else { break };
@@ -205,7 +270,8 @@ impl<'a> Tiff<'a> {
                 0x0112 => info.orientation = self.uint(&e).map(|v| v as u16),
                 0x0131 => info.software = self.ascii(&e),
                 0x0132 => info.date_time = self.ascii(&e),
-                0x8769 => *exif_ifd = self.uint(&e).map(|v| v as usize),
+                0x8769 => subs.exif = self.uint(&e).map(|v| v as usize),
+                0x8825 => subs.gps = self.uint(&e).map(|v| v as usize),
                 0x829A => info.exposure_time = self.rational(&e).and_then(format_exposure),
                 0x829D => info.f_number = self.rational(&e).and_then(ratio),
                 0x8827 => info.iso = self.uint(&e),
@@ -219,6 +285,38 @@ impl<'a> Tiff<'a> {
                 _ => {}
             }
         }
+    }
+
+    fn parse_gps_ifd(&self, offset: usize, info: &mut ExifInfo) {
+        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else { return };
+        let (mut lat_ref, mut lon_ref, mut lat, mut lon) = (None, None, None, None);
+        for i in 0..count as usize {
+            let Some(e) = self.entry(offset + 2 + i * 12) else { break };
+            match e.tag {
+                0x0001 => lat_ref = self.ascii(&e),
+                0x0002 => lat = self.degrees(&e),
+                0x0003 => lon_ref = self.ascii(&e),
+                0x0004 => lon = self.degrees(&e),
+                _ => {}
+            }
+        }
+        let signed = |value: Option<f64>, reference: Option<String>, negative: &str, limit: f64| {
+            let value = value.filter(|v| *v <= limit)?;
+            Some(if reference.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(negative)) { -value } else { value })
+        };
+        info.gps_latitude = signed(lat, lat_ref, "S", 90.0);
+        info.gps_longitude = signed(lon, lon_ref, "W", 180.0);
+        // Cameras without a fix often write zeros; a lone half is useless either way.
+        if info.gps_latitude.zip(info.gps_longitude).is_none_or(|(a, b)| a == 0.0 && b == 0.0) {
+            info.gps_latitude = None;
+            info.gps_longitude = None;
+        }
+    }
+
+    /// Degrees/minutes/seconds as three RATIONALs, to decimal degrees.
+    fn degrees(&self, e: &Entry) -> Option<f64> {
+        let part = |i| self.rational_at(e, i).and_then(ratio);
+        Some(part(0)? + part(1)? / 60.0 + part(2)? / 3600.0)
     }
 }
 
@@ -288,6 +386,18 @@ mod tests {
         assert_eq!(format_exposure((5, 2)).as_deref(), Some("2.5"));
         assert_eq!(format_exposure((0, 1)), None);
         assert_eq!(format_exposure((1, 0)), None);
+    }
+
+    #[test]
+    fn datetime_parsing() {
+        let dt = |y, mo, d, h, mi, s| Some(ExifDateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: s });
+        assert_eq!(parse_exif_datetime("2024:05:01 12:34:56"), dt(2024, 5, 1, 12, 34, 56));
+        assert_eq!(parse_exif_datetime("2024-05-01 07:08:09"), dt(2024, 5, 1, 7, 8, 9));
+        assert_eq!(parse_exif_datetime("2024:05:01"), dt(2024, 5, 1, 0, 0, 0));
+        assert_eq!(parse_exif_datetime("0000:00:00 00:00:00"), None);
+        assert_eq!(parse_exif_datetime("    :  :     :  :  "), None);
+        assert_eq!(parse_exif_datetime("2024:13:01 00:00:00"), None);
+        assert_eq!(parse_exif_datetime("2024:05:01 24:00:00"), None);
     }
 
     #[test]

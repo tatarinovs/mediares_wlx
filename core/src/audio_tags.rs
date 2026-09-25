@@ -3,7 +3,12 @@
 
 use std::path::Path;
 
-use lofty::file::{AudioFile, TaggedFileExt};
+use std::fs::File;
+
+use lofty::config::ParseOptions;
+use lofty::file::{AudioFile, FileType, TaggedFileExt};
+use lofty::iff::wav::{WavFile, WavFormat};
+use lofty::mp4::{Mp4Codec, Mp4File};
 use lofty::picture::PictureType;
 use lofty::tag::{Accessor, ItemKey, Tag};
 
@@ -23,6 +28,12 @@ pub struct AudioTags {
     pub sample_rate: Option<u32>,
     pub bit_depth: Option<u8>,
     pub channels: Option<u8>,
+    pub composer: Option<String>,
+    pub track_total: Option<u32>,
+    pub disc_total: Option<u32>,
+    /// "MP3", "FLAC", "AAC", "ALAC"...
+    pub codec: Option<&'static str>,
+    pub lossless: Option<bool>,
     /// An embedded picture exists (even if `cover` was not kept).
     pub has_cover: bool,
     /// Encoded front cover (JPEG/PNG...), or the first embedded picture.
@@ -42,6 +53,10 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
         channels: props.channels().filter(|&c| c > 0),
         ..Default::default()
     };
+    if let Some((codec, lossless)) = codec_of(path, file.file_type()) {
+        tags.codec = Some(codec);
+        tags.lossless = Some(lossless);
+    }
 
     // The primary tag first, then the others fill in what it lacks.
     let primary = file.primary_tag().map(|p| p.tag_type());
@@ -58,6 +73,9 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
         tags.year = tags.year.or_else(|| tag.date().map(|d| d.year as u32));
         tags.track = tags.track.or_else(|| tag.track());
         tags.disc = tags.disc.or_else(|| tag.disk());
+        tags.composer = tags.composer.take().or_else(|| text(tag.get_string(ItemKey::Composer).map(Into::into)));
+        tags.track_total = tags.track_total.or_else(|| tag.track_total());
+        tags.disc_total = tags.disc_total.or_else(|| tag.disk_total());
         let pictures = tag.pictures();
         tags.has_cover |= !pictures.is_empty();
         if with_cover && tags.cover.is_none() {
@@ -66,6 +84,46 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
         }
     }
     Some(tags)
+}
+
+/// Codec name and whether it is lossless. The container says it for most types; MP4 (AAC/ALAC/...)
+/// and WAV (PCM or a compressed format tag) need their stream properties, read without tags.
+fn codec_of(path: &Path, file_type: FileType) -> Option<(&'static str, bool)> {
+    let props_only = || ParseOptions::new().read_tags(false);
+    Some(match file_type {
+        FileType::Aac => ("AAC", false),
+        FileType::Aiff => ("PCM", true),
+        FileType::Ape => ("Monkey's Audio", true),
+        FileType::Flac => ("FLAC", true),
+        FileType::Mpeg => {
+            let mp2 = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp2"));
+            (if mp2 { "MP2" } else { "MP3" }, false)
+        }
+        FileType::Mp4 => {
+            let file = Mp4File::read_from(&mut File::open(path).ok()?, props_only()).ok()?;
+            match file.properties().codec()? {
+                Mp4Codec::AAC => ("AAC", false),
+                Mp4Codec::ALAC => ("ALAC", true),
+                Mp4Codec::MP3 => ("MP3", false),
+                Mp4Codec::FLAC => ("FLAC", true),
+                _ => return None,
+            }
+        }
+        FileType::Mpc => ("Musepack", false),
+        FileType::Opus => ("Opus", false),
+        FileType::Vorbis => ("Vorbis", false),
+        FileType::Speex => ("Speex", false),
+        FileType::Wav => {
+            let file = WavFile::read_from(&mut File::open(path).ok()?, props_only()).ok()?;
+            match file.properties().format() {
+                WavFormat::PCM => ("PCM", true),
+                WavFormat::IEEE_FLOAT => ("PCM float", true),
+                _ => return None,
+            }
+        }
+        FileType::WavPack => ("WavPack", true),
+        _ => return None,
+    })
 }
 
 impl AudioTags {
@@ -138,6 +196,19 @@ mod tests {
         assert_eq!(t.format_line(), "44,1 кГц · 16 бит · стерео · 1411 кбит/с");
         assert_eq!(AudioTags::default().display_title(), None);
         assert_eq!(AudioTags { sample_rate: Some(48000), ..Default::default() }.format_line(), "48 кГц");
+    }
+
+    #[test]
+    fn codec_from_container() {
+        let p = Path::new("x.mp3");
+        assert_eq!(codec_of(p, FileType::Mpeg), Some(("MP3", false)));
+        assert_eq!(codec_of(Path::new("x.MP2"), FileType::Mpeg), Some(("MP2", false)));
+        assert_eq!(codec_of(p, FileType::Flac), Some(("FLAC", true)));
+        assert_eq!(codec_of(p, FileType::Ape), Some(("Monkey's Audio", true)));
+        assert_eq!(codec_of(p, FileType::Opus), Some(("Opus", false)));
+        // MP4/WAV need the stream properties: a missing file gives nothing.
+        assert_eq!(codec_of(Path::new("missing.m4a"), FileType::Mp4), None);
+        assert_eq!(codec_of(Path::new("missing.wav"), FileType::Wav), None);
     }
 
     #[test]

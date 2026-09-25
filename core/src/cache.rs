@@ -11,7 +11,7 @@ use lru::LruCache;
 use crate::hashing::{analyze, ImageAnalysis};
 use crate::image_decode::decode_file;
 use crate::probe::{probe_file, MediaType};
-use crate::video_frame::{analyze_video, VideoAnalysis, VideoError};
+use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoError, VideoMeta};
 
 const CAPACITY: usize = 1024;
 
@@ -102,20 +102,58 @@ impl MediaCache {
     }
 }
 
-/// Tags of recently queried audio files: TC asks for every column separately, and the tags are
-/// read once per file version. Pictures are not kept.
+/// Cheap per-file metadata (tags, EXIF, stream properties) keyed by file version: TC asks for
+/// every column separately, and each file is read once. Failed reads are cached too.
+struct MetaCache<T>(Mutex<LruCache<FileKey, Option<Arc<T>>>>);
+
+impl<T> MetaCache<T> {
+    fn new() -> Self {
+        MetaCache(Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero capacity"))))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, Option<Arc<T>>>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn get_or_read(&self, path: &Path, read: impl FnOnce(&Path) -> Option<T>) -> Option<Arc<T>> {
+        let key = FileKey::for_path(path)?;
+        if let Some(hit) = self.lock().get(&key) {
+            return hit.clone();
+        }
+        let value = read(path).map(Arc::new);
+        self.lock().put(key, value.clone());
+        value
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        FileKey::for_path(path).is_some_and(|key| self.lock().contains(&key))
+    }
+}
+
+/// Audio tags without pictures.
 #[cfg(feature = "tags")]
 pub fn get_tags(path: &Path) -> Option<Arc<crate::audio_tags::AudioTags>> {
-    type TagCache = Mutex<LruCache<FileKey, Option<Arc<crate::audio_tags::AudioTags>>>>;
-    static TAGS: OnceLock<TagCache> = OnceLock::new();
-    let cache = TAGS.get_or_init(|| Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero capacity"))));
-    let key = FileKey::for_path(path)?;
-    if let Some(hit) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
-        return hit.clone();
-    }
-    let tags = crate::audio_tags::read_tags(path, false).map(Arc::new);
-    cache.lock().unwrap_or_else(|e| e.into_inner()).put(key, tags.clone());
-    tags
+    static TAGS: OnceLock<MetaCache<crate::audio_tags::AudioTags>> = OnceLock::new();
+    TAGS.get_or_init(MetaCache::new).get_or_read(path, |p| crate::audio_tags::read_tags(p, false))
+}
+
+pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
+    static EXIF: OnceLock<MetaCache<crate::exif::ExifInfo>> = OnceLock::new();
+    EXIF.get_or_init(MetaCache::new).get_or_read(path, crate::exif::read_exif)
+}
+
+fn video_meta_cache() -> &'static MetaCache<VideoMeta> {
+    static VIDEO: OnceLock<MetaCache<VideoMeta>> = OnceLock::new();
+    VIDEO.get_or_init(MetaCache::new)
+}
+
+/// Stream properties via Media Foundation: no decoding, but opening the source still takes a while.
+pub fn get_video_meta(path: &Path) -> Option<Arc<VideoMeta>> {
+    video_meta_cache().get_or_read(path, probe_video_meta)
+}
+
+pub fn is_video_meta_cached(path: &Path) -> bool {
+    video_meta_cache().contains(path)
 }
 
 pub fn get_cache() -> &'static MediaCache {
