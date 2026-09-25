@@ -8,7 +8,7 @@ use std::os::raw::{c_char, c_int, c_void};
 use windows::Win32::Foundation::HWND;
 use mediares_core::tc_api::*;
 use mediares_core::wdx_api::*;
-use wlx_window::{create_viewer_window, destroy_viewer_window, get_viewer_state};
+use wlx_window::{create_viewer_window, destroy_viewer_window, get_viewer_state, update_lister_title};
 
 // ==========================================
 // Total Commander WDX (Content Plugin) API
@@ -148,7 +148,7 @@ pub unsafe extern "system" fn ListLoad(
 
 #[no_mangle]
 pub unsafe extern "system" fn ListLoadNextW(
-    _parent_win: HWND,
+    parent_win: HWND,
     list_win: HWND,
     file_to_load: *const u16,
     _show_flags: c_int,
@@ -160,16 +160,10 @@ pub unsafe extern "system" fn ListLoadNextW(
         };
 
         if let Some(state) = get_viewer_state(list_win) {
-            state.file_path = path;
-            state.media_type = mediares_core::probe::probe_file(&state.file_path);
-            if !state.media_type.is_image_kind() {
-                return LISTPLUGIN_ERROR;
-            }
-            state.load_media();
+            state.parent_hwnd = parent_win;
+            state.set_file(&path);
             if state.image.is_some() {
-                state.zoom_factor = 1.0;
-                state.pan_x = 0;
-                state.pan_y = 0;
+                update_lister_title(parent_win, state);
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
                 LISTPLUGIN_OK
             } else {
@@ -184,7 +178,7 @@ pub unsafe extern "system" fn ListLoadNextW(
 
 #[no_mangle]
 pub unsafe extern "system" fn ListLoadNext(
-    _parent_win: HWND,
+    parent_win: HWND,
     list_win: HWND,
     file_to_load: *const c_char,
     _show_flags: c_int,
@@ -196,16 +190,10 @@ pub unsafe extern "system" fn ListLoadNext(
         };
 
         if let Some(state) = get_viewer_state(list_win) {
-            state.file_path = path;
-            state.media_type = mediares_core::probe::probe_file(&state.file_path);
-            if !state.media_type.is_image_kind() {
-                return LISTPLUGIN_ERROR;
-            }
-            state.load_media();
+            state.parent_hwnd = parent_win;
+            state.set_file(&path);
             if state.image.is_some() {
-                state.zoom_factor = 1.0;
-                state.pan_x = 0;
-                state.pan_y = 0;
+                update_lister_title(parent_win, state);
                 let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(list_win), None, true);
                 LISTPLUGIN_OK
             } else {

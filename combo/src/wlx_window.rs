@@ -14,8 +14,9 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, GetClientRect, GetParent, GetWindowLongPtrW,
-    PostMessageW, RegisterClassExW, SetWindowLongPtrW, CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW,
-    GWLP_USERDATA, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    PostMessageW, RegisterClassExW, SetWindowLongPtrW, SetWindowTextW,
+    CS_DBLCLKS, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA,
+    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
     WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_XBUTTONDOWN, WNDCLASSEXW,
     WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
@@ -63,10 +64,10 @@ pub unsafe fn create_viewer_window(parent: HWND, file_path: &Path) -> Option<HWN
         None,
     ).ok()?;
 
-    let state = Box::new(ViewerState::new(hwnd, file_path));
+    let state = Box::new(ViewerState::new(hwnd, parent, file_path));
+    update_lister_title(parent, &state);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
 
-    // Immediately acquire keyboard focus so Lister navigation hotkeys work without clicking
     let _ = SetFocus(Some(hwnd));
 
     Some(hwnd)
@@ -88,15 +89,45 @@ pub unsafe fn get_viewer_state<'a>(hwnd: HWND) -> Option<&'a mut ViewerState> {
     }
 }
 
-/// Send Next ('N') or Previous ('P') file navigation key message to Lister parent window.
-unsafe fn send_nav_to_parent(hwnd: HWND, next: bool) {
-    if let Ok(parent) = GetParent(hwnd) {
-        if !parent.is_invalid() {
-            let vk = if next { 0x4Eu32 } else { 0x50u32 }; // 'N' = 0x4E, 'P' = 0x50
-            let _ = PostMessageW(Some(parent), WM_KEYDOWN, WPARAM(vk as usize), LPARAM(0));
-            let _ = PostMessageW(Some(parent), WM_KEYUP, WPARAM(vk as usize), LPARAM(0));
-        }
+pub unsafe fn update_lister_title(parent: HWND, state: &ViewerState) {
+    if parent.is_invalid() {
+        return;
     }
+    let name = state.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let dim_str = if let Some(ref img) = state.image {
+        format!(" ({}x{})", img.width, img.height)
+    } else {
+        String::new()
+    };
+    let total = state.dir_files.len();
+    let idx = state.current_idx + 1;
+    let title_str = if total > 1 {
+        format!("{} [{}/{}]{} - Lister\0", name, idx, total, dim_str)
+    } else {
+        format!("{}{} - Lister\0", name, dim_str)
+    };
+    let title_w: Vec<u16> = title_str.encode_utf16().collect();
+    let _ = SetWindowTextW(parent, PCWSTR(title_w.as_ptr()));
+}
+
+pub unsafe fn navigate_viewer(hwnd: HWND, next: bool) {
+    let Some(state) = get_viewer_state(hwnd) else { return };
+    if state.dir_files.len() <= 1 {
+        return;
+    }
+
+    let total = state.dir_files.len();
+    let new_idx = if next {
+        (state.current_idx + 1) % total
+    } else {
+        (state.current_idx + total - 1) % total
+    };
+
+    let next_path = state.dir_files[new_idx].clone();
+    state.set_file(&next_path);
+
+    update_lister_title(state.parent_hwnd, state);
+    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, true);
 }
 
 unsafe extern "system" fn wlx_wnd_proc(
@@ -107,7 +138,6 @@ unsafe extern "system" fn wlx_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => {
-            // Prevent GDI flickering by handling background clearing inside double-buffered paint
             LRESULT(1)
         }
         WM_PAINT => {
@@ -123,46 +153,58 @@ unsafe extern "system" fn wlx_wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
-            // Set focus on click so hotkeys continue working
             let _ = SetFocus(Some(hwnd));
             LRESULT(0)
         }
+        WM_LBUTTONDBLCLK => {
+            // Forward double click to parent Lister to toggle full screen
+            if let Ok(parent) = GetParent(hwnd) {
+                if !parent.is_invalid() {
+                    let _ = PostMessageW(Some(parent), WM_LBUTTONDBLCLK, wparam, lparam);
+                }
+            }
+            LRESULT(0)
+        }
         WM_MOUSEWHEEL => {
-            // Wheel down -> Next file, Wheel up -> Previous file
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             if delta < 0 {
-                send_nav_to_parent(hwnd, true);
+                navigate_viewer(hwnd, true);
             } else if delta > 0 {
-                send_nav_to_parent(hwnd, false);
+                navigate_viewer(hwnd, false);
             }
             LRESULT(0)
         }
         WM_XBUTTONDOWN => {
-            // Mouse side buttons: forward -> Next file, back -> Previous file
             let btn = ((wparam.0 >> 16) & 0xFFFF) as u16;
             if btn == 1 {
-                send_nav_to_parent(hwnd, false);
+                navigate_viewer(hwnd, false);
             } else if btn == 2 {
-                send_nav_to_parent(hwnd, true);
+                navigate_viewer(hwnd, true);
             }
             LRESULT(1)
         }
         WM_KEYDOWN => {
             let vk = wparam.0 as usize;
             match vk {
-                // Next file triggers:
-                // 'N' (0x4E), Space (0x20), Right Arrow (0x27), PageDown (0x22)
-                0x4E | 0x20 | 0x27 | 0x22 => {
-                    send_nav_to_parent(hwnd, true);
+                // Next file: 'N' (0x4E), Space (0x20), Right Arrow (0x27), PageDown (0x22), Down Arrow (0x28)
+                0x4E | 0x20 | 0x27 | 0x22 | 0x28 => {
+                    navigate_viewer(hwnd, true);
                     LRESULT(0)
                 }
-                // Previous file triggers:
-                // 'P' (0x50), Backspace (0x08), Left Arrow (0x25), PageUp (0x21)
-                0x50 | 0x08 | 0x25 | 0x21 => {
-                    send_nav_to_parent(hwnd, false);
+                // Previous file: 'P' (0x50), Backspace (0x08), Left Arrow (0x25), PageUp (0x21), Up Arrow (0x26)
+                0x50 | 0x08 | 0x25 | 0x21 | 0x26 => {
+                    navigate_viewer(hwnd, false);
                     LRESULT(0)
                 }
-                // Forward all other keys (Esc, 1..7, F3, etc.) to parent Lister window
+                // Escape (0x1B) or other keys: forward to parent Lister window
+                0x1B => {
+                    if let Ok(parent) = GetParent(hwnd) {
+                        if !parent.is_invalid() {
+                            let _ = PostMessageW(Some(parent), WM_KEYDOWN, wparam, lparam);
+                        }
+                    }
+                    LRESULT(0)
+                }
                 _ => {
                     if let Ok(parent) = GetParent(hwnd) {
                         if !parent.is_invalid() {
