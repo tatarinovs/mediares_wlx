@@ -2,6 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::UI::WindowsAndMessaging::{HMENU, WINDOWPLACEMENT};
 use mediares_core::probe::{probe_file, MediaType};
 
 pub struct DecodedImage {
@@ -10,17 +11,32 @@ pub struct DecodedImage {
     pub bgra_pixels: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ZoomMode {
+    Fit,
+    Custom(f32),
+}
+
 pub struct ViewerState {
     pub hwnd: HWND,
     pub parent_hwnd: HWND,
     pub file_path: PathBuf,
     pub media_type: MediaType,
     pub image: Option<DecodedImage>,
-    pub zoom_factor: f32,
-    pub pan_x: i32,
-    pub pan_y: i32,
+    pub zoom_mode: ZoomMode,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub is_dragging: bool,
+    pub drag_start_x: i32,
+    pub drag_start_y: i32,
+    pub drag_start_offset_x: f32,
+    pub drag_start_offset_y: f32,
     pub dir_files: Vec<PathBuf>,
     pub current_idx: usize,
+    pub is_fullscreen: bool,
+    pub saved_placement: Option<WINDOWPLACEMENT>,
+    pub saved_style: isize,
+    pub saved_menu: HMENU,
 }
 
 impl ViewerState {
@@ -33,11 +49,20 @@ impl ViewerState {
             file_path: file_path.to_path_buf(),
             media_type,
             image: None,
-            zoom_factor: 1.0,
-            pan_x: 0,
-            pan_y: 0,
+            zoom_mode: ZoomMode::Fit,
+            offset_x: 0.0,
+            offset_y: 0.0,
+            is_dragging: false,
+            drag_start_x: 0,
+            drag_start_y: 0,
+            drag_start_offset_x: 0.0,
+            drag_start_offset_y: 0.0,
             dir_files,
             current_idx,
+            is_fullscreen: false,
+            saved_placement: None,
+            saved_style: 0,
+            saved_menu: HMENU::default(),
         };
         state.load_media();
         state
@@ -53,9 +78,10 @@ impl ViewerState {
     pub fn set_file(&mut self, path: &Path) {
         self.file_path = path.to_path_buf();
         self.media_type = probe_file(&self.file_path);
-        self.zoom_factor = 1.0;
-        self.pan_x = 0;
-        self.pan_y = 0;
+        self.zoom_mode = ZoomMode::Fit;
+        self.offset_x = 0.0;
+        self.offset_y = 0.0;
+        self.is_dragging = false;
 
         if let Some(pos) = self.dir_files.iter().position(|p| p == path) {
             self.current_idx = pos;

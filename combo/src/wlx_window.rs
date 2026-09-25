@@ -3,38 +3,42 @@
 use std::mem::size_of;
 use std::path::Path;
 use windows::core::{w, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    UpdateWindow,
+    InvalidateRect,
     BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateSolidBrush, DeleteDC,
-    DeleteObject, EndPaint, FillRect, SelectObject, SetStretchBltMode, StretchDIBits,
+    DeleteObject, EndPaint, FillRect, GetMonitorInfoW, MonitorFromWindow, ScreenToClient,
+    SelectObject, SetStretchBltMode, StretchDIBits, UpdateWindow,
     BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HALFTONE, HDC,
-    PAINTSTRUCT, SRCCOPY,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
+use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, GetAncestor, GetClientRect, GetParent, GetWindowLongPtrW,
-    PostMessageW, RegisterClassExW, SetWindowLongPtrW, SetWindowTextW,
-    CS_DBLCLKS, GA_ROOT, GWL_STYLE, GWLP_USERDATA,
-    WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MOUSEWHEEL, WM_PAINT, WM_SIZE, WM_XBUTTONDOWN, WNDCLASSEXW,
-    WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, GetAncestor, GetClientRect, GetMenu, GetParent,
+    GetWindowLongPtrW, GetWindowPlacement, LoadCursorW, PostMessageW, RegisterClassExW,
+    SetCursor, SetMenu, SetWindowLongPtrW, SetWindowPlacement, SetWindowPos, SetWindowTextW,
+    CS_DBLCLKS, GA_ROOT, GWL_STYLE, GWLP_USERDATA, IDC_ARROW, IDC_HAND, IDC_SIZEALL,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER,
+    WINDOWPLACEMENT, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_PAINT, WM_SETCURSOR,
+    WM_SIZE, WM_XBUTTONDOWN, WNDCLASSEXW,
+    WS_CAPTION, WS_CHILD, WS_CLIPCHILDREN, WS_CLIPSIBLINGS, WS_MAXIMIZEBOX,
+    WS_MINIMIZEBOX, WS_SYSMENU, WS_THICKFRAME, WS_VISIBLE,
 };
 
-use crate::wlx_state::ViewerState;
+use crate::wlx_state::{ViewerState, ZoomMode};
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("MediaresViewerClass");
 
 pub unsafe fn ensure_window_class_registered() {
     let hinstance = GetModuleHandleW(None).unwrap_or_default();
 
-    // Dark sleek background brush (0x181818) so OS never paints white
     let bg_brush = CreateSolidBrush(COLORREF(0x00181818));
 
     let mut wc = WNDCLASSEXW::default();
     wc.cbSize = size_of::<WNDCLASSEXW>() as u32;
-    wc.style = CS_DBLCLKS; // Omit CS_HREDRAW | CS_VREDRAW to prevent erase-flicker
+    wc.style = CS_DBLCLKS;
     wc.lpfnWndProc = Some(wlx_wnd_proc);
     wc.hInstance = hinstance.into();
     wc.hbrBackground = bg_brush;
@@ -46,9 +50,7 @@ pub unsafe fn ensure_window_class_registered() {
 pub unsafe fn create_viewer_window(parent: HWND, file_path: &Path) -> Option<HWND> {
     ensure_window_class_registered();
 
-    // Fix Total Commander Delphi TForm white background flicker:
-    // Ensure parent and top-level Lister windows have WS_CLIPCHILDREN enabled
-    // so TC's default white background brush is NEVER drawn over our viewer rect!
+    // Prevent Delphi parent white flicker by ensuring WS_CLIPCHILDREN
     let p_style = GetWindowLongPtrW(parent, GWL_STYLE) as u32;
     if (p_style & WS_CLIPCHILDREN.0) == 0 {
         let _ = SetWindowLongPtrW(parent, GWL_STYLE, (p_style | WS_CLIPCHILDREN.0) as isize);
@@ -95,7 +97,18 @@ pub unsafe fn create_viewer_window(parent: HWND, file_path: &Path) -> Option<HWN
 pub unsafe fn destroy_viewer_window(hwnd: HWND) {
     let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
     if ptr != 0 {
-        let _ = Box::from_raw(ptr as *mut ViewerState);
+        let state = Box::from_raw(ptr as *mut ViewerState);
+        if state.is_fullscreen {
+            let top_win = GetAncestor(state.parent_hwnd, GA_ROOT);
+            let target = if !top_win.is_invalid() { top_win } else { state.parent_hwnd };
+            let _ = SetWindowLongPtrW(target, GWL_STYLE, state.saved_style);
+            if !state.saved_menu.is_invalid() {
+                let _ = SetMenu(target, Some(state.saved_menu));
+            }
+            if let Some(ref wp) = state.saved_placement {
+                let _ = SetWindowPlacement(target, wp);
+            }
+        }
     }
 }
 
@@ -114,16 +127,21 @@ pub unsafe fn update_lister_title(parent: HWND, state: &ViewerState) {
     }
     let name = state.file_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let dim_str = if let Some(ref img) = state.image {
-        format!(" ({}x{})", img.width, img.height)
+        let zoom_str = match state.zoom_mode {
+            ZoomMode::Fit => "Fit".to_string(),
+            ZoomMode::Custom(s) => format!("{:.0}%", s * 100.0),
+        };
+        format!(" ({}x{}, {})", img.width, img.height, zoom_str)
     } else {
         String::new()
     };
     let total = state.dir_files.len();
     let idx = state.current_idx + 1;
+    let fs_str = if state.is_fullscreen { " [Fullscreen]" } else { "" };
     let title_str = if total > 1 {
-        format!("{} [{}/{}]{} - Lister\0", name, idx, total, dim_str)
+        format!("{} [{}/{}]{}{} - Lister\0", name, idx, total, dim_str, fs_str)
     } else {
-        format!("{}{} - Lister\0", name, dim_str)
+        format!("{}{}{} - Lister\0", name, dim_str, fs_str)
     };
     let title_w: Vec<u16> = title_str.encode_utf16().collect();
     let _ = SetWindowTextW(parent, PCWSTR(title_w.as_ptr()));
@@ -145,11 +163,190 @@ pub unsafe fn navigate_viewer(hwnd: HWND, next: bool) {
     let next_path = state.dir_files[new_idx].clone();
     state.set_file(&next_path);
 
-    // Immediately repaint synchronously with bErase=false to eliminate any white flash
-    let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+    let _ = InvalidateRect(Some(hwnd), None, false);
     let _ = UpdateWindow(hwnd);
 
-    // Update Lister title after image is already on screen
+    update_lister_title(state.parent_hwnd, state);
+}
+
+pub unsafe fn toggle_fullscreen(hwnd: HWND) {
+    let Some(state) = get_viewer_state(hwnd) else { return };
+    let top_win = GetAncestor(state.parent_hwnd, GA_ROOT);
+    let target = if !top_win.is_invalid() { top_win } else { state.parent_hwnd };
+
+    if !state.is_fullscreen {
+        // Entering Fullscreen
+        let mut wp = WINDOWPLACEMENT::default();
+        wp.length = size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(target, &mut wp).is_ok() {
+            state.saved_placement = Some(wp);
+        }
+
+        let style = GetWindowLongPtrW(target, GWL_STYLE);
+        state.saved_style = style;
+
+        let menu = GetMenu(target);
+        state.saved_menu = menu;
+        if !menu.is_invalid() {
+            let _ = SetMenu(target, None);
+        }
+
+        let hmon = MonitorFromWindow(target, MONITOR_DEFAULTTONEAREST);
+        let mut mi = MONITORINFO::default();
+        mi.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            let new_style = (style as u32) & !(WS_CAPTION.0 | WS_THICKFRAME.0 | WS_MINIMIZEBOX.0 | WS_MAXIMIZEBOX.0 | WS_SYSMENU.0);
+            let _ = SetWindowLongPtrW(target, GWL_STYLE, new_style as isize);
+
+            let rc = mi.rcMonitor;
+            let _ = SetWindowPos(
+                target,
+                Some(HWND::default()),
+                rc.left,
+                rc.top,
+                rc.right - rc.left,
+                rc.bottom - rc.top,
+                SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+
+            // Resize viewer window to fill new client rect
+            let mut client_rc = RECT::default();
+            if GetClientRect(target, &mut client_rc).is_ok() {
+                let w = client_rc.right - client_rc.left;
+                let h = client_rc.bottom - client_rc.top;
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND::default()),
+                    0,
+                    0,
+                    w,
+                    h,
+                    SWP_NOZORDER | SWP_FRAMECHANGED,
+                );
+            }
+
+            state.is_fullscreen = true;
+        }
+    } else {
+        // Exiting Fullscreen
+        let _ = SetWindowLongPtrW(target, GWL_STYLE, state.saved_style);
+        if !state.saved_menu.is_invalid() {
+            let _ = SetMenu(target, Some(state.saved_menu));
+        }
+        if let Some(ref wp) = state.saved_placement {
+            let _ = SetWindowPlacement(target, wp);
+        }
+        let _ = SetWindowPos(
+            target,
+            Some(HWND::default()),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED,
+        );
+
+        let mut client_rc = RECT::default();
+        if GetClientRect(target, &mut client_rc).is_ok() {
+            let w = client_rc.right - client_rc.left;
+            let h = client_rc.bottom - client_rc.top;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND::default()),
+                0,
+                0,
+                w,
+                h,
+                SWP_NOZORDER | SWP_FRAMECHANGED,
+            );
+        }
+
+        state.is_fullscreen = false;
+    }
+
+    update_lister_title(state.parent_hwnd, state);
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    let _ = UpdateWindow(hwnd);
+}
+
+pub unsafe fn perform_zoom(hwnd: HWND, zoom_in: bool, center_x: f32, center_y: f32) {
+    let Some(state) = get_viewer_state(hwnd) else { return };
+    let Some(ref img) = state.image else { return };
+
+    let mut client_rc = RECT::default();
+    if GetClientRect(hwnd, &mut client_rc).is_err() { return; }
+    let win_w = (client_rc.right - client_rc.left) as f32;
+    let win_h = (client_rc.bottom - client_rc.top) as f32;
+    if win_w <= 0.0 || win_h <= 0.0 { return; }
+
+    let fit_scale_x = win_w / img.width as f32;
+    let fit_scale_y = win_h / img.height as f32;
+    let fit_scale = fit_scale_x.min(fit_scale_y);
+
+    let (current_scale, cur_off_x, cur_off_y) = match state.zoom_mode {
+        ZoomMode::Fit => {
+            let dst_w = (img.width as f32 * fit_scale).round();
+            let dst_h = (img.height as f32 * fit_scale).round();
+            let dst_x = ((win_w - dst_w) / 2.0).round();
+            let dst_y = ((win_h - dst_h) / 2.0).round();
+            (fit_scale, dst_x, dst_y)
+        }
+        ZoomMode::Custom(s) => (s, state.offset_x, state.offset_y),
+    };
+
+    let factor = if zoom_in { 1.25 } else { 0.8 };
+    let new_scale = (current_scale * factor).clamp(0.05, 50.0);
+
+    // If zooming out and very close to fit scale, snap back to Fit
+    if (new_scale - fit_scale).abs() / fit_scale < 0.04 && !zoom_in {
+        state.zoom_mode = ZoomMode::Fit;
+        state.offset_x = 0.0;
+        state.offset_y = 0.0;
+    } else {
+        // Zoom centered at cursor
+        let img_coord_x = (center_x - cur_off_x) / current_scale;
+        let img_coord_y = (center_y - cur_off_y) / current_scale;
+        let new_off_x = center_x - img_coord_x * new_scale;
+        let new_off_y = center_y - img_coord_y * new_scale;
+
+        state.zoom_mode = ZoomMode::Custom(new_scale);
+        state.offset_x = new_off_x;
+        state.offset_y = new_off_y;
+    }
+
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    let _ = UpdateWindow(hwnd);
+    update_lister_title(state.parent_hwnd, state);
+}
+
+pub unsafe fn reset_zoom_fit(hwnd: HWND) {
+    let Some(state) = get_viewer_state(hwnd) else { return };
+    state.zoom_mode = ZoomMode::Fit;
+    state.offset_x = 0.0;
+    state.offset_y = 0.0;
+    state.is_dragging = false;
+
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    let _ = UpdateWindow(hwnd);
+    update_lister_title(state.parent_hwnd, state);
+}
+
+pub unsafe fn reset_zoom_100(hwnd: HWND) {
+    let Some(state) = get_viewer_state(hwnd) else { return };
+    let Some(ref img) = state.image else { return };
+
+    let mut client_rc = RECT::default();
+    if GetClientRect(hwnd, &mut client_rc).is_err() { return; }
+    let win_w = (client_rc.right - client_rc.left) as f32;
+    let win_h = (client_rc.bottom - client_rc.top) as f32;
+
+    state.zoom_mode = ZoomMode::Custom(1.0);
+    state.offset_x = ((win_w - img.width as f32) / 2.0).round();
+    state.offset_y = ((win_h - img.height as f32) / 2.0).round();
+    state.is_dragging = false;
+
+    let _ = InvalidateRect(Some(hwnd), None, false);
+    let _ = UpdateWindow(hwnd);
     update_lister_title(state.parent_hwnd, state);
 }
 
@@ -161,7 +358,6 @@ unsafe extern "system" fn wlx_wnd_proc(
 ) -> LRESULT {
     match msg {
         WM_ERASEBKGND => {
-            // Signal that background is fully handled inside double-buffered paint
             LRESULT(1)
         }
         WM_PAINT => {
@@ -174,27 +370,114 @@ unsafe extern "system" fn wlx_wnd_proc(
             LRESULT(0)
         }
         WM_SIZE => {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(hwnd), None, false);
+            let _ = InvalidateRect(Some(hwnd), None, false);
             LRESULT(0)
         }
         WM_LBUTTONDOWN => {
             let _ = SetFocus(Some(hwnd));
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            if let Some(state) = get_viewer_state(hwnd) {
+                if state.zoom_mode == ZoomMode::Fit {
+                    let mut client_rc = RECT::default();
+                    if GetClientRect(hwnd, &mut client_rc).is_ok() {
+                        if let Some(ref img) = state.image {
+                            let win_w = (client_rc.right - client_rc.left) as f32;
+                            let win_h = (client_rc.bottom - client_rc.top) as f32;
+                            let fit_scale = (win_w / img.width as f32).min(win_h / img.height as f32);
+                            let dst_w = (img.width as f32 * fit_scale).round();
+                            let dst_h = (img.height as f32 * fit_scale).round();
+                            state.offset_x = ((win_w - dst_w) / 2.0).round();
+                            state.offset_y = ((win_h - dst_h) / 2.0).round();
+                        }
+                    }
+                }
+
+                state.is_dragging = true;
+                state.drag_start_x = x;
+                state.drag_start_y = y;
+                state.drag_start_offset_x = state.offset_x;
+                state.drag_start_offset_y = state.offset_y;
+                let _ = SetCapture(hwnd);
+            }
             LRESULT(0)
         }
-        WM_LBUTTONDBLCLK => {
-            if let Ok(parent) = GetParent(hwnd) {
-                if !parent.is_invalid() {
-                    let _ = PostMessageW(Some(parent), WM_LBUTTONDBLCLK, wparam, lparam);
+        WM_MOUSEMOVE => {
+            let x = (lparam.0 & 0xFFFF) as i16 as i32;
+            let y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
+
+            if let Some(state) = get_viewer_state(hwnd) {
+                if state.is_dragging {
+                    let dx = x - state.drag_start_x;
+                    let dy = y - state.drag_start_y;
+
+                    if state.zoom_mode == ZoomMode::Fit {
+                        let mut client_rc = RECT::default();
+                        if GetClientRect(hwnd, &mut client_rc).is_ok() {
+                            if let Some(ref img) = state.image {
+                                let win_w = (client_rc.right - client_rc.left) as f32;
+                                let win_h = (client_rc.bottom - client_rc.top) as f32;
+                                let fit_scale = (win_w / img.width as f32).min(win_h / img.height as f32);
+                                state.zoom_mode = ZoomMode::Custom(fit_scale);
+                            }
+                        }
+                    }
+
+                    state.offset_x = state.drag_start_offset_x + dx as f32;
+                    state.offset_y = state.drag_start_offset_y + dy as f32;
+                    let _ = InvalidateRect(Some(hwnd), None, false);
+                    let _ = UpdateWindow(hwnd);
                 }
             }
             LRESULT(0)
         }
+        WM_LBUTTONUP => {
+            if let Some(state) = get_viewer_state(hwnd) {
+                if state.is_dragging {
+                    state.is_dragging = false;
+                    let _ = ReleaseCapture();
+                }
+            }
+            LRESULT(0)
+        }
+        WM_LBUTTONDBLCLK => {
+            toggle_fullscreen(hwnd);
+            LRESULT(0)
+        }
+        WM_SETCURSOR => {
+            if let Some(state) = get_viewer_state(hwnd) {
+                let cursor_id = if state.is_dragging {
+                    IDC_SIZEALL
+                } else if state.zoom_mode != ZoomMode::Fit {
+                    IDC_HAND
+                } else {
+                    IDC_ARROW
+                };
+                if let Ok(c) = LoadCursorW(None, cursor_id) {
+                    let _ = SetCursor(Some(c));
+                    return LRESULT(1);
+                }
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_MOUSEWHEEL => {
+            let ctrl_down = (GetKeyState(VK_CONTROL.0 as i32) as i16) < 0;
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            if delta < 0 {
-                navigate_viewer(hwnd, true);
-            } else if delta > 0 {
-                navigate_viewer(hwnd, false);
+
+            if ctrl_down {
+                let mut pt = POINT {
+                    x: (lparam.0 & 0xFFFF) as i16 as i32,
+                    y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+                };
+                let _ = ScreenToClient(hwnd, &mut pt);
+                perform_zoom(hwnd, delta > 0, pt.x as f32, pt.y as f32);
+            } else {
+                if delta < 0 {
+                    navigate_viewer(hwnd, true);
+                } else if delta > 0 {
+                    navigate_viewer(hwnd, false);
+                }
             }
             LRESULT(0)
         }
@@ -210,6 +493,56 @@ unsafe extern "system" fn wlx_wnd_proc(
         WM_KEYDOWN => {
             let vk = wparam.0 as usize;
             match vk {
+                // Enter (0x0D), F (0x46), or F11 (0x7A): Toggle Fullscreen
+                0x0D | 0x46 | 0x7A => {
+                    toggle_fullscreen(hwnd);
+                    LRESULT(0)
+                }
+                // Escape (0x1B): If in fullscreen -> exit fullscreen; else close Lister
+                0x1B => {
+                    if let Some(state) = get_viewer_state(hwnd) {
+                        if state.is_fullscreen {
+                            toggle_fullscreen(hwnd);
+                            return LRESULT(0);
+                        }
+                    }
+                    if let Ok(parent) = GetParent(hwnd) {
+                        if !parent.is_invalid() {
+                            let _ = PostMessageW(Some(parent), WM_KEYDOWN, wparam, lparam);
+                        }
+                    }
+                    LRESULT(0)
+                }
+                // Zoom In: '+' (0xBB = VK_OEM_PLUS, 0x6B = VK_ADD)
+                0xBB | 0x6B => {
+                    let mut rc = RECT::default();
+                    if GetClientRect(hwnd, &mut rc).is_ok() {
+                        let cx = ((rc.right - rc.left) / 2) as f32;
+                        let cy = ((rc.bottom - rc.top) / 2) as f32;
+                        perform_zoom(hwnd, true, cx, cy);
+                    }
+                    LRESULT(0)
+                }
+                // Zoom Out: '-' (0xBD = VK_OEM_MINUS, 0x6D = VK_SUBTRACT)
+                0xBD | 0x6D => {
+                    let mut rc = RECT::default();
+                    if GetClientRect(hwnd, &mut rc).is_ok() {
+                        let cx = ((rc.right - rc.left) / 2) as f32;
+                        let cy = ((rc.bottom - rc.top) / 2) as f32;
+                        perform_zoom(hwnd, false, cx, cy);
+                    }
+                    LRESULT(0)
+                }
+                // 100% Size: '1' (0x31) or Numpad 1 (0x61)
+                0x31 | 0x61 => {
+                    reset_zoom_100(hwnd);
+                    LRESULT(0)
+                }
+                // Fit to Window: '0' (0x30), Numpad 0 (0x60), '*' (0x6A), '/' (0x6F)
+                0x30 | 0x60 | 0x6A | 0x6F => {
+                    reset_zoom_fit(hwnd);
+                    LRESULT(0)
+                }
                 // Next file: 'N' (0x4E), Space (0x20), Right Arrow (0x27), PageDown (0x22), Down Arrow (0x28)
                 0x4E | 0x20 | 0x27 | 0x22 | 0x28 => {
                     navigate_viewer(hwnd, true);
@@ -218,15 +551,6 @@ unsafe extern "system" fn wlx_wnd_proc(
                 // Previous file: 'P' (0x50), Backspace (0x08), Left Arrow (0x25), PageUp (0x21), Up Arrow (0x26)
                 0x50 | 0x08 | 0x25 | 0x21 | 0x26 => {
                     navigate_viewer(hwnd, false);
-                    LRESULT(0)
-                }
-                // Escape (0x1B) or other keys: forward to parent Lister window
-                0x1B => {
-                    if let Ok(parent) = GetParent(hwnd) {
-                        if !parent.is_invalid() {
-                            let _ = PostMessageW(Some(parent), WM_KEYDOWN, wparam, lparam);
-                        }
-                    }
                     LRESULT(0)
                 }
                 _ => {
@@ -259,7 +583,6 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
         return;
     }
 
-    // Double buffering: Create offscreen memory DC and compatible bitmap
     let mem_dc = CreateCompatibleDC(Some(hdc));
     if mem_dc.is_invalid() {
         return;
@@ -271,15 +594,14 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
     }
     let old_bmp = SelectObject(mem_dc, mem_bmp.into());
 
-    // Dark sleek background (0x181818)
     let bg_brush = CreateSolidBrush(COLORREF(0x00181818));
     FillRect(mem_dc, &client_rect, bg_brush);
     let _ = DeleteObject(bg_brush.into());
 
     if let Some(state) = get_viewer_state(hwnd) {
         if let Some(ref img) = state.image {
-            let (dst_x, dst_y, dst_w, dst_h) = calculate_letterbox(
-                img.width, img.height, win_w as u32, win_h as u32,
+            let (dst_x, dst_y, dst_w, dst_h) = calculate_image_rect(
+                img.width, img.height, win_w as u32, win_h as u32, state,
             );
 
             let mut bmi = BITMAPINFO::default();
@@ -310,7 +632,6 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
         }
     }
 
-    // Blit to screen in one atomic operation
     let _ = BitBlt(hdc, 0, 0, win_w, win_h, Some(mem_dc), 0, 0, SRCCOPY);
 
     SelectObject(mem_dc, old_bmp);
@@ -318,19 +639,29 @@ unsafe fn paint_viewer(hwnd: HWND, hdc: HDC) {
     let _ = DeleteDC(mem_dc);
 }
 
-fn calculate_letterbox(src_w: u32, src_h: u32, win_w: u32, win_h: u32) -> (i32, i32, i32, i32) {
-    if src_w == 0 || src_h == 0 || win_w == 0 || win_h == 0 {
+fn calculate_image_rect(img_w: u32, img_h: u32, win_w: u32, win_h: u32, state: &ViewerState) -> (i32, i32, i32, i32) {
+    if img_w == 0 || img_h == 0 || win_w == 0 || win_h == 0 {
         return (0, 0, win_w as i32, win_h as i32);
     }
 
-    let scale_x = win_w as f64 / src_w as f64;
-    let scale_y = win_h as f64 / src_h as f64;
-    let scale = scale_x.min(scale_y);
+    let fit_scale_x = win_w as f32 / img_w as f32;
+    let fit_scale_y = win_h as f32 / img_h as f32;
+    let fit_scale = fit_scale_x.min(fit_scale_y);
 
-    let dst_w = (src_w as f64 * scale).round() as i32;
-    let dst_h = (src_h as f64 * scale).round() as i32;
-    let dst_x = (win_w as i32 - dst_w) / 2;
-    let dst_y = (win_h as i32 - dst_h) / 2;
-
-    (dst_x, dst_y, dst_w, dst_h)
+    match state.zoom_mode {
+        ZoomMode::Fit => {
+            let dst_w = (img_w as f32 * fit_scale).round();
+            let dst_h = (img_h as f32 * fit_scale).round();
+            let dst_x = ((win_w as f32 - dst_w) / 2.0).round();
+            let dst_y = ((win_h as f32 - dst_h) / 2.0).round();
+            (dst_x as i32, dst_y as i32, dst_w as i32, dst_h as i32)
+        }
+        ZoomMode::Custom(scale) => {
+            let dst_w = (img_w as f32 * scale).round();
+            let dst_h = (img_h as f32 * scale).round();
+            let dst_x = state.offset_x.round();
+            let dst_y = state.offset_y.round();
+            (dst_x as i32, dst_y as i32, dst_w as i32, dst_h as i32)
+        }
+    }
 }
