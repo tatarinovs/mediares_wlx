@@ -9,8 +9,9 @@ use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY,
     OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SetDlgItemTextW,
+    DefWindowProcW, MessageBoxW, MB_ICONINFORMATION, MB_OK, GetDlgCtrlID, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, SendDlgItemMessageW, SetDlgItemTextW,
     WS_BORDER,
     SetWindowLongPtrW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
     BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, GWLP_USERDATA,
@@ -19,7 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog::{self, Brush, GdiObject};
+use crate::file_actions::show_error;
 use crate::playlist::Repeat;
+use crate::tc_register::Registration;
 
 const CLASS_NAME: PCWSTR = w!("MediaresSettingsDialogClass");
 
@@ -47,6 +50,7 @@ const IDC_VIDEO_EDITOR: i32 = 121;
 const IDC_BROWSE_VIDEO_EDITOR: i32 = 122;
 const IDC_AUDIO_EDITOR: i32 = 123;
 const IDC_BROWSE_AUDIO_EDITOR: i32 = 124;
+const IDC_REGISTER_WDX: i32 = 125;
 
 const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
@@ -77,6 +81,8 @@ struct Context {
     slideshow_seconds: Vec<u32>,
     /// Fills both previews: the background swatch and the OSD "Aa" (shown on that background).
     background_brush: Brush,
+    /// Read from `wincmd.ini` on every opening: TC or the user may have changed the plugin list.
+    registration: Option<Registration>,
     result: Option<ViewerConfig>,
 }
 
@@ -93,6 +99,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         font_sizes: with_current(FONT_SIZES, current.osd_font_size, |a, b| a == b),
         slideshow_seconds: with_current(SLIDESHOW_SECONDS, current.slideshow_seconds, |a, b| a == b),
         background_brush: GdiObject(CreateSolidBrush(COLORREF(current.photo_background))),
+        registration: Registration::find(),
         result: None,
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
@@ -192,9 +199,40 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     program_row(225, "Видео:", &cfg.video_editor, IDC_VIDEO_EDITOR, IDC_BROWSE_VIDEO_EDITOR);
     program_row(257, "Аудио:", &cfg.audio_editor, IDC_AUDIO_EDITOR, IDC_BROWSE_AUDIO_EDITOR);
 
+    control(w!("BUTTON"), "Контентный плагин (WDX)", BS_GROUPBOX as u32, (425, 300, 395, 102), 0);
+    let hint = "Поля mediares для колонок, поиска дубликатов и группового переименования в TC";
+    control(w!("STATIC"), hint, SS_LEFT, (438, 323, 370, 36), 0);
+    let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
+    let label = if registered { REGISTERED_LABEL } else { "Зарегистрировать WDX" };
+    let button = control(w!("BUTTON"), label, tab | BS_PUSHBUTTON as u32, (438, 363, 200, 26), IDC_REGISTER_WDX);
+    let _ = EnableWindow(button, !registered);
+
     let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (615, 461, 95, 28), IDOK.0);
     control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (725, 461, 95, 28), IDCANCEL.0);
     ok
+}
+
+const REGISTERED_LABEL: &str = "WDX зарегистрирован";
+
+/// Adds this DLL to `[ContentPlugins]` right away (independent of OK / Cancel), then greys the button.
+unsafe fn register_wdx(dlg: HWND, ctx: &mut Context) {
+    let Some(registration) = ctx.registration.as_mut() else {
+        show_error(dlg, "Не найден wincmd.ini. Подключите плагин вручную: Конфигурация → Настройка → Плагины → Контентные плагины → Добавить, выбрать mediares.wlx64.");
+        return;
+    };
+    if let Err(message) = registration.register() {
+        show_error(dlg, &message);
+        return;
+    }
+    MessageBoxW(Some(dlg), w!("WDX зарегистрирован, перезапустите Total Commander."), w!("Mediares"), MB_OK | MB_ICONINFORMATION);
+    if let Ok(button) = GetDlgItem(Some(dlg), IDC_REGISTER_WDX) {
+        let _ = SetDlgItemTextW(dlg, IDC_REGISTER_WDX, &HSTRING::from(REGISTERED_LABEL));
+        let _ = EnableWindow(button, false);
+    }
+    // The disabled button can't keep the keyboard focus.
+    if let Ok(ok) = GetDlgItem(Some(dlg), IDOK.0) {
+        let _ = SetFocus(Some(ok));
+    }
 }
 
 unsafe fn is_checked(dlg: HWND, id: i32) -> bool {
@@ -327,6 +365,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     IDC_BROWSE_PHOTO_EDITOR => browse_program(hwnd, IDC_PHOTO_EDITOR),
                     IDC_BROWSE_VIDEO_EDITOR => browse_program(hwnd, IDC_VIDEO_EDITOR),
                     IDC_BROWSE_AUDIO_EDITOR => browse_program(hwnd, IDC_AUDIO_EDITOR),
+                    IDC_REGISTER_WDX => register_wdx(hwnd, ctx),
                     id if id == IDOK.0 => {
                         accept(hwnd, ctx);
                         dialog::close(hwnd);

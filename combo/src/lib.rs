@@ -21,6 +21,7 @@ mod resume;
 mod settings_dialog;
 mod snapshot;
 mod state;
+mod tc_register;
 mod transport_bar;
 mod video_view;
 mod window;

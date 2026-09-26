@@ -32,8 +32,7 @@ fn ini_path() -> PathBuf {
     if let Some(p) = portable.as_ref().filter(|p| p.exists()) {
         return p.clone();
     }
-    let tc_dir = TC_INI_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    tc_dir.map(|d| d.join(INI_NAME)).or(portable).unwrap_or_else(|| PathBuf::from(INI_NAME))
+    tc_ini_dir().map(|d| d.join(INI_NAME)).or(portable).unwrap_or_else(|| PathBuf::from(INI_NAME))
 }
 
 /// A data file kept next to `mediares.ini`.
@@ -41,13 +40,23 @@ pub fn data_file(name: &str) -> PathBuf {
     ini_path().with_file_name(name)
 }
 
-fn dll_dir() -> Option<PathBuf> {
+/// Directory of TC's default plugin INI — normally the one holding `wincmd.ini` too.
+pub fn tc_ini_dir() -> Option<PathBuf> {
+    TC_INI_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Full path of this DLL.
+pub fn dll_path() -> Option<PathBuf> {
     let mut buf = [0u16; 1024];
     let len = unsafe { GetModuleFileNameW(Some(crate::module().into()), &mut buf) } as usize;
     if len == 0 || len >= buf.len() {
         return None;
     }
-    PathBuf::from(String::from_utf16_lossy(&buf[..len])).parent().map(Path::to_path_buf)
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+fn dll_dir() -> Option<PathBuf> {
+    dll_path()?.parent().map(Path::to_path_buf)
 }
 
 /// Where the on-screen info line is shown.
