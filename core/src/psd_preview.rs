@@ -64,7 +64,8 @@ fn find_thumbnail_resource(res: &[u8]) -> Option<&[u8]> {
         let name_len = res[idx + 6] as usize;
         let data_offset = idx + 6 + ((name_len + 2) & !1);
         let size_bytes = res.get(data_offset..data_offset + 4)?;
-        let size = u32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]]) as usize;
+        let size = u32::from_be_bytes([size_bytes[0], size_bytes[1], size_bytes[2], size_bytes[3]])
+            as usize;
         let start = data_offset + 4;
         let end = start.checked_add(size)?;
 
@@ -114,7 +115,10 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
         16 => 2,
         _ => return None,
     };
-    if !matches!(color_mode, MODE_GRAYSCALE | MODE_INDEXED | MODE_RGB | MODE_CMYK) {
+    if !matches!(
+        color_mode,
+        MODE_GRAYSCALE | MODE_INDEXED | MODE_RGB | MODE_CMYK
+    ) {
         return None;
     }
     if width == 0 || height == 0 || channels == 0 {
@@ -136,7 +140,9 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
         }
         palette.resize(PALETTE_LEN, 0);
         reader.read_exact(&mut palette).ok()?;
-        reader.seek(SeekFrom::Current((color_data_len - PALETTE_LEN) as i64)).ok()?;
+        reader
+            .seek(SeekFrom::Current((color_data_len - PALETTE_LEN) as i64))
+            .ok()?;
     } else {
         reader.seek(SeekFrom::Current(color_data_len as i64)).ok()?;
     }
@@ -153,7 +159,9 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     } else {
         read_u32(&mut reader)? as u64
     };
-    reader.seek(SeekFrom::Current(i64::try_from(layer_len).ok()?)).ok()?;
+    reader
+        .seek(SeekFrom::Current(i64::try_from(layer_len).ok()?))
+        .ok()?;
 
     // Section 5: Image Data.
     let mut comp_buf = [0u8; 2];
@@ -250,7 +258,9 @@ fn compose_rgba(color_mode: u16, planes: &[Vec<u8>], palette: &[u8], num_pixels:
             // Photoshop stores CMYK inverted (255 = no ink), so R = C' * K' / 255.
             let (c, m, y, k) = (plane(0), plane(1), plane(2), plane(3));
             let mix = |v: u8, k: u8| ((v as u32 * k as u32) / 255) as u8;
-            fill(&mut rgba, alpha(4), &|i| [mix(c[i], k[i]), mix(m[i], k[i]), mix(y[i], k[i])]);
+            fill(&mut rgba, alpha(4), &|i| {
+                [mix(c[i], k[i]), mix(m[i], k[i]), mix(y[i], k[i])]
+            });
         }
         MODE_GRAYSCALE => {
             let g = plane(0);
@@ -296,15 +306,15 @@ mod tests {
     use super::*;
 
     const TEST_PSD_2X2: &[u8] = &[
-        56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 1, 255, 255, 1, 0, 0, 1,
-        0, 0, 1, 255, 255, 1, 0, 0, 1, 0, 0,
+        56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 1, 255, 255, 1, 0, 0,
+        1, 0, 0, 1, 255, 255, 1, 0, 0, 1, 0, 0,
     ];
 
     const TEST_PSD_RGBA: &[u8] = &[
-        56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 1, 255, 255,
-        1, 0, 0, 1, 0, 0, 1, 255, 255, 1, 0, 0, 1, 0, 0, 1, 255, 0, 1, 128, 255,
+        56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 4, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 0, 3, 1, 255,
+        255, 1, 0, 0, 1, 0, 0, 1, 255, 255, 1, 0, 0, 1, 0, 0, 1, 255, 0, 1, 128, 255,
     ];
 
     fn load(name: &str, bytes: &[u8]) -> Option<DynamicImage> {
@@ -317,7 +327,9 @@ mod tests {
 
     #[test]
     fn decodes_rgb_composite() {
-        let rgba = load("mediares_test_2x2.psd", TEST_PSD_2X2).expect("2x2 psd").to_rgba8();
+        let rgba = load("mediares_test_2x2.psd", TEST_PSD_2X2)
+            .expect("2x2 psd")
+            .to_rgba8();
         assert_eq!(rgba.dimensions(), (2, 2));
         assert_eq!(rgba.get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(rgba.get_pixel(0, 1).0, [0, 255, 0, 255]);
@@ -325,7 +337,9 @@ mod tests {
 
     #[test]
     fn decodes_rgba_composite() {
-        let rgba = load("mediares_test_rgba.psd", TEST_PSD_RGBA).expect("rgba psd").to_rgba8();
+        let rgba = load("mediares_test_rgba.psd", TEST_PSD_RGBA)
+            .expect("rgba psd")
+            .to_rgba8();
         assert_eq!(rgba.get_pixel(1, 0).0, [255, 0, 0, 0]);
         assert_eq!(rgba.get_pixel(0, 1).0, [0, 255, 0, 128]);
     }

@@ -86,14 +86,23 @@ impl AudioPlayer {
             muted: AtomicBool::new(false),
             volume: AtomicU32::new(1.0f32.to_bits()),
         });
-        Some(Self { track: None, levels, sink })
+        Some(Self {
+            track: None,
+            levels,
+            sink,
+        })
     }
 
     /// Replaces the current track with `path` and starts playing it. False if the file can't be
     /// decoded (the previous track keeps playing then).
     pub fn open(&mut self, path: &Path) -> bool {
-        let Some(decoder) = AudioDecoder::open(path) else { return false };
-        let (Some(channels), Some(rate)) = (NonZero::new(decoder.channels), NonZero::new(decoder.sample_rate)) else {
+        let Some(decoder) = AudioDecoder::open(path) else {
+            return false;
+        };
+        let (Some(channels), Some(rate)) = (
+            NonZero::new(decoder.channels),
+            NonZero::new(decoder.sample_rate),
+        ) else {
             return false;
         };
         let duration = decoder.duration.unwrap_or(0.0);
@@ -112,7 +121,11 @@ impl AudioPlayer {
             return false;
         }
 
-        self.track = Some(Track { state: state.clone(), commands, duration });
+        self.track = Some(Track {
+            state: state.clone(),
+            commands,
+            duration,
+        });
         self.levels.paused.store(false, Ordering::Relaxed);
         self.sink.mixer().add(TrackSource {
             levels: self.levels.clone(),
@@ -134,7 +147,9 @@ impl AudioPlayer {
 
     /// The track played to its end (and nobody pressed play since).
     pub fn is_ended(&self) -> bool {
-        self.track.as_ref().is_some_and(|t| t.state.ended.load(Ordering::Relaxed))
+        self.track
+            .as_ref()
+            .is_some_and(|t| t.state.ended.load(Ordering::Relaxed))
     }
 }
 
@@ -155,7 +170,9 @@ impl Transport for AudioPlayer {
     }
 
     fn position(&self) -> f64 {
-        self.track.as_ref().map_or(0.0, |t| f64::from_bits(t.state.position.load(Ordering::Relaxed)))
+        self.track.as_ref().map_or(0.0, |t| {
+            f64::from_bits(t.state.position.load(Ordering::Relaxed))
+        })
     }
 
     fn duration(&self) -> f64 {
@@ -164,7 +181,11 @@ impl Transport for AudioPlayer {
 
     fn seek(&self, seconds: f64, _approximate: bool) {
         let Some(track) = &self.track else { return };
-        let seconds = if track.duration > 0.0 { seconds.clamp(0.0, track.duration) } else { seconds.max(0.0) };
+        let seconds = if track.duration > 0.0 {
+            seconds.clamp(0.0, track.duration)
+        } else {
+            seconds.max(0.0)
+        };
         let epoch = track.state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         track.state.set_position(seconds);
         track.state.ended.store(false, Ordering::Relaxed);
@@ -176,7 +197,9 @@ impl Transport for AudioPlayer {
     }
 
     fn set_volume(&self, volume: f64) {
-        self.levels.volume.store((volume.clamp(0.0, 1.0) as f32).to_bits(), Ordering::Relaxed);
+        self.levels
+            .volume
+            .store((volume.clamp(0.0, 1.0) as f32).to_bits(), Ordering::Relaxed);
     }
 
     fn is_muted(&self) -> bool {
@@ -205,9 +228,17 @@ fn decode_loop(mut decoder: AudioDecoder, commands: Receiver<Command>, chunks: S
                 Err(TryRecvError::Disconnected) => return,
             }
         };
-        if let Some(Command::Seek { mut seconds, epoch: mut latest }) = command {
+        if let Some(Command::Seek {
+            mut seconds,
+            epoch: mut latest,
+        }) = command
+        {
             // Scrubbing queues many seeks: only the last one matters.
-            while let Ok(Command::Seek { seconds: s, epoch: e }) = commands.try_recv() {
+            while let Ok(Command::Seek {
+                seconds: s,
+                epoch: e,
+            }) = commands.try_recv()
+            {
                 (seconds, latest) = (s, e);
             }
             epoch = latest;
@@ -216,10 +247,20 @@ fn decode_loop(mut decoder: AudioDecoder, commands: Receiver<Command>, chunks: S
         }
 
         let chunk = match decoder.next_chunk() {
-            Some(c) => Chunk { epoch, start: c.start, samples: c.samples.to_vec(), end: false },
+            Some(c) => Chunk {
+                epoch,
+                start: c.start,
+                samples: c.samples.to_vec(),
+                end: false,
+            },
             None => {
                 finished = true;
-                Chunk { epoch, start: 0.0, samples: Vec::new(), end: true }
+                Chunk {
+                    epoch,
+                    start: 0.0,
+                    samples: Vec::new(),
+                    end: true,
+                }
             }
         };
         // Blocks while the buffer is full; the source drains stale chunks even when paused, so a
@@ -286,7 +327,8 @@ impl TrackSource {
             return false;
         }
         self.frames_played += 1;
-        self.state.set_position(self.buf_start + self.frames_played as f64 / self.rate.get() as f64);
+        self.state
+            .set_position(self.buf_start + self.frames_played as f64 / self.rate.get() as f64);
         true
     }
 }

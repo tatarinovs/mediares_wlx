@@ -62,24 +62,35 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
     let primary = file.primary_tag().map(|p| p.tag_type());
     let mut all: Vec<&Tag> = file.primary_tag().into_iter().collect();
     all.extend(file.tags().iter().filter(|t| Some(t.tag_type()) != primary));
-    let text = |s: Option<std::borrow::Cow<'_, str>>| s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    let text = |s: Option<std::borrow::Cow<'_, str>>| {
+        s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+    };
     for tag in all {
         tags.title = tags.title.take().or_else(|| text(tag.title()));
         tags.artist = tags.artist.take().or_else(|| text(tag.artist()));
         tags.album = tags.album.take().or_else(|| text(tag.album()));
-        tags.album_artist = tags.album_artist.take().or_else(|| text(tag.get_string(ItemKey::AlbumArtist).map(Into::into)));
+        tags.album_artist = tags
+            .album_artist
+            .take()
+            .or_else(|| text(tag.get_string(ItemKey::AlbumArtist).map(Into::into)));
         tags.genre = tags.genre.take().or_else(|| text(tag.genre()));
         tags.comment = tags.comment.take().or_else(|| text(tag.comment()));
         tags.year = tags.year.or_else(|| tag.date().map(|d| d.year as u32));
         tags.track = tags.track.or_else(|| tag.track());
         tags.disc = tags.disc.or_else(|| tag.disk());
-        tags.composer = tags.composer.take().or_else(|| text(tag.get_string(ItemKey::Composer).map(Into::into)));
+        tags.composer = tags
+            .composer
+            .take()
+            .or_else(|| text(tag.get_string(ItemKey::Composer).map(Into::into)));
         tags.track_total = tags.track_total.or_else(|| tag.track_total());
         tags.disc_total = tags.disc_total.or_else(|| tag.disk_total());
         let pictures = tag.pictures();
         tags.has_cover |= !pictures.is_empty();
         if with_cover && tags.cover.is_none() {
-            let front = pictures.iter().find(|p| p.pic_type() == PictureType::CoverFront).or(pictures.first());
+            let front = pictures
+                .iter()
+                .find(|p| p.pic_type() == PictureType::CoverFront)
+                .or(pictures.first());
             tags.cover = front.map(|p| p.data().to_vec()).filter(|d| !d.is_empty());
         }
     }
@@ -96,7 +107,9 @@ fn codec_of(path: &Path, file_type: FileType) -> Option<(&'static str, bool)> {
         FileType::Ape => ("Monkey's Audio", true),
         FileType::Flac => ("FLAC", true),
         FileType::Mpeg => {
-            let mp2 = path.extension().is_some_and(|e| e.eq_ignore_ascii_case("mp2"));
+            let mp2 = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("mp2"));
             (if mp2 { "MP2" } else { "MP3" }, false)
         }
         FileType::Mp4 => {
@@ -146,7 +159,16 @@ impl AudioTags {
     /// song tagged slightly differently (duplicate search).
     pub fn normalized_artist_title(&self) -> Option<String> {
         let norm = |s: &str| {
-            let cleaned: String = s.chars().flat_map(|c| if c.is_alphanumeric() { c.to_lowercase().collect() } else { vec![' '] }).collect();
+            let cleaned: String = s
+                .chars()
+                .flat_map(|c| {
+                    if c.is_alphanumeric() {
+                        c.to_lowercase().collect()
+                    } else {
+                        vec![' ']
+                    }
+                })
+                .collect();
             cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
         };
         let (artist, title) = (norm(self.any_artist()?), norm(self.title.as_deref()?));
@@ -158,7 +180,11 @@ impl AudioTags {
         let mut parts = Vec::new();
         if let Some(rate) = self.sample_rate {
             let khz = rate as f64 / 1000.0;
-            parts.push(if rate % 1000 == 0 { format!("{} кГц", rate / 1000) } else { format!("{:.1} кГц", khz).replace('.', ",") });
+            parts.push(if rate % 1000 == 0 {
+                format!("{} кГц", rate / 1000)
+            } else {
+                format!("{:.1} кГц", khz).replace('.', ",")
+            });
         }
         if let Some(bits) = self.bit_depth {
             parts.push(format!("{} бит", bits));
@@ -195,14 +221,24 @@ mod tests {
         assert_eq!(t.display_title().as_deref(), Some("Band — Song"));
         assert_eq!(t.format_line(), "44,1 кГц · 16 бит · стерео · 1411 кбит/с");
         assert_eq!(AudioTags::default().display_title(), None);
-        assert_eq!(AudioTags { sample_rate: Some(48000), ..Default::default() }.format_line(), "48 кГц");
+        assert_eq!(
+            AudioTags {
+                sample_rate: Some(48000),
+                ..Default::default()
+            }
+            .format_line(),
+            "48 кГц"
+        );
     }
 
     #[test]
     fn codec_from_container() {
         let p = Path::new("x.mp3");
         assert_eq!(codec_of(p, FileType::Mpeg), Some(("MP3", false)));
-        assert_eq!(codec_of(Path::new("x.MP2"), FileType::Mpeg), Some(("MP2", false)));
+        assert_eq!(
+            codec_of(Path::new("x.MP2"), FileType::Mpeg),
+            Some(("MP2", false))
+        );
         assert_eq!(codec_of(p, FileType::Flac), Some(("FLAC", true)));
         assert_eq!(codec_of(p, FileType::Ape), Some(("Monkey's Audio", true)));
         assert_eq!(codec_of(p, FileType::Opus), Some(("Opus", false)));
@@ -213,10 +249,31 @@ mod tests {
 
     #[test]
     fn normalized_artist_title() {
-        let t = AudioTags { artist: Some("AC/DC".into()), title: Some("  Highway to  Hell! ".into()), ..Default::default() };
-        assert_eq!(t.normalized_artist_title().as_deref(), Some("ac dc - highway to hell"));
-        let album_only = AudioTags { album_artist: Some("Пикник".into()), title: Some("Остров".into()), ..Default::default() };
-        assert_eq!(album_only.normalized_artist_title().as_deref(), Some("пикник - остров"));
-        assert_eq!(AudioTags { title: Some("x".into()), ..Default::default() }.normalized_artist_title(), None);
+        let t = AudioTags {
+            artist: Some("AC/DC".into()),
+            title: Some("  Highway to  Hell! ".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            t.normalized_artist_title().as_deref(),
+            Some("ac dc - highway to hell")
+        );
+        let album_only = AudioTags {
+            album_artist: Some("Пикник".into()),
+            title: Some("Остров".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            album_only.normalized_artist_title().as_deref(),
+            Some("пикник - остров")
+        );
+        assert_eq!(
+            AudioTags {
+                title: Some("x".into()),
+                ..Default::default()
+            }
+            .normalized_artist_title(),
+            None
+        );
     }
 }

@@ -3,8 +3,8 @@
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{GlobalFree, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    DeleteDC, GetDeviceCaps, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, PHYSICALHEIGHT, PHYSICALOFFSETX, PHYSICALOFFSETY,
-    PHYSICALWIDTH, VERTRES,
+    DeleteDC, GetDeviceCaps, HDC, HORZRES, LOGPIXELSX, LOGPIXELSY, PHYSICALHEIGHT, PHYSICALOFFSETX,
+    PHYSICALOFFSETY, PHYSICALWIDTH, VERTRES,
 };
 use windows::Win32::Storage::Xps::{EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
 use windows::Win32::UI::Controls::Dialogs::{
@@ -19,7 +19,12 @@ const DEFAULT_MARGIN: i32 = 1000;
 const MM100_PER_INCH: i64 = 2540;
 
 /// Asks for the printer and prints `img`. `margins` in 1/100 mm (as TC's `ListPrint` passes them).
-pub unsafe fn print(owner: HWND, img: &DecodedImage, doc_name: &str, margins: Option<RECT>) -> bool {
+pub unsafe fn print(
+    owner: HWND,
+    img: &DecodedImage,
+    doc_name: &str,
+    margins: Option<RECT>,
+) -> bool {
     let mut pd = PRINTDLGW {
         lStructSize: size_of::<PRINTDLGW>() as u32,
         hwndOwner: owner,
@@ -37,7 +42,12 @@ pub unsafe fn print(owner: HWND, img: &DecodedImage, doc_name: &str, margins: Op
     if pd.hDC.is_invalid() {
         return false;
     }
-    let m = margins.unwrap_or(RECT { left: DEFAULT_MARGIN, top: DEFAULT_MARGIN, right: DEFAULT_MARGIN, bottom: DEFAULT_MARGIN });
+    let m = margins.unwrap_or(RECT {
+        left: DEFAULT_MARGIN,
+        top: DEFAULT_MARGIN,
+        right: DEFAULT_MARGIN,
+        bottom: DEFAULT_MARGIN,
+    });
     let ok = print_page(pd.hDC, img, doc_name, m);
     let _ = DeleteDC(pd.hDC);
     ok
@@ -45,7 +55,11 @@ pub unsafe fn print(owner: HWND, img: &DecodedImage, doc_name: &str, margins: Op
 
 unsafe fn print_page(dc: HDC, img: &DecodedImage, doc_name: &str, margins: RECT) -> bool {
     let name = HSTRING::from(doc_name);
-    let doc = DOCINFOW { cbSize: size_of::<DOCINFOW>() as i32, lpszDocName: PCWSTR(name.as_ptr()), ..Default::default() };
+    let doc = DOCINFOW {
+        cbSize: size_of::<DOCINFOW>() as i32,
+        lpszDocName: PCWSTR(name.as_ptr()),
+        ..Default::default()
+    };
     if StartDocW(dc, &doc) <= 0 {
         return false;
     }

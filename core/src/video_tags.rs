@@ -20,9 +20,14 @@ impl VideoTags {
     /// The year the date starts with ("2019", "2019-07-10...", "2022:12:31 ...").
     pub fn year(&self) -> Option<u32> {
         let date = self.date.as_deref()?.trim();
-        let digits = date.get(..4).filter(|d| d.bytes().all(|b| b.is_ascii_digit()))?;
+        let digits = date
+            .get(..4)
+            .filter(|d| d.bytes().all(|b| b.is_ascii_digit()))?;
         let rest_is_separate = !date[4..].starts_with(|c: char| c.is_ascii_digit());
-        digits.parse().ok().filter(|y| (1800..=2200).contains(y) && rest_is_separate)
+        digits
+            .parse()
+            .ok()
+            .filter(|y| (1800..=2200).contains(y) && rest_is_separate)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -32,8 +37,13 @@ impl VideoTags {
 
 /// Tags of `path`; empty if the container has none or isn't supported.
 pub fn read_video_tags(path: &Path) -> VideoTags {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
-    let Ok(file) = File::open(path) else { return VideoTags::default() };
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    let Ok(file) = File::open(path) else {
+        return VideoTags::default();
+    };
     let mut r = BufReader::new(file);
     let tags = match ext.as_str() {
         "mkv" | "webm" | "mka" | "mk3d" => read_matroska(&mut r),
@@ -62,11 +72,14 @@ fn fill(slot: &mut Option<String>, value: Option<String>) {
 /// Larger `udta` boxes are not read.
 const MAX_UDTA: u64 = 4 << 20;
 
+/// More boxes on one level means a damaged or crafted file; `moov`/`udta` come far earlier.
+const MAX_BOXES: usize = 4096;
+
 /// Boxes `(type, payload start, payload end)` between `start` and `end` of the file.
 fn mp4_boxes<R: Read + Seek>(r: &mut R, start: u64, end: u64) -> Vec<([u8; 4], u64, u64)> {
     let mut out = Vec::new();
     let mut pos = start;
-    while pos + 8 <= end {
+    while pos + 8 <= end && out.len() < MAX_BOXES {
         let mut hdr = [0u8; 8];
         if r.seek(SeekFrom::Start(pos)).is_err() || r.read_exact(&mut hdr).is_err() {
             break;
@@ -107,13 +120,19 @@ fn mp4_children(mut data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
 fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     let len = r.seek(SeekFrom::End(0)).ok()?;
     let top = mp4_boxes(r, 0, len);
-    if !top.first().is_some_and(|(kind, _, _)| matches!(kind, b"ftyp" | b"moov" | b"wide" | b"free" | b"mdat")) {
+    if !top
+        .first()
+        .is_some_and(|(kind, _, _)| matches!(kind, b"ftyp" | b"moov" | b"wide" | b"free" | b"mdat"))
+    {
         return None;
     }
     let (_, moov_start, moov_end) = *top.iter().find(|(kind, _, _)| kind == b"moov")?;
     let mut tags = VideoTags::default();
     // Only the movie's own udta; tracks may have theirs, about the track.
-    for (_, start, end) in mp4_boxes(r, moov_start, moov_end).into_iter().filter(|(kind, _, _)| kind == b"udta") {
+    for (_, start, end) in mp4_boxes(r, moov_start, moov_end)
+        .into_iter()
+        .filter(|(kind, _, _)| kind == b"udta")
+    {
         if end - start > MAX_UDTA {
             continue;
         }
@@ -131,7 +150,11 @@ fn parse_udta(udta: &[u8], tags: &mut VideoTags) {
         match &kind {
             b"meta" => {
                 // A full box (version + flags) in MP4; QuickTime writes it without them.
-                let body = if payload.get(4..8) == Some(b"hdlr") { payload } else { payload.get(4..).unwrap_or_default() };
+                let body = if payload.get(4..8) == Some(b"hdlr") {
+                    payload
+                } else {
+                    payload.get(4..).unwrap_or_default()
+                };
                 for (_, ilst) in mp4_children(body).filter(|(k, _)| k == b"ilst") {
                     for (item, data) in mp4_children(ilst) {
                         apply_mp4(&item, ilst_text(data), tags);
@@ -139,7 +162,9 @@ fn parse_udta(udta: &[u8], tags: &mut VideoTags) {
                 }
             }
             [0xA9, ..] => apply_mp4(&kind, quicktime_text(payload), tags),
-            b"titl" | b"auth" | b"perf" | b"dscp" | b"gnre" | b"yrrc" => apply_mp4(&kind, threegpp_text(&kind, payload), tags),
+            b"titl" | b"auth" | b"perf" | b"dscp" | b"gnre" | b"yrrc" => {
+                apply_mp4(&kind, threegpp_text(&kind, payload), tags)
+            }
             _ => {}
         }
     }
@@ -162,7 +187,9 @@ fn apply_mp4(kind: &[u8; 4], value: Option<String>, tags: &mut VideoTags) {
 fn ilst_text(item: &[u8]) -> Option<String> {
     let (_, data) = mp4_children(item).find(|(k, _)| k == b"data")?;
     let kind = u32::from_be_bytes(data.get(..4)?.try_into().ok()?);
-    (kind == 1).then(|| clean(&String::from_utf8_lossy(data.get(8..)?))).flatten()
+    (kind == 1)
+        .then(|| clean(&String::from_utf8_lossy(data.get(8..)?)))
+        .flatten()
 }
 
 /// QuickTime text atom: 16-bit length, 16-bit language, text (the first of possibly several).
@@ -184,7 +211,10 @@ fn threegpp_text(kind: &[u8; 4], payload: &[u8]) -> Option<String> {
     }
     let text = payload.get(6..)?;
     if let Some(utf16) = text.strip_prefix(&[0xFE, 0xFF]) {
-        let units: Vec<u16> = utf16.chunks_exact(2).map(|c| u16::from_be_bytes([c[0], c[1]])).collect();
+        let units: Vec<u16> = utf16
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
         return clean(&String::from_utf16_lossy(&units));
     }
     clean(&String::from_utf8_lossy(text))
@@ -280,7 +310,8 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         return None;
     }
     let header = read_size(r)?;
-    r.seek(SeekFrom::Current(i64::try_from(header).ok()?)).ok()?;
+    r.seek(SeekFrom::Current(i64::try_from(header).ok()?))
+        .ok()?;
     if read_id(r)? != SEGMENT {
         return None;
     }
@@ -298,7 +329,9 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         if pos >= segment_end {
             break;
         }
-        let (Some(id), Some(size)) = (read_id(r), read_size(r)) else { break };
+        let (Some(id), Some(size)) = (read_id(r), read_size(r)) else {
+            break;
+        };
         if id == CLUSTER || size == UNKNOWN_SIZE {
             break;
         }
@@ -342,7 +375,9 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         if seen {
             continue;
         }
-        let Some(data) = at.and_then(|at| read_element_at(r, at, want)) else { continue };
+        let Some(data) = at.and_then(|at| read_element_at(r, at, want)) else {
+            continue;
+        };
         if want == INFO {
             parse_info(&data, &mut tags);
         } else {
@@ -409,7 +444,9 @@ fn parse_tags(data: &[u8], tags: &mut VideoTags) {
                     _ => {}
                 }
             }
-            let (Some(name), Some(value)) = (name, value) else { continue };
+            let (Some(name), Some(value)) = (name, value) else {
+                continue;
+            };
             let slot = match name.to_ascii_uppercase().as_str() {
                 "TITLE" => &mut tags.title,
                 "ARTIST" | "LEAD_PERFORMER" => &mut tags.artist,
@@ -431,7 +468,12 @@ mod tests {
 
     /// An element with an 8-byte size (as muxers write for patchable sizes).
     fn el(id: u32, payload: &[u8]) -> Vec<u8> {
-        let mut out: Vec<u8> = id.to_be_bytes().iter().copied().skip_while(|&b| b == 0).collect();
+        let mut out: Vec<u8> = id
+            .to_be_bytes()
+            .iter()
+            .copied()
+            .skip_while(|&b| b == 0)
+            .collect();
         out.push(0x01);
         out.extend_from_slice(&(payload.len() as u64).to_be_bytes()[1..]);
         out.extend_from_slice(payload);
@@ -443,7 +485,13 @@ mod tests {
     }
 
     fn simple(name: &str, value: &str) -> Vec<u8> {
-        el(SIMPLE_TAG, &cat(&[el(TAG_NAME, name.as_bytes()), el(TAG_STRING, value.as_bytes())]))
+        el(
+            SIMPLE_TAG,
+            &cat(&[
+                el(TAG_NAME, name.as_bytes()),
+                el(TAG_STRING, value.as_bytes()),
+            ]),
+        )
     }
 
     fn file(segment: &[u8]) -> Vec<u8> {
@@ -454,7 +502,10 @@ mod tests {
     fn sizes_and_ids() {
         assert_eq!(read_size(&mut &[0x81][..]), Some(1));
         assert_eq!(read_size(&mut &[0x40, 0x02][..]), Some(2));
-        assert_eq!(read_size(&mut &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF][..]), Some(UNKNOWN_SIZE));
+        assert_eq!(
+            read_size(&mut &[0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF][..]),
+            Some(UNKNOWN_SIZE)
+        );
         assert_eq!(read_id(&mut &[0x1A, 0x45, 0xDF, 0xA3][..]), Some(EBML));
         assert_eq!(read_id(&mut &[0x00][..]), None);
     }
@@ -462,9 +513,23 @@ mod tests {
     #[test]
     fn title_and_global_tags() {
         let info = el(INFO, &el(TITLE, "Мой фильм".as_bytes()));
-        let global = el(TAG, &cat(&[el(TARGETS, &el(0x68CA, &[50])), simple("ARTIST", "Кто-то"), simple("DATE_RELEASED", "2019")]));
-        let per_track = el(TAG, &cat(&[el(TARGETS, &el(0x63C5, &[7])), simple("GENRE", "не то")]));
-        let data = file(&cat(&[info, el(TAGS, &cat(&[global, per_track])), el(CLUSTER, &[0; 16])]));
+        let global = el(
+            TAG,
+            &cat(&[
+                el(TARGETS, &el(0x68CA, &[50])),
+                simple("ARTIST", "Кто-то"),
+                simple("DATE_RELEASED", "2019"),
+            ]),
+        );
+        let per_track = el(
+            TAG,
+            &cat(&[el(TARGETS, &el(0x63C5, &[7])), simple("GENRE", "не то")]),
+        );
+        let data = file(&cat(&[
+            info,
+            el(TAGS, &cat(&[global, per_track])),
+            el(CLUSTER, &[0; 16]),
+        ]));
 
         let tags = read_matroska(&mut Cursor::new(data)).unwrap();
         assert_eq!(tags.title.as_deref(), Some("Мой фильм"));
@@ -477,7 +542,18 @@ mod tests {
     fn tags_after_clusters_found_via_seek_head() {
         let tags_el = el(TAGS, &el(TAG, &simple("TITLE", "В конце")));
         // SeekHead with a fixed-width position, filled in once the offset is known.
-        let seek_head = |pos: u64| el(SEEK_HEAD, &el(SEEK, &cat(&[el(SEEK_ID, &TAGS.to_be_bytes()), el(SEEK_POSITION, &pos.to_be_bytes())])));
+        let seek_head = |pos: u64| {
+            el(
+                SEEK_HEAD,
+                &el(
+                    SEEK,
+                    &cat(&[
+                        el(SEEK_ID, &TAGS.to_be_bytes()),
+                        el(SEEK_POSITION, &pos.to_be_bytes()),
+                    ]),
+                ),
+            )
+        };
         let cluster = el(CLUSTER, &[0; 64]);
         let pos = (seek_head(0).len() + cluster.len()) as u64;
         let data = file(&cat(&[seek_head(pos), cluster, tags_el]));
@@ -487,18 +563,60 @@ mod tests {
     }
 
     fn mp4_box(kind: &[u8; 4], payload: &[u8]) -> Vec<u8> {
-        cat(&[((payload.len() + 8) as u32).to_be_bytes().to_vec(), kind.to_vec(), payload.to_vec()])
+        cat(&[
+            ((payload.len() + 8) as u32).to_be_bytes().to_vec(),
+            kind.to_vec(),
+            payload.to_vec(),
+        ])
     }
 
     #[test]
     fn mp4_ilst_and_quicktime_atoms() {
-        let data = |text: &str| mp4_box(b"data", &cat(&[1u32.to_be_bytes().to_vec(), vec![0; 4], text.as_bytes().to_vec()]));
-        let ilst = mp4_box(b"ilst", &cat(&[mp4_box(b"\xA9nam", &data("Фильм")), mp4_box(b"\xA9day", &data("2015-04-16"))]));
-        let meta = mp4_box(b"meta", &cat(&[vec![0; 4], mp4_box(b"hdlr", &[0; 25]), ilst]));
-        let qt = |text: &str| cat(&[(text.len() as u16).to_be_bytes().to_vec(), vec![0x15, 0xC7], text.as_bytes().to_vec()]);
-        let udta = mp4_box(b"udta", &cat(&[meta, mp4_box(b"\xA9ART", &qt("NIP")), mp4_box(b"\xA9des", &qt("Описание"))]));
-        let trak = mp4_box(b"trak", &mp4_box(b"udta", &mp4_box(b"\xA9gen", &qt("не то"))));
-        let file = cat(&[mp4_box(b"ftyp", b"mp42"), mp4_box(b"mdat", &[0; 32]), mp4_box(b"moov", &cat(&[trak, udta]))]);
+        let data = |text: &str| {
+            mp4_box(
+                b"data",
+                &cat(&[
+                    1u32.to_be_bytes().to_vec(),
+                    vec![0; 4],
+                    text.as_bytes().to_vec(),
+                ]),
+            )
+        };
+        let ilst = mp4_box(
+            b"ilst",
+            &cat(&[
+                mp4_box(b"\xA9nam", &data("Фильм")),
+                mp4_box(b"\xA9day", &data("2015-04-16")),
+            ]),
+        );
+        let meta = mp4_box(
+            b"meta",
+            &cat(&[vec![0; 4], mp4_box(b"hdlr", &[0; 25]), ilst]),
+        );
+        let qt = |text: &str| {
+            cat(&[
+                (text.len() as u16).to_be_bytes().to_vec(),
+                vec![0x15, 0xC7],
+                text.as_bytes().to_vec(),
+            ])
+        };
+        let udta = mp4_box(
+            b"udta",
+            &cat(&[
+                meta,
+                mp4_box(b"\xA9ART", &qt("NIP")),
+                mp4_box(b"\xA9des", &qt("Описание")),
+            ]),
+        );
+        let trak = mp4_box(
+            b"trak",
+            &mp4_box(b"udta", &mp4_box(b"\xA9gen", &qt("не то"))),
+        );
+        let file = cat(&[
+            mp4_box(b"ftyp", b"mp42"),
+            mp4_box(b"mdat", &[0; 32]),
+            mp4_box(b"moov", &cat(&[trak, udta])),
+        ]);
 
         let tags = read_mp4(&mut Cursor::new(file)).unwrap();
         assert_eq!(tags.title.as_deref(), Some("Фильм"));
@@ -510,7 +628,13 @@ mod tests {
 
     #[test]
     fn year_from_date() {
-        let year = |d: &str| VideoTags { date: Some(d.into()), ..Default::default() }.year();
+        let year = |d: &str| {
+            VideoTags {
+                date: Some(d.into()),
+                ..Default::default()
+            }
+            .year()
+        };
         assert_eq!(year("2019"), Some(2019));
         assert_eq!(year("2023-02-17T02:42:42+10:00"), Some(2023));
         assert_eq!(year("2022:12:31 03:00:00"), Some(2022));
@@ -520,7 +644,10 @@ mod tests {
 
     #[test]
     fn not_matroska() {
-        assert_eq!(read_matroska(&mut Cursor::new(b"RIFF....AVI ".to_vec())), None);
+        assert_eq!(
+            read_matroska(&mut Cursor::new(b"RIFF....AVI ".to_vec())),
+            None
+        );
         assert_eq!(read_matroska(&mut Cursor::new(Vec::new())), None);
         assert_eq!(read_mp4(&mut Cursor::new(b"RIFF....AVI ".to_vec())), None);
     }

@@ -60,14 +60,25 @@ impl AudioDecoder {
         };
         let mss = MediaSourceStream::new(source, Default::default());
         let format = symphonia::default::get_probe()
-            .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
+            .probe(
+                &hint,
+                mss,
+                FormatOptions::default(),
+                MetadataOptions::default(),
+            )
             .ok()?;
 
         let track = format.default_track(TrackType::Audio)?;
         let params = track.codec_params.as_ref()?.audio()?;
-        let decoder = symphonia::default::get_codecs().make_audio_decoder(params, &AudioDecoderOptions::default()).ok()?;
+        let decoder = symphonia::default::get_codecs()
+            .make_audio_decoder(params, &AudioDecoderOptions::default())
+            .ok()?;
         let sample_rate = params.sample_rate?;
-        let channels = params.channels.as_ref().map_or(2, |c| c.count()).clamp(1, 8) as u16;
+        let channels = params
+            .channels
+            .as_ref()
+            .map_or(2, |c| c.count())
+            .clamp(1, 8) as u16;
         let time_base = track.time_base;
         let duration = match (time_base, track.duration) {
             (Some(tb), Some(d)) => tb.calc_duration(d).map(|t| t.as_secs_f64()),
@@ -103,7 +114,9 @@ impl AudioDecoder {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
                 Ok(None) => return None,
-                Err(Error::IoError(_)) | Err(Error::DecodeError(_)) if bad_packets < MAX_BAD_PACKETS => {
+                Err(Error::IoError(_)) | Err(Error::DecodeError(_))
+                    if bad_packets < MAX_BAD_PACKETS =>
+                {
                     bad_packets += 1;
                     continue;
                 }
@@ -114,7 +127,9 @@ impl AudioDecoder {
             }
             let buf = match self.decoder.decode(&packet) {
                 Ok(buf) => buf,
-                Err(Error::IoError(_)) | Err(Error::DecodeError(_)) if bad_packets < MAX_BAD_PACKETS => {
+                Err(Error::IoError(_)) | Err(Error::DecodeError(_))
+                    if bad_packets < MAX_BAD_PACKETS =>
+                {
                     bad_packets += 1;
                     continue;
                 }
@@ -132,7 +147,11 @@ impl AudioDecoder {
             if let Some(until) = self.skip_until {
                 let delta = until.get().saturating_sub(packet.pts.get()).max(0) as f64;
                 let per_frame = match self.time_base {
-                    Some(tb) => tb.calc_time(Timestamp::new(1)).map_or(0.0, |t| t.as_secs_f64()) * self.sample_rate as f64,
+                    Some(tb) => {
+                        tb.calc_time(Timestamp::new(1))
+                            .map_or(0.0, |t| t.as_secs_f64())
+                            * self.sample_rate as f64
+                    }
                     None => 1.0,
                 };
                 skip = ((delta * per_frame).round() as usize).min(frames);
@@ -143,8 +162,16 @@ impl AudioDecoder {
             }
 
             let start = self.seconds(packet.pts) + skip as f64 / self.sample_rate as f64;
-            remap_channels(&self.decoded[skip * src_channels..], src_channels, self.channels as usize, &mut self.out);
-            return Some(Chunk { start, samples: &self.out });
+            remap_channels(
+                &self.decoded[skip * src_channels..],
+                src_channels,
+                self.channels as usize,
+                &mut self.out,
+            );
+            return Some(Chunk {
+                start,
+                samples: &self.out,
+            });
         }
     }
 
@@ -156,7 +183,16 @@ impl AudioDecoder {
             None => seconds.max(0.0),
         };
         let time = Time::try_from_secs_f64(seconds)?;
-        let seeked = self.format.seek(SeekMode::Accurate, SeekTo::Time { time, track_id: Some(self.track_id) }).ok()?;
+        let seeked = self
+            .format
+            .seek(
+                SeekMode::Accurate,
+                SeekTo::Time {
+                    time,
+                    track_id: Some(self.track_id),
+                },
+            )
+            .ok()?;
         self.decoder.reset();
         self.skip_until = Some(seeked.required_ts);
         Some(self.seconds(seeked.required_ts))
@@ -193,7 +229,14 @@ fn riff_mp3_data(file: &mut File) -> Option<(u64, u64)> {
             // Some writers leave the size at 0 or too large: the data runs to the end of the file.
             b"data" if is_mp3 => {
                 let available = file_len.saturating_sub(pos + 8);
-                break Some((pos + 8, if size == 0 || size > available { available } else { size }));
+                break Some((
+                    pos + 8,
+                    if size == 0 || size > available {
+                        available
+                    } else {
+                        size
+                    },
+                ));
             }
             _ => {}
         }
@@ -217,7 +260,12 @@ struct SubFile {
 impl SubFile {
     fn new(mut file: File, start: u64, len: u64) -> io::Result<Self> {
         file.seek(SeekFrom::Start(start))?;
-        Ok(Self { file, start, len, pos: 0 })
+        Ok(Self {
+            file,
+            start,
+            len,
+            pos: 0,
+        })
     }
 }
 
@@ -239,7 +287,10 @@ impl Seek for SubFile {
             SeekFrom::End(d) => self.len as i64 + d,
         };
         if target < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
         self.pos = (target as u64).min(self.len);
         self.file.seek(SeekFrom::Start(self.start + self.pos))?;
@@ -303,7 +354,8 @@ mod tests {
     }
 
     fn temp_wav(name: &str, rate: u32, channels: u16, seconds: u32) -> std::path::PathBuf {
-        let path = std::env::temp_dir().join(format!("mediares_{}_{}.wav", name, std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mediares_{}_{}.wav", name, std::process::id()));
         write_wav(&path, rate, channels, seconds);
         path
     }
@@ -331,7 +383,11 @@ mod tests {
         let chunk = dec.next_chunk().expect("chunk");
         assert!((chunk.start - 1.5).abs() < 0.001, "{}", chunk.start);
         // Sample value at 1.5 s is step 150.
-        assert!((chunk.samples[0] * 32768.0 - 150.0).abs() < 1.0, "{}", chunk.samples[0] * 32768.0);
+        assert!(
+            (chunk.samples[0] * 32768.0 - 150.0).abs() < 1.0,
+            "{}",
+            chunk.samples[0] * 32768.0
+        );
         let _ = std::fs::remove_file(path);
     }
 

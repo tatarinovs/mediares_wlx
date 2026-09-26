@@ -112,8 +112,13 @@ impl ViewerState {
     /// playlist replaces the file list with its entries and shows the first one.
     pub fn set_file(&mut self, path: &Path) -> bool {
         if probe_file(path) == MediaType::Playlist {
-            let entries: Vec<PathBuf> = playlist::read_m3u(path).into_iter().filter(|p| is_viewable(probe_file(p))).collect();
-            let Some(first) = entries.first().cloned() else { return false };
+            let entries: Vec<PathBuf> = playlist::read_m3u(path)
+                .into_iter()
+                .filter(|p| is_viewable(probe_file(p)))
+                .collect();
+            let Some(first) = entries.first().cloned() else {
+                return false;
+            };
             self.dir_files = entries;
             self.current_idx = 0;
             self.playlist = Some(path.to_path_buf());
@@ -151,7 +156,9 @@ impl ViewerState {
 
     /// Takes the background decode result if it has arrived. Returns whether the view changed.
     pub fn image_ready(&mut self) -> bool {
-        let Some(result) = self.pending.as_ref().and_then(Ticket::result) else { return false };
+        let Some(result) = self.pending.as_ref().and_then(Ticket::result) else {
+            return false;
+        };
         self.pending = None;
         self.previous = None;
         match result {
@@ -163,7 +170,9 @@ impl ViewerState {
 
     /// Shows the file at `idx` of the list; false if it can't be displayed.
     fn go_to(&mut self, idx: usize) -> bool {
-        let Some(path) = self.dir_files.get(idx).cloned() else { return false };
+        let Some(path) = self.dir_files.get(idx).cloned() else {
+            return false;
+        };
         self.current_idx = idx;
         self.show(&path)
     }
@@ -185,7 +194,12 @@ impl ViewerState {
 
     /// The bar's previous / next track and media keys: the adjacent audio/video file.
     pub fn skip_track(&mut self, forward: bool) -> bool {
-        match playlist::skip(&self.dir_files, self.current_idx, forward, &self.config.queue) {
+        match playlist::skip(
+            &self.dir_files,
+            self.current_idx,
+            forward,
+            &self.config.queue,
+        ) {
             Some(idx) => self.go_to(idx),
             None => false,
         }
@@ -211,7 +225,11 @@ impl ViewerState {
         if total <= 1 {
             return false;
         }
-        let idx = if forward { (self.current_idx + 1) % total } else { (self.current_idx + total - 1) % total };
+        let idx = if forward {
+            (self.current_idx + 1) % total
+        } else {
+            (self.current_idx + total - 1) % total
+        };
         self.forward = forward;
         self.go_to(idx);
         true
@@ -227,7 +245,10 @@ impl ViewerState {
     }
 
     fn decode_options(&self) -> DecodeOptions {
-        DecodeOptions { auto_rotate: self.config.auto_rotate_exif, background: self.config.photo_background }
+        DecodeOptions {
+            auto_rotate: self.config.auto_rotate_exif,
+            background: self.config.photo_background,
+        }
     }
 
     /// Turns the photo on screen by a quarter (for viewing only; the file is untouched).
@@ -274,7 +295,9 @@ impl ViewerState {
     fn load_media(&mut self) {
         let options = self.decode_options();
         let kind = probe_file(&self.file_path);
-        self.file_size = std::fs::metadata(&self.file_path).map(|m| m.len()).unwrap_or(0);
+        self.file_size = std::fs::metadata(&self.file_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
 
         let shown = self.image.take();
         self.pending = None;
@@ -283,7 +306,9 @@ impl ViewerState {
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
             let resume = self.config.resume_video;
-            self.media = unsafe { MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, resume) };
+            self.media = unsafe {
+                MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, resume)
+            };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
             if let Some(media) = self.media.as_mut() {
                 media.set_skip(can_skip);
@@ -296,7 +321,9 @@ impl ViewerState {
                         self.image = Some(img);
                         self.previous = None;
                     }
-                    Some(Request::Pending(ticket)) if header_looks_decodable(&self.file_path, kind) => {
+                    Some(Request::Pending(ticket))
+                        if header_looks_decodable(&self.file_path, kind) =>
+                    {
                         self.pending = Some(ticket);
                         self.previous = shown.or(self.previous.take());
                     }
@@ -320,7 +347,8 @@ impl ViewerState {
         if total <= 1 {
             return Vec::new();
         }
-        let at = |step: isize| (self.current_idx as isize + step).rem_euclid(total as isize) as usize;
+        let at =
+            |step: isize| (self.current_idx as isize + step).rem_euclid(total as isize) as usize;
         let dir = if self.forward { 1 } else { -1 };
         let mut indices = Vec::new();
         for i in [at(dir), at(-dir), at(2 * dir)] {
@@ -328,7 +356,11 @@ impl ViewerState {
                 indices.push(i);
             }
         }
-        indices.into_iter().map(|i| self.dir_files[i].clone()).filter(|p| probe_file(p).is_image_kind()).collect()
+        indices
+            .into_iter()
+            .map(|i| self.dir_files[i].clone())
+            .filter(|p| probe_file(p).is_image_kind())
+            .collect()
     }
 }
 
@@ -356,7 +388,10 @@ fn same_path(a: &Path, b: &Path) -> bool {
 /// Lists the viewable files (images, videos, audio) in the file's directory in natural ("file2" < "file10") order.
 pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
     let single = || (vec![current_file.to_path_buf()], 0);
-    let Some(entries) = current_file.parent().and_then(|p| std::fs::read_dir(p).ok()) else {
+    let Some(entries) = current_file
+        .parent()
+        .and_then(|p| std::fs::read_dir(p).ok())
+    else {
         return single();
     };
 
@@ -371,7 +406,10 @@ pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
     }
 
     files.sort_by_cached_key(|p| natural_key(&p.file_name().unwrap_or_default().to_string_lossy()));
-    let idx = files.iter().position(|p| same_path(p, current_file)).unwrap_or(0);
+    let idx = files
+        .iter()
+        .position(|p| same_path(p, current_file))
+        .unwrap_or(0);
     (files, idx)
 }
 
@@ -412,15 +450,27 @@ mod tests {
 
     #[test]
     fn paths_compare_like_the_file_system() {
-        assert!(same_path(Path::new(r"C:\Media\Clip.MP4"), Path::new("c:/media/clip.mp4")));
-        assert!(!same_path(Path::new(r"C:\Media\a.mp4"), Path::new(r"C:\Media\b.mp4")));
-        assert!(!same_path(Path::new(r"C:\Media"), Path::new(r"C:\Media\a.mp4")));
+        assert!(same_path(
+            Path::new(r"C:\Media\Clip.MP4"),
+            Path::new("c:/media/clip.mp4")
+        ));
+        assert!(!same_path(
+            Path::new(r"C:\Media\a.mp4"),
+            Path::new(r"C:\Media\b.mp4")
+        ));
+        assert!(!same_path(
+            Path::new(r"C:\Media"),
+            Path::new(r"C:\Media\a.mp4")
+        ));
     }
 
     #[test]
     fn natural_order() {
         let mut names = vec!["img10.jpg", "IMG2.jpg", "img1.jpg", "a.png", "img02.jpg"];
         names.sort_by_key(|n| natural_key(n));
-        assert_eq!(names, ["a.png", "img1.jpg", "IMG2.jpg", "img02.jpg", "img10.jpg"]);
+        assert_eq!(
+            names,
+            ["a.png", "img1.jpg", "IMG2.jpg", "img02.jpg", "img10.jpg"]
+        );
     }
 }

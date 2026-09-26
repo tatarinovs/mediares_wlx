@@ -14,27 +14,30 @@ use std::path::Path;
 use mediares_core::mf_init::{ComScope, MfSession};
 use windows::core::{implement, Interface, BSTR};
 use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
+use windows::Win32::Graphics::Direct3D::{
+    D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
+};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Multithread, ID3D11Texture2D, D3D11_BIND_RENDER_TARGET,
     D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
-    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_DEFAULT,
-    D3D11_USAGE_STAGING,
+    D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
+    D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
-    IDXGIDevice, IDXGIFactory2, IDXGISurface1, IDXGISwapChain1, DXGI_MWA_NO_ALT_ENTER, DXGI_MWA_NO_WINDOW_CHANGES,
-    DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE,
-    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_EFFECT, DXGI_SWAP_EFFECT_DISCARD, DXGI_SWAP_EFFECT_FLIP_DISCARD,
-    DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    IDXGIDevice, IDXGIFactory2, IDXGISurface1, IDXGISwapChain1, DXGI_MWA_NO_ALT_ENTER,
+    DXGI_MWA_NO_WINDOW_CHANGES, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+    DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE, DXGI_SWAP_EFFECT, DXGI_SWAP_EFFECT_DISCARD,
+    DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 use windows::Win32::Media::MediaFoundation::{
-    IMFAttributes, IMFDXGIDeviceManager, IMFMediaEngine, IMFMediaEngineClassFactory, IMFMediaEngineEx,
-    IMFMediaEngineNotify, IMFMediaEngineNotify_Impl, MFCreateAttributes, MFCreateDXGIDeviceManager,
-    CLSID_MFMediaEngineClassFactory, MFARGB, MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_DXGI_MANAGER,
-    MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE, MF_MEDIA_ENGINE_SEEK_MODE_NORMAL,
-    MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
+    CLSID_MFMediaEngineClassFactory, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEngine,
+    IMFMediaEngineClassFactory, IMFMediaEngineEx, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl,
+    MFCreateAttributes, MFCreateDXGIDeviceManager, MFARGB, MF_MEDIA_ENGINE_CALLBACK,
+    MF_MEDIA_ENGINE_DXGI_MANAGER, MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE,
+    MF_MEDIA_ENGINE_SEEK_MODE_NORMAL, MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -91,7 +94,10 @@ impl Output {
                 Width: 1,
                 Height: 1,
                 Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+                SampleDesc: DXGI_SAMPLE_DESC {
+                    Count: 1,
+                    Quality: 0,
+                },
                 BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
                 BufferCount: buffers,
                 Scaling: DXGI_SCALING_STRETCH,
@@ -103,14 +109,25 @@ impl Output {
             factory.CreateSwapChainForHwnd(&device, surface, &desc, None, None)
         };
         // Flip model is preferred; the legacy blt model is a fallback for old drivers.
-        let swap_chain = make(DXGI_SWAP_EFFECT_FLIP_DISCARD, 2).or_else(|_| make(DXGI_SWAP_EFFECT_DISCARD, 1))?;
-        let _ = factory.MakeWindowAssociation(surface, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
-        Ok(Self { device, swap_chain, size: (1, 1), last_pts: None, dirty: true, last_osd: None })
+        let swap_chain = make(DXGI_SWAP_EFFECT_FLIP_DISCARD, 2)
+            .or_else(|_| make(DXGI_SWAP_EFFECT_DISCARD, 1))?;
+        let _ = factory
+            .MakeWindowAssociation(surface, DXGI_MWA_NO_ALT_ENTER | DXGI_MWA_NO_WINDOW_CHANGES);
+        Ok(Self {
+            device,
+            swap_chain,
+            size: (1, 1),
+            last_pts: None,
+            dirty: true,
+            last_osd: None,
+        })
     }
 }
 
 unsafe fn draw_osd(swap_chain: &IDXGISwapChain1, osd: &Osd<'_>) {
-    let Ok(surface) = swap_chain.GetBuffer::<IDXGISurface1>(0) else { return };
+    let Ok(surface) = swap_chain.GetBuffer::<IDXGISurface1>(0) else {
+        return;
+    };
     // `false`: keep the frame that was just transferred.
     let Ok(dc) = surface.GetDC(false) else { return };
     crate::image_view::draw_osd_text(dc, osd.text, osd.font, osd.color);
@@ -121,10 +138,21 @@ unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
     let flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     let try_driver = |driver: D3D_DRIVER_TYPE| {
         let mut device = None;
-        D3D11CreateDevice(None, driver, HMODULE::default(), flags, None, D3D11_SDK_VERSION, Some(&mut device), None, None)
-            .and_then(|_| device.ok_or_else(|| E_FAIL.into()))
+        D3D11CreateDevice(
+            None,
+            driver,
+            HMODULE::default(),
+            flags,
+            None,
+            D3D11_SDK_VERSION,
+            Some(&mut device),
+            None,
+            None,
+        )
+        .and_then(|_| device.ok_or_else(|| E_FAIL.into()))
     };
-    let device = try_driver(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| try_driver(D3D_DRIVER_TYPE_WARP))?;
+    let device =
+        try_driver(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| try_driver(D3D_DRIVER_TYPE_WARP))?;
     // The media engine uses the device from its own threads.
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);
@@ -157,41 +185,76 @@ impl VideoPlayer {
         let manager = manager.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         manager.ResetDevice(&output.device, reset_token)?;
 
-        let factory: IMFMediaEngineClassFactory = CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)?;
-        let notify: IMFMediaEngineNotify = EngineNotify { target: events_to.0 as isize }.into();
+        let factory: IMFMediaEngineClassFactory =
+            CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)?;
+        let notify: IMFMediaEngineNotify = EngineNotify {
+            target: events_to.0 as isize,
+        }
+        .into();
 
         let mut attributes: Option<IMFAttributes> = None;
         MFCreateAttributes(&mut attributes, 3)?;
         let attributes = attributes.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         attributes.SetUnknown(&MF_MEDIA_ENGINE_CALLBACK, &notify)?;
         attributes.SetUnknown(&MF_MEDIA_ENGINE_DXGI_MANAGER, &manager)?;
-        attributes.SetUINT32(&MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32)?;
+        attributes.SetUINT32(
+            &MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
+            DXGI_FORMAT_B8G8R8A8_UNORM.0 as u32,
+        )?;
 
         let engine = factory.CreateInstance(0, &attributes)?;
         let engine_ex = engine.cast::<IMFMediaEngineEx>().ok();
-        Ok(Self { engine, engine_ex, output: RefCell::new(output), _manager: manager, _mf: mf, _com: com })
+        Ok(Self {
+            engine,
+            engine_ex,
+            output: RefCell::new(output),
+            _manager: manager,
+            _mf: mf,
+            _com: com,
+        })
     }
 
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
     pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
         self.output.borrow_mut().last_pts = None;
-        self.engine.SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
+        self.engine
+            .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
         self.engine.Play()
     }
 
     /// Render tick: presents a frame if the engine has a new one (or a redraw is pending, or the
     /// OSD text changed).
     pub unsafe fn render(&self, osd: Option<Osd<'_>>) {
-        let Ok(mut out) = self.output.try_borrow_mut() else { return };
-        let Ok(pts) = self.engine.OnVideoStreamTick() else { return };
+        let Ok(mut out) = self.output.try_borrow_mut() else {
+            return;
+        };
+        let Ok(pts) = self.engine.OnVideoStreamTick() else {
+            return;
+        };
         let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
         if out.last_pts == Some(pts) && !out.dirty && !osd_changed {
             return;
         }
-        let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else { return };
-        let dst = RECT { left: 0, top: 0, right: out.size.0 as i32, bottom: out.size.1 as i32 };
-        let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
-        if self.engine.TransferVideoFrame(&back_buffer, None, &dst, Some(&black)).is_ok() {
+        let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else {
+            return;
+        };
+        let dst = RECT {
+            left: 0,
+            top: 0,
+            right: out.size.0 as i32,
+            bottom: out.size.1 as i32,
+        };
+        let black = MFARGB {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbAlpha: 255,
+        };
+        if self
+            .engine
+            .TransferVideoFrame(&back_buffer, None, &dst, Some(&black))
+            .is_ok()
+        {
             drop(back_buffer);
             if let Some(osd) = &osd {
                 draw_osd(&out.swap_chain, osd);
@@ -208,7 +271,16 @@ impl VideoPlayer {
         let mut out = self.output.borrow_mut();
         let size = (width.max(1) as u32, height.max(1) as u32);
         if size != out.size
-            && out.swap_chain.ResizeBuffers(0, size.0, size.1, DXGI_FORMAT_UNKNOWN, DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE).is_ok()
+            && out
+                .swap_chain
+                .ResizeBuffers(
+                    0,
+                    size.0,
+                    size.1,
+                    DXGI_FORMAT_UNKNOWN,
+                    DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE,
+                )
+                .is_ok()
         {
             out.size = size;
         }
@@ -218,7 +290,9 @@ impl VideoPlayer {
     /// Native frame size once metadata is loaded.
     pub unsafe fn native_size(&self) -> Option<(u32, u32)> {
         let (mut w, mut h) = (0u32, 0u32);
-        self.engine.GetNativeVideoSize(Some(&mut w), Some(&mut h)).ok()?;
+        self.engine
+            .GetNativeVideoSize(Some(&mut w), Some(&mut h))
+            .ok()?;
         (w > 0 && h > 0).then_some((w, h))
     }
 
@@ -233,32 +307,56 @@ impl VideoPlayer {
             MipLevels: 1,
             ArraySize: 1,
             Format: DXGI_FORMAT_B8G8R8A8_UNORM,
-            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            SampleDesc: DXGI_SAMPLE_DESC {
+                Count: 1,
+                Quality: 0,
+            },
             Usage: D3D11_USAGE_DEFAULT,
             BindFlags: D3D11_BIND_RENDER_TARGET.0 as u32,
             ..Default::default()
         };
         let mut target: Option<ID3D11Texture2D> = None;
-        device.CreateTexture2D(&desc, None, Some(&mut target)).ok()?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut target))
+            .ok()?;
         let target = target?;
-        let dst = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
-        let black = MFARGB { rgbBlue: 0, rgbGreen: 0, rgbRed: 0, rgbAlpha: 255 };
-        self.engine.TransferVideoFrame(&target, None, &dst, Some(&black)).ok()?;
+        let dst = RECT {
+            left: 0,
+            top: 0,
+            right: width as i32,
+            bottom: height as i32,
+        };
+        let black = MFARGB {
+            rgbBlue: 0,
+            rgbGreen: 0,
+            rgbRed: 0,
+            rgbAlpha: 255,
+        };
+        self.engine
+            .TransferVideoFrame(&target, None, &dst, Some(&black))
+            .ok()?;
 
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ.0 as u32;
         let mut staging: Option<ID3D11Texture2D> = None;
-        device.CreateTexture2D(&desc, None, Some(&mut staging)).ok()?;
+        device
+            .CreateTexture2D(&desc, None, Some(&mut staging))
+            .ok()?;
         let staging = staging?;
         let context = device.GetImmediateContext().ok()?;
         context.CopyResource(&staging, &target);
         let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped)).ok()?;
+        context
+            .Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+            .ok()?;
         let row = width as usize * 4;
         let mut pixels = Vec::with_capacity(row * height as usize);
         for y in 0..height as usize {
-            let line = std::slice::from_raw_parts((mapped.pData as *const u8).add(y * mapped.RowPitch as usize), row);
+            let line = std::slice::from_raw_parts(
+                (mapped.pData as *const u8).add(y * mapped.RowPitch as usize),
+                row,
+            );
             pixels.extend_from_slice(line);
         }
         context.Unmap(&staging, 0);
@@ -291,7 +389,11 @@ impl VideoPlayer {
     /// target (sources without accurate seeking land elsewhere).
     pub unsafe fn step_back(&self, frame_rate: f64) -> f64 {
         let _ = self.engine.Pause();
-        let frame = if frame_rate > 0.0 { 1.0 / frame_rate } else { FALLBACK_FRAME_SEC };
+        let frame = if frame_rate > 0.0 {
+            1.0 / frame_rate
+        } else {
+            FALLBACK_FRAME_SEC
+        };
         let target = (self.position() - frame).max(0.0);
         self.seek(target, false);
         target
@@ -334,7 +436,11 @@ impl Transport for VideoPlayer {
         unsafe {
             match &self.engine_ex {
                 Some(ex) => {
-                    let mode = if approximate { MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE } else { MF_MEDIA_ENGINE_SEEK_MODE_NORMAL };
+                    let mode = if approximate {
+                        MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE
+                    } else {
+                        MF_MEDIA_ENGINE_SEEK_MODE_NORMAL
+                    };
                     let _ = ex.SetCurrentTimeEx(t, mode);
                 }
                 None => {
@@ -375,5 +481,9 @@ impl Drop for VideoPlayer {
 }
 
 fn finite(v: f64) -> f64 {
-    if v.is_finite() { v.max(0.0) } else { 0.0 }
+    if v.is_finite() {
+        v.max(0.0)
+    } else {
+        0.0
+    }
 }

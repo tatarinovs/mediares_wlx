@@ -33,7 +33,10 @@ fn ini_path() -> PathBuf {
     if let Some(p) = portable.as_ref().filter(|p| p.exists()) {
         return p.clone();
     }
-    tc_ini_dir().map(|d| d.join(INI_NAME)).or(portable).unwrap_or_else(|| PathBuf::from(INI_NAME))
+    tc_ini_dir()
+        .map(|d| d.join(INI_NAME))
+        .or(portable)
+        .unwrap_or_else(|| PathBuf::from(INI_NAME))
 }
 
 /// A data file kept next to `mediares.ini`.
@@ -174,40 +177,71 @@ impl Default for ViewerConfig {
 /// An INI template; empty means the default.
 fn template(value: String, default: &str) -> String {
     let value = osd_template::from_ini(&value);
-    if value.trim().is_empty() { default.to_string() } else { value }
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value
+    }
 }
 
 fn template_to_ini(value: &str, default: &str) -> String {
-    if value == default { String::new() } else { osd_template::to_ini(value) }
+    if value == default {
+        String::new()
+    } else {
+        osd_template::to_ini(value)
+    }
 }
 
 impl ViewerConfig {
     pub fn load() -> Self {
         let ini = HSTRING::from(ini_path().as_os_str());
         let d = Self::default();
-        let int = |key: PCWSTR, default: i32| unsafe { GetPrivateProfileIntW(SECTION, key, default, &ini) };
+        let int = |key: PCWSTR, default: i32| unsafe {
+            GetPrivateProfileIntW(SECTION, key, default, &ini)
+        };
         let string = |key: PCWSTR, default: &str| {
             let mut buf = [0u16; 4096];
-            let len = unsafe { GetPrivateProfileStringW(SECTION, key, &HSTRING::from(default), Some(&mut buf), &ini) };
+            let len = unsafe {
+                GetPrivateProfileStringW(
+                    SECTION,
+                    key,
+                    &HSTRING::from(default),
+                    Some(&mut buf),
+                    &ini,
+                )
+            };
             String::from_utf16_lossy(&buf[..len as usize])
         };
 
         let font_name = string(w!("OSDFontName"), &d.osd_font_name);
-        let loupe = string(w!("LoupeScale"), "1.0").trim().replace(',', ".").parse::<f32>().ok();
+        let loupe = string(w!("LoupeScale"), "1.0")
+            .trim()
+            .replace(',', ".")
+            .parse::<f32>()
+            .ok();
 
         Self {
             start_fullscreen: int(w!("StartFullscreen"), d.start_fullscreen as i32) != 0,
             // Older configs only had ShowOSD (photos).
-            osd: OsdMode::from_index(int(w!("OSDMode"), -1)).unwrap_or(if int(w!("ShowOSD"), 1) != 0 {
-                OsdMode::Photo
-            } else {
-                OsdMode::Off
-            }),
-            osd_font_size: int(w!("OSDFontSize"), d.osd_font_size).clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1),
+            osd: OsdMode::from_index(int(w!("OSDMode"), -1)).unwrap_or(
+                if int(w!("ShowOSD"), 1) != 0 {
+                    OsdMode::Photo
+                } else {
+                    OsdMode::Off
+                },
+            ),
+            osd_font_size: int(w!("OSDFontSize"), d.osd_font_size)
+                .clamp(FONT_SIZE_RANGE.0, FONT_SIZE_RANGE.1),
             osd_font_color: int(w!("OSDFontColor"), d.osd_font_color as i32) as u32 & 0x00FF_FFFF,
-            osd_font_name: if font_name.trim().is_empty() { d.osd_font_name } else { font_name },
+            osd_font_name: if font_name.trim().is_empty() {
+                d.osd_font_name
+            } else {
+                font_name
+            },
             auto_rotate_exif: int(w!("AutoRotateExif"), d.auto_rotate_exif as i32) != 0,
-            loupe_scale: loupe.map_or(d.loupe_scale, |v| v.clamp(LOUPE_SCALE_RANGE.0, LOUPE_SCALE_RANGE.1)),
+            loupe_scale: loupe.map_or(d.loupe_scale, |v| {
+                v.clamp(LOUPE_SCALE_RANGE.0, LOUPE_SCALE_RANGE.1)
+            }),
             queue: QueueOptions {
                 auto_advance: int(w!("AutoAdvance"), d.queue.auto_advance as i32) != 0,
                 repeat: Repeat::from_index(int(w!("Repeat"), d.queue.repeat.index())),
@@ -216,15 +250,23 @@ impl ViewerConfig {
             overlay_photo: int(w!("OverlayPhoto"), d.overlay_photo as i32) != 0,
             overlay_video: int(w!("OverlayVideo"), d.overlay_video as i32) != 0,
             overlay_autohide: int(w!("OverlayAutoHide"), d.overlay_autohide as i32) != 0,
-            slideshow_seconds: int(w!("SlideshowSeconds"), d.slideshow_seconds as i32).clamp(1, 3600) as u32,
-            photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32 & 0x00FF_FFFF,
+            slideshow_seconds: int(w!("SlideshowSeconds"), d.slideshow_seconds as i32)
+                .clamp(1, 3600) as u32,
+            photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32
+                & 0x00FF_FFFF,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
             audio_editor: string(w!("AudioEditor"), "").trim().to_string(),
-            photo_osd: template(string(w!("PhotoOSDTemplate"), ""), osd_template::DEFAULT_PHOTO),
-            video_osd: template(string(w!("VideoOSDTemplate"), ""), osd_template::DEFAULT_VIDEO),
+            photo_osd: template(
+                string(w!("PhotoOSDTemplate"), ""),
+                osd_template::DEFAULT_PHOTO,
+            ),
+            video_osd: template(
+                string(w!("VideoOSDTemplate"), ""),
+                osd_template::DEFAULT_VIDEO,
+            ),
         }
     }
 
@@ -258,8 +300,14 @@ impl ViewerConfig {
             write(w!("VideoEditor"), self.video_editor.clone()),
             write(w!("AudioEditor"), self.audio_editor.clone()),
             // The default is stored as empty, so a changed default reaches users who never edited it.
-            write(w!("PhotoOSDTemplate"), template_to_ini(&self.photo_osd, osd_template::DEFAULT_PHOTO)),
-            write(w!("VideoOSDTemplate"), template_to_ini(&self.video_osd, osd_template::DEFAULT_VIDEO)),
+            write(
+                w!("PhotoOSDTemplate"),
+                template_to_ini(&self.photo_osd, osd_template::DEFAULT_PHOTO),
+            ),
+            write(
+                w!("VideoOSDTemplate"),
+                template_to_ini(&self.video_osd, osd_template::DEFAULT_VIDEO),
+            ),
         ]
         .iter()
         .all(|&ok| ok)

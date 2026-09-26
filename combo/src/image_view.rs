@@ -6,11 +6,12 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetDeviceCaps, GetStockObject, DEFAULT_GUI_FONT,
-    DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, SelectObject, SetBkMode, SetBrushOrgEx,
-    SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-    CLIP_DEFAULT_PRECIS, COLORONCOLOR, DEFAULT_CHARSET, DEFAULT_QUALITY, DIB_RGB_COLORS,
-    FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
+    DeleteObject, DrawTextW, FillRect, GetDeviceCaps, GetStockObject, SelectObject, SetBkMode,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER,
+    BI_RGB, CLIP_DEFAULT_PRECIS, COLORONCOLOR, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_QUALITY,
+    DIB_RGB_COLORS, DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE,
+    DT_TOP, DT_VCENTER, FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY,
+    TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -49,7 +50,10 @@ fn origin(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> (f32, f3
     match state.zoom {
         ZoomMode::Fit => {
             let s = fit_scale(img, view);
-            (((view.0 - img.width as f32 * s) / 2.0).round(), ((view.1 - img.height as f32 * s) / 2.0).round())
+            (
+                ((view.0 - img.width as f32 * s) / 2.0).round(),
+                ((view.1 - img.height as f32 * s) / 2.0).round(),
+            )
         }
         ZoomMode::Custom(_) => state.offset,
     }
@@ -74,12 +78,23 @@ pub fn clamp_offset(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32
 }
 
 /// Zooms by one step keeping the image point under `anchor` fixed.
-pub fn zoom_step(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32), zoom_in: bool, anchor: (f32, f32)) {
+pub fn zoom_step(
+    state: &mut ViewerState,
+    img: &DecodedImage,
+    view: (f32, f32),
+    zoom_in: bool,
+    anchor: (f32, f32),
+) {
     state.loupe = None;
     let current = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
     let fit = fit_scale(img, view);
-    let new_scale = if zoom_in { current * ZOOM_STEP } else { current / ZOOM_STEP }.clamp(MIN_ZOOM, MAX_ZOOM);
+    let new_scale = if zoom_in {
+        current * ZOOM_STEP
+    } else {
+        current / ZOOM_STEP
+    }
+    .clamp(MIN_ZOOM, MAX_ZOOM);
 
     if !zoom_in && ((new_scale - fit).abs() / fit < FIT_SNAP) {
         state.zoom = ZoomMode::Fit;
@@ -99,19 +114,35 @@ pub fn zoom_actual_size(state: &mut ViewerState, img: &DecodedImage, view: (f32,
 }
 
 /// Starts the loupe: magnify at the configured scale and map the cursor proportionally over the image.
-pub fn loupe_begin(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32), cursor: (i32, i32)) {
-    state.loupe = Some(Loupe { saved_zoom: state.zoom, saved_offset: state.offset });
+pub fn loupe_begin(
+    state: &mut ViewerState,
+    img: &DecodedImage,
+    view: (f32, f32),
+    cursor: (i32, i32),
+) {
+    state.loupe = Some(Loupe {
+        saved_zoom: state.zoom,
+        saved_offset: state.offset,
+    });
     state.zoom = ZoomMode::Custom(state.config.loupe_scale);
     loupe_follow(state, img, view, cursor);
 }
 
-pub fn loupe_follow(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32), cursor: (i32, i32)) {
+pub fn loupe_follow(
+    state: &mut ViewerState,
+    img: &DecodedImage,
+    view: (f32, f32),
+    cursor: (i32, i32),
+) {
     let s = state.config.loupe_scale;
     let axis = |pos: i32, image_len: f32, window_len: f32| {
         let t = (pos as f32 / window_len).clamp(0.0, 1.0);
         clamp_axis(-(image_len - window_len) * t, image_len, window_len)
     };
-    state.offset = (axis(cursor.0, img.width as f32 * s, view.0), axis(cursor.1, img.height as f32 * s, view.1));
+    state.offset = (
+        axis(cursor.0, img.width as f32 * s, view.0),
+        axis(cursor.1, img.height as f32 * s, view.1),
+    );
 }
 
 pub fn loupe_end(state: &mut ViewerState) -> bool {
@@ -134,7 +165,12 @@ pub unsafe fn zoom_percent(state: &ViewerState) -> Option<i32> {
 
 /// Source span of one axis that is actually visible, and where it lands in the window.
 /// Returns `(src_start, src_len, dst_start, dst_len)`.
-fn visible_span(origin: f32, scale: f32, image_len: u32, window_len: f32) -> Option<(i32, i32, i32, i32)> {
+fn visible_span(
+    origin: f32,
+    scale: f32,
+    image_len: u32,
+    window_len: f32,
+) -> Option<(i32, i32, i32, i32)> {
     let (origin, scale) = (origin as f64, scale as f64);
     let s0 = ((-origin) / scale).floor().max(0.0) as u32;
     let s1 = (((window_len as f64 - origin) / scale).ceil().max(0.0) as u32).min(image_len);
@@ -161,18 +197,44 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
     }
     let old_bmp = SelectObject(mem_dc, mem_bmp.into());
 
-    let bg = state.as_ref().map_or(BACKGROUND, |s| s.config.photo_background);
+    let bg = state
+        .as_ref()
+        .map_or(BACKGROUND, |s| s.config.photo_background);
     let bg_brush = CreateSolidBrush(COLORREF(bg));
-    FillRect(mem_dc, &RECT { left: 0, top: 0, right: win_w, bottom: win_h }, bg_brush);
+    FillRect(
+        mem_dc,
+        &RECT {
+            left: 0,
+            top: 0,
+            right: win_w,
+            bottom: win_h,
+        },
+        bg_brush,
+    );
     let _ = DeleteObject(bg_brush.into());
 
     if let Some(state) = state {
         if let Some(img) = state.image.clone() {
             draw_image(mem_dc, state, &img, (win_w as f32, win_h as f32));
         } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
-            draw_fitted(mem_dc, &prev, RECT { left: 0, top: 0, right: win_w, bottom: win_h });
+            draw_fitted(
+                mem_dc,
+                &prev,
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: win_w,
+                    bottom: win_h,
+                },
+            );
         } else if state.load_failed {
-            draw_centered_text(mem_dc, "Не удалось открыть изображение", win_w, win_h, muted_text_color(bg));
+            draw_centered_text(
+                mem_dc,
+                "Не удалось открыть изображение",
+                win_w,
+                win_h,
+                muted_text_color(bg),
+            );
         }
         if state.config.osd.photo() {
             draw_osd(mem_dc, state);
@@ -187,30 +249,57 @@ pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h
 
 /// Gray text that stays readable on the COLORREF `background`.
 fn muted_text_color(background: u32) -> u32 {
-    let [r, g, b] = [background & 0xFF, (background >> 8) & 0xFF, (background >> 16) & 0xFF];
+    let [r, g, b] = [
+        background & 0xFF,
+        (background >> 8) & 0xFF,
+        (background >> 16) & 0xFF,
+    ];
     let luma = (r * 299 + g * 587 + b * 114) / 1000;
-    if luma > 140 { 0x0040_4040 } else { 0x00A0_A0A0 }
+    if luma > 140 {
+        0x0040_4040
+    } else {
+        0x00A0_A0A0
+    }
 }
 
 unsafe fn draw_centered_text(dc: HDC, text: &str, win_w: i32, win_h: i32, color: u32) {
     let mut text: Vec<u16> = text.encode_utf16().collect();
-    let mut rc = RECT { left: 0, top: 0, right: win_w, bottom: win_h };
+    let mut rc = RECT {
+        left: 0,
+        top: 0,
+        right: win_w,
+        bottom: win_h,
+    };
     let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COLORREF(color));
-    DrawTextW(dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    DrawTextW(
+        dc,
+        &mut text,
+        &mut rc,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
     SelectObject(dc, old_font);
 }
 
 /// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio.
 pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
-    let (rw, rh) = ((rect.right - rect.left) as f32, (rect.bottom - rect.top) as f32);
+    let (rw, rh) = (
+        (rect.right - rect.left) as f32,
+        (rect.bottom - rect.top) as f32,
+    );
     if rw <= 0.0 || rh <= 0.0 || img.width == 0 || img.height == 0 {
         return;
     }
     let s = (rw / img.width as f32).min(rh / img.height as f32);
-    let (dw, dh) = (((img.width as f32 * s).round() as i32).max(1), ((img.height as f32 * s).round() as i32).max(1));
-    let (dx, dy) = (rect.left + (rw as i32 - dw) / 2, rect.top + (rh as i32 - dh) / 2);
+    let (dw, dh) = (
+        ((img.width as f32 * s).round() as i32).max(1),
+        ((img.height as f32 * s).round() as i32).max(1),
+    );
+    let (dx, dy) = (
+        rect.left + (rw as i32 - dw) / 2,
+        rect.top + (rh as i32 - dh) / 2,
+    );
     let bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -226,15 +315,30 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
     SetStretchBltMode(dc, if s < 1.0 { HALFTONE } else { COLORONCOLOR });
     let _ = SetBrushOrgEx(dc, 0, 0, None);
     let (w, h) = (img.width as i32, img.height as i32);
-    StretchDIBits(dc, dx, dy, dw, dh, 0, 0, w, h, Some(img.bgra.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    StretchDIBits(
+        dc,
+        dx,
+        dy,
+        dw,
+        dh,
+        0,
+        0,
+        w,
+        h,
+        Some(img.bgra.as_ptr() as *const _),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
 }
 
 unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
     let s = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
-    let (Some((sx, sw, dx, dw)), Some((sy, sh, dy, dh))) =
-        (visible_span(ox, s, img.width, view.0), visible_span(oy, s, img.height, view.1))
-    else {
+    let (Some((sx, sw, dx, dw)), Some((sy, sh, dy, dh))) = (
+        visible_span(ox, s, img.width, view.0),
+        visible_span(oy, s, img.height, view.1),
+    ) else {
         return;
     };
 
@@ -261,7 +365,21 @@ unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f3
     } else {
         SetStretchBltMode(dc, COLORONCOLOR);
     }
-    StretchDIBits(dc, dx, dy, dw, dh, sx, 0, sw, sh, Some(rows.as_ptr() as *const _), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    StretchDIBits(
+        dc,
+        dx,
+        dy,
+        dw,
+        dh,
+        sx,
+        0,
+        sw,
+        sh,
+        Some(rows.as_ptr() as *const _),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
 }
 
 /// "812 KB", "45.3 MB", "1.27 GB".
@@ -287,23 +405,33 @@ pub fn format_thousands(n: u64) -> String {
 }
 
 fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
-    let position = (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
-    let file = |key: &str| osd_template::file_field(&state.file_path, state.file_size, position, key);
+    let position =
+        (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
+    let file =
+        |key: &str| osd_template::file_field(&state.file_path, state.file_size, position, key);
     let Some(img) = &state.image else {
         // Still decoding: only what is known without the picture.
         return osd_template::render("{name}< [ {index} / {count} ]>", file);
     };
     osd_template::render(&state.config.photo_osd, |key| {
-        file(key).or_else(|| osd_template::exif_field(img.exif.as_ref(), key)).or_else(|| {
-            Some(match key {
-                "width" => img.width.to_string(),
-                "height" => img.height.to_string(),
-                "mp" => format!("{:.2}", img.width as f64 * img.height as f64 / 1_000_000.0),
-                "zoom" => zoom.map(|z| z.to_string()).unwrap_or_default(),
-                "preview" => if img.is_preview { "превью RAW".to_string() } else { String::new() },
-                _ => return None,
+        file(key)
+            .or_else(|| osd_template::exif_field(img.exif.as_ref(), key))
+            .or_else(|| {
+                Some(match key {
+                    "width" => img.width.to_string(),
+                    "height" => img.height.to_string(),
+                    "mp" => format!("{:.2}", img.width as f64 * img.height as f64 / 1_000_000.0),
+                    "zoom" => zoom.map(|z| z.to_string()).unwrap_or_default(),
+                    "preview" => {
+                        if img.is_preview {
+                            "превью RAW".to_string()
+                        } else {
+                            String::new()
+                        }
+                    }
+                    _ => return None,
+                })
             })
-        })
     })
 }
 
@@ -311,7 +439,11 @@ unsafe fn osd_font(dc: HDC, state: &mut ViewerState) -> HFONT {
     if let Some(font) = state.osd_font {
         return font;
     }
-    let font = create_osd_font(&state.config.osd_font_name, state.config.osd_font_size, GetDeviceCaps(Some(dc), LOGPIXELSY));
+    let font = create_osd_font(
+        &state.config.osd_font_name,
+        state.config.osd_font_size,
+        GetDeviceCaps(Some(dc), LOGPIXELSY),
+    );
     state.osd_font = Some(font);
     font
 }
@@ -321,8 +453,19 @@ pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> HFONT {
     let height = -((size_pt * dpi + 36) / 72);
     let face: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
     CreateFontW(
-        height, 0, 0, 0, FW_BOLD.0 as i32, 0, 0, 0,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0,
+        height,
+        0,
+        0,
+        0,
+        FW_BOLD.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY,
+        0,
         PCWSTR(face.as_ptr()),
     )
 }
@@ -335,8 +478,18 @@ pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
     for (offset, color) in [(1, 0), (0, color)] {
         SetTextColor(dc, COLORREF(color));
         let (x, y) = (OSD_MARGIN + offset, OSD_MARGIN + offset);
-        let mut rc = RECT { left: x, top: y, right: x + 1, bottom: y + 1 };
-        DrawTextW(dc, &mut text, &mut rc, DT_LEFT | DT_TOP | DT_NOCLIP | DT_NOPREFIX | DT_EXPANDTABS);
+        let mut rc = RECT {
+            left: x,
+            top: y,
+            right: x + 1,
+            bottom: y + 1,
+        };
+        DrawTextW(
+            dc,
+            &mut text,
+            &mut rc,
+            DT_LEFT | DT_TOP | DT_NOCLIP | DT_NOPREFIX | DT_EXPANDTABS,
+        );
     }
     SelectObject(dc, old_font);
 }
@@ -349,7 +502,10 @@ unsafe fn draw_osd(dc: HDC, state: &mut ViewerState) {
 
 /// Client-relative cursor from a mouse message `LPARAM`.
 pub fn point_from_lparam(lparam: isize) -> POINT {
-    POINT { x: (lparam & 0xFFFF) as i16 as i32, y: ((lparam >> 16) & 0xFFFF) as i16 as i32 }
+    POINT {
+        x: (lparam & 0xFFFF) as i16 as i32,
+        y: ((lparam >> 16) & 0xFFFF) as i16 as i32,
+    }
 }
 
 #[cfg(test)]
@@ -367,9 +523,15 @@ mod tests {
     #[test]
     fn visible_span_crops_to_window() {
         // 1000px image at 4x, shifted 1000px left, 800px window: source 250..450 visible.
-        assert_eq!(visible_span(-1000.0, 4.0, 1000, 800.0), Some((250, 200, 0, 800)));
+        assert_eq!(
+            visible_span(-1000.0, 4.0, 1000, 800.0),
+            Some((250, 200, 0, 800))
+        );
         // Fully visible image is drawn whole.
-        assert_eq!(visible_span(10.0, 0.5, 1000, 800.0), Some((0, 1000, 10, 500)));
+        assert_eq!(
+            visible_span(10.0, 0.5, 1000, 800.0),
+            Some((0, 1000, 10, 500))
+        );
         // Off-screen.
         assert_eq!(visible_span(900.0, 1.0, 100, 800.0), None);
     }

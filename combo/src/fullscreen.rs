@@ -6,12 +6,14 @@
 //! coordinates); while fullscreen, [`pin`] overrides every such move with the monitor rectangle.
 
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent, SetWindowLongPtrW, SetWindowPos,
-    GWLP_HWNDPARENT, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD, WS_POPUP,
+    GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent, SetWindowLongPtrW,
+    SetWindowPos, GWLP_HWNDPARENT, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
+    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD, WS_POPUP,
 };
 
 use crate::overlay::{Fullscreen, PanelKind};
@@ -27,7 +29,10 @@ pub unsafe fn toggle(state: &mut ViewerState) {
 
 unsafe fn enter(state: &mut ViewerState) {
     let hwnd = state.hwnd;
-    let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
     let monitor = MonitorFromWindow(state.lister, MONITOR_DEFAULTTONEAREST);
     if !GetMonitorInfoW(monitor, &mut info).as_bool() {
         return;
@@ -67,8 +72,15 @@ pub unsafe fn sync_overlay(state: &mut ViewerState) {
         None => None,
     };
     let autohide = config.overlay_autohide;
-    let panel = state.overlay.as_mut().and_then(|fs| fs.set_panel(state.hwnd, kind, autohide));
-    let bar_host = if kind == Some(PanelKind::Video) { panel } else { None };
+    let panel = state
+        .overlay
+        .as_mut()
+        .and_then(|fs| fs.set_panel(state.hwnd, kind, autohide));
+    let bar_host = if kind == Some(PanelKind::Video) {
+        panel
+    } else {
+        None
+    };
     if let Some(media) = state.media.as_mut() {
         media.set_bar_host(bar_host);
     }
@@ -82,7 +94,15 @@ unsafe fn exit(state: &mut ViewerState) {
     sync_overlay(state);
     // Unpin first so the moves below are not overridden.
     state.fullscreen = None;
-    let _ = SetWindowPos(hwnd, Some(HWND_NOTOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE);
+    let _ = SetWindowPos(
+        hwnd,
+        Some(HWND_NOTOPMOST),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE,
+    );
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
     // Switch WS_POPUP -> WS_CHILD before re-parenting.
     set_style(hwnd, WS_CHILD.0, WS_POPUP.0);
@@ -90,7 +110,15 @@ unsafe fn exit(state: &mut ViewerState) {
 
     let mut rc = RECT::default();
     let _ = GetClientRect(state.lister, &mut rc);
-    let _ = SetWindowPos(hwnd, None, 0, 0, rc.right - rc.left, rc.bottom - rc.top, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    let _ = SetWindowPos(
+        hwnd,
+        None,
+        0,
+        0,
+        rc.right - rc.left,
+        rc.bottom - rc.top,
+        SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW,
+    );
     let _ = SetForegroundWindow(state.lister);
     let _ = SetFocus(Some(hwnd));
 }

@@ -124,14 +124,13 @@ impl Field {
             PluginVersion => Source::Constant,
             MediaTypeName => Source::Probe,
             ImageWidth | ImageHeight => Source::ImageSize,
-            PhotoMake | PhotoModel | PhotoLens | PhotoDateTaken | PhotoExposure | PhotoFNumber | PhotoIso
-            | PhotoFocalLength | PhotoFocalLength35 | PhotoFlash | PhotoOrientation | PhotoSoftware
-            | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
-            VideoWidth | VideoHeight | VideoLength | VideoFrameRate | VideoCodec | VideoBitrate | VideoAudioCodec
-            | VideoAudioChannels | VideoAudioSampleRate => Source::VideoMeta,
-            VideoTitle | VideoArtist | VideoDirector | VideoDate | VideoYear | VideoGenre | VideoComment => {
-                Source::VideoTags
-            }
+            PhotoMake | PhotoModel | PhotoLens | PhotoDateTaken | PhotoExposure | PhotoFNumber
+            | PhotoIso | PhotoFocalLength | PhotoFocalLength35 | PhotoFlash | PhotoOrientation
+            | PhotoSoftware | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
+            VideoWidth | VideoHeight | VideoLength | VideoFrameRate | VideoCodec | VideoBitrate
+            | VideoAudioCodec | VideoAudioChannels | VideoAudioSampleRate => Source::VideoMeta,
+            VideoTitle | VideoArtist | VideoDirector | VideoDate | VideoYear | VideoGenre
+            | VideoComment => Source::VideoTags,
             _ if self.is_tag() => Source::Tags,
             _ => Source::Analysis,
         }
@@ -194,7 +193,11 @@ const FIELDS: &[(Field, &str, c_int)] = &[
     (Field::AudioComment, "Audio_Comment", FT_STRINGW),
     (Field::AudioLength, "Audio_Length", FT_TIME),
     (Field::AudioBitrate, "Audio_Bitrate_kbps", FT_NUMERIC_32),
-    (Field::AudioSampleRate, "Audio_Sample_Rate_Hz", FT_NUMERIC_32),
+    (
+        Field::AudioSampleRate,
+        "Audio_Sample_Rate_Hz",
+        FT_NUMERIC_32,
+    ),
     (Field::AudioChannels, "Audio_Channels", FT_NUMERIC_32),
     (Field::AudioBitDepth, "Audio_Bit_Depth", FT_NUMERIC_32),
     (Field::AudioHasCover, "Audio_Has_Cover", FT_BOOLEAN),
@@ -207,23 +210,51 @@ const FIELDS: &[(Field, &str, c_int)] = &[
     (Field::PhotoExposure, "Photo_Exposure", FT_STRINGW),
     (Field::PhotoFNumber, "Photo_FNumber", FT_NUMERIC_FLOATING),
     (Field::PhotoIso, "Photo_ISO", FT_NUMERIC_32),
-    (Field::PhotoFocalLength, "Photo_Focal_Length_mm", FT_NUMERIC_FLOATING),
-    (Field::PhotoFocalLength35, "Photo_Focal_Length_35mm", FT_NUMERIC_32),
+    (
+        Field::PhotoFocalLength,
+        "Photo_Focal_Length_mm",
+        FT_NUMERIC_FLOATING,
+    ),
+    (
+        Field::PhotoFocalLength35,
+        "Photo_Focal_Length_35mm",
+        FT_NUMERIC_32,
+    ),
     (Field::PhotoFlash, "Photo_Flash", FT_BOOLEAN),
     (Field::PhotoOrientation, "Photo_Orientation", FT_NUMERIC_32),
     (Field::PhotoSoftware, "Photo_Software", FT_STRINGW),
-    (Field::PhotoGpsLatitude, "Photo_GPS_Latitude", FT_NUMERIC_FLOATING),
-    (Field::PhotoGpsLongitude, "Photo_GPS_Longitude", FT_NUMERIC_FLOATING),
+    (
+        Field::PhotoGpsLatitude,
+        "Photo_GPS_Latitude",
+        FT_NUMERIC_FLOATING,
+    ),
+    (
+        Field::PhotoGpsLongitude,
+        "Photo_GPS_Longitude",
+        FT_NUMERIC_FLOATING,
+    ),
     (Field::PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN),
     (Field::VideoWidth, "Video_Width", FT_NUMERIC_32),
     (Field::VideoHeight, "Video_Height", FT_NUMERIC_32),
     (Field::VideoLength, "Video_Length", FT_TIME),
-    (Field::VideoFrameRate, "Video_Frame_Rate", FT_NUMERIC_FLOATING),
+    (
+        Field::VideoFrameRate,
+        "Video_Frame_Rate",
+        FT_NUMERIC_FLOATING,
+    ),
     (Field::VideoCodec, "Video_Codec", FT_STRINGW),
     (Field::VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32),
     (Field::VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW),
-    (Field::VideoAudioChannels, "Video_Audio_Channels", FT_NUMERIC_32),
-    (Field::VideoAudioSampleRate, "Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32),
+    (
+        Field::VideoAudioChannels,
+        "Video_Audio_Channels",
+        FT_NUMERIC_32,
+    ),
+    (
+        Field::VideoAudioSampleRate,
+        "Video_Audio_Sample_Rate_Hz",
+        FT_NUMERIC_32,
+    ),
     (Field::AudioCodec, "Audio_Codec", FT_STRINGW),
     (Field::AudioLossless, "Audio_Lossless", FT_BOOLEAN),
     (Field::AudioComposer, "Audio_Composer", FT_STRINGW),
@@ -246,7 +277,12 @@ fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int)> {
 pub fn wdx_detect_string() -> &'static str {
     static S: OnceLock<String> = OnceLock::new();
     S.get_or_init(|| {
-        let mut kinds = vec![MediaType::StandardImage, MediaType::RawImage, MediaType::PsdImage, MediaType::Video];
+        let mut kinds = vec![
+            MediaType::StandardImage,
+            MediaType::RawImage,
+            MediaType::PsdImage,
+            MediaType::Video,
+        ];
         if cfg!(feature = "audio-decode") {
             kinds.push(MediaType::Audio);
         }
@@ -280,7 +316,14 @@ pub unsafe fn content_get_value_w(
     max_len: c_int,
     flags: c_int,
 ) -> c_int {
-    get_value(pwstr_to_path(file_name), field_index, field_value, max_len, flags, true)
+    get_value(
+        pwstr_to_path(file_name),
+        field_index,
+        field_value,
+        max_len,
+        flags,
+        true,
+    )
 }
 
 /// # Safety
@@ -292,7 +335,14 @@ pub unsafe fn content_get_value_a(
     max_len: c_int,
     flags: c_int,
 ) -> c_int {
-    get_value(pstr_to_path(file_name), field_index, field_value, max_len, flags, false)
+    get_value(
+        pstr_to_path(file_name),
+        field_index,
+        field_value,
+        max_len,
+        flags,
+        false,
+    )
 }
 
 pub fn content_stop_get_value() {
@@ -319,8 +369,12 @@ unsafe fn get_value(
     unicode: bool,
 ) -> c_int {
     reset_stop_flag();
-    let Some(path) = path else { return FT_FILEERROR };
-    let Some(&(field, _, _)) = field_at(field_index) else { return FT_FIELDEMPTY };
+    let Some(path) = path else {
+        return FT_FILEERROR;
+    };
+    let Some(&(field, _, _)) = field_at(field_index) else {
+        return FT_FIELDEMPTY;
+    };
     if field_value.is_null() {
         return FT_FIELDEMPTY;
     }
@@ -330,7 +384,11 @@ unsafe fn get_value(
         return FT_DELAYED;
     }
 
-    let out = Output { dest: field_value, max_bytes: max_len.max(0) as usize, unicode };
+    let out = Output {
+        dest: field_value,
+        max_bytes: max_len.max(0) as usize,
+        unicode,
+    };
     match compute(&path, field, kind) {
         Some(Value::Text(text)) => out.text(&text),
         Some(Value::Int(n)) => out.int(n),
@@ -348,7 +406,9 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || kind.is_slow_kind() && !get_cache().is_cached(path);
     match field.source() {
         Source::Constant | Source::Probe | Source::Exif | Source::VideoTags => false,
-        Source::Tags => needs_audio_meta(path, field, kind) && !crate::cache::is_audio_meta_cached(path),
+        Source::Tags => {
+            needs_audio_meta(path, field, kind) && !crate::cache::is_audio_meta_cached(path)
+        }
         Source::ImageSize => kind != MediaType::StandardImage && analysis_pending(),
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::Analysis => analysis_pending(),
@@ -439,7 +499,10 @@ fn exif_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         PhotoFocalLength => positive(exif.focal_length),
         PhotoFocalLength35 => exif.focal_length_35mm.filter(|&v| v > 0).map(int),
         PhotoFlash => exif.flash_fired.map(Value::Bool),
-        PhotoOrientation => exif.orientation.filter(|o| (1..=8).contains(o)).map(|o| int(o.into())),
+        PhotoOrientation => exif
+            .orientation
+            .filter(|o| (1..=8).contains(o))
+            .map(|o| int(o.into())),
         PhotoSoftware => text(&exif.software),
         PhotoGpsLatitude => exif.gps_latitude.map(Value::Float),
         PhotoGpsLongitude => exif.gps_longitude.map(Value::Float),
@@ -458,9 +521,13 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
     match field {
         VideoWidth => positive(meta.width),
         VideoHeight => positive(meta.height),
-        VideoLength => (meta.duration_sec > 0.0).then(|| Value::Time(meta.duration_sec.round() as u32)),
+        VideoLength => {
+            (meta.duration_sec > 0.0).then(|| Value::Time(meta.duration_sec.round() as u32))
+        }
         // Two decimals: 29.97, 23.98.
-        VideoFrameRate => (meta.frame_rate > 0.0).then(|| Value::Float((meta.frame_rate * 100.0).round() / 100.0)),
+        VideoFrameRate => {
+            (meta.frame_rate > 0.0).then(|| Value::Float((meta.frame_rate * 100.0).round() / 100.0))
+        }
         VideoCodec => meta.codec.clone().map(Value::Text),
         VideoBitrate => meta.bitrate_kbps.and_then(positive),
         VideoAudioCodec => meta.audio_codec.clone().map(Value::Text),
@@ -518,7 +585,13 @@ impl Field {
         use Field::*;
         matches!(
             self,
-            AudioLength | AudioBitrate | AudioSampleRate | AudioChannels | AudioBitDepth | AudioCodec | AudioLossless
+            AudioLength
+                | AudioBitrate
+                | AudioSampleRate
+                | AudioChannels
+                | AudioBitDepth
+                | AudioCodec
+                | AudioLossless
         )
     }
 }
@@ -553,7 +626,9 @@ fn audio_meta_value(path: &Path, field: Field) -> Option<Value> {
     let meta = crate::cache::get_audio_meta(path)?;
     let num = |n: Option<u32>| n.filter(|&n| n > 0).map(int);
     match field {
-        AudioLength => (meta.duration_sec > 0.0).then(|| Value::Time(meta.duration_sec.round() as u32)),
+        AudioLength => {
+            (meta.duration_sec > 0.0).then(|| Value::Time(meta.duration_sec.round() as u32))
+        }
         AudioBitrate => num(meta.bitrate_kbps),
         AudioSampleRate => num(meta.sample_rate),
         AudioChannels => num(meta.channels),
@@ -581,7 +656,9 @@ fn lofty_value(path: &Path, field: Field) -> Option<Value> {
         AudioDisc => num(tags.disc),
         AudioGenre => text(&tags.genre),
         AudioComment => text(&tags.comment),
-        AudioLength => (tags.duration_sec > 0.0).then(|| Value::Time(tags.duration_sec.round() as u32)),
+        AudioLength => {
+            (tags.duration_sec > 0.0).then(|| Value::Time(tags.duration_sec.round() as u32))
+        }
         AudioBitrate => num(tags.bitrate_kbps),
         AudioSampleRate => num(tags.sample_rate),
         AudioChannels => num(tags.channels.map(u32::from)),
@@ -610,7 +687,11 @@ struct Output {
 impl Output {
     unsafe fn text(&self, text: &str) -> c_int {
         if self.unicode {
-            if write_wide(self.dest as *mut u16, self.max_bytes, text) { FT_STRINGW } else { FT_FIELDEMPTY }
+            if write_wide(self.dest as *mut u16, self.max_bytes, text) {
+                FT_STRINGW
+            } else {
+                FT_FIELDEMPTY
+            }
         } else if write_ansi(self.dest as *mut c_char, self.max_bytes, text) {
             FT_STRING
         } else {
@@ -678,7 +759,12 @@ macro_rules! export_content_plugin {
             max_len: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             $crate::ffi::guard($crate::tc_api::FT_NOMOREFIELDS, || unsafe {
-                $crate::wdx_api::content_get_supported_field(field_index, field_name, units, max_len)
+                $crate::wdx_api::content_get_supported_field(
+                    field_index,
+                    field_name,
+                    units,
+                    max_len,
+                )
             })
         }
 
@@ -692,7 +778,13 @@ macro_rules! export_content_plugin {
             flags: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
-                $crate::wdx_api::content_get_value_w(file_name, field_index, field_value, max_len, flags)
+                $crate::wdx_api::content_get_value_w(
+                    file_name,
+                    field_index,
+                    field_value,
+                    max_len,
+                    flags,
+                )
             })
         }
 
@@ -706,7 +798,13 @@ macro_rules! export_content_plugin {
             flags: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
-                $crate::wdx_api::content_get_value_a(file_name, field_index, field_value, max_len, flags)
+                $crate::wdx_api::content_get_value_a(
+                    file_name,
+                    field_index,
+                    field_value,
+                    max_len,
+                    flags,
+                )
             })
         }
 
@@ -716,7 +814,9 @@ macro_rules! export_content_plugin {
         }
 
         #[no_mangle]
-        pub unsafe extern "system" fn ContentStopGetValue(_file_name: *const ::std::os::raw::c_char) {
+        pub unsafe extern "system" fn ContentStopGetValue(
+            _file_name: *const ::std::os::raw::c_char,
+        ) {
             $crate::ffi::guard((), $crate::wdx_api::content_stop_get_value)
         }
 
@@ -731,7 +831,10 @@ macro_rules! export_content_plugin {
         }
 
         #[no_mangle]
-        pub unsafe extern "system" fn ContentSetDefaultParams(_dps: *mut $crate::tc_api::ContentDefaultParamStruct) {}
+        pub unsafe extern "system" fn ContentSetDefaultParams(
+            _dps: *mut $crate::tc_api::ContentDefaultParamStruct,
+        ) {
+        }
 
         #[no_mangle]
         pub unsafe extern "system" fn ContentPluginUnloading() {

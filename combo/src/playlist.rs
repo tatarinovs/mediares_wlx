@@ -51,7 +51,11 @@ pub struct QueueOptions {
 
 impl Default for QueueOptions {
     fn default() -> Self {
-        Self { auto_advance: true, repeat: Repeat::Off, shuffle: false }
+        Self {
+            auto_advance: true,
+            repeat: Repeat::Off,
+            shuffle: false,
+        }
     }
 }
 
@@ -74,18 +78,31 @@ pub fn step(files: &[PathBuf], current: usize, forward: bool, wrap: bool) -> Opt
     let dir = if forward { 1 } else { -1 };
     (1..n)
         .map(|k| current as isize + dir * k)
-        .filter_map(|i| if (0..n).contains(&i) || wrap { Some(i.rem_euclid(n) as usize) } else { None })
+        .filter_map(|i| {
+            if (0..n).contains(&i) || wrap {
+                Some(i.rem_euclid(n) as usize)
+            } else {
+                None
+            }
+        })
         .find(|&i| is_playable(&files[i]))
 }
 
 /// A random playable file other than `current`.
 pub fn random(files: &[PathBuf], current: usize) -> Option<usize> {
-    let candidates: Vec<usize> = (0..files.len()).filter(|&i| i != current && is_playable(&files[i])).collect();
+    let candidates: Vec<usize> = (0..files.len())
+        .filter(|&i| i != current && is_playable(&files[i]))
+        .collect();
     (!candidates.is_empty()).then(|| candidates[next_random() as usize % candidates.len()])
 }
 
 /// Previous / next track for the bar buttons and media keys (always wraps).
-pub fn skip(files: &[PathBuf], current: usize, forward: bool, options: &QueueOptions) -> Option<usize> {
+pub fn skip(
+    files: &[PathBuf],
+    current: usize,
+    forward: bool,
+    options: &QueueOptions,
+) -> Option<usize> {
     if forward && options.shuffle {
         return random(files, current);
     }
@@ -117,7 +134,9 @@ fn next_random() -> u64 {
     static STATE: AtomicU64 = AtomicU64::new(0);
     let mut x = STATE.load(Ordering::Relaxed);
     if x == 0 {
-        let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(1, |d| d.as_nanos() as u64);
         x = nanos | 1;
     }
     x ^= x >> 12;
@@ -130,9 +149,14 @@ fn next_random() -> u64 {
 /// Reads an M3U / M3U8 playlist: entries that exist as files, relative ones resolved against
 /// the playlist's folder. `#` lines (EXTINF etc.) and URLs are skipped.
 pub fn read_m3u(path: &Path) -> Vec<PathBuf> {
-    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(bytes) = std::fs::read(path) else {
+        return Vec::new();
+    };
     let base = path.parent().unwrap_or(Path::new(""));
-    parse_m3u(&bytes, base).into_iter().filter(|p| p.is_file()).collect()
+    parse_m3u(&bytes, base)
+        .into_iter()
+        .filter(|p| p.is_file())
+        .collect()
 }
 
 fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
@@ -140,14 +164,20 @@ fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
     // M3U8 is UTF-8; plain M3U is usually the ANSI code page, but UTF-8 is common too.
     let text = match std::str::from_utf8(bytes) {
         Ok(s) => s.to_string(),
-        Err(_) => ansi_to_os_string(bytes).map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+        Err(_) => ansi_to_os_string(bytes)
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
     };
     text.lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.contains("://"))
         .map(|line| {
             let entry = Path::new(line.strip_prefix("file:///").unwrap_or(line));
-            if entry.is_absolute() || entry.has_root() { entry.to_path_buf() } else { base.join(entry) }
+            if entry.is_absolute() || entry.has_root() {
+                entry.to_path_buf()
+            } else {
+                base.join(entry)
+            }
         })
         .collect()
 }
@@ -182,9 +212,15 @@ mod tests {
         assert_eq!(on_end(&files(&["only.mp3"]), 0, &o), EndAction::Replay);
         o.repeat = Repeat::One;
         assert_eq!(on_end(&list, 0, &o), EndAction::Replay);
-        o = QueueOptions { auto_advance: false, ..Default::default() };
+        o = QueueOptions {
+            auto_advance: false,
+            ..Default::default()
+        };
         assert_eq!(on_end(&list, 0, &o), EndAction::Stop);
-        o = QueueOptions { shuffle: true, ..Default::default() };
+        o = QueueOptions {
+            shuffle: true,
+            ..Default::default()
+        };
         assert_eq!(on_end(&list, 0, &o), EndAction::Play(1));
     }
 
@@ -192,6 +228,12 @@ mod tests {
     fn m3u_parsing() {
         let text = "\u{FEFF}#EXTM3U\r\n#EXTINF:123,Artist - Song\r\nmusic\\a.mp3\r\n\r\nC:\\abs\\b.flac\r\nhttp://radio/stream\r\n";
         let base = Path::new(r"D:\lists");
-        assert_eq!(parse_m3u(text.as_bytes(), base), [PathBuf::from(r"D:\lists\music\a.mp3"), PathBuf::from(r"C:\abs\b.flac")]);
+        assert_eq!(
+            parse_m3u(text.as_bytes(), base),
+            [
+                PathBuf::from(r"D:\lists\music\a.mp3"),
+                PathBuf::from(r"C:\abs\b.flac")
+            ]
+        );
     }
 }

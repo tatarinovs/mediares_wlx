@@ -6,7 +6,10 @@ use std::os::windows::ffi::OsStringExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 
-use windows::Win32::Globalization::{MultiByteToWideChar, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS};
+use windows::core::PCSTR;
+use windows::Win32::Globalization::{
+    MultiByteToWideChar, WideCharToMultiByte, CP_ACP, MULTI_BYTE_TO_WIDE_CHAR_FLAGS,
+};
 
 /// Runs `f`, turning a panic into `fallback`. A panic must never unwind into Total Commander.
 #[inline]
@@ -60,7 +63,24 @@ pub fn ansi_to_os_string(ansi: &[u8]) -> Option<OsString> {
     Some(OsString::from_wide(&wide))
 }
 
-/// Writes `text` as a NUL-terminated byte string, truncating to `max_bytes` (including the NUL).
+/// Converts `wide` to the system ANSI code page; unmappable characters become `?`.
+fn wide_to_ansi(wide: &[u16]) -> Vec<u8> {
+    if wide.is_empty() {
+        return Vec::new();
+    }
+    let len = unsafe { WideCharToMultiByte(CP_ACP, 0, wide, None, PCSTR::null(), None) };
+    if len <= 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; len as usize];
+    let written =
+        unsafe { WideCharToMultiByte(CP_ACP, 0, wide, Some(&mut out), PCSTR::null(), None) };
+    out.truncate(written.max(0) as usize);
+    out
+}
+
+/// Writes `text` in the system ANSI code page as a NUL-terminated string, truncating to
+/// `max_bytes` (including the NUL) on a character boundary.
 ///
 /// # Safety
 /// `dest` must be null or valid for writes of `max_bytes` bytes.
@@ -68,8 +88,31 @@ pub unsafe fn write_ansi(dest: *mut c_char, max_bytes: usize, text: &str) -> boo
     if dest.is_null() || max_bytes == 0 {
         return false;
     }
-    let bytes = text.as_bytes();
-    let len = bytes.len().min(max_bytes - 1);
+    let limit = max_bytes - 1;
+    let bytes = if text.is_ascii() {
+        text.as_bytes()[..text.len().min(limit)].to_vec()
+    } else {
+        // Every UTF-16 unit yields at least one byte, so the first `limit` units are an upper
+        // bound; drop whole characters until the encoding fits (DBCS code pages vary in width).
+        let mut chars: Vec<char> = Vec::new();
+        let mut units = 0;
+        for ch in text.chars() {
+            units += ch.len_utf16();
+            if units > limit {
+                break;
+            }
+            chars.push(ch);
+        }
+        loop {
+            let wide: Vec<u16> = chars.iter().collect::<String>().encode_utf16().collect();
+            let bytes = wide_to_ansi(&wide);
+            if bytes.len() <= limit {
+                break bytes;
+            }
+            chars.pop();
+        }
+    };
+    let len = bytes.len();
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), dest as *mut u8, len);
     *dest.add(len) = 0;
     true

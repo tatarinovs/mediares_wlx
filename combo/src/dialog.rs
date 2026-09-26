@@ -3,16 +3,17 @@
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET, DEFAULT_QUALITY, FW_NORMAL,
-    HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
+    CreateFontW, DeleteObject, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET,
+    DEFAULT_QUALITY, FW_NORMAL, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetMessageW, GetWindow,
     GetWindowRect, IsDialogMessageW, IsWindow, LoadCursorW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, SW_SHOW, CS_HREDRAW, CS_VREDRAW,
-    GA_ROOT, GW_OWNER, HMENU, IDC_ARROW, MSG, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDCLASSEXW,
-    WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
+    GA_ROOT, GW_OWNER, HMENU, IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT,
+    WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
+    WS_VISIBLE,
 };
 
 use crate::module;
@@ -49,8 +50,19 @@ pub unsafe fn register_class(name: PCWSTR, proc: WNDPROC) {
 
 pub unsafe fn create_font(face: PCWSTR, height: i32) -> Font {
     GdiObject(CreateFontW(
-        height, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
-        DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, DEFAULT_QUALITY, 0,
+        height,
+        0,
+        0,
+        0,
+        FW_NORMAL.0 as i32,
+        0,
+        0,
+        0,
+        DEFAULT_CHARSET,
+        OUT_DEFAULT_PRECIS,
+        CLIP_DEFAULT_PRECIS,
+        DEFAULT_QUALITY,
+        0,
         face,
     ))
 }
@@ -61,10 +73,19 @@ pub unsafe fn modal_owner(hwnd: HWND) -> HWND {
 }
 
 /// Creates a dialog frame centered over `owner`.
-pub unsafe fn create_frame(owner: HWND, class: PCWSTR, title: &str, width: i32, height: i32) -> Option<HWND> {
+pub unsafe fn create_frame(
+    owner: HWND,
+    class: PCWSTR,
+    title: &str,
+    width: i32,
+    height: i32,
+) -> Option<HWND> {
     let mut rc = RECT::default();
     let (x, y) = if GetWindowRect(owner, &mut rc).is_ok() {
-        ((rc.left + rc.right - width) / 2, (rc.top + rc.bottom - height) / 2)
+        (
+            (rc.left + rc.right - width) / 2,
+            (rc.top + rc.bottom - height) / 2,
+        )
     } else {
         (200, 200)
     };
@@ -111,7 +132,12 @@ pub unsafe fn control(
         None,
     )
     .unwrap_or_default();
-    SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(font.0 as usize)), Some(LPARAM(1)));
+    SendMessageW(
+        hwnd,
+        WM_SETFONT,
+        Some(WPARAM(font.0 as usize)),
+        Some(LPARAM(1)),
+    );
     hwnd
 }
 

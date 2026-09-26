@@ -1,7 +1,7 @@
+use mediares_core::tc_api::*;
+use mediares_wdx::*;
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
-use mediares_wdx::*;
-use mediares_core::tc_api::*;
 
 #[test]
 fn test_supported_fields_enumeration() {
@@ -9,27 +9,47 @@ fn test_supported_fields_enumeration() {
     let mut units = [0 as c_char; 128];
 
     // Field 0: Image_dHash
-    let f0 = unsafe { ContentGetSupportedField(0, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f0 =
+        unsafe { ContentGetSupportedField(0, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f0, FT_STRINGW);
-    let name0 = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+    let name0 = unsafe {
+        std::ffi::CStr::from_ptr(field_name.as_ptr())
+            .to_str()
+            .unwrap()
+    };
     assert_eq!(name0, "Image_dHash");
 
     // Field 7: Video_Duration_Sec
-    let f7 = unsafe { ContentGetSupportedField(7, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f7 =
+        unsafe { ContentGetSupportedField(7, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f7, FT_NUMERIC_32);
-    let name7 = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+    let name7 = unsafe {
+        std::ffi::CStr::from_ptr(field_name.as_ptr())
+            .to_str()
+            .unwrap()
+    };
     assert_eq!(name7, "Video_Duration_Sec");
 
     // Field 9: Media_Type
-    let f9 = unsafe { ContentGetSupportedField(9, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f9 =
+        unsafe { ContentGetSupportedField(9, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f9, FT_STRINGW);
-    let name9 = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+    let name9 = unsafe {
+        std::ffi::CStr::from_ptr(field_name.as_ptr())
+            .to_str()
+            .unwrap()
+    };
     assert_eq!(name9, "Media_Type");
 
     // Field 10: Plugin_Version
-    let f10 = unsafe { ContentGetSupportedField(10, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f10 =
+        unsafe { ContentGetSupportedField(10, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f10, FT_STRINGW);
-    let name10 = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+    let name10 = unsafe {
+        std::ffi::CStr::from_ptr(field_name.as_ptr())
+            .to_str()
+            .unwrap()
+    };
     assert_eq!(name10, "Plugin_Version");
 
     // Fields 11..14: audio, appended after the original ones (indices are stored by TC).
@@ -39,9 +59,15 @@ fn test_supported_fields_enumeration() {
         (13, "Audio_Duration_Sec", FT_NUMERIC_32),
         (14, "Audio_Artist_Title", FT_STRINGW),
     ] {
-        let f = unsafe { ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+        let f = unsafe {
+            ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128)
+        };
         assert_eq!(f, kind);
-        let got = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+        let got = unsafe {
+            std::ffi::CStr::from_ptr(field_name.as_ptr())
+                .to_str()
+                .unwrap()
+        };
         assert_eq!(got, name);
     }
 
@@ -64,14 +90,21 @@ fn test_supported_fields_enumeration() {
         (65, "Video_Year", FT_NUMERIC_32),
         (67, "Video_Comment", FT_STRINGW),
     ] {
-        let f = unsafe { ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+        let f = unsafe {
+            ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128)
+        };
         assert_eq!(f, kind);
-        let got = unsafe { std::ffi::CStr::from_ptr(field_name.as_ptr()).to_str().unwrap() };
+        let got = unsafe {
+            std::ffi::CStr::from_ptr(field_name.as_ptr())
+                .to_str()
+                .unwrap()
+        };
         assert_eq!(got, name);
     }
 
     // Out of bounds
-    let f15 = unsafe { ContentGetSupportedField(68, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f15 =
+        unsafe { ContentGetSupportedField(68, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f15, FT_NOMOREFIELDS);
 }
 
@@ -83,7 +116,11 @@ fn test_detect_string() {
         ContentGetDetectString(buf.as_mut_ptr(), 2048);
     }
     let detect = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap() };
-    assert!(detect.len() < 2047 && detect.ends_with('"'), "detect string truncated: {} bytes", detect.len());
+    assert!(
+        detect.len() < 2047 && detect.ends_with('"'),
+        "detect string truncated: {} bytes",
+        detect.len()
+    );
     assert!(detect.contains(r#"EXT="JPG""#));
     assert!(detect.contains(r#"EXT="PNG""#));
     assert!(detect.contains(r#"EXT="MP4""#));
@@ -95,7 +132,10 @@ fn test_detect_string() {
     assert!(detect.contains(r#"EXT="PSB""#));
     assert!(detect.contains(r#"EXT="MP3""#));
     assert!(detect.contains(r#"EXT="FLAC""#));
-    assert!(!detect.contains(r#"EXT="M3U""#), "playlists have no content fields");
+    assert!(
+        !detect.contains(r#"EXT="M3U""#),
+        "playlists have no content fields"
+    );
 }
 
 #[test]
@@ -162,7 +202,10 @@ fn test_image_hashes_and_duplicate_matching() {
     assert_eq!(res2, FT_STRINGW);
     assert_eq!(res3, FT_STRINGW);
 
-    assert_eq!(dhash1, dhash2, "Original and scaled image should match dHash");
+    assert_eq!(
+        dhash1, dhash2,
+        "Original and scaled image should match dHash"
+    );
     assert_ne!(dhash1, dhash3, "Different images must not match dHash");
 
     let (_, dim1) = read_field(&img1_path, 3);
@@ -183,13 +226,13 @@ fn test_image_hashes_and_duplicate_matching() {
 #[test]
 fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
     use std::os::windows::ffi::OsStrExt;
-    for filename in &["target/test_dummy.mp4", "target/test_dummy.cr2", "target/test_dummy.psd"] {
+    for filename in &[
+        "target/test_dummy.mp4",
+        "target/test_dummy.cr2",
+        "target/test_dummy.psd",
+    ] {
         let path = PathBuf::from(filename);
-        let wide: Vec<u16> = path
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
 
         let mut buf = [0u16; 128];
         let res = unsafe {
@@ -205,7 +248,8 @@ fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
 
         assert_eq!(
             res, FT_DELAYED,
-            "Uncached file {} with CONTENT_DELAYIFSLOW must return FT_DELAYED", filename
+            "Uncached file {} with CONTENT_DELAYIFSLOW must return FT_DELAYED",
+            filename
         );
     }
 }
@@ -245,7 +289,14 @@ fn write_wav(path: &std::path::Path, rate: u32, seconds: u32, lead_silence: u32,
 }
 
 /// Same, with a RIFF `LIST/INFO` chunk of (id, text) tags.
-fn write_wav_tagged(path: &std::path::Path, rate: u32, seconds: u32, lead_silence: u32, pitch_shift: f32, info: &[(&[u8; 4], &str)]) {
+fn write_wav_tagged(
+    path: &std::path::Path,
+    rate: u32,
+    seconds: u32,
+    lead_silence: u32,
+    pitch_shift: f32,
+    info: &[(&[u8; 4], &str)],
+) {
     let total = rate * (seconds + lead_silence);
     let mut data = Vec::with_capacity(total as usize * 2);
     for i in 0..total {
@@ -255,7 +306,8 @@ fn write_wav_tagged(path: &std::path::Path, rate: u32, seconds: u32, lead_silenc
             // Time from the start of the sound (exact), so padding doesn't change the samples.
             let t = (i - lead_silence * rate) as f32 / rate as f32;
             let f = (220.0 + 55.0 * (t as u32 % 7) as f32) * pitch_shift;
-            0.3 * (2.0 * std::f32::consts::PI * f * t).sin() + 0.2 * (2.0 * std::f32::consts::PI * f * 2.5 * t).sin()
+            0.3 * (2.0 * std::f32::consts::PI * f * t).sin()
+                + 0.2 * (2.0 * std::f32::consts::PI * f * 2.5 * t).sin()
         };
         data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
     }
@@ -263,7 +315,11 @@ fn write_wav_tagged(path: &std::path::Path, rate: u32, seconds: u32, lead_silenc
     b.extend_from_slice(b"RIFF");
     b.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
     b.extend_from_slice(b"WAVEfmt ");
-    for v in [16u32.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec(), 1u16.to_le_bytes().to_vec()] {
+    for v in [
+        16u32.to_le_bytes().to_vec(),
+        1u16.to_le_bytes().to_vec(),
+        1u16.to_le_bytes().to_vec(),
+    ] {
         b.extend_from_slice(&v);
     }
     b.extend_from_slice(&rate.to_le_bytes());
@@ -299,7 +355,11 @@ fn test_audio_fields() {
     use std::os::windows::ffi::OsStrExt;
     let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
     let _ = std::fs::create_dir_all(&dir);
-    let (a, padded, other) = (dir.join("a.wav"), dir.join("a_padded.wav"), dir.join("other.wav"));
+    let (a, padded, other) = (
+        dir.join("a.wav"),
+        dir.join("a_padded.wav"),
+        dir.join("other.wav"),
+    );
     write_wav(&a, 22050, 40, 0, 1.0);
     write_wav(&padded, 22050, 40, 1, 1.0);
     write_wav(&other, 22050, 40, 0, 1.5);
@@ -307,11 +367,34 @@ fn test_audio_fields() {
     let read = |path: &std::path::Path, field: i32| -> (i32, String) {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut buf = [0u16; 256];
-        let res = unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 512, 0) };
+        let res = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                512,
+                0,
+            )
+        };
         if res == FT_NUMERIC_32 {
-            return (res, i32::from_le_bytes([buf[0] as u8, (buf[0] >> 8) as u8, buf[1] as u8, (buf[1] >> 8) as u8]).to_string());
+            return (
+                res,
+                i32::from_le_bytes([
+                    buf[0] as u8,
+                    (buf[0] >> 8) as u8,
+                    buf[1] as u8,
+                    (buf[1] >> 8) as u8,
+                ])
+                .to_string(),
+            );
         }
-        (res, String::from_utf16_lossy(&buf).trim_matches('\0').to_string())
+        (
+            res,
+            String::from_utf16_lossy(&buf)
+                .trim_matches('\0')
+                .to_string(),
+        )
     };
 
     let (res, fp) = read(&a, 11);
@@ -333,18 +416,36 @@ fn test_audio_tag_fields() {
     let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("tagged.wav");
-    let info: &[(&[u8; 4], &str)] = &[(b"IART", "Пикник"), (b"INAM", "Остров"), (b"IPRD", "Иероглиф"), (b"IGNR", "Rock"), (b"ICRD", "1986")];
+    let info: &[(&[u8; 4], &str)] = &[
+        (b"IART", "Пикник"),
+        (b"INAM", "Остров"),
+        (b"IPRD", "Иероглиф"),
+        (b"IGNR", "Rock"),
+        (b"ICRD", "1986"),
+    ];
     write_wav_tagged(&path, 22050, 75, 0, 1.0, info);
 
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let raw = |field: i32, flags: i32| -> (i32, [u16; 256]) {
         let mut buf = [0u16; 256];
-        let res = unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 512, flags) };
+        let res = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                512,
+                flags,
+            )
+        };
         (res, buf)
     };
     let text = |field: i32| {
         let (res, buf) = raw(field, 0);
-        (res, String::from_utf16_lossy(&buf).trim_matches(' ').to_string())
+        (
+            res,
+            String::from_utf16_lossy(&buf).trim_matches(' ').to_string(),
+        )
     };
     // Tag fields are never delayed, unlike the decoding-based ones.
     assert_eq!(raw(15, CONTENT_DELAYIFSLOW).0, FT_STRINGW);
@@ -356,25 +457,45 @@ fn test_audio_tag_fields() {
     assert_eq!(text(22), (FT_STRINGW, "Rock".to_string()));
     assert_eq!(text(14), (FT_STRINGW, "пикник - остров".to_string()));
     let (res, buf) = raw(19, 0);
-    assert_eq!((res, buf[0] as u32 | (buf[1] as u32) << 16), (FT_NUMERIC_32, 1986));
+    assert_eq!(
+        (res, buf[0] as u32 | (buf[1] as u32) << 16),
+        (FT_NUMERIC_32, 1986)
+    );
     // Length 75 s as ttimeformat (h, m, s).
     let (res, buf) = raw(24, 0);
     assert_eq!((res, &buf[..3]), (FT_TIME, &[0u16, 1, 15][..]));
     let (res, buf) = raw(26, 0);
-    assert_eq!((res, buf[0] as u32 | (buf[1] as u32) << 16), (FT_NUMERIC_32, 22050));
+    assert_eq!(
+        (res, buf[0] as u32 | (buf[1] as u32) << 16),
+        (FT_NUMERIC_32, 22050)
+    );
     assert_eq!(raw(29, 0).0, FT_BOOLEAN);
     assert_eq!(raw(29, 0).1[0], 0, "no cover");
     assert_eq!(raw(20, 0).0, FT_FIELDEMPTY, "no track number");
     let (res, buf) = raw(56, CONTENT_DELAYIFSLOW);
-    assert_eq!((res, String::from_utf16_lossy(&buf[..3])), (FT_STRINGW, "PCM".to_string()));
+    assert_eq!(
+        (res, String::from_utf16_lossy(&buf[..3])),
+        (FT_STRINGW, "PCM".to_string())
+    );
     assert_eq!(buf[3], 0);
-    assert_eq!((raw(57, 0).0, raw(57, 0).1[0]), (FT_BOOLEAN, 1), "PCM is lossless");
+    assert_eq!(
+        (raw(57, 0).0, raw(57, 0).1[0]),
+        (FT_BOOLEAN, 1),
+        "PCM is lossless"
+    );
     assert_eq!(raw(58, 0).0, FT_FIELDEMPTY, "no composer");
     assert_eq!(raw(59, 0).0, FT_FIELDEMPTY, "no track total");
     // Not audio: tag fields are empty.
-    let img: Vec<u16> = std::path::Path::new("Cargo.toml").as_os_str().encode_wide().chain(Some(0)).collect();
+    let img: Vec<u16> = std::path::Path::new("Cargo.toml")
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let mut buf = [0u16; 64];
-    assert_eq!(unsafe { ContentGetValueW(img.as_ptr(), 15, 0, buf.as_mut_ptr() as *mut c_void, 128, 0) }, FT_FIELDEMPTY);
+    assert_eq!(
+        unsafe { ContentGetValueW(img.as_ptr(), 15, 0, buf.as_mut_ptr() as *mut c_void, 128, 0) },
+        FT_FIELDEMPTY
+    );
 }
 
 /// Little-endian TIFF from IFDs of (tag, type, value bytes). IFD0 is written first; tag 0x8769
@@ -386,7 +507,17 @@ fn tiff_le(ifds: &[Vec<(u16, u16, Vec<u8>)>]) -> Vec<u8> {
         5 => 8,
         _ => 1,
     };
-    let data_len = |ifd: &Vec<(u16, u16, Vec<u8>)>| ifd.iter().map(|e| if e.2.len() > 4 { (e.2.len() + 1) & !1 } else { 0 }).sum::<usize>();
+    let data_len = |ifd: &Vec<(u16, u16, Vec<u8>)>| {
+        ifd.iter()
+            .map(|e| {
+                if e.2.len() > 4 {
+                    (e.2.len() + 1) & !1
+                } else {
+                    0
+                }
+            })
+            .sum::<usize>()
+    };
     let mut starts = vec![8usize];
     for ifd in ifds {
         starts.push(starts.last().unwrap() + 2 + ifd.len() * 12 + 4 + data_len(ifd));
@@ -432,7 +563,10 @@ fn ascii(s: &str) -> Vec<u8> {
 }
 
 fn rationals(parts: &[(u32, u32)]) -> Vec<u8> {
-    parts.iter().flat_map(|(n, d)| n.to_le_bytes().into_iter().chain(d.to_le_bytes())).collect()
+    parts
+        .iter()
+        .flat_map(|(n, d)| n.to_le_bytes().into_iter().chain(d.to_le_bytes()))
+        .collect()
 }
 
 /// Days from 1601-01-01 (the FILETIME epoch) to a civil date.
@@ -488,12 +622,25 @@ fn test_photo_exif_fields() {
     let raw = |path: &std::path::Path, field: i32, flags: i32| -> (i32, [u8; 512]) {
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
         let mut buf = [0u8; 512];
-        let res = unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 512, flags) };
+        let res = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                512,
+                flags,
+            )
+        };
         (res, buf)
     };
     let text = |field: i32| {
         let (res, buf) = raw(&jpg, field, 0);
-        let wide: Vec<u16> = buf.chunks(2).map(|c| u16::from_le_bytes([c[0], c[1]])).take_while(|&c| c != 0).collect();
+        let wide: Vec<u16> = buf
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .take_while(|&c| c != 0)
+            .collect();
         (res, String::from_utf16_lossy(&wide))
     };
     let int = |path: &std::path::Path, field: i32| {
@@ -524,9 +671,17 @@ fn test_photo_exif_fields() {
 
     let (res, lat) = float(44);
     assert_eq!(res, FT_NUMERIC_FLOATING);
-    assert!((lat - -(33.0 + 51.0 / 60.0 + 35.9 / 3600.0)).abs() < 1e-9, "{}", lat);
+    assert!(
+        (lat - -(33.0 + 51.0 / 60.0 + 35.9 / 3600.0)).abs() < 1e-9,
+        "{}",
+        lat
+    );
     let (_, lon) = float(45);
-    assert!((lon - (151.0 + 12.0 / 60.0 + 40.0 / 3600.0)).abs() < 1e-9, "{}", lon);
+    assert!(
+        (lon - (151.0 + 12.0 / 60.0 + 40.0 / 3600.0)).abs() < 1e-9,
+        "{}",
+        lon
+    );
     assert_eq!(int(&jpg, 46), (FT_BOOLEAN, 1));
     assert_eq!(int(&png, 46), (FT_BOOLEAN, 0), "no EXIF means no GPS");
     assert_eq!(raw(&png, 32, 0).0, FT_FIELDEMPTY);
@@ -536,7 +691,12 @@ fn test_photo_exif_fields() {
     assert_eq!(res, FT_DATETIME);
     let filetime = u64::from_le_bytes(buf[..8].try_into().unwrap()) as i64;
     let naive = ((days_since_1601(2024, 5, 1) * 86_400) + 12 * 3600 + 34 * 60 + 56) * 10_000_000;
-    assert!((filetime - naive).abs() <= 14 * 3600 * 10_000_000, "{} vs {}", filetime, naive);
+    assert!(
+        (filetime - naive).abs() <= 14 * 3600 * 10_000_000,
+        "{} vs {}",
+        filetime,
+        naive
+    );
     assert_eq!(filetime % 10_000_000, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -546,12 +706,35 @@ fn test_photo_exif_fields() {
 fn test_video_meta_fields_delay_and_scope() {
     use std::os::windows::ffi::OsStrExt;
     let call = |name: &str, field: i32, flags: i32| {
-        let wide: Vec<u16> = std::path::Path::new(name).as_os_str().encode_wide().chain(Some(0)).collect();
+        let wide: Vec<u16> = std::path::Path::new(name)
+            .as_os_str()
+            .encode_wide()
+            .chain(Some(0))
+            .collect();
         let mut buf = [0u8; 256];
-        unsafe { ContentGetValueW(wide.as_ptr(), field, 0, buf.as_mut_ptr() as *mut c_void, 256, flags) }
+        unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                256,
+                flags,
+            )
+        }
     };
     for field in 47..=55 {
-        assert_eq!(call("target/test_dummy_meta.mp4", field, CONTENT_DELAYIFSLOW), FT_DELAYED, "field {}", field);
-        assert_eq!(call("Cargo.toml", field, 0), FT_FIELDEMPTY, "field {}", field);
+        assert_eq!(
+            call("target/test_dummy_meta.mp4", field, CONTENT_DELAYIFSLOW),
+            FT_DELAYED,
+            "field {}",
+            field
+        );
+        assert_eq!(
+            call("Cargo.toml", field, 0),
+            FT_FIELDEMPTY,
+            "field {}",
+            field
+        );
     }
 }

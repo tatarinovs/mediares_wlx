@@ -18,20 +18,24 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use mediares_combo::{ListCloseWindow, ListGetPreviewBitmapW, ListLoadNextW, ListLoadW, ListSendCommand};
+use mediares_combo::{
+    ListCloseWindow, ListGetPreviewBitmapW, ListLoadNextW, ListLoadW, ListSendCommand,
+};
 use mediares_core::image::{ImageBuffer, Rgba};
 use windows::core::w;
+use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY, CAPTUREBLT,
+    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
+    SRCCOPY,
 };
+use windows::Win32::Graphics::Gdi::{DeleteObject as DeleteGdi, GetObjectW, BITMAP, HBITMAP};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::Foundation::HGLOBAL;
-use windows::Win32::Graphics::Gdi::{DeleteObject as DeleteGdi, GetObjectW, BITMAP, HBITMAP};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
+    KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -39,10 +43,21 @@ fn save_bgra(path: &Path, width: u32, height: u32, bgra: &[u8], bottom_up: bool)
     let row = width as usize * 4;
     let mut rgba = Vec::with_capacity(bgra.len());
     for y in 0..height as usize {
-        let src = if bottom_up { height as usize - 1 - y } else { y };
-        rgba.extend(bgra[src * row..(src + 1) * row].chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], 255]));
+        let src = if bottom_up {
+            height as usize - 1 - y
+        } else {
+            y
+        };
+        rgba.extend(
+            bgra[src * row..(src + 1) * row]
+                .chunks_exact(4)
+                .flat_map(|p| [p[2], p[1], p[0], 255]),
+        );
     }
-    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba).expect("buffer").save(path).expect("save png");
+    ImageBuffer::<Rgba<u8>, _>::from_raw(width, height, rgba)
+        .expect("buffer")
+        .save(path)
+        .expect("save png");
 }
 
 unsafe fn save_clipboard_dib(owner: HWND, path: &Path) {
@@ -56,7 +71,10 @@ unsafe fn save_clipboard_dib(owner: HWND, path: &Path) {
             let p = GlobalLock(mem) as *const u8;
             let head = &*(p as *const BITMAPINFOHEADER);
             let (w, h) = (head.biWidth as u32, head.biHeight.unsigned_abs());
-            let pixels = std::slice::from_raw_parts(p.add(head.biSize as usize), w as usize * 4 * h as usize);
+            let pixels = std::slice::from_raw_parts(
+                p.add(head.biSize as usize),
+                w as usize * 4 * h as usize,
+            );
             println!("clipboard DIB {}x{} {}bpp", w, h, head.biBitCount);
             save_bgra(path, w, h, pixels, head.biHeight > 0);
             let _ = GlobalUnlock(mem);
@@ -68,8 +86,15 @@ unsafe fn save_clipboard_dib(owner: HWND, path: &Path) {
 
 unsafe fn save_hbitmap(bitmap: HBITMAP, path: &Path) {
     let mut info = BITMAP::default();
-    GetObjectW(bitmap.into(), size_of::<BITMAP>() as i32, Some(&mut info as *mut _ as *mut _));
-    println!("preview bitmap {}x{} {}bpp", info.bmWidth, info.bmHeight, info.bmBitsPixel);
+    GetObjectW(
+        bitmap.into(),
+        size_of::<BITMAP>() as i32,
+        Some(&mut info as *mut _ as *mut _),
+    );
+    println!(
+        "preview bitmap {}x{} {}bpp",
+        info.bmWidth, info.bmHeight, info.bmBitsPixel
+    );
     let len = info.bmWidthBytes as usize * info.bmHeight as usize;
     let bits = std::slice::from_raw_parts(info.bmBits as *const u8, len);
     save_bgra(path, info.bmWidth as u32, info.bmHeight as u32, bits, false);
@@ -82,14 +107,27 @@ unsafe fn send_keys(keys: &[(u16, bool)]) {
         .map(|&(vk, up)| INPUT {
             r#type: INPUT_KEYBOARD,
             Anonymous: INPUT_0 {
-                ki: KEYBDINPUT { wVk: VIRTUAL_KEY(vk), dwFlags: if up { KEYEVENTF_KEYUP } else { KEYBD_EVENT_FLAGS(0) }, ..Default::default() },
+                ki: KEYBDINPUT {
+                    wVk: VIRTUAL_KEY(vk),
+                    dwFlags: if up {
+                        KEYEVENTF_KEYUP
+                    } else {
+                        KEYBD_EVENT_FLAGS(0)
+                    },
+                    ..Default::default()
+                },
             },
         })
         .collect();
     SendInput(&inputs, size_of::<INPUT>() as i32);
 }
 
-unsafe extern "system" fn host_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn host_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_SIZE {
         // Like TC: keep the plugin window filling the client area.
         if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
@@ -121,7 +159,17 @@ unsafe fn capture(rc: RECT, out: &Path) {
     let dc = CreateCompatibleDC(Some(screen));
     let bmp = CreateCompatibleBitmap(screen, w, h);
     let old = SelectObject(dc, bmp.into());
-    let _ = BitBlt(dc, 0, 0, w, h, Some(screen), rc.left, rc.top, SRCCOPY | CAPTUREBLT);
+    let _ = BitBlt(
+        dc,
+        0,
+        0,
+        w,
+        h,
+        Some(screen),
+        rc.left,
+        rc.top,
+        SRCCOPY | CAPTUREBLT,
+    );
     let mut bmi = BITMAPINFO {
         bmiHeader: BITMAPINFOHEADER {
             biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -135,7 +183,15 @@ unsafe fn capture(rc: RECT, out: &Path) {
         ..Default::default()
     };
     let mut buf = vec![0u8; (w * h * 4) as usize];
-    GetDIBits(dc, bmp, 0, h as u32, Some(buf.as_mut_ptr() as *mut _), &mut bmi, DIB_RGB_COLORS);
+    GetDIBits(
+        dc,
+        bmp,
+        0,
+        h as u32,
+        Some(buf.as_mut_ptr() as *mut _),
+        &mut bmi,
+        DIB_RGB_COLORS,
+    );
     SelectObject(dc, old);
     let _ = DeleteObject(bmp.into());
     let _ = DeleteDC(dc);
@@ -145,7 +201,8 @@ unsafe fn capture(rc: RECT, out: &Path) {
         px.swap(0, 2);
         px[3] = 255;
     }
-    let img: ImageBuffer<Rgba<u8>, _> = ImageBuffer::from_raw(w as u32, h as u32, buf).expect("buffer size");
+    let img: ImageBuffer<Rgba<u8>, _> =
+        ImageBuffer::from_raw(w as u32, h as u32, buf).expect("buffer size");
     img.save(out).expect("save png");
     println!("shot {}", out.display());
 }
@@ -216,7 +273,11 @@ fn main() {
 
         let started = Instant::now();
         let viewer = ListLoadW(parent, wide(&file).as_ptr(), 0);
-        println!("ListLoadW -> {:?} in {} ms", viewer, started.elapsed().as_millis());
+        println!(
+            "ListLoadW -> {:?} in {} ms",
+            viewer,
+            started.elapsed().as_millis()
+        );
         if viewer.is_invalid() {
             let _ = DestroyWindow(host);
             return;
@@ -228,7 +289,8 @@ fn main() {
                 "wait" => pump(arg.parse().expect("ms")),
                 "shot" => {
                     // A fullscreen viewer is a top-level popup (GetParent would return its owner).
-                    let fullscreen = (GetWindowLongPtrW(viewer, GWL_STYLE) as u32 & WS_CHILD.0) == 0;
+                    let fullscreen =
+                        (GetWindowLongPtrW(viewer, GWL_STYLE) as u32 & WS_CHILD.0) == 0;
                     let mut rc = RECT::default();
                     let _ = GetWindowRect(if fullscreen { viewer } else { host }, &mut rc);
                     capture(rc, &out_dir.join(format!("{}.png", arg)));
@@ -251,7 +313,12 @@ fn main() {
                 }
                 "wheel" => {
                     let delta: i16 = arg.parse().expect("delta");
-                    let _ = PostMessageW(Some(viewer), WM_MOUSEWHEEL, WPARAM((delta as u16 as usize) << 16), LPARAM(0));
+                    let _ = PostMessageW(
+                        Some(viewer),
+                        WM_MOUSEWHEEL,
+                        WPARAM((delta as u16 as usize) << 16),
+                        LPARAM(0),
+                    );
                     pump(50);
                 }
                 "rects" => {
@@ -305,7 +372,11 @@ fn main() {
                         after = Some(h);
                     }
                     strips.sort_by_key(|(top, _)| *top);
-                    let target = if which == "top" { strips.first() } else { strips.last() };
+                    let target = if which == "top" {
+                        strips.first()
+                    } else {
+                        strips.last()
+                    };
                     match target {
                         Some(&(_, h)) => {
                             let (x, y) = xy(xy_arg);
@@ -332,10 +403,18 @@ fn main() {
                 "thumb" => {
                     let parts: Vec<&str> = arg.splitn(4, ',').collect();
                     let (w, h) = (parts[0].parse().expect("w"), parts[1].parse().expect("h"));
-                    let target = parts.get(3).map(PathBuf::from).unwrap_or_else(|| file.clone());
+                    let target = parts
+                        .get(3)
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| file.clone());
                     let started = Instant::now();
-                    let bitmap = ListGetPreviewBitmapW(wide(&target).as_ptr(), w, h, std::ptr::null(), 0);
-                    println!("ListGetPreviewBitmapW({}) in {} ms", target.display(), started.elapsed().as_millis());
+                    let bitmap =
+                        ListGetPreviewBitmapW(wide(&target).as_ptr(), w, h, std::ptr::null(), 0);
+                    println!(
+                        "ListGetPreviewBitmapW({}) in {} ms",
+                        target.display(),
+                        started.elapsed().as_millis()
+                    );
                     if bitmap.is_invalid() {
                         println!("no preview bitmap");
                     } else {

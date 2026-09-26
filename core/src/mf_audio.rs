@@ -6,10 +6,11 @@
 use std::path::Path;
 
 use windows::Win32::Media::MediaFoundation::{
-    IMFSourceReader, MFAudioFormat_Float, MFCreateMediaType, MFMediaType_Audio, MF_MT_AUDIO_AVG_BYTES_PER_SECOND,
-    MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE,
-    MF_MT_SUBTYPE, MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READERF_ERROR,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    IMFSourceReader, MFAudioFormat_Float, MFCreateMediaType, MFMediaType_Audio,
+    MF_MT_AUDIO_AVG_BYTES_PER_SECOND, MF_MT_AUDIO_BITS_PER_SAMPLE, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE,
+    MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
 };
 
 use crate::mf_init::{ensure_mf_started, ComScope};
@@ -44,7 +45,13 @@ impl MfAudioReader {
             wanted.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float).ok()?;
             reader.SetCurrentMediaType(STREAM, None, &wanted).ok()?;
             let (sample_rate, channels) = float_format(&reader)?;
-            Some(Self { reader, sample_rate, channels, out: Vec::new(), _com: com })
+            Some(Self {
+                reader,
+                sample_rate,
+                channels,
+                out: Vec::new(),
+                _com: com,
+            })
         }
     }
 
@@ -54,7 +61,9 @@ impl MfAudioReader {
         unsafe {
             for _ in 0..MAX_EMPTY_READS {
                 let (mut flags, mut sample) = (0u32, None);
-                self.reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)).ok()?;
+                self.reader
+                    .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+                    .ok()?;
                 if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
                     return None;
                 }
@@ -78,7 +87,11 @@ impl MfAudioReader {
                     let frame_bytes = 4 * self.channels as usize;
                     let whole = bytes.len() / frame_bytes * frame_bytes;
                     // The buffer isn't guaranteed to be aligned for f32.
-                    self.out.extend(bytes[..whole].chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])));
+                    self.out.extend(
+                        bytes[..whole]
+                            .chunks_exact(4)
+                            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                    );
                 }
                 let _ = buffer.Unlock();
                 if !self.out.is_empty() {
@@ -98,8 +111,14 @@ unsafe fn float_format(reader: &IMFSourceReader) -> Option<(u32, u16)> {
     {
         return None;
     }
-    let rate = current.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND).ok().filter(|&r| r > 0)?;
-    let channels = current.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS).ok().filter(|&c| c > 0)?;
+    let rate = current
+        .GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)
+        .ok()
+        .filter(|&r| r > 0)?;
+    let channels = current
+        .GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)
+        .ok()
+        .filter(|&c| c > 0)?;
     Some((rate, u16::try_from(channels).ok()?))
 }
 
@@ -126,14 +145,18 @@ pub fn probe_audio_meta(path: &Path) -> Option<AudioStreamMeta> {
         let reader = open_reader_for(path, STREAM, false).ok()?;
         let native = reader.GetNativeMediaType(STREAM, 0).ok()?;
         let positive = |v: windows::core::Result<u32>| v.ok().filter(|&v| v > 0);
-        let codec = native.GetGUID(&MF_MT_SUBTYPE).ok().and_then(|g| audio_codec_name(&g));
+        let codec = native
+            .GetGUID(&MF_MT_SUBTYPE)
+            .ok()
+            .and_then(|g| audio_codec_name(&g));
         let lossless = codec.as_deref().and_then(is_lossless);
         let duration_sec = duration_hns(&reader) as f64 / 10_000_000.0;
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
         let bitrate_kbps = positive(native.GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND))
             .map(|b| (b as f64 * 8.0 / 1000.0).round() as u32)
             .or_else(|| {
-                (duration_sec >= 1.0 && file_size > 0).then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32)
+                (duration_sec >= 1.0 && file_size > 0)
+                    .then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32)
             })
             .filter(|&k| k > 0);
         Some(AudioStreamMeta {
@@ -143,7 +166,11 @@ pub fn probe_audio_meta(path: &Path) -> Option<AudioStreamMeta> {
             bitrate_kbps,
             sample_rate: positive(native.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND)),
             channels: positive(native.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS)),
-            bit_depth: if lossless == Some(true) { positive(native.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE)) } else { None },
+            bit_depth: if lossless == Some(true) {
+                positive(native.GetUINT32(&MF_MT_AUDIO_BITS_PER_SAMPLE))
+            } else {
+                None
+            },
         })
     }
 }
@@ -200,11 +227,18 @@ mod tests {
             samples.extend_from_slice(chunk);
         }
         assert_eq!(samples.len(), frames as usize);
-        assert!((samples[500] * 32768.0 - 8000.0).abs() < 1.0, "{}", samples[500] * 32768.0);
+        assert!(
+            (samples[500] * 32768.0 - 8000.0).abs() < 1.0,
+            "{}",
+            samples[500] * 32768.0
+        );
 
         let meta = probe_audio_meta(&path).expect("meta");
         assert_eq!(meta.codec.as_deref(), Some("PCM"));
-        assert_eq!((meta.sample_rate, meta.channels, meta.bit_depth), (Some(rate), Some(1), Some(16)));
+        assert_eq!(
+            (meta.sample_rate, meta.channels, meta.bit_depth),
+            (Some(rate), Some(1), Some(16))
+        );
         assert_eq!(meta.bitrate_kbps, Some(128));
         assert!((meta.duration_sec - 2.0).abs() < 0.01);
         let _ = std::fs::remove_file(path);

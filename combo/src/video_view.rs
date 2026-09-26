@@ -8,7 +8,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use mediares_core::video_frame::{probe_video, probe_video_meta, KeyframeIndex, VideoInfo, VideoMeta};
+use mediares_core::video_frame::{
+    probe_video, probe_video_meta, KeyframeIndex, VideoInfo, VideoMeta,
+};
 use mediares_core::video_tags::{read_video_tags, VideoTags};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -17,12 +19,13 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR,
     MF_MEDIA_ENGINE_EVENT_FORMATCHANGE, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA,
     MF_MEDIA_ENGINE_EVENT_PAUSE, MF_MEDIA_ENGINE_EVENT_PLAY, MF_MEDIA_ENGINE_EVENT_PLAYING,
-    MF_MEDIA_ENGINE_EVENT_SEEKED, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE, MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE,
+    MF_MEDIA_ENGINE_EVENT_SEEKED, MF_MEDIA_ENGINE_EVENT_TIMEUPDATE,
+    MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, KillTimer, MoveWindow, RegisterClassExW,
-    SetTimer, HTTRANSPARENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, KillTimer, MoveWindow,
+    RegisterClassExW, SetTimer, HTTRANSPARENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST,
+    WNDCLASSEXW, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
 use crate::media_view::EventEffect;
@@ -48,9 +51,22 @@ impl Surface {
     pub unsafe fn new(viewer: HWND, visible: bool) -> Option<Self> {
         register_surface_class();
         let style = WS_CHILD | WS_CLIPSIBLINGS | if visible { WS_VISIBLE } else { WINDOW_STYLE(0) };
-        CreateWindowExW(WINDOW_EX_STYLE(0), SURFACE_CLASS, None, style, 0, 0, 1, 1, Some(viewer), None, Some(module()), None)
-            .ok()
-            .map(Self)
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            SURFACE_CLASS,
+            None,
+            style,
+            0,
+            0,
+            1,
+            1,
+            Some(viewer),
+            None,
+            Some(module()),
+            None,
+        )
+        .ok()
+        .map(Self)
     }
 }
 
@@ -64,7 +80,12 @@ impl Drop for Surface {
     }
 }
 
-unsafe extern "system" fn surface_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn surface_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     match msg {
         WM_NCHITTEST => LRESULT(HTTRANSPARENT as isize),
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -132,7 +153,10 @@ const STEP_RATE: f64 = 0.25;
 
 /// Containers whose Media Foundation source can't seek to an exact frame.
 fn seeks_precisely(path: &Path) -> bool {
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     !matches!(ext.as_str(), "mpg" | "mpeg" | "vob")
 }
 
@@ -198,7 +222,9 @@ impl VideoView {
 
     /// Switches to another file, reusing the engine (and its speed).
     pub unsafe fn open(&mut self, path: &Path, resume: bool) -> bool {
-        let Some(info) = probe_video(path) else { return false };
+        let Some(info) = probe_video(path) else {
+            return false;
+        };
         self.remember_position();
         self.finish_step();
         if self.player.open(path).is_err() {
@@ -233,7 +259,10 @@ impl VideoView {
     /// One step slower / faster through [`RATES`], or back to normal (`None`). Returns the speed.
     pub unsafe fn change_rate(&mut self, faster: Option<bool>) -> f64 {
         self.finish_step();
-        let at = RATES.iter().position(|&r| r >= self.rate).unwrap_or(RATES.len() - 1);
+        let at = RATES
+            .iter()
+            .position(|&r| r >= self.rate)
+            .unwrap_or(RATES.len() - 1);
         self.rate = match faster {
             None => 1.0,
             Some(true) => RATES[(at + 1).min(RATES.len() - 1)],
@@ -259,7 +288,11 @@ impl VideoView {
                 let muted = self.player.is_muted();
                 self.player.set_muted(true);
                 self.player.set_current_rate(STEP_RATE);
-                self.stepping = Some(Step { from_pts: self.player.presented_pts(), remaining: 1, muted });
+                self.stepping = Some(Step {
+                    from_pts: self.player.presented_pts(),
+                    remaining: 1,
+                    muted,
+                });
                 self.player.play();
             }
         }
@@ -268,7 +301,9 @@ impl VideoView {
 
     /// Render tick of a forward step: pause once enough new frames were shown.
     unsafe fn advance_step(&mut self) {
-        let Some(step) = &mut self.stepping else { return };
+        let Some(step) = &mut self.stepping else {
+            return;
+        };
         if self.player.is_paused() {
             // Paused by the user (or the end reached) mid-step.
             self.finish_step();
@@ -312,7 +347,11 @@ impl VideoView {
                     "duration" => Some(duration.clone()),
                     _ => osd.text.fields.get(key).cloned(),
                 });
-                self.player.render(Some(Osd { text: &text, font: osd.font.0, color: osd.style.color }));
+                self.player.render(Some(Osd {
+                    text: &text,
+                    font: osd.font.0,
+                    color: osd.style.color,
+                }));
             }
             None => self.player.render(None),
         }
@@ -322,7 +361,10 @@ impl VideoView {
     /// Stream properties and tags of the current file, read on first call.
     pub fn details(&mut self) -> &VideoDetails {
         let path = &self.path;
-        self.details.get_or_insert_with(|| VideoDetails { meta: probe_video_meta(path), tags: read_video_tags(path) })
+        self.details.get_or_insert_with(|| VideoDetails {
+            meta: probe_video_meta(path),
+            tags: read_video_tags(path),
+        })
     }
 
     /// Shows (`Some`) or hides the OSD.
@@ -336,7 +378,11 @@ impl VideoView {
                         0 => 96,
                         dpi => dpi as i32,
                     };
-                    let font = crate::dialog::GdiObject(crate::image_view::create_osd_font(&style.face, style.size_pt, dpi));
+                    let font = crate::dialog::GdiObject(crate::image_view::create_osd_font(
+                        &style.face,
+                        style.size_pt,
+                        dpi,
+                    ));
                     Some(VideoOsd { style, font, text })
                 }
             },
@@ -345,15 +391,31 @@ impl VideoView {
 
     /// Letterboxes the surface into `area` (viewer client coordinates).
     pub unsafe fn layout(&self, area: RECT) {
-        let (area_w, area_h) = ((area.right - area.left).max(1), (area.bottom - area.top).max(1));
-        let (vw, vh) = self.player.native_size().unwrap_or((self.info.width, self.info.height));
+        let (area_w, area_h) = (
+            (area.right - area.left).max(1),
+            (area.bottom - area.top).max(1),
+        );
+        let (vw, vh) = self
+            .player
+            .native_size()
+            .unwrap_or((self.info.width, self.info.height));
         let (w, h) = if vw > 0 && vh > 0 {
             let scale = (area_w as f64 / vw as f64).min(area_h as f64 / vh as f64);
-            (((vw as f64 * scale).round() as i32).max(1), ((vh as f64 * scale).round() as i32).max(1))
+            (
+                ((vw as f64 * scale).round() as i32).max(1),
+                ((vh as f64 * scale).round() as i32).max(1),
+            )
         } else {
             (area_w, area_h)
         };
-        let _ = MoveWindow(self.surface.0, area.left + (area_w - w) / 2, area.top + (area_h - h) / 2, w, h, true);
+        let _ = MoveWindow(
+            self.surface.0,
+            area.left + (area_w - w) / 2,
+            area.top + (area_h - h) / 2,
+            w,
+            h,
+            true,
+        );
         self.player.resize(w, h);
     }
 
@@ -364,7 +426,11 @@ impl VideoView {
         }
         let Some(index) = &self.keyframes else { return };
         let now = self.player.position();
-        let target = if forward { index.next_after(now + 0.01) } else { index.previous_before(now - KEYFRAME_BACK_SLACK_SEC) };
+        let target = if forward {
+            index.next_after(now + 0.01)
+        } else {
+            index.previous_before(now - KEYFRAME_BACK_SLACK_SEC)
+        };
         if let Some(t) = target {
             self.player.seek(t, false);
         }
@@ -373,25 +439,42 @@ impl VideoView {
     /// The frame on screen, at its native size.
     pub unsafe fn capture_frame(&self) -> Option<crate::image_cache::DecodedImage> {
         let (width, height, bgra) = self.player.capture_frame()?;
-        Some(crate::image_cache::DecodedImage { width, height, bgra, is_preview: false, exif: None })
+        Some(crate::image_cache::DecodedImage {
+            width,
+            height,
+            bgra,
+            is_preview: false,
+            exif: None,
+        })
     }
 
     /// "1920x1080, 1:23:45"
     pub fn title_info(&self) -> String {
-        format!("{}x{}, {}", self.info.width, self.info.height, format_time(self.info.duration_sec))
+        format!(
+            "{}x{}, {}",
+            self.info.width,
+            self.info.height,
+            format_time(self.info.duration_sec)
+        )
     }
 
     pub unsafe fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
         if event == MF_MEDIA_ENGINE_EVENT_SEEKED.0 {
             if let Some(target) = self.back_target.take() {
-                let frame = if self.info.frame_rate > 0.0 { 1.0 / self.info.frame_rate } else { 0.04 };
+                let frame = if self.info.frame_rate > 0.0 {
+                    1.0 / self.info.frame_rate
+                } else {
+                    0.04
+                };
                 if (self.player.position() - target).abs() > 1.5 * frame {
                     self.precise_seek = false;
                 }
             }
         }
         match event {
-            e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 || e == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE.0 => {
+            e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0
+                || e == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE.0 =>
+            {
                 if let Some((w, h)) = self.player.native_size() {
                     self.info.width = w;
                     self.info.height = h;
@@ -407,7 +490,9 @@ impl VideoView {
             }
             e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => EventEffect::Ended,
             e if e == MF_MEDIA_ENGINE_EVENT_ERROR.0 => {
-                self.error = Some(engine_error_text(self.player.error_code().unwrap_or(param1 as u16)));
+                self.error = Some(engine_error_text(
+                    self.player.error_code().unwrap_or(param1 as u16),
+                ));
                 EventEffect::RepaintBar
             }
             e if is_progress_event(e) => EventEffect::RepaintBar,
@@ -417,7 +502,9 @@ impl VideoView {
 }
 
 fn resume_point(path: &Path, info: &VideoInfo, enabled: bool) -> Option<f64> {
-    (enabled && info.duration_sec >= resume::MIN_DURATION_SEC).then(|| resume::load(path)).flatten()
+    (enabled && info.duration_sec >= resume::MIN_DURATION_SEC)
+        .then(|| resume::load(path))
+        .flatten()
 }
 
 impl Drop for VideoView {

@@ -17,30 +17,64 @@ const IDC_EXIF_TEXT: usize = 201;
 
 pub unsafe fn show(owner: HWND, file_path: &Path) {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let filename = file_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let Some(dlg) = dialog::create_frame(owner, CLASS_NAME, &format!("EXIF метаданные - {}", filename), 540, 440) else {
+    let filename = file_path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    let Some(dlg) = dialog::create_frame(
+        owner,
+        CLASS_NAME,
+        &format!("EXIF метаданные - {}", filename),
+        540,
+        440,
+    ) else {
         return;
     };
 
     // Monospace so the label column lines up.
     let font = dialog::create_font(w!("Consolas"), -13);
     let ui_font = dialog::create_font(w!("Segoe UI"), -12);
-    let edit_style = WS_TABSTOP.0 | WS_VSCROLL.0 | WS_BORDER.0 | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32;
-    dialog::control(dlg, w!("EDIT"), &exif_text(file_path), edit_style, (15, 15, 495, 335), IDC_EXIF_TEXT, font.0);
+    let edit_style = WS_TABSTOP.0
+        | WS_VSCROLL.0
+        | WS_BORDER.0
+        | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32;
+    dialog::control(
+        dlg,
+        w!("EDIT"),
+        &exif_text(file_path),
+        edit_style,
+        (15, 15, 495, 335),
+        IDC_EXIF_TEXT,
+        font.0,
+    );
     let close = dialog::control(
-        dlg, w!("BUTTON"), "Закрыть", WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32, (410, 360, 100, 28), IDOK.0 as usize, ui_font.0,
+        dlg,
+        w!("BUTTON"),
+        "Закрыть",
+        WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
+        (410, 360, 100, 28),
+        IDOK.0 as usize,
+        ui_font.0,
     );
 
     dialog::run_modal(dlg, close);
 }
 
 fn exif_text(file_path: &Path) -> String {
-    let rows = read_exif(file_path).map(|info| display_rows(&info)).unwrap_or_default();
+    let rows = read_exif(file_path)
+        .map(|info| display_rows(&info))
+        .unwrap_or_default();
     let mut text = if rows.is_empty() {
         "EXIF метаданные не найдены или формат не поддерживается.\r\n".to_string()
     } else {
-        let width = rows.iter().map(|(k, _)| k.chars().count()).max().unwrap_or(0);
-        rows.iter().map(|(k, v)| format!("{:<width$} : {}\r\n", k, v)).collect()
+        let width = rows
+            .iter()
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(0);
+        rows.iter()
+            .map(|(k, v)| format!("{:<width$} : {}\r\n", k, v))
+            .collect()
     };
     text.push_str("\r\n--- Путь к файлу ---\r\n");
     text.push_str(&file_path.to_string_lossy());
@@ -63,9 +97,15 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
         (Some(taken), _) => push("Дата и время съемки", Some(taken.clone())),
         (None, modified) => push("Дата изменения", modified.clone()),
     }
-    push("Выдержка", info.exposure_time.as_ref().map(|s| format!("{} c", s)));
+    push(
+        "Выдержка",
+        info.exposure_time.as_ref().map(|s| format!("{} c", s)),
+    );
     push("Диафрагма", info.f_number.map(|f| format!("f/{:.1}", f)));
-    push("Светочувствительность (ISO)", info.iso.map(|v| v.to_string()));
+    push(
+        "Светочувствительность (ISO)",
+        info.iso.map(|v| v.to_string()),
+    );
     push(
         "Фокусное расстояние",
         info.focal_length.map(|f| match info.focal_length_35mm {
@@ -73,12 +113,28 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
             None => format!("{:.1} мм", f),
         }),
     );
-    push("Вспышка", info.flash_fired.map(|f| if f { "Сработала" } else { "Не сработала" }.to_string()));
+    push(
+        "Вспышка",
+        info.flash_fired.map(|f| {
+            if f {
+                "Сработала"
+            } else {
+                "Не сработала"
+            }
+            .to_string()
+        }),
+    );
     push(
         "Ориентация EXIF",
-        info.orientation.map(|o| format!("{} (код {})", orientation_name(o), o)),
+        info.orientation
+            .map(|o| format!("{} (код {})", orientation_name(o), o)),
     );
-    push("Разрешение EXIF", info.width.zip(info.height).map(|(w, h)| format!("{} x {}", w, h)));
+    push(
+        "Разрешение EXIF",
+        info.width
+            .zip(info.height)
+            .map(|(w, h)| format!("{} x {}", w, h)),
+    );
     push("Программное обеспечение", info.software.clone());
     rows
 }
@@ -97,7 +153,12 @@ fn orientation_name(code: u16) -> &'static str {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
         let id = dialog::loword(wparam) as i32;
         match msg {

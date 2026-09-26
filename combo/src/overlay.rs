@@ -12,16 +12,18 @@ use std::sync::Once;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateRoundRectRgn, CreateSolidBrush, DeleteDC,
-    DeleteObject, FillRect, Polygon, SelectObject, SetWindowRgn, HDC, PS_NULL, SRCCOPY,
+    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateRoundRectRgn,
+    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, Polygon, SelectObject, SetWindowRgn, HDC,
+    PS_NULL, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow, GetGUIThreadInfo,
-    GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE, GetWindowLongPtrW, GetWindowRect, KillTimer,
-    LoadCursorW, RegisterClassExW, SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow,
-    GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
+    GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
+    SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow, GUITHREADINFO,
+    GUI_INMENUMODE, GUI_POPUPMENUMODE, GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE,
+    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 use crate::module;
@@ -57,16 +59,28 @@ pub enum PhotoButton {
 pub fn photo_layout(dpi_scale: f32) -> ((i32, i32), [(PhotoButton, RECT); 3]) {
     let h = transport_bar::height(dpi_scale);
     let pad = (8.0 * dpi_scale).round() as i32;
-    let button = |i: i32| RECT { left: pad + h * i, top: 0, right: pad + h * (i + 1), bottom: h };
+    let button = |i: i32| RECT {
+        left: pad + h * i,
+        top: 0,
+        right: pad + h * (i + 1),
+        bottom: h,
+    };
     (
         (3 * h + 2 * pad, h),
-        [(PhotoButton::Previous, button(0)), (PhotoButton::Slideshow, button(1)), (PhotoButton::Next, button(2))],
+        [
+            (PhotoButton::Previous, button(0)),
+            (PhotoButton::Slideshow, button(1)),
+            (PhotoButton::Next, button(2)),
+        ],
     )
 }
 
 pub fn hit_photo(dpi_scale: f32, x: i32, y: i32) -> Option<PhotoButton> {
     let (_, buttons) = photo_layout(dpi_scale);
-    buttons.iter().find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|(b, _)| *b)
+    buttons
+        .iter()
+        .find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+        .map(|(b, _)| *b)
 }
 
 pub fn dpi_scale(hwnd: HWND) -> f32 {
@@ -100,7 +114,12 @@ pub struct Fullscreen {
     last_cursor: POINT,
 }
 
-unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn panel_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
         match msg {
             WM_MOUSEACTIVATE => return LRESULT(MA_NOACTIVATE as isize),
@@ -109,7 +128,11 @@ unsafe extern "system" fn panel_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lpara
         }
         // Mouse input and painting are handled by the viewer window module.
         let viewer = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
-        let handled = if viewer.is_invalid() { None } else { crate::window::overlay_message(viewer, hwnd, msg, lparam) };
+        let handled = if viewer.is_invalid() {
+            None
+        } else {
+            crate::window::overlay_message(viewer, hwnd, msg, lparam)
+        };
         handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     })
 }
@@ -134,12 +157,20 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
     let scale = dpi_scale(viewer);
     let h = transport_bar::height(scale);
     let rect = match kind {
-        PanelKind::Video => RECT { top: monitor.bottom - h, ..monitor },
+        PanelKind::Video => RECT {
+            top: monitor.bottom - h,
+            ..monitor
+        },
         PanelKind::Photo => {
             let ((w, h), _) = photo_layout(scale);
             let margin = (24.0 * scale).round() as i32;
             let left = (monitor.left + monitor.right - w) / 2;
-            RECT { left, top: monitor.bottom - margin - h, right: left + w, bottom: monitor.bottom - margin }
+            RECT {
+                left,
+                top: monitor.bottom - margin - h,
+                right: left + w,
+                bottom: monitor.bottom - margin,
+            }
         }
     };
     let hwnd = CreateWindowExW(
@@ -162,16 +193,33 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), OPACITY, LWA_ALPHA);
     if kind == PanelKind::Photo {
         let radius = (12.0 * scale).round() as i32;
-        let region = CreateRoundRectRgn(0, 0, rect.right - rect.left + 1, rect.bottom - rect.top + 1, radius, radius);
+        let region = CreateRoundRectRgn(
+            0,
+            0,
+            rect.right - rect.left + 1,
+            rect.bottom - rect.top + 1,
+            radius,
+            radius,
+        );
         // The window owns the region from here on.
         SetWindowRgn(hwnd, Some(region), false);
     }
-    Some(Panel { hwnd, kind, visible: false })
+    Some(Panel {
+        hwnd,
+        kind,
+        visible: false,
+    })
 }
 
 impl Fullscreen {
     pub unsafe fn new(viewer: HWND, monitor: RECT) -> Self {
-        let mut fs = Self { monitor, panel: None, autohide: true, cursor_hidden: false, last_cursor: POINT::default() };
+        let mut fs = Self {
+            monitor,
+            panel: None,
+            autohide: true,
+            cursor_hidden: false,
+            last_cursor: POINT::default(),
+        };
         let _ = GetCursorPos(&mut fs.last_cursor);
         SetTimer(Some(viewer), OVERLAY_TIMER_ID, IDLE_MS, None);
         fs
@@ -179,7 +227,12 @@ impl Fullscreen {
 
     /// Creates, replaces or removes the panel (after switching files or changing options).
     /// Returns the panel window if there is one.
-    pub unsafe fn set_panel(&mut self, viewer: HWND, kind: Option<PanelKind>, autohide: bool) -> Option<HWND> {
+    pub unsafe fn set_panel(
+        &mut self,
+        viewer: HWND,
+        kind: Option<PanelKind>,
+        autohide: bool,
+    ) -> Option<HWND> {
         self.autohide = autohide;
         if self.panel.as_ref().map(|p| p.kind) != kind {
             self.panel = kind.and_then(|k| create_panel(viewer, self.monitor, k));
@@ -260,7 +313,9 @@ impl Fullscreen {
     }
 
     unsafe fn cursor_over_panel(&self) -> bool {
-        let Some(panel) = self.panel.as_ref().filter(|p| p.visible) else { return false };
+        let Some(panel) = self.panel.as_ref().filter(|p| p.visible) else {
+            return false;
+        };
         let mut pt = POINT::default();
         let _ = GetCursorPos(&mut pt);
         let mut rc = RECT::default();
@@ -282,8 +337,12 @@ impl Fullscreen {
 /// A menu is open or another window (a dialog, another program) is active: the cursor belongs
 /// to it and must not be hidden.
 unsafe fn ui_elsewhere(viewer: HWND) -> bool {
-    let mut info = GUITHREADINFO { cbSize: size_of::<GUITHREADINFO>() as u32, ..Default::default() };
-    let in_menu = GetGUIThreadInfo(0, &mut info).is_ok() && (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0;
+    let mut info = GUITHREADINFO {
+        cbSize: size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    let in_menu = GetGUIThreadInfo(0, &mut info).is_ok()
+        && (info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE)).0 != 0;
     in_menu || GetForegroundWindow() != viewer
 }
 
@@ -315,7 +374,16 @@ pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool
     let u = (7.0 * dpi_scale).round() as i32;
     let bar = (2.0 * dpi_scale).round().max(1.0) as i32;
     let block = |l: i32, t: i32, r: i32, b: i32| {
-        FillRect(dc, &RECT { left: l, top: t, right: r, bottom: b }, icon);
+        FillRect(
+            dc,
+            &RECT {
+                left: l,
+                top: t,
+                right: r,
+                bottom: b,
+            },
+            icon,
+        );
     };
     let (_, buttons) = photo_layout(dpi_scale);
     for (button, r) in buttons {
@@ -324,11 +392,25 @@ pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool
         match button {
             // Previous / next: a triangle ending in a bar, as on the transport bar.
             PhotoButton::Previous => {
-                let _ = Polygon(dc, &[p(cx + u / 2, cy - u), p(cx + u / 2, cy + u), p(cx - u / 2, cy)]);
+                let _ = Polygon(
+                    dc,
+                    &[
+                        p(cx + u / 2, cy - u),
+                        p(cx + u / 2, cy + u),
+                        p(cx - u / 2, cy),
+                    ],
+                );
                 block(cx - u / 2 - bar, cy - u, cx - u / 2, cy + u);
             }
             PhotoButton::Next => {
-                let _ = Polygon(dc, &[p(cx - u / 2, cy - u), p(cx - u / 2, cy + u), p(cx + u / 2, cy)]);
+                let _ = Polygon(
+                    dc,
+                    &[
+                        p(cx - u / 2, cy - u),
+                        p(cx - u / 2, cy + u),
+                        p(cx + u / 2, cy),
+                    ],
+                );
                 block(cx + u / 2, cy - u, cx + u / 2 + bar, cy + u);
             }
             PhotoButton::Slideshow if playing => {
@@ -336,7 +418,14 @@ pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool
                 block(cx + u / 5, cy - u, cx + u * 2 / 3, cy + u);
             }
             PhotoButton::Slideshow => {
-                let _ = Polygon(dc, &[p(cx - u * 2 / 3, cy - u), p(cx - u * 2 / 3, cy + u), p(cx + u, cy)]);
+                let _ = Polygon(
+                    dc,
+                    &[
+                        p(cx - u * 2 / 3, cy - u),
+                        p(cx - u * 2 / 3, cy + u),
+                        p(cx + u, cy),
+                    ],
+                );
             }
         }
     }

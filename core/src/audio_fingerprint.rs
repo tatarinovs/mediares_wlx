@@ -75,7 +75,10 @@ impl PcmSource for MfAudioReader {
 /// Decodes with symphonia; files it can't open or decode go through Media Foundation, whose
 /// results depend on the system's decoders (still stable on one machine, which is what TC's
 /// duplicate search compares).
-pub fn analyze_audio(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<AudioAnalysis, AudioError> {
+pub fn analyze_audio(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioAnalysis, AudioError> {
     if let Some(mut decoder) = AudioDecoder::open(path) {
         match analyze_source(&mut decoder, cancelled) {
             Err(AudioError::Unsupported) => {}
@@ -86,7 +89,10 @@ pub fn analyze_audio(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<AudioA
     analyze_source(&mut reader, cancelled)
 }
 
-fn analyze_source(source: &mut dyn PcmSource, cancelled: &dyn Fn() -> bool) -> Result<AudioAnalysis, AudioError> {
+fn analyze_source(
+    source: &mut dyn PcmSource,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioAnalysis, AudioError> {
     let (rate, channels) = source.format();
     let mut pcm = PcmHash::new(rate, channels);
     let mut bands = BandAnalyzer::new(rate);
@@ -133,7 +139,12 @@ impl PcmHash {
     const MAX_PENDING: usize = 1 << 22;
 
     fn new(rate: u32, channels: usize) -> Self {
-        let mut h = Self { hash: 0xCBF2_9CE4_8422_2325, channels, started: false, pending: Vec::new() };
+        let mut h = Self {
+            hash: 0xCBF2_9CE4_8422_2325,
+            channels,
+            started: false,
+            pending: Vec::new(),
+        };
         h.mix(rate as i64);
         h.mix(channels as i64);
         h
@@ -199,13 +210,18 @@ struct Frame {
 
 impl BandAnalyzer {
     fn new(rate: u32) -> Self {
-        let window = (0..FFT_SIZE).map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos()).collect();
+        let window = (0..FFT_SIZE)
+            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos())
+            .collect();
         let hz_per_bin = ANALYSIS_RATE as f32 / FFT_SIZE as f32;
         let edge = |i: usize| LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / SUB_BANDS as f32);
         let sub_band_bins = (0..SUB_BANDS)
             .map(|b| {
                 let lo = (edge(b) / hz_per_bin).round() as usize;
-                (lo, ((edge(b + 1) / hz_per_bin).round() as usize).max(lo + 1))
+                (
+                    lo,
+                    ((edge(b + 1) / hz_per_bin).round() as usize).max(lo + 1),
+                )
             })
             .collect();
         Self {
@@ -258,7 +274,8 @@ impl BandAnalyzer {
         // Oldest sample first.
         let start = self.filled % FFT_SIZE;
         let sample = |i: usize| self.ring[(start + i) % FFT_SIZE];
-        let rms = ((0..FFT_SIZE).map(|i| sample(i) * sample(i)).sum::<f32>() / FFT_SIZE as f32).sqrt();
+        let rms =
+            ((0..FFT_SIZE).map(|i| sample(i) * sample(i)).sum::<f32>() / FFT_SIZE as f32).sqrt();
         let (mut re, mut im) = (vec![0.0f32; FFT_SIZE], vec![0.0f32; FFT_SIZE]);
         for (i, v) in re.iter_mut().enumerate() {
             *v = sample(i) * self.window[i];
@@ -283,7 +300,10 @@ struct Fft {
 impl Fft {
     fn new(n: usize) -> Self {
         let angle = |k: usize| -2.0 * PI * k as f32 / n as f32;
-        Self { cos: (0..n / 2).map(|k| angle(k).cos()).collect(), sin: (0..n / 2).map(|k| angle(k).sin()).collect() }
+        Self {
+            cos: (0..n / 2).map(|k| angle(k).cos()).collect(),
+            sin: (0..n / 2).map(|k| angle(k).sin()).collect(),
+        }
     }
 
     /// In place; `re.len()` must be the size given to `new`.
@@ -351,7 +371,8 @@ fn window_bits(frames: &[Frame]) -> u32 {
     let mut energy = [[0.0f32; BANDS]; SLICES];
     for (t, slice) in split_even(frames, SLICES).enumerate() {
         for (b, e) in energy[t].iter_mut().enumerate() {
-            *e = slice.iter().map(|f| (f.bands[b] + 1e-9).ln()).sum::<f32>() / slice.len().max(1) as f32;
+            *e = slice.iter().map(|f| (f.bands[b] + 1e-9).ln()).sum::<f32>()
+                / slice.len().max(1) as f32;
         }
     }
     let mut bits = 0u32;
@@ -384,16 +405,26 @@ mod tests {
     #[test]
     fn fft_finds_a_tone() {
         let n = 64;
-        let mut re: Vec<f32> = (0..n).map(|i| (2.0 * PI * 5.0 * i as f32 / n as f32).cos()).collect();
+        let mut re: Vec<f32> = (0..n)
+            .map(|i| (2.0 * PI * 5.0 * i as f32 / n as f32).cos())
+            .collect();
         let mut im = vec![0.0; n];
         Fft::new(n).run(&mut re, &mut im);
-        let peak = (0..n / 2).max_by(|&a, &b| re[a].hypot(im[a]).total_cmp(&re[b].hypot(im[b]))).unwrap();
+        let peak = (0..n / 2)
+            .max_by(|&a, &b| re[a].hypot(im[a]).total_cmp(&re[b].hypot(im[b])))
+            .unwrap();
         assert_eq!(peak, 5);
     }
 
     #[test]
     fn silence_has_no_fingerprint() {
-        let frames = vec![Frame { rms: 0.0, bands: [0.0; BANDS] }; 5000];
+        let frames = vec![
+            Frame {
+                rms: 0.0,
+                bands: [0.0; BANDS]
+            };
+            5000
+        ];
         assert_eq!(fingerprint(&frames, 120.0), None);
     }
 

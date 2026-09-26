@@ -17,7 +17,10 @@ type Entry = (f64, PathBuf);
 /// The position to continue `video` from, if one was remembered.
 pub fn load(video: &Path) -> Option<f64> {
     let text = std::fs::read_to_string(config::data_file(FILE_NAME)).ok()?;
-    parse(&text).into_iter().find(|(_, p)| same(p, video)).map(|(t, _)| t)
+    parse(&text)
+        .into_iter()
+        .find(|(_, p)| same(p, video))
+        .map(|(t, _)| t)
 }
 
 /// Remembers (or forgets, near the start or end) where `video` was left.
@@ -26,10 +29,17 @@ pub fn store(video: &Path, position: f64, duration: f64) {
         return;
     }
     let file = config::data_file(FILE_NAME);
-    let entries = std::fs::read_to_string(&file).map(|t| parse(&t)).unwrap_or_default();
-    let keep = (EDGE_SEC..duration - EDGE_SEC).contains(&position).then_some(position);
+    let entries = std::fs::read_to_string(&file)
+        .map(|t| parse(&t))
+        .unwrap_or_default();
+    let keep = (EDGE_SEC..duration - EDGE_SEC)
+        .contains(&position)
+        .then_some(position);
     let updated = update(entries, video, keep);
-    let text: String = updated.iter().map(|(t, p)| format!("{:.1}\t{}\n", t, p.display())).collect();
+    let text: String = updated
+        .iter()
+        .map(|(t, p)| format!("{:.1}\t{}\n", t, p.display()))
+        .collect();
     let _ = std::fs::write(file, text);
 }
 
@@ -76,6 +86,12 @@ mod tests {
     #[test]
     fn parses_saved_lines() {
         let list = parse("12.5\tC:\\x.mkv\nbroken line\n7\tC:\\y.mp4\n");
-        assert_eq!(list, vec![(12.5, PathBuf::from("C:\\x.mkv")), (7.0, PathBuf::from("C:\\y.mp4"))]);
+        assert_eq!(
+            list,
+            vec![
+                (12.5, PathBuf::from("C:\\x.mkv")),
+                (7.0, PathBuf::from("C:\\y.mp4"))
+            ]
+        );
     }
 }

@@ -11,12 +11,16 @@ use mediares_core::image_decode::{apply_exif_orientation, decode_bytes, decode_f
 use mediares_core::probe::{probe_file, MediaType};
 use mediares_core::video_frame::video_frame_rgba;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::UI::Shell::DROPFILES;
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
 };
-use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData};
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT};
+use windows::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows::Win32::System::Memory::{
+    GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
+};
+use windows::Win32::UI::Shell::DROPFILES;
 
 use crate::audio_view::folder_cover;
 use crate::image_cache::{self, DecodedImage};
@@ -57,10 +61,22 @@ unsafe fn global_block(size: usize, fill: impl FnOnce(*mut u8)) -> Option<HGLOBA
 /// `CF_HDROP`: a `DROPFILES` header followed by the double-NUL-terminated wide path.
 unsafe fn file_drop(path: &Path) -> Option<HGLOBAL> {
     let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0, 0]).collect();
-    let header = DROPFILES { pFiles: size_of::<DROPFILES>() as u32, fWide: true.into(), ..Default::default() };
+    let header = DROPFILES {
+        pFiles: size_of::<DROPFILES>() as u32,
+        fWide: true.into(),
+        ..Default::default()
+    };
     global_block(size_of::<DROPFILES>() + wide.len() * 2, |dest| unsafe {
-        std::ptr::copy_nonoverlapping(&header as *const _ as *const u8, dest, size_of::<DROPFILES>());
-        std::ptr::copy_nonoverlapping(wide.as_ptr() as *const u8, dest.add(size_of::<DROPFILES>()), wide.len() * 2);
+        std::ptr::copy_nonoverlapping(
+            &header as *const _ as *const u8,
+            dest,
+            size_of::<DROPFILES>(),
+        );
+        std::ptr::copy_nonoverlapping(
+            wide.as_ptr() as *const u8,
+            dest.add(size_of::<DROPFILES>()),
+            wide.len() * 2,
+        );
     })
 }
 
@@ -101,13 +117,24 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -
 pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&Path>) -> bool {
     let row = img.width as usize * 4;
     let head = header(img.width, img.height as i32);
-    let dib = global_block(size_of::<BITMAPINFOHEADER>() + row * img.height as usize, |dest| unsafe {
-        std::ptr::copy_nonoverlapping(&head as *const _ as *const u8, dest, size_of::<BITMAPINFOHEADER>());
-        let pixels = dest.add(size_of::<BITMAPINFOHEADER>());
-        for (y, line) in img.bgra.chunks_exact(row).enumerate() {
-            std::ptr::copy_nonoverlapping(line.as_ptr(), pixels.add((img.height as usize - 1 - y) * row), row);
-        }
-    });
+    let dib = global_block(
+        size_of::<BITMAPINFOHEADER>() + row * img.height as usize,
+        |dest| unsafe {
+            std::ptr::copy_nonoverlapping(
+                &head as *const _ as *const u8,
+                dest,
+                size_of::<BITMAPINFOHEADER>(),
+            );
+            let pixels = dest.add(size_of::<BITMAPINFOHEADER>());
+            for (y, line) in img.bgra.chunks_exact(row).enumerate() {
+                std::ptr::copy_nonoverlapping(
+                    line.as_ptr(),
+                    pixels.add((img.height as usize - 1 - y) * row),
+                    row,
+                );
+            }
+        },
+    );
     let Some(dib) = dib else { return false };
     if OpenClipboard(Some(owner)).is_err() {
         let _ = GlobalFree(Some(dib));
@@ -124,20 +151,40 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
 
 /// "clip_0-01-23.456.png" next to the video; " (2)", " (3)"... if taken.
 pub fn frame_file_name(video: &Path, position: f64) -> PathBuf {
-    let stem = video.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+    let stem = video
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let millis = ((position.max(0.0) * 1000.0).round() as u64) % 1000;
     let time = format!("{}.{:03}", format_time(position), millis).replace(':', "-");
     let dir = video.parent().unwrap_or(Path::new(""));
     let base = format!("{}_{}", stem, time);
     (1..)
-        .map(|n| dir.join(if n == 1 { format!("{}.png", base) } else { format!("{} ({}).png", base, n) }))
+        .map(|n| {
+            dir.join(if n == 1 {
+                format!("{}.png", base)
+            } else {
+                format!("{} ({}).png", base, n)
+            })
+        })
         .find(|p| !p.exists())
         .expect("an unused name exists")
 }
 
 pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
-    let rgba: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], 255]).collect();
-    mediares_core::image::save_buffer(path, &rgba, img.width, img.height, mediares_core::image::ExtendedColorType::Rgba8).is_ok()
+    let rgba: Vec<u8> = img
+        .bgra
+        .chunks_exact(4)
+        .flat_map(|px| [px[2], px[1], px[0], 255])
+        .collect();
+    mediares_core::image::save_buffer(
+        path,
+        &rgba,
+        img.width,
+        img.height,
+        mediares_core::image::ExtendedColorType::Rgba8,
+    )
+    .is_ok()
 }
 
 /// Picture representing the file: the photo, a video frame, or the album art.
@@ -152,7 +199,9 @@ fn source_picture(path: &Path) -> Option<DynamicImage> {
         }
         MediaType::Video => video_frame_rgba(path, THUMBNAIL_AT).map(DynamicImage::ImageRgba8),
         MediaType::Audio => {
-            let embedded = read_tags(path, true).and_then(|t| t.cover).and_then(|bytes| decode_bytes(&bytes));
+            let embedded = read_tags(path, true)
+                .and_then(|t| t.cover)
+                .and_then(|bytes| decode_bytes(&bytes));
             match embedded {
                 Some(img) => Some(img),
                 None => {
@@ -168,13 +217,20 @@ fn source_picture(path: &Path) -> Option<DynamicImage> {
 /// Fitted into `max_w` x `max_h` (never enlarged), transparency flattened onto white.
 pub fn thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<DecodedImage> {
     let img = source_picture(path)?;
-    let img = if img.width() > max_w || img.height() > max_h { img.thumbnail(max_w.max(1), max_h.max(1)) } else { img };
+    let img = if img.width() > max_w || img.height() > max_h {
+        img.thumbnail(max_w.max(1), max_h.max(1))
+    } else {
+        img
+    };
     Some(image_cache::to_bgra(img, THUMBNAIL_BACKGROUND, false))
 }
 
 /// A top-down 32-bit DIB section with the picture; the caller (TC) owns it.
 pub unsafe fn to_hbitmap(img: &DecodedImage) -> Option<HBITMAP> {
-    let bmi = BITMAPINFO { bmiHeader: header(img.width, -(img.height as i32)), ..Default::default() };
+    let bmi = BITMAPINFO {
+        bmiHeader: header(img.width, -(img.height as i32)),
+        ..Default::default()
+    };
     let mut bits = std::ptr::null_mut();
     let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
     if bits.is_null() {
@@ -196,7 +252,10 @@ mod tests {
         let first = frame_file_name(&video, 83.4567);
         assert_eq!(first.file_name().unwrap(), "clip_1-23.457.png");
         std::fs::write(&first, b"x").unwrap();
-        assert_eq!(frame_file_name(&video, 83.4567).file_name().unwrap(), "clip_1-23.457 (2).png");
+        assert_eq!(
+            frame_file_name(&video, 83.4567).file_name().unwrap(),
+            "clip_1-23.457 (2).png"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

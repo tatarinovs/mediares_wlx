@@ -7,8 +7,8 @@ use std::sync::Mutex;
 
 use windows::Win32::Foundation::{COLORREF, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, Polygon, SelectObject, SetBkMode,
-    SetTextColor, CreatePen, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC,
+    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, Polygon, SelectObject,
+    SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC,
     HFONT, PS_NULL, TRANSPARENT,
 };
 
@@ -43,7 +43,11 @@ pub trait Transport {
     fn set_muted(&self, muted: bool);
 
     fn toggle_play(&self) {
-        if self.is_playing() { self.pause() } else { self.play() }
+        if self.is_playing() {
+            self.pause()
+        } else {
+            self.play()
+        }
     }
 }
 
@@ -77,8 +81,15 @@ pub fn toggle_mute(t: &dyn Transport) {
 
 /// ±5 s.
 pub fn seek_by(t: &dyn Transport, forward: bool) {
-    let delta = if forward { SEEK_STEP_SEC } else { -SEEK_STEP_SEC };
-    t.seek((t.position() + delta).clamp(0.0, t.duration().max(0.0)), false);
+    let delta = if forward {
+        SEEK_STEP_SEC
+    } else {
+        -SEEK_STEP_SEC
+    };
+    t.seek(
+        (t.position() + delta).clamp(0.0, t.duration().max(0.0)),
+        false,
+    );
 }
 
 pub fn bar_state(t: &dyn Transport, known_duration: f64) -> BarState {
@@ -136,10 +147,26 @@ pub fn layout(width: i32, height_px: i32, dpi_scale: f32, skip: bool) -> Layout 
     let s = |v: f32| (v * dpi_scale).round() as i32;
     let bar_h = height(dpi_scale);
     let top = height_px - bar_h;
-    let bar = RECT { left: 0, top, right: width, bottom: height_px };
-    let row = |left: i32, right: i32| RECT { left, top, right, bottom: height_px };
+    let bar = RECT {
+        left: 0,
+        top,
+        right: width,
+        bottom: height_px,
+    };
+    let row = |left: i32, right: i32| RECT {
+        left,
+        top,
+        right,
+        bottom: height_px,
+    };
 
-    let button = |left: i32, on: bool| if on { row(left, left + bar_h) } else { row(left, left) };
+    let button = |left: i32, on: bool| {
+        if on {
+            row(left, left + bar_h)
+        } else {
+            row(left, left)
+        }
+    };
     let prev = button(s(4.0), skip);
     let play = button(prev.right, true);
     let next = button(play.right, skip);
@@ -147,11 +174,27 @@ pub fn layout(width: i32, height_px: i32, dpi_scale: f32, skip: bool) -> Layout 
     let volume_right = (width - s(12.0)).max(time.right);
     // In a narrow window the timeline keeps its room and the volume slider goes (mute stays).
     let fixed = volume_right - time.right - s(8.0 + 12.0 + 8.0) - bar_h;
-    let volume_w = if fixed - s(80.0) >= s(120.0) { s(80.0) } else { 0 };
+    let volume_w = if fixed - s(80.0) >= s(120.0) {
+        s(80.0)
+    } else {
+        0
+    };
     let volume = row((volume_right - volume_w).max(time.right), volume_right);
     let speaker = row(volume.left - s(8.0) - bar_h, volume.left - s(8.0));
-    let timeline = row(time.right + s(8.0), (speaker.left - s(12.0)).max(time.right + s(8.0)));
-    Layout { bar, prev, play, next, time, timeline, speaker, volume }
+    let timeline = row(
+        time.right + s(8.0),
+        (speaker.left - s(12.0)).max(time.right + s(8.0)),
+    );
+    Layout {
+        bar,
+        prev,
+        play,
+        next,
+        time,
+        timeline,
+        speaker,
+        volume,
+    }
 }
 
 fn contains(r: &RECT, x: i32, y: i32) -> bool {
@@ -215,7 +258,14 @@ pub struct BarControl {
 }
 
 impl BarControl {
-    pub fn mouse_down(&mut self, t: &dyn Transport, l: &Layout, known_duration: f64, x: i32, y: i32) -> Click {
+    pub fn mouse_down(
+        &mut self,
+        t: &dyn Transport,
+        l: &Layout,
+        known_duration: f64,
+        x: i32,
+        y: i32,
+    ) -> Click {
         match hit(l, x, y) {
             Hit::Outside => return Click::Outside,
             Hit::Prev => return Click::Skip(false),
@@ -243,9 +293,18 @@ impl BarControl {
     }
 
     /// Returns whether anything changed.
-    pub fn mouse_move(&mut self, t: &dyn Transport, l: &Layout, known_duration: f64, x: i32) -> bool {
+    pub fn mouse_move(
+        &mut self,
+        t: &dyn Transport,
+        l: &Layout,
+        known_duration: f64,
+        x: i32,
+    ) -> bool {
         match self.drag {
-            Some(BarDrag::Timeline { .. }) => t.seek(timeline_fraction(l, x) * t.duration().max(known_duration), true),
+            Some(BarDrag::Timeline { .. }) => t.seek(
+                timeline_fraction(l, x) * t.duration().max(known_duration),
+                true,
+            ),
             Some(BarDrag::Volume) => set_volume(t, volume_fraction(l, x)),
             None => return false,
         }
@@ -255,7 +314,10 @@ impl BarControl {
     pub fn mouse_up(&mut self, t: &dyn Transport, l: &Layout, known_duration: f64, x: i32) {
         if let Some(BarDrag::Timeline { was_playing }) = self.drag.take() {
             // Final precise seek, then resume if it was playing before scrubbing.
-            t.seek(timeline_fraction(l, x) * t.duration().max(known_duration), false);
+            t.seek(
+                timeline_fraction(l, x) * t.duration().max(known_duration),
+                false,
+            );
             if was_playing {
                 t.play();
             }
@@ -270,7 +332,11 @@ impl BarControl {
 pub fn format_time(seconds: f64) -> String {
     let total = seconds.max(0.0) as u64;
     let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
-    if h > 0 { format!("{}:{:02}:{:02}", h, m, s) } else { format!("{}:{:02}", m, s) }
+    if h > 0 {
+        format!("{}:{:02}:{:02}", h, m, s)
+    } else {
+        format!("{}:{:02}", m, s)
+    }
 }
 
 unsafe fn fill(dc: HDC, r: RECT, color: u32) {
@@ -294,15 +360,42 @@ unsafe fn polygon(dc: HDC, points: &[POINT], color: u32) {
 /// Thin horizontal track through the middle of `r`, filled up to `value` (0..=1).
 unsafe fn slider(dc: HDC, r: RECT, value: f64, thickness: i32) {
     let mid = (r.top + r.bottom) / 2;
-    let track = RECT { left: r.left, top: mid - thickness / 2, right: r.right, bottom: mid - thickness / 2 + thickness };
+    let track = RECT {
+        left: r.left,
+        top: mid - thickness / 2,
+        right: r.right,
+        bottom: mid - thickness / 2 + thickness,
+    };
     fill(dc, track, TRACK);
     let filled = r.left + ((r.right - r.left) as f64 * value.clamp(0.0, 1.0)).round() as i32;
-    fill(dc, RECT { right: filled, ..track }, FILL);
+    fill(
+        dc,
+        RECT {
+            right: filled,
+            ..track
+        },
+        FILL,
+    );
     let knob = thickness * 2;
-    fill(dc, RECT { left: filled - knob / 2, top: mid - knob / 2, right: filled + knob / 2, bottom: mid + knob / 2 }, ICON);
+    fill(
+        dc,
+        RECT {
+            left: filled - knob / 2,
+            top: mid - knob / 2,
+            right: filled + knob / 2,
+            bottom: mid + knob / 2,
+        },
+        ICON,
+    );
 }
 
-unsafe fn text(dc: HDC, r: RECT, s: &str, color: u32, flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT) {
+unsafe fn text(
+    dc: HDC,
+    r: RECT,
+    s: &str,
+    color: u32,
+    flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
+) {
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     let mut rc = r;
     SetTextColor(dc, COLORREF(color));
@@ -316,21 +409,63 @@ pub enum Message<'a> {
 }
 
 /// Paints the bar. `message` (a playback error, "frame saved") replaces the timeline when present.
-pub unsafe fn paint(dc: HDC, l: &Layout, state: &BarState, font: HFONT, message: Option<Message<'_>>, dpi_scale: f32) {
+pub unsafe fn paint(
+    dc: HDC,
+    l: &Layout,
+    state: &BarState,
+    font: HFONT,
+    message: Option<Message<'_>>,
+    dpi_scale: f32,
+) {
     let s = |v: f32| (v * dpi_scale).round() as i32;
     fill(dc, l.bar, BG);
     let old_font = SelectObject(dc, font.into());
     SetBkMode(dc, TRANSPARENT);
 
     // Play / pause icon.
-    let (cx, cy) = ((l.play.left + l.play.right) / 2, (l.play.top + l.play.bottom) / 2);
+    let (cx, cy) = (
+        (l.play.left + l.play.right) / 2,
+        (l.play.top + l.play.bottom) / 2,
+    );
     let r = s(8.0);
     if state.playing {
         let (w, gap) = (s(4.0), s(3.0));
-        fill(dc, RECT { left: cx - gap - w, top: cy - r, right: cx - gap, bottom: cy + r }, ICON);
-        fill(dc, RECT { left: cx + gap, top: cy - r, right: cx + gap + w, bottom: cy + r }, ICON);
+        fill(
+            dc,
+            RECT {
+                left: cx - gap - w,
+                top: cy - r,
+                right: cx - gap,
+                bottom: cy + r,
+            },
+            ICON,
+        );
+        fill(
+            dc,
+            RECT {
+                left: cx + gap,
+                top: cy - r,
+                right: cx + gap + w,
+                bottom: cy + r,
+            },
+            ICON,
+        );
     } else {
-        polygon(dc, &[POINT { x: cx - r * 2 / 3, y: cy - r }, POINT { x: cx - r * 2 / 3, y: cy + r }, POINT { x: cx + r, y: cy }], ICON);
+        polygon(
+            dc,
+            &[
+                POINT {
+                    x: cx - r * 2 / 3,
+                    y: cy - r,
+                },
+                POINT {
+                    x: cx - r * 2 / 3,
+                    y: cy + r,
+                },
+                POINT { x: cx + r, y: cy },
+            ],
+            ICON,
+        );
     }
 
     // Previous / next: a triangle pointing away from the play button, ending in a bar.
@@ -342,43 +477,105 @@ pub unsafe fn paint(dc: HDC, l: &Layout, state: &BarState, font: HFONT, message:
         let (h, w) = (s(6.0), s(7.0));
         let tip = cx + dir * w / 2;
         let base = cx - dir * w / 2;
-        polygon(dc, &[POINT { x: base, y: cy - h }, POINT { x: base, y: cy + h }, POINT { x: tip, y: cy }], ICON);
+        polygon(
+            dc,
+            &[
+                POINT { x: base, y: cy - h },
+                POINT { x: base, y: cy + h },
+                POINT { x: tip, y: cy },
+            ],
+            ICON,
+        );
         let bar_x = if dir > 0 { tip } else { tip - s(2.0) };
-        fill(dc, RECT { left: bar_x, top: cy - h, right: bar_x + s(2.0), bottom: cy + h }, ICON);
+        fill(
+            dc,
+            RECT {
+                left: bar_x,
+                top: cy - h,
+                right: bar_x + s(2.0),
+                bottom: cy + h,
+            },
+            ICON,
+        );
     }
 
-    let time = format!("{} / {}", format_time(state.position), format_time(state.duration));
+    let time = format!(
+        "{} / {}",
+        format_time(state.position),
+        format_time(state.duration)
+    );
     text(dc, l.time, &time, TEXT, DT_LEFT);
 
     match message {
-        Some(Message::Error(msg)) => text(dc, l.timeline, msg, ERROR_TEXT, DT_LEFT | DT_END_ELLIPSIS),
+        Some(Message::Error(msg)) => {
+            text(dc, l.timeline, msg, ERROR_TEXT, DT_LEFT | DT_END_ELLIPSIS)
+        }
         Some(Message::Info(msg)) => text(dc, l.timeline, msg, TEXT, DT_LEFT | DT_END_ELLIPSIS),
         None => {
-            let progress = if state.duration > 0.0 { state.position / state.duration } else { 0.0 };
+            let progress = if state.duration > 0.0 {
+                state.position / state.duration
+            } else {
+                0.0
+            };
             slider(dc, l.timeline, progress, s(4.0));
         }
     }
 
     // Speaker: box + cone; a red bar when muted.
-    let (sx, sy) = ((l.speaker.left + l.speaker.right) / 2, (l.speaker.top + l.speaker.bottom) / 2);
+    let (sx, sy) = (
+        (l.speaker.left + l.speaker.right) / 2,
+        (l.speaker.top + l.speaker.bottom) / 2,
+    );
     let u = s(3.0);
     polygon(
         dc,
         &[
-            POINT { x: sx - 3 * u, y: sy - u },
-            POINT { x: sx - u, y: sy - u },
-            POINT { x: sx + u, y: sy - 3 * u },
-            POINT { x: sx + u, y: sy + 3 * u },
-            POINT { x: sx - u, y: sy + u },
-            POINT { x: sx - 3 * u, y: sy + u },
+            POINT {
+                x: sx - 3 * u,
+                y: sy - u,
+            },
+            POINT {
+                x: sx - u,
+                y: sy - u,
+            },
+            POINT {
+                x: sx + u,
+                y: sy - 3 * u,
+            },
+            POINT {
+                x: sx + u,
+                y: sy + 3 * u,
+            },
+            POINT {
+                x: sx - u,
+                y: sy + u,
+            },
+            POINT {
+                x: sx - 3 * u,
+                y: sy + u,
+            },
         ],
         ICON,
     );
     if state.muted {
-        text(dc, RECT { left: sx + u, ..l.speaker }, "×", ERROR_TEXT, DT_CENTER);
+        text(
+            dc,
+            RECT {
+                left: sx + u,
+                ..l.speaker
+            },
+            "×",
+            ERROR_TEXT,
+            DT_CENTER,
+        );
     }
     if l.volume.right > l.volume.left {
-        slider(dc, l.volume, if state.muted { 0.0 } else { state.volume }, s(3.0));
+        slider(
+            dc,
+            l.volume,
+            if state.muted { 0.0 } else { state.volume },
+            s(3.0),
+        );
     }
 
     SelectObject(dc, old_font);

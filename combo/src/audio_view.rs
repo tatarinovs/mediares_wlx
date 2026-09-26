@@ -13,8 +13,9 @@ use mediares_core::video_frame::probe_audio;
 use windows::core::w;
 use windows::Win32::Foundation::{COLORREF, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode, SetTextColor, DRAW_TEXT_FORMAT,
-    DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT, TRANSPARENT,
+    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode, SetTextColor,
+    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
+    HDC, HFONT, TRANSPARENT,
 };
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA,
@@ -46,7 +47,11 @@ const PLACEHOLDER: u32 = 0x00282828;
 enum Backend {
     Native(AudioPlayer),
     /// Field order matters: the engine shuts down before its surface is destroyed.
-    Engine { player: VideoPlayer, _surface: Surface, duration: f64 },
+    Engine {
+        player: VideoPlayer,
+        _surface: Surface,
+        duration: f64,
+    },
 }
 
 impl Backend {
@@ -63,7 +68,11 @@ impl Backend {
         let player = VideoPlayer::new(surface.0, viewer).ok()?;
         transport_bar::restore_audio_level(&player);
         player.open(path).ok()?;
-        Some(Backend::Engine { player, _surface: surface, duration })
+        Some(Backend::Engine {
+            player,
+            _surface: surface,
+            duration,
+        })
     }
 
     fn transport(&self) -> &dyn Transport {
@@ -133,10 +142,21 @@ impl AudioView {
 
     fn load_meta(&mut self, path: &Path) {
         self.tags = read_tags(path, true).unwrap_or_default();
-        let embedded = self.tags.cover.take().and_then(|bytes| image_cache::decode_picture(&bytes)).map(Arc::new);
+        let embedded = self
+            .tags
+            .cover
+            .take()
+            .and_then(|bytes| image_cache::decode_picture(&bytes))
+            .map(Arc::new);
         self.cover = embedded.or_else(|| folder_cover(path));
-        self.file_stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-        self.format = path.extension().map(|e| e.to_string_lossy().to_uppercase()).unwrap_or_default();
+        self.file_stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.format = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_uppercase())
+            .unwrap_or_default();
         self.error = None;
         self.end_reported = false;
     }
@@ -163,7 +183,9 @@ impl AudioView {
         if let Some(kbps) = self.tags.bitrate_kbps {
             parts.push(format!("{} кбит/с", kbps));
         }
-        parts.push(format_time(self.transport().duration().max(self.known_duration())));
+        parts.push(format_time(
+            self.transport().duration().max(self.known_duration()),
+        ));
         parts.join(", ")
     }
 
@@ -179,7 +201,9 @@ impl AudioView {
 
     /// `WM_TIMER` with [`PROGRESS_TIMER_ID`].
     pub fn on_tick(&mut self) -> EventEffect {
-        let Backend::Native(player) = &self.backend else { return EventEffect::None };
+        let Backend::Native(player) = &self.backend else {
+            return EventEffect::None;
+        };
         let ended = player.is_ended();
         if !ended {
             self.end_reported = false;
@@ -187,12 +211,18 @@ impl AudioView {
             self.end_reported = true;
             return EventEffect::Ended;
         }
-        if player.is_playing() { EventEffect::RepaintBar } else { EventEffect::None }
+        if player.is_playing() {
+            EventEffect::RepaintBar
+        } else {
+            EventEffect::None
+        }
     }
 
     /// Media Foundation events (engine backend only).
     pub fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
-        let Backend::Engine { player, .. } = &self.backend else { return EventEffect::None };
+        let Backend::Engine { player, .. } = &self.backend else {
+            return EventEffect::None;
+        };
         match event {
             e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => EventEffect::Ended,
             e if e == MF_MEDIA_ENGINE_EVENT_ERROR.0 => {
@@ -229,7 +259,12 @@ impl AudioView {
         fill(dc, area, BACKGROUND);
         let s = |v: f32| (v * scale).round() as i32;
         let m = s(24.0);
-        let inner = RECT { left: area.left + m, top: area.top + m, right: area.right - m, bottom: area.bottom - m };
+        let inner = RECT {
+            left: area.left + m,
+            top: area.top + m,
+            right: area.right - m,
+            bottom: area.bottom - m,
+        };
         let (w, h) = (inner.right - inner.left, inner.bottom - inner.top);
         if w < s(40.0) || h < s(20.0) {
             return;
@@ -238,7 +273,8 @@ impl AudioView {
         let lines = self.text_lines();
         let cover = self.cover.clone();
         let fonts = self.fonts(scale);
-        let (title_font, text_font, small_font, note_font) = (fonts.title.0, fonts.text.0, fonts.small.0, fonts.note.0);
+        let (title_font, text_font, small_font, note_font) =
+            (fonts.title.0, fonts.text.0, fonts.small.0, fonts.note.0);
         let line_h = |kind: LineKind| match kind {
             LineKind::Title => s(34.0),
             LineKind::Text => s(26.0),
@@ -250,18 +286,46 @@ impl AudioView {
         let wide = w as f32 > h as f32 * 1.4;
         let (art, text_rect, align) = if wide {
             let side = h.min(w * 2 / 5);
-            let art = RECT { left: inner.left, top: inner.top + (h - side) / 2, right: inner.left + side, bottom: inner.top + (h - side) / 2 + side };
+            let art = RECT {
+                left: inner.left,
+                top: inner.top + (h - side) / 2,
+                right: inner.left + side,
+                bottom: inner.top + (h - side) / 2 + side,
+            };
             let top = inner.top + (h - text_h).max(0) / 2;
-            (art, RECT { left: art.right + gap, top, right: inner.right, bottom: top + text_h }, DT_LEFT)
+            (
+                art,
+                RECT {
+                    left: art.right + gap,
+                    top,
+                    right: inner.right,
+                    bottom: top + text_h,
+                },
+                DT_LEFT,
+            )
         } else {
             let side = w.min(h - text_h - gap).max(0);
             let side = if side < s(64.0) { 0 } else { side };
             let block = side + if side > 0 { gap } else { 0 } + text_h;
             let top = inner.top + (h - block).max(0) / 2;
             let left = inner.left + (w - side) / 2;
-            let art = RECT { left, top, right: left + side, bottom: top + side };
+            let art = RECT {
+                left,
+                top,
+                right: left + side,
+                bottom: top + side,
+            };
             let text_top = art.bottom + if side > 0 { gap } else { 0 };
-            (art, RECT { left: inner.left, top: text_top, right: inner.right, bottom: text_top + text_h }, DT_CENTER)
+            (
+                art,
+                RECT {
+                    left: inner.left,
+                    top: text_top,
+                    right: inner.right,
+                    bottom: text_top + text_h,
+                },
+                DT_CENTER,
+            )
         };
 
         if art.right > art.left {
@@ -281,7 +345,12 @@ impl AudioView {
                 LineKind::Text => (text_font, TEXT_COLOR),
                 LineKind::Small => (small_font, DIM_COLOR),
             };
-            let r = RECT { left: text_rect.left, top: y, right: text_rect.right, bottom: y + line_h(*kind) };
+            let r = RECT {
+                left: text_rect.left,
+                top: y,
+                right: text_rect.right,
+                bottom: y + line_h(*kind),
+            };
             text(dc, r, line, font, color, align);
             y = r.bottom;
         }
@@ -289,7 +358,10 @@ impl AudioView {
 
     fn text_lines(&self) -> Vec<(String, LineKind)> {
         let t = &self.tags;
-        let mut lines = vec![(t.title.clone().unwrap_or_else(|| self.file_stem.clone()), LineKind::Title)];
+        let mut lines = vec![(
+            t.title.clone().unwrap_or_else(|| self.file_stem.clone()),
+            LineKind::Title,
+        )];
         if let Some(artist) = t.any_artist() {
             lines.push((artist.to_string(), LineKind::Text));
         }
@@ -302,7 +374,11 @@ impl AudioView {
         if let Some(album) = album {
             lines.push((album, LineKind::Text));
         }
-        let format = [self.format.clone(), t.format_line()].into_iter().filter(|s| !s.is_empty()).collect::<Vec<_>>().join(" · ");
+        let format = [self.format.clone(), t.format_line()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · ");
         lines.push((format, LineKind::Small));
         lines
     }
@@ -334,8 +410,19 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
         }
         COVER_STEMS.iter().position(|s| *s == stem)
     };
-    let best = entries.flatten().map(|e| e.path()).filter_map(|p| Some((rank(&p)?, p))).min_by_key(|(r, _)| *r)?;
-    image_cache::load(&best.1, MediaType::StandardImage, DecodeOptions { auto_rotate: false, background: BACKGROUND })
+    let best = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter_map(|p| Some((rank(&p)?, p)))
+        .min_by_key(|(r, _)| *r)?;
+    image_cache::load(
+        &best.1,
+        MediaType::StandardImage,
+        DecodeOptions {
+            auto_rotate: false,
+            background: BACKGROUND,
+        },
+    )
 }
 
 unsafe fn fill(dc: HDC, r: RECT, color: u32) {
@@ -350,6 +437,11 @@ unsafe fn text(dc: HDC, r: RECT, s: &str, font: HFONT, color: u32, align: DRAW_T
     let old = SelectObject(dc, font.into());
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, COLORREF(color));
-    DrawTextW(dc, &mut wide, &mut rc, align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX);
+    DrawTextW(
+        dc,
+        &mut wide,
+        &mut rc,
+        align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
     SelectObject(dc, old);
 }

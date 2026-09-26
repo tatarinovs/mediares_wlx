@@ -14,14 +14,20 @@ pub enum MediaType {
     Unsupported,
 }
 
-const STANDARD_IMAGE_EXTS: &[&str] = &["jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "tiff", "tif", "ico"];
-const RAW_EXTS: &[&str] = &["cr2", "cr3", "crw", "nef", "arw", "orf", "rw2", "dng", "raf", "pef", "raw"];
+const STANDARD_IMAGE_EXTS: &[&str] = &[
+    "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "tiff", "tif", "ico",
+];
+const RAW_EXTS: &[&str] = &[
+    "cr2", "cr3", "crw", "nef", "arw", "orf", "rw2", "dng", "raf", "pef", "raw",
+];
 const PSD_EXTS: &[&str] = &["psd", "psb"];
 const VIDEO_EXTS: &[&str] = &[
-    "mp4", "mkv", "avi", "mov", "qt", "wmv", "asf", "webm", "m4v", "3gp", "3g2", "flv", "ts", "mts", "mpg", "mpeg", "vob",
+    "mp4", "mkv", "avi", "mov", "qt", "wmv", "asf", "webm", "m4v", "3gp", "3g2", "flv", "ts",
+    "mts", "mpg", "mpeg", "vob",
 ];
 const AUDIO_EXTS: &[&str] = &[
-    "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff", "aifc", "caf", "mka", "ac3",
+    "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff",
+    "aifc", "caf", "mka", "ac3",
 ];
 const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
 
@@ -48,7 +54,10 @@ impl MediaType {
     }
 
     pub fn is_image_kind(self) -> bool {
-        matches!(self, MediaType::StandardImage | MediaType::RawImage | MediaType::PsdImage)
+        matches!(
+            self,
+            MediaType::StandardImage | MediaType::RawImage | MediaType::PsdImage
+        )
     }
 
     /// Audio or video: something with a timeline that can be played through.
@@ -58,7 +67,10 @@ impl MediaType {
 
     /// Kinds that are expensive to analyze and should be deferred with `FT_DELAYED`.
     pub fn is_slow_kind(self) -> bool {
-        matches!(self, MediaType::Video | MediaType::Audio | MediaType::RawImage | MediaType::PsdImage)
+        matches!(
+            self,
+            MediaType::Video | MediaType::Audio | MediaType::RawImage | MediaType::PsdImage
+        )
     }
 }
 
@@ -68,7 +80,11 @@ pub fn probe_file(path: &Path) -> MediaType {
     };
     MediaType::ALL
         .into_iter()
-        .find(|kind| kind.extensions().iter().any(|e| e.eq_ignore_ascii_case(ext)))
+        .find(|kind| {
+            kind.extensions()
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(ext))
+        })
         .unwrap_or(MediaType::Unsupported)
 }
 

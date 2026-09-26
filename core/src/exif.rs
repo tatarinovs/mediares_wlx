@@ -45,7 +45,9 @@ pub struct ExifInfo {
 impl ExifInfo {
     /// When the photo was taken (`DateTimeOriginal`), else when it was last written (`DateTime`).
     pub fn taken(&self) -> Option<&str> {
-        self.date_time_original.as_deref().or(self.date_time.as_deref())
+        self.date_time_original
+            .as_deref()
+            .or(self.date_time.as_deref())
     }
 }
 
@@ -194,12 +196,20 @@ impl<'a> Tiff<'a> {
 
     fn u16_at(&self, b: &[u8]) -> u16 {
         let v = [b[0], b[1]];
-        if self.le { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
+        if self.le {
+            u16::from_le_bytes(v)
+        } else {
+            u16::from_be_bytes(v)
+        }
     }
 
     fn u32_at(&self, b: &[u8]) -> u32 {
         let v = [b[0], b[1], b[2], b[3]];
-        if self.le { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
+        if self.le {
+            u32::from_le_bytes(v)
+        } else {
+            u32::from_be_bytes(v)
+        }
     }
 
     fn u32(&self, offset: usize) -> Option<u32> {
@@ -217,7 +227,14 @@ impl<'a> Tiff<'a> {
             TYPE_SHORT => 2,
             TYPE_LONG => 4,
             TYPE_RATIONAL => 8,
-            _ => return Some(Entry { tag, typ, count, value: &[] }),
+            _ => {
+                return Some(Entry {
+                    tag,
+                    typ,
+                    count,
+                    value: &[],
+                })
+            }
         };
         let size = (count as usize).checked_mul(unit)?;
         let value = if size <= 4 {
@@ -225,7 +242,12 @@ impl<'a> Tiff<'a> {
         } else {
             self.bytes(self.u32_at(&raw[8..12]) as usize, size)?
         };
-        Some(Entry { tag, typ, count, value })
+        Some(Entry {
+            tag,
+            typ,
+            count,
+            value,
+        })
     }
 
     fn uint(&self, e: &Entry) -> Option<u32> {
@@ -261,9 +283,13 @@ impl<'a> Tiff<'a> {
     }
 
     fn parse_ifd(&self, offset: usize, info: &mut ExifInfo, subs: &mut SubIfds) {
-        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else { return };
+        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else {
+            return;
+        };
         for i in 0..count as usize {
-            let Some(e) = self.entry(offset + 2 + i * 12) else { break };
+            let Some(e) = self.entry(offset + 2 + i * 12) else {
+                break;
+            };
             match e.tag {
                 0x010F => info.make = self.ascii(&e),
                 0x0110 => info.model = self.ascii(&e),
@@ -288,10 +314,14 @@ impl<'a> Tiff<'a> {
     }
 
     fn parse_gps_ifd(&self, offset: usize, info: &mut ExifInfo) {
-        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else { return };
+        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else {
+            return;
+        };
         let (mut lat_ref, mut lon_ref, mut lat, mut lon) = (None, None, None, None);
         for i in 0..count as usize {
-            let Some(e) = self.entry(offset + 2 + i * 12) else { break };
+            let Some(e) = self.entry(offset + 2 + i * 12) else {
+                break;
+            };
             match e.tag {
                 0x0001 => lat_ref = self.ascii(&e),
                 0x0002 => lat = self.degrees(&e),
@@ -302,12 +332,25 @@ impl<'a> Tiff<'a> {
         }
         let signed = |value: Option<f64>, reference: Option<String>, negative: &str, limit: f64| {
             let value = value.filter(|v| *v <= limit)?;
-            Some(if reference.as_deref().is_some_and(|r| r.eq_ignore_ascii_case(negative)) { -value } else { value })
+            Some(
+                if reference
+                    .as_deref()
+                    .is_some_and(|r| r.eq_ignore_ascii_case(negative))
+                {
+                    -value
+                } else {
+                    value
+                },
+            )
         };
         info.gps_latitude = signed(lat, lat_ref, "S", 90.0);
         info.gps_longitude = signed(lon, lon_ref, "W", 180.0);
         // Cameras without a fix often write zeros; a lone half is useless either way.
-        if info.gps_latitude.zip(info.gps_longitude).is_none_or(|(a, b)| a == 0.0 && b == 0.0) {
+        if info
+            .gps_latitude
+            .zip(info.gps_longitude)
+            .is_none_or(|(a, b)| a == 0.0 && b == 0.0)
+        {
             info.gps_latitude = None;
             info.gps_longitude = None;
         }
@@ -390,9 +433,24 @@ mod tests {
 
     #[test]
     fn datetime_parsing() {
-        let dt = |y, mo, d, h, mi, s| Some(ExifDateTime { year: y, month: mo, day: d, hour: h, minute: mi, second: s });
-        assert_eq!(parse_exif_datetime("2024:05:01 12:34:56"), dt(2024, 5, 1, 12, 34, 56));
-        assert_eq!(parse_exif_datetime("2024-05-01 07:08:09"), dt(2024, 5, 1, 7, 8, 9));
+        let dt = |y, mo, d, h, mi, s| {
+            Some(ExifDateTime {
+                year: y,
+                month: mo,
+                day: d,
+                hour: h,
+                minute: mi,
+                second: s,
+            })
+        };
+        assert_eq!(
+            parse_exif_datetime("2024:05:01 12:34:56"),
+            dt(2024, 5, 1, 12, 34, 56)
+        );
+        assert_eq!(
+            parse_exif_datetime("2024-05-01 07:08:09"),
+            dt(2024, 5, 1, 7, 8, 9)
+        );
         assert_eq!(parse_exif_datetime("2024:05:01"), dt(2024, 5, 1, 0, 0, 0));
         assert_eq!(parse_exif_datetime("0000:00:00 00:00:00"), None);
         assert_eq!(parse_exif_datetime("    :  :     :  :  "), None);

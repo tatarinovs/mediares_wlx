@@ -80,13 +80,18 @@ impl Cache {
 }
 
 fn cache() -> MutexGuard<'static, Cache> {
-    static CACHE: Mutex<Cache> = Mutex::new(Cache { entries: Vec::new() });
+    static CACHE: Mutex<Cache> = Mutex::new(Cache {
+        entries: Vec::new(),
+    });
     CACHE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Returns the image for display, decoding it on the calling thread on a cache miss.
 pub fn load(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Arc<DecodedImage>> {
-    let key = Key { file: FileKey::for_path(path)?, options };
+    let key = Key {
+        file: FileKey::for_path(path)?,
+        options,
+    };
     if let Some(img) = cache().get(&key) {
         return Some(img);
     }
@@ -103,8 +108,16 @@ pub enum Request {
 
 /// Returns a cached image right away, otherwise schedules it ahead of any prefetching.
 /// `None` if the file is gone.
-pub fn request(path: &Path, kind: MediaType, options: DecodeOptions, notify: HWND) -> Option<Request> {
-    let key = Key { file: FileKey::for_path(path)?, options };
+pub fn request(
+    path: &Path,
+    kind: MediaType,
+    options: DecodeOptions,
+    notify: HWND,
+) -> Option<Request> {
+    let key = Key {
+        file: FileKey::for_path(path)?,
+        options,
+    };
     if let Some(img) = cache().get(&key) {
         return Some(Request::Ready(img));
     }
@@ -121,7 +134,12 @@ pub fn request(path: &Path, kind: MediaType, options: DecodeOptions, notify: HWN
         notify.retain(|&h| h != hwnd);
         !notify.is_empty()
     });
-    let existing = q.in_flight.iter().chain(&q.foreground).find(|job| job.key == key).cloned();
+    let existing = q
+        .in_flight
+        .iter()
+        .chain(&q.foreground)
+        .find(|job| job.key == key)
+        .cloned();
     let job = existing.unwrap_or_else(|| {
         let job = Job::new(key, path.to_path_buf(), kind);
         q.foreground.push_back(job.clone());
@@ -174,7 +192,13 @@ struct Job {
 
 impl Job {
     fn new(key: Key, path: PathBuf, kind: MediaType) -> Arc<Job> {
-        Arc::new(Job { key, path, kind, notify: Mutex::new(Vec::new()), result: OnceLock::new() })
+        Arc::new(Job {
+            key,
+            path,
+            kind,
+            notify: Mutex::new(Vec::new()),
+            result: OnceLock::new(),
+        })
     }
 
     fn lock_notify(&self) -> MutexGuard<'_, Vec<isize>> {
@@ -196,7 +220,9 @@ impl Queue {
             return Some(job);
         }
         while let Some((path, options)) = self.prefetch.pop_front() {
-            let Some(file) = FileKey::for_path(&path) else { continue };
+            let Some(file) = FileKey::for_path(&path) else {
+                continue;
+            };
             let key = Key { file, options };
             if self.in_flight.iter().any(|job| job.key == key) || cache().contains(&key) {
                 continue;
@@ -224,9 +250,14 @@ fn pool() -> &'static Pool {
     POOL.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
         for i in 0..cores.saturating_sub(1).clamp(1, MAX_WORKERS) {
-            let _ = std::thread::Builder::new().name(format!("mediares-decode-{i}")).spawn(worker_loop);
+            let _ = std::thread::Builder::new()
+                .name(format!("mediares-decode-{i}"))
+                .spawn(worker_loop);
         }
-        Pool { queue: Mutex::new(Queue::default()), wake: Condvar::new() }
+        Pool {
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+        }
     })
 }
 
@@ -261,7 +292,12 @@ fn worker_loop() {
         };
         for hwnd in notify {
             unsafe {
-                let _ = PostMessageW(Some(HWND(hwnd as *mut _)), WM_IMAGE_READY, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(HWND(hwnd as *mut _)),
+                    WM_IMAGE_READY,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
             }
         }
     }
@@ -275,7 +311,10 @@ fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Decode
             apply_exif_orientation(&mut img, orientation);
         }
     }
-    Some(DecodedImage { exif, ..to_bgra(img, options.background, kind == MediaType::RawImage) })
+    Some(DecodedImage {
+        exif,
+        ..to_bgra(img, options.background, kind == MediaType::RawImage)
+    })
 }
 
 /// Decodes an in-memory picture (e.g. embedded album art) for display; not cached.
@@ -288,14 +327,32 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
     let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
-    let bg = [background & 0xFF, (background >> 8) & 0xFF, (background >> 16) & 0xFF];
+    let bg = [
+        background & 0xFF,
+        (background >> 8) & 0xFF,
+        (background >> 16) & 0xFF,
+    ];
     for px in bgra.chunks_exact_mut(4) {
         let a = px[3] as u32;
         let blend = |c: u8, bg: u32| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
-        let (r, g, b) = if a == 255 { (px[0], px[1], px[2]) } else { (blend(px[0], bg[0]), blend(px[1], bg[1]), blend(px[2], bg[2])) };
+        let (r, g, b) = if a == 255 {
+            (px[0], px[1], px[2])
+        } else {
+            (
+                blend(px[0], bg[0]),
+                blend(px[1], bg[1]),
+                blend(px[2], bg[2]),
+            )
+        };
         px.copy_from_slice(&[b, g, r, 255]);
     }
-    DecodedImage { width, height, bgra, is_preview, exif: None }
+    DecodedImage {
+        width,
+        height,
+        bgra,
+        is_preview,
+        exif: None,
+    }
 }
 
 /// The picture turned by a quarter, clockwise or counter-clockwise.
@@ -305,18 +362,33 @@ pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
     // Output row `y` (of `w` rows, each `h` pixels wide) reads a source column.
     for y in 0..w {
         for x in 0..h {
-            let (sx, sy) = if clockwise { (y, h - 1 - x) } else { (w - 1 - y, x) };
+            let (sx, sy) = if clockwise {
+                (y, h - 1 - x)
+            } else {
+                (w - 1 - y, x)
+            };
             let i = (sy * w + sx) * 4;
             dst.extend_from_slice(&img.bgra[i..i + 4]);
         }
     }
-    DecodedImage { width: img.height, height: img.width, bgra: dst, is_preview: img.is_preview, exif: img.exif.clone() }
+    DecodedImage {
+        width: img.height,
+        height: img.width,
+        bgra: dst,
+        is_preview: img.is_preview,
+        exif: img.exif.clone(),
+    }
 }
 
 /// Back to an `image` buffer (e.g. to scale a cached picture).
 pub fn to_dynamic(img: &DecodedImage) -> Option<DynamicImage> {
-    let rgba: Vec<u8> = img.bgra.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], px[3]]).collect();
-    mediares_core::image::RgbaImage::from_raw(img.width, img.height, rgba).map(DynamicImage::ImageRgba8)
+    let rgba: Vec<u8> = img
+        .bgra
+        .chunks_exact(4)
+        .flat_map(|px| [px[2], px[1], px[0], px[3]])
+        .collect();
+    mediares_core::image::RgbaImage::from_raw(img.width, img.height, rgba)
+        .map(DynamicImage::ImageRgba8)
 }
 
 #[cfg(test)]
@@ -326,7 +398,13 @@ mod tests {
 
     #[test]
     fn converts_to_bgra_over_background() {
-        let img = RgbaImage::from_fn(2, 1, |x, _| if x == 0 { Rgba([255, 0, 10, 255]) } else { Rgba([255, 255, 255, 0]) });
+        let img = RgbaImage::from_fn(2, 1, |x, _| {
+            if x == 0 {
+                Rgba([255, 0, 10, 255])
+            } else {
+                Rgba([255, 255, 255, 0])
+            }
+        });
         let out = to_bgra(DynamicImage::ImageRgba8(img), 0x0030_2010, false);
         assert_eq!(&out.bgra[0..4], &[10, 0, 255, 255]);
         assert_eq!(&out.bgra[4..8], &[0x30, 0x20, 0x10, 255]);
@@ -335,26 +413,55 @@ mod tests {
     #[test]
     fn rotates_by_quarter_turns() {
         // 2x1: red, green  ->  clockwise 1x2: red above green; counter-clockwise: green above red.
-        let img = DecodedImage { width: 2, height: 1, bgra: vec![0, 0, 255, 255, 0, 255, 0, 255], is_preview: false, exif: None };
+        let img = DecodedImage {
+            width: 2,
+            height: 1,
+            bgra: vec![0, 0, 255, 255, 0, 255, 0, 255],
+            is_preview: false,
+            exif: None,
+        };
         let cw = rotated(&img, true);
         assert_eq!((cw.width, cw.height), (1, 2));
         assert_eq!(cw.bgra, vec![0, 0, 255, 255, 0, 255, 0, 255]);
-        assert_eq!(rotated(&img, false).bgra, vec![0, 255, 0, 255, 0, 0, 255, 255]);
+        assert_eq!(
+            rotated(&img, false).bgra,
+            vec![0, 255, 0, 255, 0, 0, 255, 255]
+        );
         // 2x2 turned four times is the original.
-        let square = DecodedImage { width: 2, height: 2, bgra: (0..16).collect(), is_preview: false, exif: None };
+        let square = DecodedImage {
+            width: 2,
+            height: 2,
+            bgra: (0..16).collect(),
+            is_preview: false,
+            exif: None,
+        };
         let back = (0..4).fold(square, |img, _| rotated(&img, true));
         assert_eq!(back.bgra, (0..16).collect::<Vec<u8>>());
     }
 
     #[test]
     fn cache_evicts_least_recently_used_by_bytes() {
-        let big = |n: usize| Arc::new(DecodedImage { width: 1, height: 1, bgra: vec![0; n], is_preview: false, exif: None });
+        let big = |n: usize| {
+            Arc::new(DecodedImage {
+                width: 1,
+                height: 1,
+                bgra: vec![0; n],
+                is_preview: false,
+                exif: None,
+            })
+        };
         let key = |name: &str| Key {
-            file: FileKey::for_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(name).as_path()).expect("file exists"),
-            options: DecodeOptions { auto_rotate: true, background: BACKGROUND },
+            file: FileKey::for_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(name).as_path())
+                .expect("file exists"),
+            options: DecodeOptions {
+                auto_rotate: true,
+                background: BACKGROUND,
+            },
         };
         let (a, b, c) = (key("Cargo.toml"), key("src/lib.rs"), key("src/config.rs"));
-        let mut cache = Cache { entries: Vec::new() };
+        let mut cache = Cache {
+            entries: Vec::new(),
+        };
         let third = CACHE_BUDGET_BYTES / 3 + 1;
         cache.insert(a.clone(), big(third));
         cache.insert(b.clone(), big(third));

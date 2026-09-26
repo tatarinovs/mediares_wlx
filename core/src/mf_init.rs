@@ -5,7 +5,9 @@
 
 use std::sync::Mutex;
 
-use windows::Win32::Media::MediaFoundation::{MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION};
+use windows::Win32::Media::MediaFoundation::{
+    MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION,
+};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 /// Initializes COM on the current thread for the lifetime of the value.

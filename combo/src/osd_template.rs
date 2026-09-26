@@ -10,7 +10,8 @@ use mediares_core::video_tags::VideoTags;
 /// Photo OSD as it was before templates.
 pub const DEFAULT_PHOTO: &str = "{name} ( {width} x {height} = {mp} MP , {size_kb} KB )< [ {index} / {count} ]><  {zoom}%><  [{preview}]>";
 /// Video OSD as it was before templates.
-pub const DEFAULT_VIDEO: &str = "{name} ( {width} x {height} , {size} )< [ {index} / {count} ]>   {time} / {duration}";
+pub const DEFAULT_VIDEO: &str =
+    "{name} ( {width} x {height} , {size} )< [ {index} / {count} ]>   {time} / {duration}";
 
 /// A field offered by the editor's "Добавить поле" menu.
 pub struct Field {
@@ -73,7 +74,10 @@ pub const PHOTO_FIELDS: FieldGroups = &[
 
 pub const VIDEO_FIELDS: FieldGroups = &[
     ("Файл", FILE_FIELDS),
-    ("Воспроизведение", &[f("time", "Текущая позиция"), f("duration", "Длительность")]),
+    (
+        "Воспроизведение",
+        &[f("time", "Текущая позиция"), f("duration", "Длительность")],
+    ),
     (
         "Видео и звук",
         &[
@@ -102,8 +106,16 @@ pub const VIDEO_FIELDS: FieldGroups = &[
 
 /// Fields every file has. `position`: (index from 0, count), `None` outside a list.
 /// Outer `None`: not a file field.
-pub fn file_field(path: &Path, size: u64, position: Option<(usize, usize)>, key: &str) -> Option<String> {
-    let os = |s: Option<&std::ffi::OsStr>| s.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+pub fn file_field(
+    path: &Path,
+    size: u64,
+    position: Option<(usize, usize)>,
+    key: &str,
+) -> Option<String> {
+    let os = |s: Option<&std::ffi::OsStr>| {
+        s.map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
     Some(match key {
         "name" => os(path.file_name()),
         "stem" => os(path.file_stem()),
@@ -112,7 +124,9 @@ pub fn file_field(path: &Path, size: u64, position: Option<(usize, usize)>, key:
         "path" => path.to_string_lossy().into_owned(),
         "size" => crate::image_view::format_size(size),
         "size_kb" => crate::image_view::format_thousands(size.div_ceil(1024)),
-        "index" => position.map(|(i, _)| (i + 1).to_string()).unwrap_or_default(),
+        "index" => position
+            .map(|(i, _)| (i + 1).to_string())
+            .unwrap_or_default(),
         "count" => position.map(|(_, n)| n.to_string()).unwrap_or_default(),
         _ => return None,
     })
@@ -128,24 +142,68 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
         "make" => text(e.make),
         "model" => text(e.model),
         "lens" => text(e.lens_model),
-        "taken" => taken.map(|t| format!("{:02}.{:02}.{} {:02}:{:02}", t.day, t.month, t.year, t.hour, t.minute)).unwrap_or_default(),
-        "date" => taken.map(|t| format!("{:02}.{:02}.{}", t.day, t.month, t.year)).unwrap_or_default(),
-        "time" => taken.map(|t| format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second)).unwrap_or_default(),
-        "exposure" => e.exposure_time.map(|t| format!("{} с", t)).unwrap_or_default(),
-        "aperture" => e.f_number.map(|f| format!("f/{}", trim_float(f, 1))).unwrap_or_default(),
+        "taken" => taken
+            .map(|t| {
+                format!(
+                    "{:02}.{:02}.{} {:02}:{:02}",
+                    t.day, t.month, t.year, t.hour, t.minute
+                )
+            })
+            .unwrap_or_default(),
+        "date" => taken
+            .map(|t| format!("{:02}.{:02}.{}", t.day, t.month, t.year))
+            .unwrap_or_default(),
+        "time" => taken
+            .map(|t| format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second))
+            .unwrap_or_default(),
+        "exposure" => e
+            .exposure_time
+            .map(|t| format!("{} с", t))
+            .unwrap_or_default(),
+        "aperture" => e
+            .f_number
+            .map(|f| format!("f/{}", trim_float(f, 1)))
+            .unwrap_or_default(),
         "iso" => e.iso.map(|v| v.to_string()).unwrap_or_default(),
-        "focal" => e.focal_length.map(|f| format!("{} мм", trim_float(f, 1))).unwrap_or_default(),
-        "focal35" => e.focal_length_35mm.map(|f| format!("{} мм", f)).unwrap_or_default(),
-        "flash" => if e.flash_fired == Some(true) { "вспышка".to_string() } else { String::new() },
+        "focal" => e
+            .focal_length
+            .map(|f| format!("{} мм", trim_float(f, 1)))
+            .unwrap_or_default(),
+        "focal35" => e
+            .focal_length_35mm
+            .map(|f| format!("{} мм", f))
+            .unwrap_or_default(),
+        "flash" => {
+            if e.flash_fired == Some(true) {
+                "вспышка".to_string()
+            } else {
+                String::new()
+            }
+        }
         "software" => text(e.software),
-        "gps" => e.gps_latitude.zip(e.gps_longitude).map(|(la, lo)| format!("{:.5}, {:.5}", la, lo)).unwrap_or_default(),
+        "gps" => e
+            .gps_latitude
+            .zip(e.gps_longitude)
+            .map(|(la, lo)| format!("{:.5}, {:.5}", la, lo))
+            .unwrap_or_default(),
         _ => return None,
     })
 }
 
 /// Video fields that need the file's stream properties or tags (read once per file, on demand).
-pub const VIDEO_DETAIL_KEYS: &[&str] =
-    &["codec", "bitrate", "audio_codec", "channels", "sample_rate", "title", "artist", "director", "year", "genre", "comment"];
+pub const VIDEO_DETAIL_KEYS: &[&str] = &[
+    "codec",
+    "bitrate",
+    "audio_codec",
+    "channels",
+    "sample_rate",
+    "title",
+    "artist",
+    "director",
+    "year",
+    "genre",
+    "comment",
+];
 
 /// Stream and tag fields of a video; `""` when unknown. `None`: not such a field.
 pub fn video_field(meta: Option<&VideoMeta>, tags: &VideoTags, key: &str) -> Option<String> {
@@ -155,7 +213,10 @@ pub fn video_field(meta: Option<&VideoMeta>, tags: &VideoTags, key: &str) -> Opt
         "codec" => meta.map(|m| text(&m.codec)).unwrap_or_default(),
         "bitrate" => num(meta.and_then(|m| m.bitrate_kbps)),
         "audio_codec" => meta.map(|m| text(&m.audio_codec)).unwrap_or_default(),
-        "channels" => meta.and_then(|m| m.audio_channels).map(channels).unwrap_or_default(),
+        "channels" => meta
+            .and_then(|m| m.audio_channels)
+            .map(channels)
+            .unwrap_or_default(),
         "sample_rate" => num(meta.and_then(|m| m.audio_sample_rate)),
         "title" => text(&tags.title),
         "artist" => text(&tags.artist),
@@ -175,11 +236,21 @@ fn format_date(raw: &str) -> String {
     let (date, time) = raw.split_once(['T', ' ']).unwrap_or((raw, ""));
     let parts: Vec<&str> = date.split(['-', ':', '.']).collect();
     let hm: Vec<&str> = time.split(':').take(2).collect();
-    let has_time = hm.len() == 2 && hm.iter().all(|p| digits(p) && p.len() == 2) && time != "00:00:00";
-    let time = if has_time { format!(" {}:{}", hm[0], hm[1]) } else { String::new() };
+    let has_time =
+        hm.len() == 2 && hm.iter().all(|p| digits(p) && p.len() == 2) && time != "00:00:00";
+    let time = if has_time {
+        format!(" {}:{}", hm[0], hm[1])
+    } else {
+        String::new()
+    };
     match parts.as_slice() {
         [y] if y.len() == 4 && digits(y) => y.to_string(),
-        [y, m, d] if y.len() == 4 && [y, m, d].iter().all(|p| digits(p)) && m.len() <= 2 && d.len() <= 2 => {
+        [y, m, d]
+            if y.len() == 4
+                && [y, m, d].iter().all(|p| digits(p))
+                && m.len() <= 2
+                && d.len() <= 2 =>
+        {
             format!("{:0>2}.{:0>2}.{}{}", d, m, y, time)
         }
         _ => raw.to_string(),
@@ -198,7 +269,11 @@ fn channels(n: u32) -> String {
 
 /// Frames per second: "25", "29.97".
 pub fn format_fps(fps: f64) -> String {
-    if fps > 0.0 { trim_float(fps, 2) } else { String::new() }
+    if fps > 0.0 {
+        trim_float(fps, 2)
+    } else {
+        String::new()
+    }
 }
 
 /// "Canon EOS R5", not "Canon Canon EOS R5" (many cameras repeat the make in the model).
@@ -217,7 +292,11 @@ fn camera(make: Option<&str>, model: Option<&str>) -> String {
 /// "2.8", "50" — no trailing zeros.
 fn trim_float(v: f64, decimals: usize) -> String {
     let s = format!("{:.*}", decimals, v);
-    if s.contains('.') { s.trim_end_matches('0').trim_end_matches('.').to_string() } else { s }
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -333,7 +412,10 @@ pub fn uses_any(template: &str, keys: &[&str]) -> bool {
 
 /// One INI line: `\` → `\\`, line break → `\n`.
 pub fn to_ini(template: &str) -> String {
-    template.replace('\r', "").replace('\\', "\\\\").replace('\n', "\\n")
+    template
+        .replace('\r', "")
+        .replace('\\', "\\\\")
+        .replace('\n', "\\n")
 }
 
 pub fn from_ini(value: &str) -> String {
@@ -370,7 +452,10 @@ mod tests {
 
     #[test]
     fn fields_and_blocks() {
-        assert_eq!(render("{name}< ISO {iso}>< {lens} мм>", lookup), "a.jpg ISO 400");
+        assert_eq!(
+            render("{name}< ISO {iso}>< {lens} мм>", lookup),
+            "a.jpg ISO 400"
+        );
         assert_eq!(render("<[{index}] >{name}", lookup), "a.jpg");
     }
 
@@ -382,7 +467,10 @@ mod tests {
     #[test]
     fn escapes_and_unknown_fields() {
         assert_eq!(render("{{name}} <<{name}>>", lookup), "{name} <a.jpg>");
-        assert_eq!(render("{nope} {not a field} {", lookup), "{nope} {not a field} {");
+        assert_eq!(
+            render("{nope} {not a field} {", lookup),
+            "{nope} {not a field} {"
+        );
         assert_eq!(render("{name} > 1", lookup), "a.jpg > 1");
     }
 
@@ -422,21 +510,37 @@ mod tests {
         assert_eq!(exif_field(None, "lens").unwrap(), "");
         assert_eq!(exif_field(None, "name"), None);
         assert_eq!(camera(Some("Canon"), Some("Canon EOS R5")), "Canon EOS R5");
-        assert_eq!(camera(Some("NIKON CORPORATION"), Some("NIKON D750")), "NIKON D750");
+        assert_eq!(
+            camera(Some("NIKON CORPORATION"), Some("NIKON D750")),
+            "NIKON D750"
+        );
     }
 
     #[test]
     fn video_values() {
-        let meta = VideoMeta { codec: Some("HEVC".into()), audio_channels: Some(2), ..Default::default() };
-        let tags = VideoTags { title: Some("Фильм".into()), ..Default::default() };
+        let meta = VideoMeta {
+            codec: Some("HEVC".into()),
+            audio_channels: Some(2),
+            ..Default::default()
+        };
+        let tags = VideoTags {
+            title: Some("Фильм".into()),
+            ..Default::default()
+        };
         assert_eq!(video_field(Some(&meta), &tags, "codec").unwrap(), "HEVC");
-        assert_eq!(video_field(Some(&meta), &tags, "channels").unwrap(), "стерео");
+        assert_eq!(
+            video_field(Some(&meta), &tags, "channels").unwrap(),
+            "стерео"
+        );
         assert_eq!(video_field(None, &tags, "title").unwrap(), "Фильм");
         assert_eq!(video_field(None, &tags, "bitrate").unwrap(), "");
         assert_eq!(video_field(None, &tags, "name"), None);
         assert_eq!(format_date("2019"), "2019");
         assert_eq!(format_date("2015-04-16"), "16.04.2015");
-        assert_eq!(format_date("2023-02-17T02:42:42.2592209+10:00"), "17.02.2023 02:42");
+        assert_eq!(
+            format_date("2023-02-17T02:42:42.2592209+10:00"),
+            "17.02.2023 02:42"
+        );
         assert_eq!(format_date("2022:12:31 03:00:00"), "31.12.2022 03:00");
         assert_eq!(format_date("весна 2020"), "весна 2020");
         assert_eq!(format_fps(29.97), "29.97");

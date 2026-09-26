@@ -10,8 +10,9 @@ use mediares_core::probe::MediaType;
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, FillRect, GetStockObject,
-    BeginPaint, EndPaint, InvalidateRect, IntersectClipRect, SelectObject, BLACK_BRUSH, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+    EndPaint, FillRect, GetStockObject, IntersectClipRect, InvalidateRect, SelectObject,
+    BLACK_BRUSH, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer};
@@ -59,7 +60,13 @@ pub struct MediaView {
 impl MediaView {
     /// Opens `path` (`kind` must be playable), reusing `previous` when it shows the same kind of
     /// content. `None` if the file can't be played.
-    pub unsafe fn open(viewer: HWND, previous: Option<MediaView>, path: &Path, kind: MediaType, resume: bool) -> Option<MediaView> {
+    pub unsafe fn open(
+        viewer: HWND,
+        previous: Option<MediaView>,
+        path: &Path,
+        kind: MediaType,
+        resume: bool,
+    ) -> Option<MediaView> {
         if let Some(mut view) = previous {
             let reused = match &mut view.content {
                 Content::Video(v) if kind == MediaType::Video => v.open(path, resume),
@@ -79,7 +86,15 @@ impl MediaView {
             MediaType::Audio => Content::Audio(Box::new(AudioView::new(viewer, path)?)),
             _ => return None,
         };
-        let view = MediaView { content, viewer, bar: BarControl::default(), skip: false, font: None, status: None, bar_host: None };
+        let view = MediaView {
+            content,
+            viewer,
+            bar: BarControl::default(),
+            skip: false,
+            font: None,
+            status: None,
+            bar_host: None,
+        };
         view.layout();
         Some(view)
     }
@@ -146,7 +161,12 @@ impl MediaView {
         if self.bar_host.is_none() {
             rc.bottom = self.bar_layout().bar.top;
         }
-        RECT { left: 0, top: 0, right: rc.right.max(1), bottom: rc.bottom.max(1) }
+        RECT {
+            left: 0,
+            top: 0,
+            right: rc.right.max(1),
+            bottom: rc.bottom.max(1),
+        }
     }
 
     /// After a resize.
@@ -182,7 +202,16 @@ impl MediaView {
         let area = self.content_area();
         match &mut self.content {
             Content::Video(_) => {
-                FillRect(mem_dc, &RECT { left: 0, top: 0, right: width, bottom: height }, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+                FillRect(
+                    mem_dc,
+                    &RECT {
+                        left: 0,
+                        top: 0,
+                        right: width,
+                        bottom: height,
+                    },
+                    HBRUSH(GetStockObject(BLACK_BRUSH).0),
+                );
             }
             Content::Audio(a) => a.paint(mem_dc, area, scale),
         }
@@ -192,7 +221,17 @@ impl MediaView {
         }
 
         let (dw, dh) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
-        let _ = BitBlt(hdc, dirty.left, dirty.top, dw, dh, Some(mem_dc), dirty.left, dirty.top, SRCCOPY);
+        let _ = BitBlt(
+            hdc,
+            dirty.left,
+            dirty.top,
+            dw,
+            dh,
+            Some(mem_dc),
+            dirty.left,
+            dirty.top,
+            SRCCOPY,
+        );
         SelectObject(mem_dc, old);
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem_dc);
@@ -205,7 +244,10 @@ impl MediaView {
         let status = self.status.clone();
         let dpi_key = (scale * 96.0) as u32;
         if self.font.as_ref().is_none_or(|(k, _)| *k != dpi_key) {
-            self.font = Some((dpi_key, dialog::create_font(w!("Segoe UI"), -(13.0 * scale).round() as i32)));
+            self.font = Some((
+                dpi_key,
+                dialog::create_font(w!("Segoe UI"), -(13.0 * scale).round() as i32),
+            ));
         }
         let font = self.font.as_ref().map(|(_, f)| f.0).unwrap_or_default();
         let layout = transport_bar::layout(width, height, scale, self.skip);
@@ -227,7 +269,9 @@ impl MediaView {
         let mut rc = RECT::default();
         let _ = GetClientRect(host, &mut rc);
         let scale = self.dpi_scale();
-        crate::overlay::with_buffer(hdc, rc, |dc| unsafe { self.paint_bar(dc, rc.right, rc.bottom, scale) });
+        crate::overlay::with_buffer(hdc, rc, |dc| unsafe {
+            self.paint_bar(dc, rc.right, rc.bottom, scale)
+        });
         let _ = EndPaint(host, &ps);
     }
 
@@ -336,14 +380,19 @@ impl MediaView {
             // Audio has no key frames: a finer step instead.
             Content::Audio(a) => {
                 let t = a.transport();
-                t.seek((t.position() + if forward { 1.0 } else { -1.0 }).max(0.0), false);
+                t.seek(
+                    (t.position() + if forward { 1.0 } else { -1.0 }).max(0.0),
+                    false,
+                );
             }
         }
     }
 
     /// Video speed one step slower / faster, or normal (`None`); the bar shows the new speed.
     pub unsafe fn change_rate(&mut self, faster: Option<bool>) {
-        let Content::Video(v) = &mut self.content else { return };
+        let Content::Video(v) = &mut self.content else {
+            return;
+        };
         let rate = v.change_rate(faster);
         self.show_status(format!("Скорость {}×", rate.to_string().replace('.', ",")));
     }
@@ -351,7 +400,9 @@ impl MediaView {
     pub unsafe fn frame_step(&mut self, forward: bool) {
         if let Content::Video(v) = &mut self.content {
             if !v.frame_step(forward) {
-                self.show_status("Шаг назад недоступен для этого файла (неточная перемотка)".to_string());
+                self.show_status(
+                    "Шаг назад недоступен для этого файла (неточная перемотка)".to_string(),
+                );
             }
         }
     }

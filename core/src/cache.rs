@@ -44,7 +44,11 @@ pub struct FileKey {
 impl FileKey {
     pub fn for_path(path: &Path) -> Option<Self> {
         let meta = fs::metadata(path).ok()?;
-        Some(FileKey { path: path.to_path_buf(), size: meta.len(), modified: meta.modified().ok() })
+        Some(FileKey {
+            path: path.to_path_buf(),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        })
     }
 }
 
@@ -54,7 +58,9 @@ pub struct MediaCache {
 
 impl MediaCache {
     fn new(capacity: NonZeroUsize) -> Self {
-        Self { cache: Mutex::new(LruCache::new(capacity)) }
+        Self {
+            cache: Mutex::new(LruCache::new(capacity)),
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, CachedMedia>> {
@@ -83,7 +89,9 @@ impl MediaCache {
             #[cfg(feature = "audio-decode")]
             MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
                 Ok(a) => CachedMedia::Audio(Arc::new(a)),
-                Err(crate::audio_fingerprint::AudioError::Cancelled) => return CachedMedia::Unsupported,
+                Err(crate::audio_fingerprint::AudioError::Cancelled) => {
+                    return CachedMedia::Unsupported
+                }
                 Err(crate::audio_fingerprint::AudioError::Unsupported) => CachedMedia::Unsupported,
             },
             _ => CachedMedia::Unsupported,
@@ -108,7 +116,9 @@ struct MetaCache<T>(Mutex<LruCache<FileKey, Option<Arc<T>>>>);
 
 impl<T> MetaCache<T> {
     fn new() -> Self {
-        MetaCache(Mutex::new(LruCache::new(NonZeroUsize::new(512).expect("non-zero capacity"))))
+        MetaCache(Mutex::new(LruCache::new(
+            NonZeroUsize::new(512).expect("non-zero capacity"),
+        )))
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, Option<Arc<T>>>> {
@@ -134,12 +144,14 @@ impl<T> MetaCache<T> {
 #[cfg(feature = "tags")]
 pub fn get_tags(path: &Path) -> Option<Arc<crate::audio_tags::AudioTags>> {
     static TAGS: OnceLock<MetaCache<crate::audio_tags::AudioTags>> = OnceLock::new();
-    TAGS.get_or_init(MetaCache::new).get_or_read(path, |p| crate::audio_tags::read_tags(p, false))
+    TAGS.get_or_init(MetaCache::new)
+        .get_or_read(path, |p| crate::audio_tags::read_tags(p, false))
 }
 
 pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
     static EXIF: OnceLock<MetaCache<crate::exif::ExifInfo>> = OnceLock::new();
-    EXIF.get_or_init(MetaCache::new).get_or_read(path, crate::exif::read_exif)
+    EXIF.get_or_init(MetaCache::new)
+        .get_or_read(path, crate::exif::read_exif)
 }
 
 fn video_meta_cache() -> &'static MetaCache<VideoMeta> {
@@ -175,10 +187,13 @@ pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> 
     static VIDEO_TAGS: OnceLock<MetaCache<crate::video_tags::VideoTags>> = OnceLock::new();
     VIDEO_TAGS
         .get_or_init(MetaCache::new)
-        .get_or_read(path, |p| Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty()))
+        .get_or_read(path, |p| {
+            Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty())
+        })
 }
 
 pub fn get_cache() -> &'static MediaCache {
     static GLOBAL_CACHE: OnceLock<MediaCache> = OnceLock::new();
-    GLOBAL_CACHE.get_or_init(|| MediaCache::new(NonZeroUsize::new(CAPACITY).expect("non-zero capacity")))
+    GLOBAL_CACHE
+        .get_or_init(|| MediaCache::new(NonZeroUsize::new(CAPACITY).expect("non-zero capacity")))
 }

@@ -27,7 +27,9 @@ fn within_pixel_budget(img: &DynamicImage) -> bool {
 
 /// Decodes an in-memory image (format detected from content) under the shared limits.
 pub fn decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
-    let mut reader = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .ok()?;
     reader.limits(limits());
     reader.decode().ok().filter(within_pixel_budget)
 }
@@ -57,7 +59,9 @@ pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
             .ok()
             .and_then(|r| r.with_guessed_format().ok())
             .and_then(|r| r.into_dimensions().ok())
-            .is_some_and(|(w, h)| w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS),
+            .is_some_and(|(w, h)| {
+                w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
+            }),
         MediaType::RawImage | MediaType::PsdImage => path.is_file(),
         _ => false,
     }
@@ -66,12 +70,20 @@ pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
 /// Width and height of a standard image from its header, without decoding (EXIF rotation not
 /// applied — the same sizes the analysis reports).
 pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
-    ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()
+    ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .into_dimensions()
+        .ok()
 }
 
 /// Applies an EXIF orientation code (1..=8); other values leave the image untouched.
 pub fn apply_exif_orientation(img: &mut DynamicImage, orientation: u16) {
-    if let Some(o) = u8::try_from(orientation).ok().and_then(Orientation::from_exif) {
+    if let Some(o) = u8::try_from(orientation)
+        .ok()
+        .and_then(Orientation::from_exif)
+    {
         img.apply_orientation(o);
     }
 }

@@ -77,7 +77,13 @@ fn compute_phash(gray: &GrayImage) -> u64 {
             *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / (2 * N) as f64).cos();
         }
     }
-    let alpha = |k: usize| if k == 0 { (1.0 / N as f64).sqrt() } else { (2.0 / N as f64).sqrt() };
+    let alpha = |k: usize| {
+        if k == 0 {
+            (1.0 / N as f64).sqrt()
+        } else {
+            (2.0 / N as f64).sqrt()
+        }
+    };
 
     let mut dct = [0.0f64; 64];
     for u in 0..8 {
@@ -96,7 +102,8 @@ fn compute_phash(gray: &GrayImage) -> u64 {
     ac.sort_by(f64::total_cmp);
     let median = ac[ac.len() / 2];
 
-    dct.iter().fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
+    dct.iter()
+        .fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
 pub fn compute_aspect_ratio(w: u32, h: u32) -> String {
@@ -155,8 +162,16 @@ mod tests {
         }));
         let small = img.resize_exact(300, 200, FilterType::Triangle);
         let (a, b) = (analyze(&img), analyze(&small));
-        assert!((a.dhash ^ b.dhash).count_ones() <= 4, "dhash distance {}", (a.dhash ^ b.dhash).count_ones());
-        assert!((a.phash ^ b.phash).count_ones() <= 6, "phash distance {}", (a.phash ^ b.phash).count_ones());
+        assert!(
+            (a.dhash ^ b.dhash).count_ones() <= 4,
+            "dhash distance {}",
+            (a.dhash ^ b.dhash).count_ones()
+        );
+        assert!(
+            (a.phash ^ b.phash).count_ones() <= 6,
+            "phash distance {}",
+            (a.phash ^ b.phash).count_ones()
+        );
         assert_eq!((a.width, a.height), (1200, 800));
     }
 }

@@ -8,10 +8,12 @@ use windows::core::{Interface, GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSourceReader, MF2DBuffer_LockFlags_Read,
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
-    MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE, MFSampleExtension_CleanPoint, MF_SOURCE_READERF_ENDOFSTREAM,
+    MFSampleExtension_CleanPoint, MFVideoFormat_NV12, MFVideoFormat_RGB32,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
@@ -81,15 +83,23 @@ impl From<windows::core::Error> for VideoError {
 const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
 /// Opens a source reader restricted to the first video stream.
-unsafe fn open_reader(path: &Path, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
+unsafe fn open_reader(
+    path: &Path,
+    video_processing: bool,
+) -> windows::core::Result<IMFSourceReader> {
     open_reader_for(path, STREAM, video_processing)
 }
 
-pub(crate) unsafe fn open_reader_for(path: &Path, stream: u32, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
+pub(crate) unsafe fn open_reader_for(
+    path: &Path,
+    stream: u32,
+    video_processing: bool,
+) -> windows::core::Result<IMFSourceReader> {
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut attributes: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut attributes, 1)?;
-    let attributes = attributes.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+    let attributes =
+        attributes.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
     if video_processing {
         attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
     }
@@ -124,7 +134,11 @@ pub fn probe_video(path: &Path) -> Option<VideoInfo> {
             width: (frame_size >> 32) as u32,
             height: frame_size as u32,
             duration_sec: duration_hns(&reader) as f64 / 10_000_000.0,
-            frame_rate: if den > 0 { num as f64 / den as f64 } else { 0.0 },
+            frame_rate: if den > 0 {
+                num as f64 / den as f64
+            } else {
+                0.0
+            },
         })
     }
 }
@@ -143,19 +157,35 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
         let (num, den) = ((rate >> 32) as u32, rate as u32);
         let duration_sec = duration_hns(&reader) as f64 / 10_000_000.0;
         let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-        let audio = reader.GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0).ok();
+        let audio = reader
+            .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
+            .ok();
         let positive = |v: windows::core::Result<u32>| v.ok().filter(|&v| v > 0);
         Some(VideoMeta {
             width: (frame_size >> 32) as u32,
             height: frame_size as u32,
             duration_sec,
-            frame_rate: if den > 0 { num as f64 / den as f64 } else { 0.0 },
-            codec: video.GetGUID(&MF_MT_SUBTYPE).ok().and_then(|g| video_codec_name(&g)),
+            frame_rate: if den > 0 {
+                num as f64 / den as f64
+            } else {
+                0.0
+            },
+            codec: video
+                .GetGUID(&MF_MT_SUBTYPE)
+                .ok()
+                .and_then(|g| video_codec_name(&g)),
             bitrate_kbps: (duration_sec >= 1.0 && file_size > 0)
                 .then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32),
-            audio_codec: audio.as_ref().and_then(|a| a.GetGUID(&MF_MT_SUBTYPE).ok()).and_then(|g| audio_codec_name(&g)),
-            audio_channels: audio.as_ref().and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS))),
-            audio_sample_rate: audio.as_ref().and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND))),
+            audio_codec: audio
+                .as_ref()
+                .and_then(|a| a.GetGUID(&MF_MT_SUBTYPE).ok())
+                .and_then(|g| audio_codec_name(&g)),
+            audio_channels: audio
+                .as_ref()
+                .and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_NUM_CHANNELS))),
+            audio_sample_rate: audio
+                .as_ref()
+                .and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND))),
         })
     }
 }
@@ -163,8 +193,10 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
 /// Most MF subtypes are `XXXXXXXX-0000-0010-8000-00AA00389B71`, with a FOURCC (video) or a WAVE
 /// format tag (audio) in the first field.
 fn fourcc_base(guid: &GUID) -> Option<u32> {
-    (guid.data2 == 0x0000 && guid.data3 == 0x0010 && guid.data4 == [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
-        .then_some(guid.data1)
+    (guid.data2 == 0x0000
+        && guid.data3 == 0x0010
+        && guid.data4 == [0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71])
+    .then_some(guid.data1)
 }
 
 /// Subtypes outside the FOURCC family (MPEG-1/2 video and Dolby audio from DirectShow).
@@ -197,7 +229,12 @@ fn video_codec_name(guid: &GUID) -> Option<String> {
         b"WVC1" => "VC-1",
         b"H263" => "H.263",
         b"DVSD" | b"DV25" | b"DV50" => "DV",
-        _ => return fourcc.iter().all(|b| b.is_ascii_graphic()).then(|| String::from_utf8_lossy(&fourcc).trim().to_string()),
+        _ => {
+            return fourcc
+                .iter()
+                .all(|b| b.is_ascii_graphic())
+                .then(|| String::from_utf8_lossy(&fourcc).trim().to_string())
+        }
     };
     Some(name.into())
 }
@@ -245,12 +282,21 @@ pub fn probe_audio(path: &Path) -> Option<f64> {
     }
 }
 
-pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoAnalysis, VideoError> {
+pub fn analyze_video(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<VideoAnalysis, VideoError> {
     let _com = ComScope::new();
     if !ensure_mf_started() {
         return Err(VideoError::Failed("Media Foundation is unavailable".into()));
     }
-    let check = || if cancelled() { Err(VideoError::Cancelled) } else { Ok(()) };
+    let check = || {
+        if cancelled() {
+            Err(VideoError::Cancelled)
+        } else {
+            Ok(())
+        }
+    };
     check()?;
 
     unsafe {
@@ -269,7 +315,10 @@ pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoA
             width: (frame_size >> 32) as u32,
             height: frame_size as u32,
             // MF_MT_DEFAULT_STRIDE is a signed value stored as UINT32; negative means bottom-up.
-            default_stride: current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(0),
+            default_stride: current
+                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                .map(|s| s as i32)
+                .unwrap_or(0),
             format,
         };
 
@@ -288,7 +337,10 @@ pub fn analyze_video(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<VideoA
             width: geometry.width,
             height: geometry.height,
             dhash_mid,
-            fingerprint: format!("{}s_{:016x}_{:016x}_{:016x}", duration_sec, dhash_25, dhash_mid, dhash_75),
+            fingerprint: format!(
+                "{}s_{:016x}_{:016x}_{:016x}",
+                duration_sec, dhash_25, dhash_mid, dhash_75
+            ),
         })
     }
 }
@@ -306,17 +358,25 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
         let current = reader.GetCurrentMediaType(STREAM).ok()?;
         let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
         let (width, height) = ((frame_size >> 32) as u32, frame_size as u32);
-        if width == 0 || height == 0 {
+        if width == 0
+            || height == 0
+            || (width as u64) * (height as u64) > crate::image_decode::MAX_PIXELS
+        {
             return None;
         }
-        let stride = current.GetUINT32(&MF_MT_DEFAULT_STRIDE).map(|s| s as i32).unwrap_or(width as i32 * 4);
+        let stride = current
+            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+            .map(|s| s as i32)
+            .unwrap_or(width as i32 * 4);
         let at = (duration_hns(&reader) as f64 * fraction.clamp(0.0, 1.0)) as i64;
         set_position(&reader, at).ok()?;
 
         // The first reads after a seek may carry no sample (stream tick, format change).
         let sample = (0..16).find_map(|_| {
             let (mut flags, mut sample) = (0u32, None);
-            reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)).ok()?;
+            reader
+                .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+                .ok()?;
             if sample.is_none() && flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
                 return Some(None);
             }
@@ -329,14 +389,27 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
         let image = (!ptr.is_null()).then(|| {
             let data = std::slice::from_raw_parts(ptr, len as usize);
             let row = width as usize * 4;
-            let pitch = if stride == 0 { row as isize } else { stride as isize };
+            let pitch = if stride == 0 {
+                row as isize
+            } else {
+                stride as isize
+            };
             // Bottom-up frames start with the last row.
-            let top = if pitch < 0 { (height as usize - 1) * pitch.unsigned_abs() } else { 0 };
+            let top = if pitch < 0 {
+                (height as usize - 1) * pitch.unsigned_abs()
+            } else {
+                0
+            };
             let mut rgba = Vec::with_capacity(row * height as usize);
             for y in 0..height as isize {
                 let start = top as isize + y * pitch;
-                let line = usize::try_from(start).ok().and_then(|s| data.get(s..s + row))?;
-                rgba.extend(line.chunks_exact(4).flat_map(|px| [px[2], px[1], px[0], 255]));
+                let line = usize::try_from(start)
+                    .ok()
+                    .and_then(|s| data.get(s..s + row))?;
+                rgba.extend(
+                    line.chunks_exact(4)
+                        .flat_map(|px| [px[2], px[1], px[0], 255]),
+                );
             }
             image::RgbaImage::from_raw(width, height, rgba)
         });
@@ -375,7 +448,11 @@ struct FrameGeometry {
     format: PixelFormat,
 }
 
-unsafe fn grab_frame_dhash(reader: &IMFSourceReader, timestamp_hns: u64, geo: &FrameGeometry) -> Option<u64> {
+unsafe fn grab_frame_dhash(
+    reader: &IMFSourceReader,
+    timestamp_hns: u64,
+    geo: &FrameGeometry,
+) -> Option<u64> {
     if geo.width < 9 || geo.height < 8 {
         return None;
     }
@@ -383,19 +460,36 @@ unsafe fn grab_frame_dhash(reader: &IMFSourceReader, timestamp_hns: u64, geo: &F
     set_position(reader, timestamp_hns as i64).ok()?;
 
     let mut sample = None;
-    reader.ReadSample(STREAM, 0, None, None, None, Some(&mut sample)).ok()?;
+    reader
+        .ReadSample(STREAM, 0, None, None, None, Some(&mut sample))
+        .ok()?;
     let buffer = sample?.ConvertToContiguousBuffer().ok()?;
 
     if let Ok(buf2d) = buffer.cast::<IMF2DBuffer2>() {
         let (mut scanline0, mut pitch) = (std::ptr::null_mut(), 0i32);
         let (mut start, mut len) = (std::ptr::null_mut(), 0u32);
-        if buf2d.Lock2DSize(MF2DBuffer_LockFlags_Read, &mut scanline0, &mut pitch, &mut start, &mut len).is_ok() {
+        if buf2d
+            .Lock2DSize(
+                MF2DBuffer_LockFlags_Read,
+                &mut scanline0,
+                &mut pitch,
+                &mut start,
+                &mut len,
+            )
+            .is_ok()
+        {
             let hash = if start.is_null() || scanline0 < start {
                 None
             } else {
                 let data = std::slice::from_raw_parts(start, len as usize);
                 let top = scanline0.offset_from(start) as usize;
-                FrameView { data, top, pitch: pitch as isize, geo }.dhash()
+                FrameView {
+                    data,
+                    top,
+                    pitch: pitch as isize,
+                    geo,
+                }
+                .dhash()
             };
             let _ = buf2d.Unlock2D();
             return hash;
@@ -413,10 +507,24 @@ unsafe fn hash_linear_buffer(buffer: &IMFMediaBuffer, geo: &FrameGeometry) -> Op
     } else {
         let data = std::slice::from_raw_parts(ptr, cur_len as usize);
         let row = geo.width as usize * geo.format.bytes_per_pixel();
-        let pitch = if geo.default_stride != 0 { geo.default_stride as isize } else { row as isize };
+        let pitch = if geo.default_stride != 0 {
+            geo.default_stride as isize
+        } else {
+            row as isize
+        };
         // Bottom-up images start with the last row in memory.
-        let top = if pitch < 0 { (geo.height as usize - 1) * pitch.unsigned_abs() } else { 0 };
-        FrameView { data, top, pitch, geo }.dhash()
+        let top = if pitch < 0 {
+            (geo.height as usize - 1) * pitch.unsigned_abs()
+        } else {
+            0
+        };
+        FrameView {
+            data,
+            top,
+            pitch,
+            geo,
+        }
+        .dhash()
     };
     let _ = buffer.Unlock();
     hash
@@ -457,7 +565,11 @@ impl FrameView<'_> {
                 *cell = self.luma(x, y)?;
             }
         }
-        Some(grid.iter().flat_map(|row| row.windows(2)).fold(0u64, |hash, pair| (hash << 1) | (pair[0] > pair[1]) as u64))
+        Some(
+            grid.iter()
+                .flat_map(|row| row.windows(2))
+                .fold(0u64, |hash, pair| (hash << 1) | (pair[0] > pair[1]) as u64),
+        )
     }
 }
 
@@ -497,7 +609,9 @@ impl KeyframeIndex {
     unsafe fn read(&self) -> Option<(f64, bool)> {
         let mut flags = 0u32;
         let mut sample = None;
-        self.reader.ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample)).ok()?;
+        self.reader
+            .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+            .ok()?;
         if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
             return None;
         }
@@ -511,7 +625,10 @@ impl KeyframeIndex {
     /// Sources position on the key frame preceding the requested time.
     unsafe fn key_frame_from(&self, seconds: f64) -> Option<f64> {
         set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
-        (0..MAX_SCAN_SAMPLES).map_while(|_| self.read()).find(|&(_, key)| key).map(|(t, _)| t)
+        (0..MAX_SCAN_SAMPLES)
+            .map_while(|_| self.read())
+            .find(|&(_, key)| key)
+            .map(|(t, _)| t)
     }
 
     /// First key frame strictly after `seconds`.
@@ -557,19 +674,38 @@ mod tests {
 
     #[test]
     fn codec_names() {
-        use windows::Win32::Media::MediaFoundation::{MFAudioFormat_AAC, MFVideoFormat_H264, MFVideoFormat_HEVC};
-        assert_eq!(video_codec_name(&MFVideoFormat_H264).as_deref(), Some("H.264"));
-        assert_eq!(video_codec_name(&MFVideoFormat_HEVC).as_deref(), Some("HEVC"));
+        use windows::Win32::Media::MediaFoundation::{
+            MFAudioFormat_AAC, MFVideoFormat_H264, MFVideoFormat_HEVC,
+        };
+        assert_eq!(
+            video_codec_name(&MFVideoFormat_H264).as_deref(),
+            Some("H.264")
+        );
+        assert_eq!(
+            video_codec_name(&MFVideoFormat_HEVC).as_deref(),
+            Some("HEVC")
+        );
         assert_eq!(video_codec_name(&MPEG2_VIDEO).as_deref(), Some("MPEG-2"));
-        assert_eq!(video_codec_name(&GUID::from_u128(0x5a5a5a5a_0000_0010_8000_00aa00389b71)).as_deref(), Some("ZZZZ"));
+        assert_eq!(
+            video_codec_name(&GUID::from_u128(0x5a5a5a5a_0000_0010_8000_00aa00389b71)).as_deref(),
+            Some("ZZZZ")
+        );
         assert_eq!(video_codec_name(&GUID::zeroed()), None);
         assert_eq!(audio_codec_name(&MFAudioFormat_AAC).as_deref(), Some("AAC"));
         assert_eq!(audio_codec_name(&DOLBY_AC3).as_deref(), Some("AC-3"));
-        assert_eq!(audio_codec_name(&GUID::from_u128(0x00001234_0000_0010_8000_00aa00389b71)).as_deref(), Some("0x1234"));
+        assert_eq!(
+            audio_codec_name(&GUID::from_u128(0x00001234_0000_0010_8000_00aa00389b71)).as_deref(),
+            Some("0x1234")
+        );
     }
 
     fn geo(stride: i32) -> FrameGeometry {
-        FrameGeometry { width: 18, height: 16, default_stride: stride, format: PixelFormat::Nv12 }
+        FrameGeometry {
+            width: 18,
+            height: 16,
+            default_stride: stride,
+            format: PixelFormat::Nv12,
+        }
     }
 
     #[test]
@@ -578,8 +714,20 @@ mod tests {
         let top_down: Vec<u8> = (0..18 * 16).map(|i| ((i * 37) % 251) as u8).collect();
         let bottom_up: Vec<u8> = top_down.chunks(18).rev().flatten().copied().collect();
 
-        let a = FrameView { data: &top_down, top: 0, pitch: 18, geo: &g }.dhash();
-        let b = FrameView { data: &bottom_up, top: 15 * 18, pitch: -18, geo: &g }.dhash();
+        let a = FrameView {
+            data: &top_down,
+            top: 0,
+            pitch: 18,
+            geo: &g,
+        }
+        .dhash();
+        let b = FrameView {
+            data: &bottom_up,
+            top: 15 * 18,
+            pitch: -18,
+            geo: &g,
+        }
+        .dhash();
         assert!(a.is_some());
         assert_eq!(a, b);
     }
@@ -588,6 +736,15 @@ mod tests {
     fn short_buffer_is_rejected() {
         let g = geo(18);
         let data = vec![0u8; 18 * 4];
-        assert_eq!(FrameView { data: &data, top: 0, pitch: 18, geo: &g }.dhash(), None);
+        assert_eq!(
+            FrameView {
+                data: &data,
+                top: 0,
+                pitch: 18,
+                geo: &g
+            }
+            .dhash(),
+            None
+        );
     }
 }

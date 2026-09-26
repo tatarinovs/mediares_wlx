@@ -43,13 +43,20 @@ fn tiff_preview(file: &mut File, file_len: u64) -> Option<Vec<u8>> {
     let mut visited = Vec::new();
 
     while let Some(offset) = queue.pop_front() {
-        if offset == 0 || offset + 2 > file_len || visited.contains(&offset) || visited.len() >= MAX_IFDS {
+        if offset == 0
+            || offset + 2 > file_len
+            || visited.contains(&offset)
+            || visited.len() >= MAX_IFDS
+        {
             continue;
         }
         visited.push(offset);
 
-        let Some(ifd) = read_ifd(file, offset, rd) else { continue };
-        let pair = |a: Option<u64>, b: Option<u64>| a.zip(b).filter(|&(o, l)| l > 0 && o + l <= file_len);
+        let Some(ifd) = read_ifd(file, offset, rd) else {
+            continue;
+        };
+        let pair =
+            |a: Option<u64>, b: Option<u64>| a.zip(b).filter(|&(o, l)| l > 0 && o + l <= file_len);
 
         if let Some(c) = pair(ifd.jpeg_offset, ifd.jpeg_length) {
             candidates.push(c);
@@ -79,7 +86,8 @@ fn read_candidate(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
         return None;
     }
     buf.resize(len, 0);
-    file.read_exact(&mut buf[HEADER_PROBE_LEN.min(len)..]).ok()?;
+    file.read_exact(&mut buf[HEADER_PROBE_LEN.min(len)..])
+        .ok()?;
     Some(buf)
 }
 
@@ -87,7 +95,9 @@ fn read_candidate(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
 fn signature_preview(file: &mut File) -> Option<Vec<u8>> {
     let mut data = Vec::new();
     file.seek(SeekFrom::Start(0)).ok()?;
-    file.take(SIGNATURE_SCAN_BYTES).read_to_end(&mut data).ok()?;
+    file.take(SIGNATURE_SCAN_BYTES)
+        .read_to_end(&mut data)
+        .ok()?;
     jpeg::find_largest(&data, MIN_PREVIEW_LEN).map(<[u8]>::to_vec)
 }
 
@@ -97,12 +107,20 @@ struct Endian(bool);
 impl Endian {
     fn u16(self, b: &[u8]) -> u16 {
         let v = [b[0], b[1]];
-        if self.0 { u16::from_le_bytes(v) } else { u16::from_be_bytes(v) }
+        if self.0 {
+            u16::from_le_bytes(v)
+        } else {
+            u16::from_be_bytes(v)
+        }
     }
 
     fn u32(self, b: &[u8]) -> u32 {
         let v = [b[0], b[1], b[2], b[3]];
-        if self.0 { u32::from_le_bytes(v) } else { u32::from_be_bytes(v) }
+        if self.0 {
+            u32::from_le_bytes(v)
+        } else {
+            u32::from_be_bytes(v)
+        }
     }
 
     /// First value of a SHORT/LONG entry stored inline in the 4-byte value field.
@@ -137,7 +155,10 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
     let mut entries = vec![0u8; count * 12 + 4];
     file.read_exact(&mut entries).ok()?;
 
-    let mut ifd = Ifd { next: rd.u32(&entries[count * 12..]) as u64, ..Ifd::default() };
+    let mut ifd = Ifd {
+        next: rd.u32(&entries[count * 12..]) as u64,
+        ..Ifd::default()
+    };
     let mut sub_ifd_array = None;
 
     for e in entries[..count * 12].chunks_exact(12) {
@@ -146,7 +167,13 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
         let n = rd.u32(&e[4..8]);
         let value = &e[8..12];
         // Multi-valued strip tables mean a tiled/multi-strip image, not a single JPEG.
-        let single = || if n == 1 { rd.inline_uint(typ, value) } else { None };
+        let single = || {
+            if n == 1 {
+                rd.inline_uint(typ, value)
+            } else {
+                None
+            }
+        };
         match tag {
             0x0103 => ifd.compression = single(),
             0x0111 => ifd.strip_offset = single(),
@@ -154,7 +181,9 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
             0x0201 => ifd.jpeg_offset = single(),
             0x0202 => ifd.jpeg_length = single(),
             0x014A if n == 1 => ifd.sub_ifds.extend(rd.inline_uint(typ, value)),
-            0x014A if n > 1 => sub_ifd_array = Some((rd.u32(value) as u64, (n as usize).min(MAX_SUB_IFDS))),
+            0x014A if n > 1 => {
+                sub_ifd_array = Some((rd.u32(value) as u64, (n as usize).min(MAX_SUB_IFDS)))
+            }
             _ => {}
         }
     }
@@ -162,7 +191,8 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
     if let Some((array_offset, n)) = sub_ifd_array {
         let mut buf = vec![0u8; n * 4];
         if file.seek(SeekFrom::Start(array_offset)).is_ok() && file.read_exact(&mut buf).is_ok() {
-            ifd.sub_ifds.extend(buf.chunks_exact(4).map(|c| rd.u32(c) as u64));
+            ifd.sub_ifds
+                .extend(buf.chunks_exact(4).map(|c| rd.u32(c) as u64));
         }
     }
     Some(ifd)

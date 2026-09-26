@@ -20,7 +20,9 @@ fn main() {
                 a.duration_sec,
                 a.pcm_hash,
                 a.fingerprint.as_deref().unwrap_or("-"),
-                read_tags(Path::new(&arg), false).and_then(|t| t.normalized_artist_title()).unwrap_or_else(|| "-".into()),
+                read_tags(Path::new(&arg), false)
+                    .and_then(|t| t.normalized_artist_title())
+                    .unwrap_or_else(|| "-".into()),
                 started.elapsed().as_millis()
             ),
             Err(e) => println!("{}\terror: {:?}", arg, e),

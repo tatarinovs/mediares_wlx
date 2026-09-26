@@ -7,7 +7,9 @@
 use std::path::{Path, PathBuf};
 
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::System::WindowsProgramming::{GetPrivateProfileStringW, WritePrivateProfileStringW};
+use windows::Win32::System::WindowsProgramming::{
+    GetPrivateProfileStringW, WritePrivateProfileStringW,
+};
 
 const SECTION: PCWSTR = w!("ContentPlugins");
 
@@ -27,7 +29,11 @@ impl Registration {
         let registered = read_section(&ini).iter().any(|(key, value)| {
             plugin_index(key).is_some() && is_ours(value, &dll, |name| std::env::var(name).ok())
         });
-        Some(Self { ini, dll, registered })
+        Some(Self {
+            ini,
+            dll,
+            registered,
+        })
     }
 
     /// Adds our entry under the first free number. Err: what to tell the user to add by hand.
@@ -41,11 +47,20 @@ impl Registration {
         let stale = format!("{}_", index);
         for (key, _) in entries.iter().filter(|(key, _)| key.starts_with(&stale)) {
             unsafe {
-                let _ = WritePrivateProfileStringW(SECTION, &HSTRING::from(key.as_str()), PCWSTR::null(), &file);
+                let _ = WritePrivateProfileStringW(
+                    SECTION,
+                    &HSTRING::from(key.as_str()),
+                    PCWSTR::null(),
+                    &file,
+                );
             }
         }
         let key = HSTRING::from(index.to_string());
-        if unsafe { WritePrivateProfileStringW(SECTION, &key, &HSTRING::from(value.as_str()), &file) }.is_err() {
+        if unsafe {
+            WritePrivateProfileStringW(SECTION, &key, &HSTRING::from(value.as_str()), &file)
+        }
+        .is_err()
+        {
             return Err(format!(
                 "Не удалось записать в {}.\n\nДобавьте вручную в секцию [ContentPlugins]:\n{}={}",
                 self.ini.display(),
@@ -60,10 +75,15 @@ impl Registration {
 
 /// TC puts its INI path into its own environment; failing that, it sits next to the plugin INI.
 fn wincmd_ini() -> Option<PathBuf> {
-    if let Some(ini) = std::env::var_os("COMMANDER_INI").map(PathBuf::from).filter(|p| p.is_file()) {
+    if let Some(ini) = std::env::var_os("COMMANDER_INI")
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+    {
         return Some(ini);
     }
-    crate::config::tc_ini_dir().map(|d| d.join("wincmd.ini")).filter(|p| p.is_file())
+    crate::config::tc_ini_dir()
+        .map(|d| d.join("wincmd.ini"))
+        .filter(|p| p.is_file())
 }
 
 /// Follows `RedirectSection=` (a shared install may keep the plugin list in another file).
@@ -72,7 +92,9 @@ fn content_plugins_ini(wincmd: &Path) -> PathBuf {
     if redirect.trim().is_empty() {
         return wincmd.to_path_buf();
     }
-    let target = PathBuf::from(expand_vars(redirect.trim(), |name| std::env::var(name).ok()));
+    let target = PathBuf::from(expand_vars(redirect.trim(), |name| {
+        std::env::var(name).ok()
+    }));
     match wincmd.parent() {
         Some(dir) if target.is_relative() => dir.join(target),
         _ => target,
@@ -92,7 +114,9 @@ fn read_section(ini: &Path) -> Vec<(String, String)> {
     // With no key name the API returns all key names, each NUL-terminated; retry until they fit.
     let mut buf = vec![0u16; 8192];
     let len = loop {
-        let len = unsafe { GetPrivateProfileStringW(SECTION, PCWSTR::null(), w!(""), Some(&mut buf), &file) } as usize;
+        let len = unsafe {
+            GetPrivateProfileStringW(SECTION, PCWSTR::null(), w!(""), Some(&mut buf), &file)
+        } as usize;
         if len + 2 < buf.len() || buf.len() >= 1 << 20 {
             break len;
         }
@@ -111,7 +135,10 @@ fn read_section(ini: &Path) -> Vec<(String, String)> {
 
 /// `N` for a plugin entry `N=path`; other keys (`N_detect`, `RedirectSection`...) are `None`.
 fn plugin_index(key: &str) -> Option<u32> {
-    key.bytes().all(|b| b.is_ascii_digit()).then(|| key.parse().ok()).flatten()
+    key.bytes()
+        .all(|b| b.is_ascii_digit())
+        .then(|| key.parse().ok())
+        .flatten()
 }
 
 /// The lowest number without a plugin entry (fills gaps left by hand edits).
@@ -156,7 +183,10 @@ fn expand_vars(s: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
 }
 
 fn normalize(path: &str) -> String {
-    path.trim().trim_matches('"').replace('/', "\\").to_lowercase()
+    path.trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_lowercase()
 }
 
 /// Whether the entry `value` points at `dll`. A standalone `mediares.wdx64` counts too: it has the
@@ -167,14 +197,20 @@ fn is_ours(value: &str, dll: &Path, lookup: impl Fn(&str) -> Option<String>) -> 
         return true;
     }
     let name = entry.rsplit('\\').next().unwrap_or("");
-    let own_name = dll.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let own_name = dll
+        .file_name()
+        .map(|n| n.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
     name == own_name || name == "mediares.wdx64"
 }
 
 /// The path as TC itself writes it: relative to `%COMMANDER_PATH%` when inside it (portable installs).
 fn ini_value(dll: &Path, commander_path: Option<&str>) -> String {
     let full = dll.to_string_lossy().into_owned();
-    if let Some(root) = commander_path.map(|r| r.trim_end_matches('\\')).filter(|r| !r.is_empty()) {
+    if let Some(root) = commander_path
+        .map(|r| r.trim_end_matches('\\'))
+        .filter(|r| !r.is_empty())
+    {
         let prefix = format!("{}\\", root.to_lowercase());
         if full.to_lowercase().starts_with(&prefix) {
             return format!("%COMMANDER_PATH%\\{}", &full[prefix.len()..]);
@@ -202,13 +238,19 @@ mod tests {
     #[test]
     fn free_index_fills_gaps() {
         assert_eq!(first_free_index([].into_iter()), 0);
-        assert_eq!(first_free_index(["0", "0_detect", "1", "1_detect"].into_iter()), 2);
+        assert_eq!(
+            first_free_index(["0", "0_detect", "1", "1_detect"].into_iter()),
+            2
+        );
         assert_eq!(first_free_index(["2", "0", "3"].into_iter()), 1);
     }
 
     #[test]
     fn vars_are_expanded() {
-        assert_eq!(expand_vars(r"%COMMANDER_PATH%\plugins", env), r"C:\TC\plugins");
+        assert_eq!(
+            expand_vars(r"%COMMANDER_PATH%\plugins", env),
+            r"C:\TC\plugins"
+        );
         assert_eq!(expand_vars("100% sure", env), "100% sure");
         assert_eq!(expand_vars("%NOPE%\\x", env), "%NOPE%\\x");
     }
@@ -216,9 +258,17 @@ mod tests {
     #[test]
     fn recognizes_own_entry() {
         let dll = Path::new(r"C:\TC\Plugins\wlx\mediares\mediares.wlx64");
-        assert!(is_ours(r"%COMMANDER_PATH%\plugins\WLX\mediares\Mediares.wlx64", dll, env));
+        assert!(is_ours(
+            r"%COMMANDER_PATH%\plugins\WLX\mediares\Mediares.wlx64",
+            dll,
+            env
+        ));
         assert!(is_ours(r"D:\other\mediares.wlx64", dll, env));
-        assert!(is_ours(r"C:\TC\Plugins\wdx\mediares\mediares.wdx64", dll, env));
+        assert!(is_ours(
+            r"C:\TC\Plugins\wdx\mediares\mediares.wdx64",
+            dll,
+            env
+        ));
         assert!(!is_ours(r"C:\TC\Plugins\wdx\exif\exif.wdx64", dll, env));
     }
 
@@ -227,15 +277,24 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mediares_tc_register_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let wincmd = dir.join("wincmd.ini");
-        std::fs::write(&wincmd, "[ContentPlugins]\r\nRedirectSection=plugins.ini\r\n").unwrap();
+        std::fs::write(
+            &wincmd,
+            "[ContentPlugins]\r\nRedirectSection=plugins.ini\r\n",
+        )
+        .unwrap();
         let plugins = dir.join("plugins.ini");
-        let list = "[ContentPlugins]\r\n0=C:\\x\\exif.wdx64\r\n0_detect=EXT=\"JPG\"\r\n1_detect=old\r\n";
+        let list =
+            "[ContentPlugins]\r\n0=C:\\x\\exif.wdx64\r\n0_detect=EXT=\"JPG\"\r\n1_detect=old\r\n";
         std::fs::write(&plugins, list).unwrap();
 
         let ini = content_plugins_ini(&wincmd);
         assert_eq!(ini, plugins);
         let dll = PathBuf::from(r"D:\nowhere\mediares.wlx64");
-        let mut reg = Registration { ini: ini.clone(), dll: dll.clone(), registered: false };
+        let mut reg = Registration {
+            ini: ini.clone(),
+            dll: dll.clone(),
+            registered: false,
+        };
         reg.register().unwrap();
 
         let entries = read_section(&ini);
@@ -248,7 +307,10 @@ mod tests {
     #[test]
     fn value_is_relative_to_commander_path() {
         let dll = Path::new(r"C:\TC\Plugins\wlx\mediares\mediares.wlx64");
-        assert_eq!(ini_value(dll, Some(r"c:\tc\")), r"%COMMANDER_PATH%\Plugins\wlx\mediares\mediares.wlx64");
+        assert_eq!(
+            ini_value(dll, Some(r"c:\tc\")),
+            r"%COMMANDER_PATH%\Plugins\wlx\mediares\mediares.wlx64"
+        );
         assert_eq!(ini_value(dll, Some(r"C:\TCX")), dll.to_string_lossy());
         assert_eq!(ini_value(dll, None), dll.to_string_lossy());
     }

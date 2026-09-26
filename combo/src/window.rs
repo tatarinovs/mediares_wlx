@@ -8,17 +8,22 @@ use std::sync::Once;
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, PAINTSTRUCT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, PAINTSTRUCT,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, GWL_STYLE, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetClassNameW, GetClientRect, GetWindowLongPtrW, LoadCursorW, PostMessageW, RegisterClassExW,
-    SetCursor, SetWindowLongPtrW, SetWindowTextW, TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA,
-    IDC_ARROW, IDC_HAND, IDC_SIZEALL, MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_DESTROY,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE,
-    KillTimer, SetTimer, WM_APP, WM_APPCOMMAND, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SIZE, WM_XBUTTONDOWN,
-    ShowWindow, SW_PARENTCLOSING, SW_SHOW, WM_SHOWWINDOW, WM_TIMER, WM_WINDOWPOSCHANGING, WINDOWPOS, WNDCLASSEXW, WS_CHILD,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    GetClassNameW, GetClientRect, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW,
+    RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
+    TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, IDC_HAND, IDC_SIZEALL,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SW_PARENTCLOSING, SW_SHOW,
+    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP,
+    WM_APPCOMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
+    WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CHILD,
     WS_CLIPCHILDREN,
 };
 
@@ -28,12 +33,15 @@ use crate::config::ViewerConfig;
 use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, client_size, point_from_lparam};
 use crate::media_view::EventEffect;
+use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
 use crate::playback_video::WM_MEDIA_EVENT;
 use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
-use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
-use crate::{config, dialog, exif_dialog, file_actions, fullscreen, module, osd_template, settings_dialog, snapshot};
+use crate::{
+    config, dialog, exif_dialog, file_actions, fullscreen, module, osd_template, settings_dialog,
+    snapshot,
+};
 use mediares_core::exif::read_orientation;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
@@ -124,7 +132,8 @@ impl Command {
         use Command::*;
         match self {
             SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward => video,
-            TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne | ToggleShuffle => media,
+            TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
+            | ToggleShuffle => media,
             ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SetWallpaper => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
@@ -144,18 +153,57 @@ impl Command {
     fn from_raw(value: usize) -> Option<Command> {
         use Command::*;
         [
-            ToggleFullscreen, ToggleOsd, ShowExif, ShowSettings, Next, Previous, ZoomIn, ZoomOut, ZoomActualSize, ZoomFit,
-            TogglePlay, ToggleMute, SeekBack, SeekForward, KeyframeBack, KeyframeForward, VolumeUp, VolumeDown,
-            PreviousTrack, NextTrack, ToggleAutoAdvance, RepeatOff, RepeatAll, RepeatOne, ToggleShuffle, Copy, SaveFrame,
-            ToggleSlideshow, RotateLeft, RotateRight, Delete, OpenInEditor, ShowInFolder, SetWallpaper, Print, Slower,
-            Faster, NormalSpeed, FrameBack, FrameForward,
+            ToggleFullscreen,
+            ToggleOsd,
+            ShowExif,
+            ShowSettings,
+            Next,
+            Previous,
+            ZoomIn,
+            ZoomOut,
+            ZoomActualSize,
+            ZoomFit,
+            TogglePlay,
+            ToggleMute,
+            SeekBack,
+            SeekForward,
+            KeyframeBack,
+            KeyframeForward,
+            VolumeUp,
+            VolumeDown,
+            PreviousTrack,
+            NextTrack,
+            ToggleAutoAdvance,
+            RepeatOff,
+            RepeatAll,
+            RepeatOne,
+            ToggleShuffle,
+            Copy,
+            SaveFrame,
+            ToggleSlideshow,
+            RotateLeft,
+            RotateRight,
+            Delete,
+            OpenInEditor,
+            ShowInFolder,
+            SetWallpaper,
+            Print,
+            Slower,
+            Faster,
+            NormalSpeed,
+            FrameBack,
+            FrameForward,
         ]
         .into_iter()
         .find(|&c| c as usize == value)
     }
 
     fn from_id(id: i32) -> Option<Command> {
-        Command::MENU.iter().flatten().map(|&(c, _)| c).find(|&c| c as i32 == id)
+        Command::MENU
+            .iter()
+            .flatten()
+            .map(|&(c, _)| c)
+            .find(|&c| c as i32 == id)
     }
 
     /// Hotkeys. With Ctrl held only zoom keys are ours; everything else goes to the Lister
@@ -201,27 +249,27 @@ impl Command {
             }
         }
         let zoom = match vk {
-            0xBB | 0x6B => Some(ZoomIn),          // '+' / numpad +
-            0xBD | 0x6D => Some(ZoomOut),         // '-' / numpad -
-            0x30 | 0x60 => Some(ZoomFit),         // '0' / numpad 0
+            0xBB | 0x6B => Some(ZoomIn),  // '+' / numpad +
+            0xBD | 0x6D => Some(ZoomOut), // '-' / numpad -
+            0x30 | 0x60 => Some(ZoomFit), // '0' / numpad 0
             _ => None,
         };
         if ctrl {
             return zoom;
         }
         zoom.or(match vk {
-            0x0D | 0x46 | 0x7A => Some(ToggleFullscreen),            // Enter, F, F11
-            0x4F | 0x49 => Some(ToggleOsd),                          // O, I
-            0x74 => Some(ToggleSlideshow),                           // F5
-            0x45 => Some(ShowExif),                                  // E
-            0x53 => Some(ShowSettings),                              // S
-            0x31 | 0x61 => Some(ZoomActualSize),                     // '1' / numpad 1
-            0x4C => Some(RotateLeft),                                // L
-            0x52 => Some(RotateRight),                               // R
-            0x2E => Some(Delete),                                    // Del
-            0x6A | 0x6F => Some(ZoomFit),                            // numpad * and /
-            0x4E | 0x20 | 0x27 | 0x22 | 0x28 => Some(Next),          // N, Space, Right, PgDn, Down
-            0x50 | 0x08 | 0x25 | 0x21 | 0x26 => Some(Previous),      // P, Backspace, Left, PgUp, Up
+            0x0D | 0x46 | 0x7A => Some(ToggleFullscreen), // Enter, F, F11
+            0x4F | 0x49 => Some(ToggleOsd),               // O, I
+            0x74 => Some(ToggleSlideshow),                // F5
+            0x45 => Some(ShowExif),                       // E
+            0x53 => Some(ShowSettings),                   // S
+            0x31 | 0x61 => Some(ZoomActualSize),          // '1' / numpad 1
+            0x4C => Some(RotateLeft),                     // L
+            0x52 => Some(RotateRight),                    // R
+            0x2E => Some(Delete),                         // Del
+            0x6A | 0x6F => Some(ZoomFit),                 // numpad * and /
+            0x4E | 0x20 | 0x27 | 0x22 | 0x28 => Some(Next), // N, Space, Right, PgDn, Down
+            0x50 | 0x08 | 0x25 | 0x21 | 0x26 => Some(Previous), // P, Backspace, Left, PgUp, Up
             _ => None,
         })
     }
@@ -270,7 +318,8 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
     .ok()?;
 
     // The window exists before loading: a video needs it to host its rendering surface.
-    let Some(mut state) = ViewerState::new(hwnd, lister, path, ViewerConfig::load()).map(Box::new) else {
+    let Some(mut state) = ViewerState::new(hwnd, lister, path, ViewerConfig::load()).map(Box::new)
+    else {
         let _ = DestroyWindow(hwnd);
         return None;
     };
@@ -294,7 +343,9 @@ pub unsafe fn close_viewer(hwnd: HWND) {
 
 /// `ListLoadNext`: shows `path` in the existing window. False if it can't be displayed.
 pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) -> bool {
-    let Some(state) = get_state(hwnd) else { return false };
+    let Some(state) = get_state(hwnd) else {
+        return false;
+    };
     state.lister = lister;
     state.show_flags = show_flags;
     if !state.set_file(path) {
@@ -307,7 +358,9 @@ pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) 
 /// `ListSendCommand`. A toggled `LCP_FITTOWINDOW` means the user pressed TC's `F` hotkey,
 /// which we map to fullscreen (the viewer always fits the window anyway).
 pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
-    let Some(state) = get_state(hwnd) else { return false };
+    let Some(state) = get_state(hwnd) else {
+        return false;
+    };
     if command != LC_NEWPARAMS && command != LC_COPY {
         return false;
     }
@@ -339,7 +392,11 @@ unsafe fn get_live_state<'a>(hwnd: HWND) -> Option<&'a mut ViewerState> {
     let mut class = [0u16; 64];
     let len = GetClassNameW(hwnd, &mut class) as usize;
     let ours = HSTRING::from_wide(&class[..len]) == CLASS_NAME.to_hstring();
-    if ours { get_state(hwnd) } else { None }
+    if ours {
+        get_state(hwnd)
+    } else {
+        None
+    }
 }
 
 unsafe fn redraw(hwnd: HWND) {
@@ -365,7 +422,9 @@ unsafe fn update_title(state: &ViewerState) {
 
 /// Video OSD per the config's template.
 unsafe fn sync_video_osd(state: &mut ViewerState) {
-    let Some(video) = state.media.as_mut().and_then(|m| m.video_mut()) else { return };
+    let Some(video) = state.media.as_mut().and_then(|m| m.video_mut()) else {
+        return;
+    };
     let config = &state.config;
     let style = config.osd.video().then(|| crate::video_view::OsdStyle {
         face: config.osd_font_name.clone(),
@@ -373,13 +432,21 @@ unsafe fn sync_video_osd(state: &mut ViewerState) {
         color: config.osd_font_color,
     });
     if style.is_none() {
-        video.set_osd(None, crate::video_view::OsdText { template: String::new(), fields: Default::default() });
+        video.set_osd(
+            None,
+            crate::video_view::OsdText {
+                template: String::new(),
+                fields: Default::default(),
+            },
+        );
         return;
     }
     let template = config.video_osd.clone();
-    let position = (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
+    let position =
+        (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
     let (width, height, fps) = (video.info.width, video.info.height, video.info.frame_rate);
-    let details = osd_template::uses_any(&template, osd_template::VIDEO_DETAIL_KEYS).then(|| video.details());
+    let details =
+        osd_template::uses_any(&template, osd_template::VIDEO_DETAIL_KEYS).then(|| video.details());
     let empty_tags = Default::default();
     let (meta, tags) = match details {
         Some(d) => (d.meta.as_ref(), &d.tags),
@@ -388,14 +455,15 @@ unsafe fn sync_video_osd(state: &mut ViewerState) {
     let mut fields = std::collections::HashMap::new();
     for (_, group) in osd_template::VIDEO_FIELDS {
         for field in *group {
-            let value = osd_template::file_field(&state.file_path, state.file_size, position, field.key)
-                .or_else(|| osd_template::video_field(meta, tags, field.key))
-                .or_else(|| match field.key {
-                    "width" => Some(width.to_string()),
-                    "height" => Some(height.to_string()),
-                    "fps" => Some(osd_template::format_fps(fps)),
-                    _ => None,
-                });
+            let value =
+                osd_template::file_field(&state.file_path, state.file_size, position, field.key)
+                    .or_else(|| osd_template::video_field(meta, tags, field.key))
+                    .or_else(|| match field.key {
+                        "width" => Some(width.to_string()),
+                        "height" => Some(height.to_string()),
+                        "fps" => Some(osd_template::format_fps(fps)),
+                        _ => None,
+                    });
             if let Some(value) = value {
                 fields.insert(field.key, value);
             }
@@ -406,7 +474,11 @@ unsafe fn sync_video_osd(state: &mut ViewerState) {
 
 /// "name - [details] [3/12]" for the Lister caption.
 unsafe fn caption(state: &ViewerState) -> String {
-    let name = state.file_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+    let name = state
+        .file_path
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
     let mut title = name.into_owned();
     if let Some(img) = &state.image {
         let mp = img.width as f64 * img.height as f64 / 1_000_000.0;
@@ -421,8 +493,17 @@ unsafe fn caption(state: &ViewerState) -> String {
         title += &format!(" - [{}]", media.title_info());
     }
     if state.has_content() && !state.dir_files.is_empty() {
-        let list = state.playlist.as_ref().and_then(|p| p.file_name()).map(|n| format!(" · {}", n.to_string_lossy()));
-        title += &format!(" [{}/{}{}]", state.current_idx + 1, state.dir_files.len(), list.unwrap_or_default());
+        let list = state
+            .playlist
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| format!(" · {}", n.to_string_lossy()));
+        title += &format!(
+            " [{}/{}{}]",
+            state.current_idx + 1,
+            state.dir_files.len(),
+            list.unwrap_or_default()
+        );
     }
     if state.slideshow {
         title += " [слайд-шоу]";
@@ -435,7 +516,12 @@ unsafe fn caption(state: &ViewerState) -> String {
 const WM_OVERLAY_COMMAND: u32 = WM_APP + 0x11;
 
 /// Messages of the fullscreen panel window (see `overlay.rs`); `None` = default handling.
-pub unsafe fn overlay_message(viewer: HWND, window: HWND, msg: u32, lparam: LPARAM) -> Option<LRESULT> {
+pub unsafe fn overlay_message(
+    viewer: HWND,
+    window: HWND,
+    msg: u32,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
     let state = get_live_state(viewer)?;
     let fs = state.overlay.as_mut()?;
     let kind = fs.panel.as_ref().filter(|p| p.hwnd == window)?.kind;
@@ -452,7 +538,9 @@ pub unsafe fn overlay_message(viewer: HWND, window: HWND, msg: u32, lparam: LPAR
             let _ = GetClientRect(window, &mut rc);
             let scale = overlay::dpi_scale(window);
             let playing = state.slideshow;
-            overlay::with_buffer(hdc, rc, |dc| unsafe { overlay::paint_photo_panel(dc, rc, scale, playing) });
+            overlay::with_buffer(hdc, rc, |dc| unsafe {
+                overlay::paint_photo_panel(dc, rc, scale, playing)
+            });
             let _ = EndPaint(window, &ps);
         }
         (WM_MOUSEMOVE, PanelKind::Video) => state.media.as_mut()?.mouse_move(pt.x),
@@ -463,20 +551,35 @@ pub unsafe fn overlay_message(viewer: HWND, window: HWND, msg: u32, lparam: LPAR
                     let _ = SetCapture(window);
                 }
                 Click::Skip(forward) => {
-                    let cmd = if forward { Command::NextTrack } else { Command::PreviousTrack };
-                    let _ = PostMessageW(Some(viewer), WM_OVERLAY_COMMAND, WPARAM(cmd as usize), LPARAM(0));
+                    let cmd = if forward {
+                        Command::NextTrack
+                    } else {
+                        Command::PreviousTrack
+                    };
+                    let _ = PostMessageW(
+                        Some(viewer),
+                        WM_OVERLAY_COMMAND,
+                        WPARAM(cmd as usize),
+                        LPARAM(0),
+                    );
                 }
                 _ => {}
             }
         }
         (WM_LBUTTONDOWN, PanelKind::Photo) => {
-            let command = overlay::hit_photo(overlay::dpi_scale(window), pt.x, pt.y).map(|b| match b {
-                PhotoButton::Previous => Command::Previous,
-                PhotoButton::Slideshow => Command::ToggleSlideshow,
-                PhotoButton::Next => Command::Next,
-            });
+            let command =
+                overlay::hit_photo(overlay::dpi_scale(window), pt.x, pt.y).map(|b| match b {
+                    PhotoButton::Previous => Command::Previous,
+                    PhotoButton::Slideshow => Command::ToggleSlideshow,
+                    PhotoButton::Next => Command::Next,
+                });
             if let Some(cmd) = command {
-                let _ = PostMessageW(Some(viewer), WM_OVERLAY_COMMAND, WPARAM(cmd as usize), LPARAM(0));
+                let _ = PostMessageW(
+                    Some(viewer),
+                    WM_OVERLAY_COMMAND,
+                    WPARAM(cmd as usize),
+                    LPARAM(0),
+                );
             }
         }
         (WM_LBUTTONUP, _) => {
@@ -544,26 +647,42 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let (picture, file) = match &state.media {
                 Some(media) => {
                     let picture = media.current_picture();
-                    let file = picture.as_ref().and_then(|img| snapshot::save_temp_png(img, &state.file_path, media.is_video().then(|| media.position())));
+                    let file = picture.as_ref().and_then(|img| {
+                        snapshot::save_temp_png(
+                            img,
+                            &state.file_path,
+                            media.is_video().then(|| media.position()),
+                        )
+                    });
                     (picture, file)
                 }
                 None => (state.image.clone(), Some(state.file_path.clone())),
             };
-            let copied = picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
+            let copied =
+                picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
             if let Some(media) = state.media.as_mut() {
-                let text = if copied { "Изображение скопировано в буфер обмена" } else { "Нечего копировать" };
+                let text = if copied {
+                    "Изображение скопировано в буфер обмена"
+                } else {
+                    "Нечего копировать"
+                };
                 media.show_status(text.to_string());
             }
         }
         Command::SaveFrame => {
             let path = state.file_path.clone();
-            let Some(media) = state.media.as_mut().filter(|m| m.is_video()) else { return };
+            let Some(media) = state.media.as_mut().filter(|m| m.is_video()) else {
+                return;
+            };
             let saved = media.current_picture().and_then(|frame| {
                 let target = snapshot::frame_file_name(&path, media.position());
                 snapshot::save_png(&frame, &target).then_some(target)
             });
             let text = match saved {
-                Some(target) => format!("Кадр сохранён: {}", target.file_name().unwrap_or_default().to_string_lossy()),
+                Some(target) => format!(
+                    "Кадр сохранён: {}",
+                    target.file_name().unwrap_or_default().to_string_lossy()
+                ),
                 None => "Не удалось сохранить кадр".to_string(),
             };
             media.show_status(text);
@@ -592,7 +711,10 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 let text = if editor.is_empty() {
                     "Не удалось открыть файл во внешней программе.".to_string()
                 } else {
-                    format!("Не удалось запустить редактор:\n{}\n\nПуть задаётся в настройках (S).", editor)
+                    format!(
+                        "Не удалось запустить редактор:\n{}\n\nПуть задаётся в настройках (S).",
+                        editor
+                    )
                 };
                 file_actions::show_error(dialog::modal_owner(hwnd), &text);
             }
@@ -626,7 +748,11 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 refresh(state);
             }
         }
-        Command::ToggleAutoAdvance | Command::RepeatOff | Command::RepeatAll | Command::RepeatOne | Command::ToggleShuffle => {
+        Command::ToggleAutoAdvance
+        | Command::RepeatOff
+        | Command::RepeatAll
+        | Command::RepeatOne
+        | Command::ToggleShuffle => {
             let queue = &mut state.config.queue;
             match command {
                 Command::ToggleAutoAdvance => queue.auto_advance = !queue.auto_advance,
@@ -637,7 +763,12 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         }
         Command::ZoomIn | Command::ZoomOut => {
             if let Some(view) = client_size(hwnd) {
-                zoom_at(state, view, command == Command::ZoomIn, (view.0 / 2.0, view.1 / 2.0));
+                zoom_at(
+                    state,
+                    view,
+                    command == Command::ZoomIn,
+                    (view.0 / 2.0, view.1 / 2.0),
+                );
             }
         }
         Command::ZoomActualSize => {
@@ -660,12 +791,18 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         | Command::KeyframeForward
         | Command::VolumeUp
         | Command::VolumeDown => {
-            let Some(media) = state.media.as_mut() else { return };
+            let Some(media) = state.media.as_mut() else {
+                return;
+            };
             match command {
                 Command::TogglePlay => media.toggle_play(),
                 Command::ToggleMute => media.toggle_mute(),
-                Command::SeekBack | Command::SeekForward => media.seek_by(command == Command::SeekForward),
-                Command::KeyframeBack | Command::KeyframeForward => media.seek_keyframe(command == Command::KeyframeForward),
+                Command::SeekBack | Command::SeekForward => {
+                    media.seek_by(command == Command::SeekForward)
+                }
+                Command::KeyframeBack | Command::KeyframeForward => {
+                    media.seek_keyframe(command == Command::KeyframeForward)
+                }
                 _ => media.change_volume(command == Command::VolumeUp),
             }
             media.invalidate_bar();
@@ -692,11 +829,15 @@ unsafe fn delete_current(hwnd: HWND) {
     if confirm && !file_actions::confirm_delete(owner, &path) {
         return;
     }
-    let Some(state) = get_live_state(hwnd) else { return };
+    let Some(state) = get_live_state(hwnd) else {
+        return;
+    };
     // A player keeps its file open: close it first.
     let had_player = state.media.take().is_some();
     let deleted = file_actions::recycle(owner, &path);
-    let Some(state) = get_live_state(hwnd) else { return };
+    let Some(state) = get_live_state(hwnd) else {
+        return;
+    };
     if !deleted {
         if had_player {
             state.reload();
@@ -707,7 +848,12 @@ unsafe fn delete_current(hwnd: HWND) {
     if state.remove_current() {
         refresh(state);
     } else if !state.lister.is_invalid() {
-        let _ = PostMessageW(Some(state.lister), WM_KEYDOWN, WPARAM(VK_ESCAPE as usize), LPARAM(0));
+        let _ = PostMessageW(
+            Some(state.lister),
+            WM_KEYDOWN,
+            WPARAM(VK_ESCAPE as usize),
+            LPARAM(0),
+        );
     }
 }
 
@@ -715,9 +861,14 @@ unsafe fn delete_current(hwnd: HWND) {
 /// (RAW, PSD, turned with R / L, EXIF-rotated) the picture on screen saved as PNG.
 unsafe fn set_wallpaper(hwnd: HWND) {
     let Some(state) = get_state(hwnd) else { return };
-    let Some(img) = state.image.clone() else { return };
+    let Some(img) = state.image.clone() else {
+        return;
+    };
     let path = state.file_path.clone();
-    let ext = path.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
     let as_is = !state.turned
         && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp")
         && read_orientation(&path).is_none_or(|o| o == 1);
@@ -734,13 +885,19 @@ unsafe fn set_wallpaper(hwnd: HWND) {
 
 /// Prints the photo, or the video frame / album art. `margins` in 1/100 mm.
 pub unsafe fn print(hwnd: HWND, margins: Option<RECT>) -> bool {
-    let Some(state) = get_state(hwnd) else { return false };
+    let Some(state) = get_state(hwnd) else {
+        return false;
+    };
     let picture = match &state.media {
         Some(media) => media.current_picture(),
         None => state.image.clone(),
     };
     let Some(picture) = picture else { return false };
-    let name = state.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let name = state
+        .file_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
     crate::print::print(dialog::modal_owner(hwnd), &picture, &name, margins)
 }
 
@@ -750,7 +907,12 @@ const SLIDESHOW_TIMER_ID: usize = 0x4D56;
 unsafe fn set_slideshow(state: &mut ViewerState, run: bool) {
     state.slideshow = run;
     if run {
-        SetTimer(Some(state.hwnd), SLIDESHOW_TIMER_ID, state.config.slideshow_seconds.max(1) * 1000, None);
+        SetTimer(
+            Some(state.hwnd),
+            SLIDESHOW_TIMER_ID,
+            state.config.slideshow_seconds.max(1) * 1000,
+            None,
+        );
     } else {
         let _ = KillTimer(Some(state.hwnd), SLIDESHOW_TIMER_ID);
     }
@@ -795,16 +957,26 @@ unsafe fn zoom_at(state: &mut ViewerState, view: (f32, f32), zoom_in: bool, anch
 unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     let Some(state) = get_state(hwnd) else { return };
     let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
-    let (fullscreen, media, queue) = (state.fullscreen.is_some(), state.media.is_some(), state.config.queue);
+    let (fullscreen, media, queue) = (
+        state.fullscreen.is_some(),
+        state.media.is_some(),
+        state.config.queue,
+    );
     let video = state.media.as_ref().is_some_and(|m| m.is_video());
-    let osd = if video { state.config.osd.video() } else { state.config.osd.photo() };
+    let osd = if video {
+        state.config.osd.video()
+    } else {
+        state.config.osd.photo()
+    };
 
     let Ok(menu) = CreatePopupMenu() else { return };
     // Fullscreen hides the idle cursor: the menu needs it.
     if let Some(fs) = state.overlay.as_mut() {
         fs.reveal_cursor(hwnd);
     }
-    let items = Command::MENU.iter().filter(|item| item.is_none_or(|(cmd, _)| cmd.available(media, video)));
+    let items = Command::MENU
+        .iter()
+        .filter(|item| item.is_none_or(|(cmd, _)| cmd.available(media, video)));
     let mut previous_was_separator = true;
     for item in items {
         // Skip separators that would end up leading or doubled after filtering.
@@ -819,16 +991,31 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
                     Command::ToggleOsd => checked(osd),
                     Command::ToggleAutoAdvance => checked(queue.auto_advance),
                     Command::ToggleShuffle => checked(queue.shuffle),
-                    cmd => cmd.repeat_mode().map_or(MENU_ITEM_FLAGS(0), |r| checked(r == queue.repeat)),
+                    cmd => cmd
+                        .repeat_mode()
+                        .map_or(MENU_ITEM_FLAGS(0), |r| checked(r == queue.repeat)),
                 };
-                let _ = AppendMenuW(menu, MF_STRING | flags, *cmd as usize, &HSTRING::from(*label));
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING | flags,
+                    *cmd as usize,
+                    &HSTRING::from(*label),
+                );
             }
             None => {
                 let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
             }
         }
     }
-    let id = TrackPopupMenu(menu, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD, screen.x, screen.y, Some(0), hwnd, None);
+    let id = TrackPopupMenu(
+        menu,
+        TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+        screen.x,
+        screen.y,
+        Some(0),
+        hwnd,
+        None,
+    );
     let _ = DestroyMenu(menu);
 
     if let Some(cmd) = Command::from_id(id.0) {
@@ -836,8 +1023,15 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    mediares_core::ffi::guard(LRESULT(0), || unsafe { handle_message(hwnd, msg, wparam, lparam) })
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    mediares_core::ffi::guard(LRESULT(0), || unsafe {
+        handle_message(hwnd, msg, wparam, lparam)
+    })
 }
 
 unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -851,7 +1045,9 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 let _ = GetClientRect(hwnd, &mut rc);
                 let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
                 match get_state(hwnd) {
-                    Some(ViewerState { media: Some(media), .. }) => media.paint(hdc, w, h, ps.rcPaint),
+                    Some(ViewerState {
+                        media: Some(media), ..
+                    }) => media.paint(hdc, w, h, ps.rcPaint),
                     state => image_view::paint(hdc, state, w, h),
                 }
                 let _ = EndPaint(hwnd, &ps);
@@ -922,7 +1118,11 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
         }
         WM_TIMER => {
-            match state.media.as_mut().and_then(|media| media.on_timer(wparam.0)) {
+            match state
+                .media
+                .as_mut()
+                .and_then(|media| media.on_timer(wparam.0))
+            {
                 Some(effect) => apply_effect(hwnd, effect),
                 None => return DefWindowProcW(hwnd, msg, wparam, lparam),
             }
@@ -940,8 +1140,8 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_APPCOMMAND if state.media.is_some() => {
             // Multimedia keys delivered as app commands (GET_APPCOMMAND_LPARAM).
             let command = match ((lparam.0 >> 16) & 0x0FFF) as u32 {
-                11 => Some(Command::NextTrack),       // APPCOMMAND_MEDIA_NEXTTRACK
-                12 => Some(Command::PreviousTrack),   // APPCOMMAND_MEDIA_PREVIOUSTRACK
+                11 => Some(Command::NextTrack),     // APPCOMMAND_MEDIA_NEXTTRACK
+                12 => Some(Command::PreviousTrack), // APPCOMMAND_MEDIA_PREVIOUSTRACK
                 14 | 46 | 47 => Some(Command::TogglePlay), // PLAY_PAUSE, PLAY, PAUSE
                 _ => None,
             };
@@ -981,7 +1181,14 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                         let _ = SetCapture(hwnd);
                     }
                     Click::Bar => {}
-                    Click::Skip(forward) => execute(hwnd, if forward { Command::NextTrack } else { Command::PreviousTrack }),
+                    Click::Skip(forward) => execute(
+                        hwnd,
+                        if forward {
+                            Command::NextTrack
+                        } else {
+                            Command::PreviousTrack
+                        },
+                    ),
                 }
                 return LRESULT(0);
             }
@@ -992,7 +1199,10 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 image_view::loupe_begin(state, &img, view, (pt.x, pt.y));
                 refresh(state);
             } else {
-                state.drag = Some(Drag { start: (pt.x, pt.y), start_offset: state.offset });
+                state.drag = Some(Drag {
+                    start: (pt.x, pt.y),
+                    start_offset: state.offset,
+                });
             }
             let _ = SetCapture(hwnd);
         }
@@ -1046,7 +1256,14 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                         let _ = SetCapture(hwnd);
                     }
                     Click::Bar => {}
-                    Click::Skip(forward) => execute(hwnd, if forward { Command::NextTrack } else { Command::PreviousTrack }),
+                    Click::Skip(forward) => execute(
+                        hwnd,
+                        if forward {
+                            Command::NextTrack
+                        } else {
+                            Command::PreviousTrack
+                        },
+                    ),
                 }
                 return LRESULT(0);
             }
@@ -1077,7 +1294,14 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             if state.media.is_some() {
                 // Wheel = volume, as in common players.
                 if delta != 0 {
-                    execute(hwnd, if delta > 0 { Command::VolumeUp } else { Command::VolumeDown });
+                    execute(
+                        hwnd,
+                        if delta > 0 {
+                            Command::VolumeUp
+                        } else {
+                            Command::VolumeDown
+                        },
+                    );
                 }
             } else if ctrl_down() {
                 let mut pt = point_from_lparam(lparam.0);
@@ -1086,7 +1310,14 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     zoom_at(state, view, delta > 0, (pt.x as f32, pt.y as f32));
                 }
             } else if delta != 0 {
-                execute(hwnd, if delta < 0 { Command::Next } else { Command::Previous });
+                execute(
+                    hwnd,
+                    if delta < 0 {
+                        Command::Next
+                    } else {
+                        Command::Previous
+                    },
+                );
             }
         }
         WM_XBUTTONDOWN => {
@@ -1101,7 +1332,9 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let vk = wparam.0 as u16;
             if vk == VK_ESCAPE && state.fullscreen.is_some() {
                 execute(hwnd, Command::ToggleFullscreen);
-            } else if let Some(cmd) = Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some()) {
+            } else if let Some(cmd) =
+                Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some())
+            {
                 execute(hwnd, cmd);
             } else {
                 forward_to_lister(state, wparam, lparam);
@@ -1126,38 +1359,104 @@ mod tests {
 
     #[test]
     fn ctrl_combinations_go_to_lister() {
-        assert_eq!(Command::from_key(0x50, false, false, false), Some(Command::Previous)); // P
+        assert_eq!(
+            Command::from_key(0x50, false, false, false),
+            Some(Command::Previous)
+        ); // P
         assert_eq!(Command::from_key(0x50, true, false, false), None); // Ctrl+P: print in Lister
-        assert_eq!(Command::from_key(0x43, true, false, false), Some(Command::Copy)); // Ctrl+C: the picture
-        assert_eq!(Command::from_key(0x53, false, true, true), Some(Command::SaveFrame)); // Shift+S
-        assert_eq!(Command::from_key(0x53, false, false, true), Some(Command::ShowSettings)); // S
-        assert_eq!(Command::from_key(0xBB, true, false, false), Some(Command::ZoomIn));
+        assert_eq!(
+            Command::from_key(0x43, true, false, false),
+            Some(Command::Copy)
+        ); // Ctrl+C: the picture
+        assert_eq!(
+            Command::from_key(0x53, false, true, true),
+            Some(Command::SaveFrame)
+        ); // Shift+S
+        assert_eq!(
+            Command::from_key(0x53, false, false, true),
+            Some(Command::ShowSettings)
+        ); // S
+        assert_eq!(
+            Command::from_key(0xBB, true, false, false),
+            Some(Command::ZoomIn)
+        );
     }
 
     #[test]
     fn video_keys_override_navigation() {
-        assert_eq!(Command::from_key(0x20, false, false, true), Some(Command::TogglePlay)); // Space
-        assert_eq!(Command::from_key(0x20, false, false, false), Some(Command::Next));
-        assert_eq!(Command::from_key(0x27, false, false, true), Some(Command::SeekForward)); // Right
-        assert_eq!(Command::from_key(0x26, false, false, true), Some(Command::KeyframeForward)); // Up
-        assert_eq!(Command::from_key(0x28, false, false, true), Some(Command::KeyframeBack)); // Down
-        assert_eq!(Command::from_key(0xBB, false, false, true), Some(Command::VolumeUp)); // '+'
-        assert_eq!(Command::from_key(0xBB, false, false, false), Some(Command::ZoomIn)); // '+' on a photo
-        assert_eq!(Command::from_key(0x22, false, false, true), Some(Command::Next)); // PgDn still navigates
-        assert_eq!(Command::from_key(0x4E, false, false, true), Some(Command::Next)); // N
-        assert_eq!(Command::from_key(0xB0, false, false, true), Some(Command::NextTrack)); // media key
-        assert_eq!(Command::from_key(0xB3, true, false, true), Some(Command::TogglePlay));
+        assert_eq!(
+            Command::from_key(0x20, false, false, true),
+            Some(Command::TogglePlay)
+        ); // Space
+        assert_eq!(
+            Command::from_key(0x20, false, false, false),
+            Some(Command::Next)
+        );
+        assert_eq!(
+            Command::from_key(0x27, false, false, true),
+            Some(Command::SeekForward)
+        ); // Right
+        assert_eq!(
+            Command::from_key(0x26, false, false, true),
+            Some(Command::KeyframeForward)
+        ); // Up
+        assert_eq!(
+            Command::from_key(0x28, false, false, true),
+            Some(Command::KeyframeBack)
+        ); // Down
+        assert_eq!(
+            Command::from_key(0xBB, false, false, true),
+            Some(Command::VolumeUp)
+        ); // '+'
+        assert_eq!(
+            Command::from_key(0xBB, false, false, false),
+            Some(Command::ZoomIn)
+        ); // '+' on a photo
+        assert_eq!(
+            Command::from_key(0x22, false, false, true),
+            Some(Command::Next)
+        ); // PgDn still navigates
+        assert_eq!(
+            Command::from_key(0x4E, false, false, true),
+            Some(Command::Next)
+        ); // N
+        assert_eq!(
+            Command::from_key(0xB0, false, false, true),
+            Some(Command::NextTrack)
+        ); // media key
+        assert_eq!(
+            Command::from_key(0xB3, true, false, true),
+            Some(Command::TogglePlay)
+        );
         assert_eq!(Command::from_key(0xB0, false, false, false), None); // photos: to the Lister
     }
 
     #[test]
     fn photo_and_video_tool_keys() {
-        assert_eq!(Command::from_key(0x52, false, false, false), Some(Command::RotateRight)); // R
-        assert_eq!(Command::from_key(0x4C, false, false, false), Some(Command::RotateLeft)); // L
-        assert_eq!(Command::from_key(0x2E, false, false, false), Some(Command::Delete)); // Del
-        assert_eq!(Command::from_key(0x2E, false, false, true), Some(Command::Delete));
-        assert_eq!(Command::from_key(0xDD, false, false, true), Some(Command::Faster)); // ]
-        assert_eq!(Command::from_key(0xBC, false, false, true), Some(Command::FrameBack)); // ,
+        assert_eq!(
+            Command::from_key(0x52, false, false, false),
+            Some(Command::RotateRight)
+        ); // R
+        assert_eq!(
+            Command::from_key(0x4C, false, false, false),
+            Some(Command::RotateLeft)
+        ); // L
+        assert_eq!(
+            Command::from_key(0x2E, false, false, false),
+            Some(Command::Delete)
+        ); // Del
+        assert_eq!(
+            Command::from_key(0x2E, false, false, true),
+            Some(Command::Delete)
+        );
+        assert_eq!(
+            Command::from_key(0xDD, false, false, true),
+            Some(Command::Faster)
+        ); // ]
+        assert_eq!(
+            Command::from_key(0xBC, false, false, true),
+            Some(Command::FrameBack)
+        ); // ,
         assert_eq!(Command::from_key(0xBE, false, false, false), None); // '.' on a photo: to the Lister
     }
 
