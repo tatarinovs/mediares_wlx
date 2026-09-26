@@ -59,6 +59,10 @@ fn test_supported_fields_enumeration() {
         (58, "Audio_Composer", FT_STRINGW),
         (59, "Audio_Track_Total", FT_NUMERIC_32),
         (60, "Audio_Disc_Total", FT_NUMERIC_32),
+        (61, "Video_Title", FT_STRINGW),
+        (64, "Video_Date", FT_STRINGW),
+        (65, "Video_Year", FT_NUMERIC_32),
+        (67, "Video_Comment", FT_STRINGW),
     ] {
         let f = unsafe { ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
         assert_eq!(f, kind);
@@ -67,7 +71,7 @@ fn test_supported_fields_enumeration() {
     }
 
     // Out of bounds
-    let f15 = unsafe { ContentGetSupportedField(61, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    let f15 = unsafe { ContentGetSupportedField(68, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     assert_eq!(f15, FT_NOMOREFIELDS);
 }
 

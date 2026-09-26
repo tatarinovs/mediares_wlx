@@ -6,15 +6,16 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, ExtTextOutW, FillRect, GetDeviceCaps, GetStockObject, DEFAULT_GUI_FONT,
-    DT_CENTER, DT_SINGLELINE, DT_VCENTER, SelectObject, SetBkMode, SetBrushOrgEx,
+    DeleteObject, DrawTextW, FillRect, GetDeviceCaps, GetStockObject, DEFAULT_GUI_FONT,
+    DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE, DT_TOP, DT_VCENTER, SelectObject, SetBkMode, SetBrushOrgEx,
     SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
     CLIP_DEFAULT_PRECIS, COLORONCOLOR, DEFAULT_CHARSET, DEFAULT_QUALITY, DIB_RGB_COLORS,
-    ETO_OPTIONS, FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
+    FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::image_cache::{DecodedImage, BACKGROUND};
+use crate::osd_template;
 use crate::state::{Loupe, ViewerState, ZoomMode};
 
 const MIN_ZOOM: f32 = 0.05;
@@ -286,19 +287,24 @@ pub fn format_thousands(n: u64) -> String {
 }
 
 fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
-    let name = state.file_path.file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
-    let position = match state.dir_files.len() {
-        0 => String::new(),
-        n => format!(" [ {} / {} ]", state.current_idx + 1, n),
-    };
+    let position = (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
+    let file = |key: &str| osd_template::file_field(&state.file_path, state.file_size, position, key);
     let Some(img) = &state.image else {
-        return format!("{}{}", name, position);
+        // Still decoding: only what is known without the picture.
+        return osd_template::render("{name}< [ {index} / {count} ]>", file);
     };
-    let mp = img.width as f64 * img.height as f64 / 1_000_000.0;
-    let kb = format_thousands(state.file_size.div_ceil(1024));
-    let preview = if img.is_preview { "  [превью RAW]" } else { "" };
-    let zoom = zoom.map(|z| format!("  {}%", z)).unwrap_or_default();
-    format!("{} ( {} x {} = {:.2} MP , {} KB ){}{}{}", name, img.width, img.height, mp, kb, position, zoom, preview)
+    osd_template::render(&state.config.photo_osd, |key| {
+        file(key).or_else(|| osd_template::exif_field(img.exif.as_ref(), key)).or_else(|| {
+            Some(match key {
+                "width" => img.width.to_string(),
+                "height" => img.height.to_string(),
+                "mp" => format!("{:.2}", img.width as f64 * img.height as f64 / 1_000_000.0),
+                "zoom" => zoom.map(|z| z.to_string()).unwrap_or_default(),
+                "preview" => if img.is_preview { "превью RAW".to_string() } else { String::new() },
+                _ => return None,
+            })
+        })
+    })
 }
 
 unsafe fn osd_font(dc: HDC, state: &mut ViewerState) -> HFONT {
@@ -321,14 +327,16 @@ pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> HFONT {
     )
 }
 
-/// OSD text with a 1px black drop shadow, readable over any picture.
+/// OSD text (may span lines) with a 1px black drop shadow, readable over any picture.
 pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
-    let text: Vec<u16> = text.encode_utf16().collect();
+    let mut text: Vec<u16> = text.encode_utf16().collect();
     let old_font = SelectObject(dc, font.into());
     SetBkMode(dc, TRANSPARENT);
     for (offset, color) in [(1, 0), (0, color)] {
         SetTextColor(dc, COLORREF(color));
-        let _ = ExtTextOutW(dc, OSD_MARGIN + offset, OSD_MARGIN + offset, ETO_OPTIONS(0), None, PCWSTR(text.as_ptr()), text.len() as u32, None);
+        let (x, y) = (OSD_MARGIN + offset, OSD_MARGIN + offset);
+        let mut rc = RECT { left: x, top: y, right: x + 1, bottom: y + 1 };
+        DrawTextW(dc, &mut text, &mut rc, DT_LEFT | DT_TOP | DT_NOCLIP | DT_NOPREFIX | DT_EXPANDTABS);
     }
     SelectObject(dc, old_font);
 }

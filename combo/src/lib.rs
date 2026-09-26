@@ -12,6 +12,8 @@ mod fullscreen;
 mod image_cache;
 mod image_view;
 mod media_view;
+mod osd_template;
+mod osd_template_dialog;
 mod overlay;
 mod playback_audio;
 mod playback_video;

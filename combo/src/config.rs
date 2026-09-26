@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 use windows::core::{w, HSTRING, PCWSTR};
 
+use crate::osd_template;
 use crate::playlist::{QueueOptions, Repeat};
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::WindowsProgramming::{
@@ -138,6 +139,9 @@ pub struct ViewerConfig {
     pub photo_editor: String,
     pub video_editor: String,
     pub audio_editor: String,
+    /// OSD templates (see [`crate::osd_template`]).
+    pub photo_osd: String,
+    pub video_osd: String,
 }
 
 impl Default for ViewerConfig {
@@ -161,8 +165,20 @@ impl Default for ViewerConfig {
             photo_editor: String::new(),
             video_editor: String::new(),
             audio_editor: String::new(),
+            photo_osd: osd_template::DEFAULT_PHOTO.to_string(),
+            video_osd: osd_template::DEFAULT_VIDEO.to_string(),
         }
     }
+}
+
+/// An INI template; empty means the default.
+fn template(value: String, default: &str) -> String {
+    let value = osd_template::from_ini(&value);
+    if value.trim().is_empty() { default.to_string() } else { value }
+}
+
+fn template_to_ini(value: &str, default: &str) -> String {
+    if value == default { String::new() } else { osd_template::to_ini(value) }
 }
 
 impl ViewerConfig {
@@ -171,7 +187,7 @@ impl ViewerConfig {
         let d = Self::default();
         let int = |key: PCWSTR, default: i32| unsafe { GetPrivateProfileIntW(SECTION, key, default, &ini) };
         let string = |key: PCWSTR, default: &str| {
-            let mut buf = [0u16; 1024];
+            let mut buf = [0u16; 4096];
             let len = unsafe { GetPrivateProfileStringW(SECTION, key, &HSTRING::from(default), Some(&mut buf), &ini) };
             String::from_utf16_lossy(&buf[..len as usize])
         };
@@ -207,6 +223,8 @@ impl ViewerConfig {
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
             audio_editor: string(w!("AudioEditor"), "").trim().to_string(),
+            photo_osd: template(string(w!("PhotoOSDTemplate"), ""), osd_template::DEFAULT_PHOTO),
+            video_osd: template(string(w!("VideoOSDTemplate"), ""), osd_template::DEFAULT_VIDEO),
         }
     }
 
@@ -239,6 +257,9 @@ impl ViewerConfig {
             write(w!("PhotoEditor"), self.photo_editor.clone()),
             write(w!("VideoEditor"), self.video_editor.clone()),
             write(w!("AudioEditor"), self.audio_editor.clone()),
+            // The default is stored as empty, so a changed default reaches users who never edited it.
+            write(w!("PhotoOSDTemplate"), template_to_ini(&self.photo_osd, osd_template::DEFAULT_PHOTO)),
+            write(w!("VideoOSDTemplate"), template_to_ini(&self.video_osd, osd_template::DEFAULT_VIDEO)),
         ]
         .iter()
         .all(|&ok| ok)

@@ -33,7 +33,7 @@ use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
-use crate::{config, dialog, exif_dialog, file_actions, fullscreen, module, settings_dialog, snapshot};
+use crate::{config, dialog, exif_dialog, file_actions, fullscreen, module, osd_template, settings_dialog, snapshot};
 use mediares_core::exif::read_orientation;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
@@ -363,26 +363,45 @@ unsafe fn update_title(state: &ViewerState) {
     let _ = SetWindowTextW(state.lister, &HSTRING::from(title));
 }
 
-/// Video OSD per the config: file name, resolution, size, position in the list (+ time).
+/// Video OSD per the config's template.
 unsafe fn sync_video_osd(state: &mut ViewerState) {
-    let Some(media) = state.media.as_mut() else { return };
-    if !media.is_video() {
-        return;
-    }
+    let Some(video) = state.media.as_mut().and_then(|m| m.video_mut()) else { return };
     let config = &state.config;
     let style = config.osd.video().then(|| crate::video_view::OsdStyle {
         face: config.osd_font_name.clone(),
         size_pt: config.osd_font_size,
         color: config.osd_font_color,
     });
-    let name = state.file_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    let size = image_view::format_size(state.file_size);
-    let (w, h) = media.video_size();
-    let position = match state.dir_files.len() {
-        0 => String::new(),
-        n => format!(" [ {} / {} ]", state.current_idx + 1, n),
+    if style.is_none() {
+        video.set_osd(None, crate::video_view::OsdText { template: String::new(), fields: Default::default() });
+        return;
+    }
+    let template = config.video_osd.clone();
+    let position = (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
+    let (width, height, fps) = (video.info.width, video.info.height, video.info.frame_rate);
+    let details = osd_template::uses_any(&template, osd_template::VIDEO_DETAIL_KEYS).then(|| video.details());
+    let empty_tags = Default::default();
+    let (meta, tags) = match details {
+        Some(d) => (d.meta.as_ref(), &d.tags),
+        None => (None, &empty_tags),
     };
-    media.set_video_osd(style, format!("{} ( {} x {} , {} ){}", name, w, h, size, position));
+    let mut fields = std::collections::HashMap::new();
+    for (_, group) in osd_template::VIDEO_FIELDS {
+        for field in *group {
+            let value = osd_template::file_field(&state.file_path, state.file_size, position, field.key)
+                .or_else(|| osd_template::video_field(meta, tags, field.key))
+                .or_else(|| match field.key {
+                    "width" => Some(width.to_string()),
+                    "height" => Some(height.to_string()),
+                    "fps" => Some(osd_template::format_fps(fps)),
+                    _ => None,
+                });
+            if let Some(value) = value {
+                fields.insert(field.key, value);
+            }
+        }
+    }
+    video.set_osd(style, crate::video_view::OsdText { template, fields });
 }
 
 /// "name - [details] [3/12]" for the Lister caption.

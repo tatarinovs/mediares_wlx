@@ -156,6 +156,14 @@ pub fn is_video_meta_cached(path: &Path) -> bool {
     video_meta_cache().contains(path)
 }
 
+/// Title, artist... of MKV/WebM and MP4/MOV: header reads only.
+pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> {
+    static VIDEO_TAGS: OnceLock<MetaCache<crate::video_tags::VideoTags>> = OnceLock::new();
+    VIDEO_TAGS
+        .get_or_init(MetaCache::new)
+        .get_or_read(path, |p| Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty()))
+}
+
 pub fn get_cache() -> &'static MediaCache {
     static GLOBAL_CACHE: OnceLock<MediaCache> = OnceLock::new();
     GLOBAL_CACHE.get_or_init(|| MediaCache::new(NonZeroUsize::new(CAPACITY).expect("non-zero capacity")))

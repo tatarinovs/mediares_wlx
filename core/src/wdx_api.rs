@@ -87,6 +87,13 @@ enum Field {
     AudioComposer,
     AudioTrackTotal,
     AudioDiscTotal,
+    VideoTitle,
+    VideoArtist,
+    VideoDirector,
+    VideoDate,
+    VideoYear,
+    VideoGenre,
+    VideoComment,
 }
 
 /// Where a field's value comes from; decides whether it is worth delaying.
@@ -103,6 +110,8 @@ enum Source {
     ImageSize,
     /// Media Foundation stream properties: no decoding, but slow to open.
     VideoMeta,
+    /// Video container tags: headers only, never delayed.
+    VideoTags,
     /// Decoding and hashing.
     Analysis,
 }
@@ -119,6 +128,9 @@ impl Field {
             | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
             VideoWidth | VideoHeight | VideoLength | VideoFrameRate | VideoCodec | VideoBitrate | VideoAudioCodec
             | VideoAudioChannels | VideoAudioSampleRate => Source::VideoMeta,
+            VideoTitle | VideoArtist | VideoDirector | VideoDate | VideoYear | VideoGenre | VideoComment => {
+                Source::VideoTags
+            }
             _ if self.is_tag() => Source::Tags,
             _ => Source::Analysis,
         }
@@ -216,6 +228,13 @@ const FIELDS: &[(Field, &str, c_int)] = &[
     (Field::AudioComposer, "Audio_Composer", FT_STRINGW),
     (Field::AudioTrackTotal, "Audio_Track_Total", FT_NUMERIC_32),
     (Field::AudioDiscTotal, "Audio_Disc_Total", FT_NUMERIC_32),
+    (Field::VideoTitle, "Video_Title", FT_STRINGW),
+    (Field::VideoArtist, "Video_Artist", FT_STRINGW),
+    (Field::VideoDirector, "Video_Director", FT_STRINGW),
+    (Field::VideoDate, "Video_Date", FT_STRINGW),
+    (Field::VideoYear, "Video_Year", FT_NUMERIC_32),
+    (Field::VideoGenre, "Video_Genre", FT_STRINGW),
+    (Field::VideoComment, "Video_Comment", FT_STRINGW),
 ];
 
 fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int)> {
@@ -327,7 +346,7 @@ unsafe fn get_value(
 fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || kind.is_slow_kind() && !get_cache().is_cached(path);
     match field.source() {
-        Source::Constant | Source::Probe | Source::Tags | Source::Exif => false,
+        Source::Constant | Source::Probe | Source::Tags | Source::Exif | Source::VideoTags => false,
         Source::ImageSize => kind != MediaType::StandardImage && analysis_pending(),
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::Analysis => analysis_pending(),
@@ -366,6 +385,7 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         Source::Tags => return tag_value(path, field),
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
+        Source::VideoTags => return video_tag_value(path, field, kind),
         Source::ImageSize if kind == MediaType::StandardImage => {
             let (w, h) = crate::image_decode::header_dimensions(path)?;
             return Some(int(if field == ImageWidth { w } else { h }));
@@ -444,6 +464,25 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
         VideoAudioCodec => meta.audio_codec.clone().map(Value::Text),
         VideoAudioChannels => meta.audio_channels.map(int),
         VideoAudioSampleRate => meta.audio_sample_rate.map(int),
+        _ => None,
+    }
+}
+
+fn video_tag_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
+    use Field::*;
+    if kind != MediaType::Video {
+        return None;
+    }
+    let tags = crate::cache::get_video_tags(path)?;
+    let text = |s: &Option<String>| s.clone().map(Value::Text);
+    match field {
+        VideoTitle => text(&tags.title),
+        VideoArtist => text(&tags.artist),
+        VideoDirector => text(&tags.director),
+        VideoDate => text(&tags.date),
+        VideoYear => tags.year().map(int),
+        VideoGenre => text(&tags.genre),
+        VideoComment => text(&tags.comment),
         _ => None,
     }
 }

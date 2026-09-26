@@ -22,6 +22,7 @@ pub mod psd_preview;
 pub mod raw_preview;
 pub mod tc_api;
 pub mod video_frame;
+pub mod video_tags;
 pub mod wdx_api;
 
 pub use image;

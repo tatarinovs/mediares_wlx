@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use mediares_core::cache::FileKey;
-use mediares_core::exif::read_orientation;
+use mediares_core::exif::{read_exif, ExifInfo};
 use mediares_core::image::DynamicImage;
 use mediares_core::image_decode::{apply_exif_orientation, decode_bytes, decode_file};
 use mediares_core::probe::{probe_file, MediaType};
@@ -33,6 +33,8 @@ pub struct DecodedImage {
     pub bgra: Vec<u8>,
     /// True when the picture is an embedded preview rather than the full image (RAW files).
     pub is_preview: bool,
+    /// Read along with the picture (it is needed for the orientation anyway); shown in the OSD.
+    pub exif: Option<ExifInfo>,
 }
 
 /// How a photo is prepared for display; part of the cache key.
@@ -267,12 +269,13 @@ fn worker_loop() {
 
 fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<DecodedImage> {
     let mut img = decode_file(path, kind)?;
+    let exif = read_exif(path);
     if options.auto_rotate {
-        if let Some(orientation) = read_orientation(path) {
+        if let Some(orientation) = exif.as_ref().and_then(|e| e.orientation) {
             apply_exif_orientation(&mut img, orientation);
         }
     }
-    Some(to_bgra(img, options.background, kind == MediaType::RawImage))
+    Some(DecodedImage { exif, ..to_bgra(img, options.background, kind == MediaType::RawImage) })
 }
 
 /// Decodes an in-memory picture (e.g. embedded album art) for display; not cached.
@@ -292,7 +295,7 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
         let (r, g, b) = if a == 255 { (px[0], px[1], px[2]) } else { (blend(px[0], bg[0]), blend(px[1], bg[1]), blend(px[2], bg[2])) };
         px.copy_from_slice(&[b, g, r, 255]);
     }
-    DecodedImage { width, height, bgra, is_preview }
+    DecodedImage { width, height, bgra, is_preview, exif: None }
 }
 
 /// The picture turned by a quarter, clockwise or counter-clockwise.
@@ -307,7 +310,7 @@ pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
             dst.extend_from_slice(&img.bgra[i..i + 4]);
         }
     }
-    DecodedImage { width: img.height, height: img.width, bgra: dst, is_preview: img.is_preview }
+    DecodedImage { width: img.height, height: img.width, bgra: dst, is_preview: img.is_preview, exif: img.exif.clone() }
 }
 
 /// Back to an `image` buffer (e.g. to scale a cached picture).
@@ -332,20 +335,20 @@ mod tests {
     #[test]
     fn rotates_by_quarter_turns() {
         // 2x1: red, green  ->  clockwise 1x2: red above green; counter-clockwise: green above red.
-        let img = DecodedImage { width: 2, height: 1, bgra: vec![0, 0, 255, 255, 0, 255, 0, 255], is_preview: false };
+        let img = DecodedImage { width: 2, height: 1, bgra: vec![0, 0, 255, 255, 0, 255, 0, 255], is_preview: false, exif: None };
         let cw = rotated(&img, true);
         assert_eq!((cw.width, cw.height), (1, 2));
         assert_eq!(cw.bgra, vec![0, 0, 255, 255, 0, 255, 0, 255]);
         assert_eq!(rotated(&img, false).bgra, vec![0, 255, 0, 255, 0, 0, 255, 255]);
         // 2x2 turned four times is the original.
-        let square = DecodedImage { width: 2, height: 2, bgra: (0..16).collect(), is_preview: false };
+        let square = DecodedImage { width: 2, height: 2, bgra: (0..16).collect(), is_preview: false, exif: None };
         let back = (0..4).fold(square, |img, _| rotated(&img, true));
         assert_eq!(back.bgra, (0..16).collect::<Vec<u8>>());
     }
 
     #[test]
     fn cache_evicts_least_recently_used_by_bytes() {
-        let big = |n: usize| Arc::new(DecodedImage { width: 1, height: 1, bgra: vec![0; n], is_preview: false });
+        let big = |n: usize| Arc::new(DecodedImage { width: 1, height: 1, bgra: vec![0; n], is_preview: false, exif: None });
         let key = |name: &str| Key {
             file: FileKey::for_path(Path::new(env!("CARGO_MANIFEST_DIR")).join(name).as_path()).expect("file exists"),
             options: DecodeOptions { auto_rotate: true, background: BACKGROUND },

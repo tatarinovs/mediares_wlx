@@ -4,10 +4,12 @@
 //! The surface is transparent to mouse input (`HTTRANSPARENT`), so the viewer window receives
 //! every click and decides between the video area and the bar.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Once;
 
-use mediares_core::video_frame::{probe_video, KeyframeIndex, VideoInfo};
+use mediares_core::video_frame::{probe_video, probe_video_meta, KeyframeIndex, VideoInfo, VideoMeta};
+use mediares_core::video_tags::{read_video_tags, VideoTags};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
@@ -93,6 +95,8 @@ pub struct VideoView {
     /// Opened on first key-frame step; reset when the file changes.
     keyframes: Option<KeyframeIndex>,
     pub info: VideoInfo,
+    /// Read on first use (OSD fields); reset when the file changes.
+    details: Option<VideoDetails>,
     error: Option<String>,
     osd: Option<VideoOsd>,
     rate: f64,
@@ -143,8 +147,20 @@ pub struct OsdStyle {
 struct VideoOsd {
     style: OsdStyle,
     font: crate::dialog::Font,
-    /// "name ( 1920 x 1080 , 45.3 MB ) [ 3 / 12 ]"; the time is appended per frame.
-    label: String,
+    text: OsdText,
+}
+
+/// What the OSD shows: a template and the values of its fields, except the playback position
+/// and duration, which are filled per frame.
+pub struct OsdText {
+    pub template: String,
+    pub fields: HashMap<&'static str, String>,
+}
+
+/// Stream properties and tags, beyond what playback needs.
+pub struct VideoDetails {
+    pub meta: Option<VideoMeta>,
+    pub tags: VideoTags,
 }
 
 impl VideoView {
@@ -166,6 +182,7 @@ impl VideoView {
             path: path.to_path_buf(),
             keyframes: None,
             info,
+            details: None,
             error: None,
             osd: None,
             rate: 1.0,
@@ -196,6 +213,7 @@ impl VideoView {
         self.info = info;
         self.path = path.to_path_buf();
         self.keyframes = None;
+        self.details = None;
         self.error = None;
         true
     }
@@ -287,8 +305,13 @@ impl VideoView {
     pub unsafe fn render(&mut self) {
         match &self.osd {
             Some(osd) => {
-                let time = format!("{} / {}", format_time(self.player.position()), format_time(self.player.duration().max(self.info.duration_sec)));
-                let text = format!("{}   {}", osd.label, time);
+                let position = format_time(self.player.position());
+                let duration = format_time(self.player.duration().max(self.info.duration_sec));
+                let text = crate::osd_template::render(&osd.text.template, |key| match key {
+                    "time" => Some(position.clone()),
+                    "duration" => Some(duration.clone()),
+                    _ => osd.text.fields.get(key).cloned(),
+                });
                 self.player.render(Some(Osd { text: &text, font: osd.font.0, color: osd.style.color }));
             }
             None => self.player.render(None),
@@ -296,19 +319,25 @@ impl VideoView {
         self.advance_step();
     }
 
-    /// Shows (`Some`) or hides the OSD; `label` describes the file.
-    pub unsafe fn set_osd(&mut self, style: Option<OsdStyle>, label: String) {
+    /// Stream properties and tags of the current file, read on first call.
+    pub fn details(&mut self) -> &VideoDetails {
+        let path = &self.path;
+        self.details.get_or_insert_with(|| VideoDetails { meta: probe_video_meta(path), tags: read_video_tags(path) })
+    }
+
+    /// Shows (`Some`) or hides the OSD.
+    pub unsafe fn set_osd(&mut self, style: Option<OsdStyle>, text: OsdText) {
         self.osd = match style {
             None => None,
             Some(style) => match self.osd.take() {
-                Some(osd) if osd.style == style => Some(VideoOsd { label, ..osd }),
+                Some(osd) if osd.style == style => Some(VideoOsd { text, ..osd }),
                 _ => {
                     let dpi = match windows::Win32::UI::HiDpi::GetDpiForWindow(self.viewer) {
                         0 => 96,
                         dpi => dpi as i32,
                     };
                     let font = crate::dialog::GdiObject(crate::image_view::create_osd_font(&style.face, style.size_pt, dpi));
-                    Some(VideoOsd { style, font, label })
+                    Some(VideoOsd { style, font, text })
                 }
             },
         };
@@ -344,7 +373,7 @@ impl VideoView {
     /// The frame on screen, at its native size.
     pub unsafe fn capture_frame(&self) -> Option<crate::image_cache::DecodedImage> {
         let (width, height, bgra) = self.player.capture_frame()?;
-        Some(crate::image_cache::DecodedImage { width, height, bgra, is_preview: false })
+        Some(crate::image_cache::DecodedImage { width, height, bgra, is_preview: false, exif: None })
     }
 
     /// "1920x1080, 1:23:45"

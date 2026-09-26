@@ -284,10 +284,11 @@ impl MediaView {
         self.invalidate_bar();
     }
 
-    /// Video OSD on or off (`style` = `None`); no effect for audio.
-    pub unsafe fn set_video_osd(&mut self, style: Option<crate::video_view::OsdStyle>, label: String) {
-        if let Content::Video(v) = &mut self.content {
-            v.set_osd(style, label);
+    /// The video shown, if it is one.
+    pub fn video_mut(&mut self) -> Option<&mut VideoView> {
+        match &mut self.content {
+            Content::Video(v) => Some(v),
+            Content::Audio(_) => None,
         }
     }
 
@@ -303,14 +304,6 @@ impl MediaView {
         match &self.content {
             Content::Video(v) => v.capture_frame().map(Arc::new),
             Content::Audio(a) => a.cover(),
-        }
-    }
-
-    /// Frame size of a video ((0, 0) for audio).
-    pub fn video_size(&self) -> (u32, u32) {
-        match &self.content {
-            Content::Video(v) => (v.info.width, v.info.height),
-            Content::Audio(_) => (0, 0),
         }
     }
 

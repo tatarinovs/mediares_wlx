@@ -21,6 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog::{self, Brush, GdiObject};
 use crate::file_actions::show_error;
+use crate::{osd_template, osd_template_dialog};
 use crate::playlist::Repeat;
 use crate::tc_register::Registration;
 
@@ -51,6 +52,8 @@ const IDC_BROWSE_VIDEO_EDITOR: i32 = 122;
 const IDC_AUDIO_EDITOR: i32 = 123;
 const IDC_BROWSE_AUDIO_EDITOR: i32 = 124;
 const IDC_REGISTER_WDX: i32 = 125;
+const IDC_PHOTO_OSD: i32 = 126;
+const IDC_VIDEO_OSD: i32 = 127;
 
 const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
@@ -89,7 +92,7 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 850, 540)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 850, 575)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
@@ -163,7 +166,7 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     control(w!("STATIC"), "", SS_SUNKEN, (320, 130, 45, 26), IDC_BACKGROUND_PREVIEW);
     checkbox("Спрашивать перед удалением в корзину (Del)", (28, 163, 365, 22), IDC_CONFIRM_DELETE, cfg.confirm_delete);
 
-    control(w!("BUTTON"), "Информационная строка (OSD)", BS_GROUPBOX as u32, (15, 204, 395, 135), 0);
+    control(w!("BUTTON"), "Информационная строка (OSD)", BS_GROUPBOX as u32, (15, 204, 395, 170), 0);
     control(w!("STATIC"), "Показывать OSD:", SS_LEFT, (28, 232, 140, 20), 0);
     let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
     combo((175, 229, 190, 150), IDC_SHOW_OSD, osd_labels, cfg.osd.index() as usize);
@@ -175,15 +178,18 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     control(w!("STATIC"), "Цвет шрифта:", SS_LEFT, (28, 300, 140, 20), 0);
     control(w!("BUTTON"), "Выбрать цвет...", tab | BS_PUSHBUTTON as u32, (175, 297, 130, 26), IDC_CHOOSE_COLOR);
     control(w!("STATIC"), "Aa", SS_CENTER | SS_CENTERIMAGE, (320, 297, 45, 26), IDC_COLOR_PREVIEW);
+    control(w!("STATIC"), "Что показывать:", SS_LEFT, (28, 337, 140, 20), 0);
+    control(w!("BUTTON"), "Для фото...", tab | BS_PUSHBUTTON as u32, (175, 334, 105, 26), IDC_PHOTO_OSD);
+    control(w!("BUTTON"), "Для видео...", tab | BS_PUSHBUTTON as u32, (290, 334, 105, 26), IDC_VIDEO_OSD);
 
-    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 349, 395, 140), 0);
-    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 372, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
-    checkbox("Панель управления поверх видео", (28, 397, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
-    checkbox("Скрывать панель при бездействии", (28, 422, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
-    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 455, 170, 20), 0);
+    control(w!("BUTTON"), "Полноэкранный режим", BS_GROUPBOX as u32, (15, 384, 395, 140), 0);
+    checkbox("Кнопки ⏮ ⏯ ⏭ поверх фото", (28, 407, 365, 22), IDC_OVERLAY_PHOTO, cfg.overlay_photo);
+    checkbox("Панель управления поверх видео", (28, 432, 365, 22), IDC_OVERLAY_VIDEO, cfg.overlay_video);
+    checkbox("Скрывать панель при бездействии", (28, 457, 365, 22), IDC_OVERLAY_AUTOHIDE, cfg.overlay_autohide);
+    control(w!("STATIC"), "Интервал слайд-шоу (F5):", SS_LEFT, (28, 490, 170, 20), 0);
     let slide_labels = ctx.slideshow_seconds.iter().map(|s| format!("{} с", s)).collect();
     let slide_sel = ctx.slideshow_seconds.iter().position(|&s| s == cfg.slideshow_seconds).unwrap_or(0);
-    combo((205, 452, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
+    combo((205, 487, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
 
     // Right column: audio / video, external editors.
     control(w!("BUTTON"), "Аудио и видео", BS_GROUPBOX as u32, (425, 15, 395, 140), 0);
@@ -207,9 +213,22 @@ unsafe fn build_controls(dlg: HWND, ctx: &Context, font: windows::Win32::Graphic
     let button = control(w!("BUTTON"), label, tab | BS_PUSHBUTTON as u32, (438, 363, 200, 26), IDC_REGISTER_WDX);
     let _ = EnableWindow(button, !registered);
 
-    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (615, 461, 95, 28), IDOK.0);
-    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (725, 461, 95, 28), IDCANCEL.0);
+    let ok = control(w!("BUTTON"), "ОК", tab | BS_DEFPUSHBUTTON as u32, (615, 496, 95, 28), IDOK.0);
+    control(w!("BUTTON"), "Отмена", tab | BS_PUSHBUTTON as u32, (725, 496, 95, 28), IDCANCEL.0);
     ok
+}
+
+/// Opens the template editor; the result is kept in `ctx` and saved with OK.
+unsafe fn edit_osd_template(dlg: HWND, ctx: &mut Context, video: bool) {
+    let cfg = &mut ctx.config;
+    let (title, template, default, fields) = if video {
+        ("OSD для видео", &mut cfg.video_osd, osd_template::DEFAULT_VIDEO, osd_template::VIDEO_FIELDS)
+    } else {
+        ("OSD для фото", &mut cfg.photo_osd, osd_template::DEFAULT_PHOTO, osd_template::PHOTO_FIELDS)
+    };
+    if let Some(edited) = osd_template_dialog::show(dlg, title, template, default, fields) {
+        *template = edited;
+    }
 }
 
 const REGISTERED_LABEL: &str = "WDX зарегистрирован";
@@ -366,6 +385,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                     IDC_BROWSE_VIDEO_EDITOR => browse_program(hwnd, IDC_VIDEO_EDITOR),
                     IDC_BROWSE_AUDIO_EDITOR => browse_program(hwnd, IDC_AUDIO_EDITOR),
                     IDC_REGISTER_WDX => register_wdx(hwnd, ctx),
+                    IDC_PHOTO_OSD => edit_osd_template(hwnd, ctx, false),
+                    IDC_VIDEO_OSD => edit_osd_template(hwnd, ctx, true),
                     id if id == IDOK.0 => {
                         accept(hwnd, ctx);
                         dialog::close(hwnd);
