@@ -1,7 +1,7 @@
 //! Audio content: album art (embedded, or cover.jpg / folder.jpg next to the file) and tags,
 //! painted into the area above the transport bar.
 //!
-//! Playback is pure Rust ([`AudioPlayer`]); formats symphonia can't decode (WMA, Opus) fall back to
+//! Playback is pure Rust ([`AudioPlayer`]); formats symphonia can't decode (WMA, Opus, AC3) fall back to
 //! the Media Foundation engine with a hidden surface.
 
 use std::path::Path;

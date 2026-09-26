@@ -102,7 +102,8 @@ enum Source {
     Constant,
     /// The file extension.
     Probe,
-    /// Audio tags: headers only, never delayed.
+    /// Audio tags: headers only. Delayed only for stream properties of files lofty can't parse,
+    /// which come from Media Foundation.
     Tags,
     /// EXIF block: a small read, never delayed.
     Exif,
@@ -346,7 +347,8 @@ unsafe fn get_value(
 fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || kind.is_slow_kind() && !get_cache().is_cached(path);
     match field.source() {
-        Source::Constant | Source::Probe | Source::Tags | Source::Exif | Source::VideoTags => false,
+        Source::Constant | Source::Probe | Source::Exif | Source::VideoTags => false,
+        Source::Tags => needs_audio_meta(path, field, kind) && !crate::cache::is_audio_meta_cached(path),
         Source::ImageSize => kind != MediaType::StandardImage && analysis_pending(),
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::Analysis => analysis_pending(),
@@ -510,12 +512,61 @@ fn local_to_filetime(t: crate::exif::ExifDateTime) -> Option<u64> {
     Some((ft.dwHighDateTime as u64) << 32 | ft.dwLowDateTime as u64)
 }
 
+impl Field {
+    /// Stream properties, which Media Foundation can supply when lofty can't parse the file.
+    fn is_audio_stream_property(self) -> bool {
+        use Field::*;
+        matches!(
+            self,
+            AudioLength | AudioBitrate | AudioSampleRate | AudioChannels | AudioBitDepth | AudioCodec | AudioLossless
+        )
+    }
+}
+
+/// The field has to come from Media Foundation: an audio file lofty doesn't recognize (WMA, AC3...).
+fn needs_audio_meta(path: &Path, field: Field, kind: MediaType) -> bool {
+    kind == MediaType::Audio && field.is_audio_stream_property() && !has_tags(path)
+}
+
 #[cfg(feature = "tags")]
+fn has_tags(path: &Path) -> bool {
+    crate::cache::get_tags(path).is_some()
+}
+
+#[cfg(not(feature = "tags"))]
+fn has_tags(_path: &Path) -> bool {
+    false
+}
+
 fn tag_value(path: &Path, field: Field) -> Option<Value> {
-    use Field::*;
     if probe_file(path) != MediaType::Audio {
         return None;
     }
+    if needs_audio_meta(path, field, MediaType::Audio) {
+        return audio_meta_value(path, field);
+    }
+    lofty_value(path, field)
+}
+
+fn audio_meta_value(path: &Path, field: Field) -> Option<Value> {
+    use Field::*;
+    let meta = crate::cache::get_audio_meta(path)?;
+    let num = |n: Option<u32>| n.filter(|&n| n > 0).map(int);
+    match field {
+        AudioLength => (meta.duration_sec > 0.0).then(|| Value::Time(meta.duration_sec.round() as u32)),
+        AudioBitrate => num(meta.bitrate_kbps),
+        AudioSampleRate => num(meta.sample_rate),
+        AudioChannels => num(meta.channels),
+        AudioBitDepth => num(meta.bit_depth),
+        AudioCodec => meta.codec.clone().map(Value::Text),
+        AudioLossless => meta.lossless.map(Value::Bool),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "tags")]
+fn lofty_value(path: &Path, field: Field) -> Option<Value> {
+    use Field::*;
     let tags = crate::cache::get_tags(path)?;
     let text = |s: &Option<String>| s.clone().map(Value::Text);
     let num = |n: Option<u32>| n.filter(|&n| n > 0).map(int);
@@ -546,7 +597,7 @@ fn tag_value(path: &Path, field: Field) -> Option<Value> {
 }
 
 #[cfg(not(feature = "tags"))]
-fn tag_value(_path: &Path, _field: Field) -> Option<Value> {
+fn lofty_value(_path: &Path, _field: Field) -> Option<Value> {
     None
 }
 

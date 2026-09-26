@@ -1,5 +1,5 @@
 //! Video playback via `IMFMediaEngine` (video + its audio track, A/V sync handled by MF). Also
-//! the fallback for audio formats the pure-Rust decoder doesn't cover (WMA, Opus).
+//! the fallback for audio formats the pure-Rust decoder doesn't cover (WMA, Opus, AC3).
 //!
 //! The engine runs in frame-server mode: on each render tick we ask it for the current frame
 //! (`OnVideoStreamTick`) and copy it with `TransferVideoFrame` into our own D3D11 swap chain on

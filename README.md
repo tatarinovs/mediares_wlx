@@ -27,6 +27,7 @@ mediares_wlx/
 │   ├── audio_decode.rs         # Декодирование аудио в PCM (symphonia), точная перемотка — фича audio-decode
 │   ├── audio_tags.rs           # Теги и обложка (lofty) — фича tags
 │   ├── audio_fingerprint.rs    # Поля аудио-дубликатов: отпечаток, хеш PCM, длительность
+│   ├── mf_audio.rs             # Аудио через Media Foundation (WMA, AC3, Opus): PCM и параметры потока
 │   ├── cache.rs                # Потокобезопасный LRU-кэш анализа (ключ: путь + размер + mtime)
 │   ├── video_tags.rs           # Теги видео: свой разбор Matroska/WebM (EBML) и MP4/MOV (ilst, QuickTime, 3GPP)
 │   └── wdx_api.rs              # Логика полей WDX + макрос export_content_plugin!
@@ -96,8 +97,8 @@ JPEG-превью; PSD/PSB — по композиту.
 **Видео** — MP4, MKV, AVI, MOV, WMV, WEBM, M4V, FLV, TS, MTS, MPG/MPEG, VOB (в т.ч. DVD-оцифровки
 MPEG-2 PS), декодирование через системные кодеки Media Foundation.
 
-**Аудио** — MP3, MP2, FLAC, WAV, OGG/OGA (Vorbis), M4A/M4B (AAC, ALAC), AAC, AIFF, CAF, MKA декодируются
-на чистом Rust (`symphonia`, вывод через `rodio`/WASAPI) и не зависят от установленных кодеков. WMA и Opus,
+**Аудио** — MP3, MP2, FLAC, WAV, OGG/OGA (Vorbis), M4A/M4B (AAC, ALAC), AAC, AIFF/AIFC, CAF, MKA декодируются
+на чистом Rust (`symphonia`, вывод через `rodio`/WASAPI) и не зависят от установленных кодеков. WMA, Opus и AC3,
 которых нет в symphonia, играются через Media Foundation. Показываются обложка (встроенная или
 `cover`/`folder`/`front.jpg` из папки), название, исполнитель, альбом, год и параметры потока (`lofty`).
 
@@ -176,6 +177,13 @@ EXIF берётся из того же чтения, что нужно для а
 WavPack, PCM...) и `Audio_Lossless` (да/нет — удобно искать lossless-версии треков). Они читают только заголовки
 и теги, поэтому не откладываются и не требуют декодирования; теги файла кэшируются, так что несколько
 колонок читают их один раз.
+
+Файлы, которые не открывает symphonia (WMA, Opus, AC3 и всё, для чего в системе есть декодер), для полей
+дубликатов декодируются через Media Foundation (`IMFSourceReader`). `Audio_PCM_Hash` у них зависит от
+установленных в системе декодеров: стабилен на одной машине, но может отличаться на другой. Если теги файла
+не читаются `lofty` (WMA, AC3), параметры потока (`Audio_Length`, `Audio_Bitrate_kbps`, `Audio_Sample_Rate_Hz`,
+`Audio_Channels`, `Audio_Bit_Depth`, `Audio_Codec`, `Audio_Lossless`) берутся из Media Foundation — такие поля
+откладываются, как видео.
 
 Поиск дубликатов в TC сравнивает поля на точное равенство, нечёткого сравнения нет. Поэтому в отпечатке
 всего 18 бит, подобранных на перекодированных копиях реальных треков: ~99 % копий дают ровно то же

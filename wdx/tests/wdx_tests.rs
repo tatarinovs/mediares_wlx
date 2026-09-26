@@ -77,11 +77,13 @@ fn test_supported_fields_enumeration() {
 
 #[test]
 fn test_detect_string() {
-    let mut buf = [0 as c_char; 512];
+    // TC passes a 2 KB buffer; a longer string would be cut mid-expression.
+    let mut buf = [0 as c_char; 2048];
     unsafe {
-        ContentGetDetectString(buf.as_mut_ptr(), 512);
+        ContentGetDetectString(buf.as_mut_ptr(), 2048);
     }
     let detect = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()).to_str().unwrap() };
+    assert!(detect.len() < 2047 && detect.ends_with('"'), "detect string truncated: {} bytes", detect.len());
     assert!(detect.contains(r#"EXT="JPG""#));
     assert!(detect.contains(r#"EXT="PNG""#));
     assert!(detect.contains(r#"EXT="MP4""#));

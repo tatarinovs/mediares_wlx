@@ -156,6 +156,20 @@ pub fn is_video_meta_cached(path: &Path) -> bool {
     video_meta_cache().contains(path)
 }
 
+fn audio_meta_cache() -> &'static MetaCache<crate::mf_audio::AudioStreamMeta> {
+    static AUDIO: OnceLock<MetaCache<crate::mf_audio::AudioStreamMeta>> = OnceLock::new();
+    AUDIO.get_or_init(MetaCache::new)
+}
+
+/// Audio stream properties via Media Foundation, for files lofty can't parse (WMA, AC3...).
+pub fn get_audio_meta(path: &Path) -> Option<Arc<crate::mf_audio::AudioStreamMeta>> {
+    audio_meta_cache().get_or_read(path, crate::mf_audio::probe_audio_meta)
+}
+
+pub fn is_audio_meta_cached(path: &Path) -> bool {
+    audio_meta_cache().contains(path)
+}
+
 /// Title, artist... of MKV/WebM and MP4/MOV: header reads only.
 pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> {
     static VIDEO_TAGS: OnceLock<MetaCache<crate::video_tags::VideoTags>> = OnceLock::new();

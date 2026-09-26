@@ -85,7 +85,7 @@ unsafe fn open_reader(path: &Path, video_processing: bool) -> windows::core::Res
     open_reader_for(path, STREAM, video_processing)
 }
 
-unsafe fn open_reader_for(path: &Path, stream: u32, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
+pub(crate) unsafe fn open_reader_for(path: &Path, stream: u32, video_processing: bool) -> windows::core::Result<IMFSourceReader> {
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut attributes: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut attributes, 1)?;
@@ -99,7 +99,7 @@ unsafe fn open_reader_for(path: &Path, stream: u32, video_processing: bool) -> w
     Ok(reader)
 }
 
-unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
+pub(crate) unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
     reader
         .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
         .ok()
@@ -202,7 +202,7 @@ fn video_codec_name(guid: &GUID) -> Option<String> {
     Some(name.into())
 }
 
-fn audio_codec_name(guid: &GUID) -> Option<String> {
+pub(crate) fn audio_codec_name(guid: &GUID) -> Option<String> {
     if *guid == DOLBY_AC3 {
         return Some("AC-3".into());
     }

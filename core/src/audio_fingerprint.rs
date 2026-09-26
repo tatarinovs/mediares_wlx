@@ -16,6 +16,7 @@ use std::path::Path;
 
 use crate::audio_decode::AudioDecoder;
 use crate::cache::AudioAnalysis;
+use crate::mf_audio::MfAudioReader;
 
 const ANALYSIS_RATE: u32 = 11_025;
 const FFT_SIZE: usize = 1024;
@@ -45,24 +46,63 @@ pub enum AudioError {
     Unsupported,
 }
 
+/// Interleaved PCM from either decoder.
+trait PcmSource {
+    fn format(&self) -> (u32, usize);
+    fn next_samples(&mut self) -> Option<&[f32]>;
+}
+
+impl PcmSource for AudioDecoder {
+    fn format(&self) -> (u32, usize) {
+        (self.sample_rate, self.channels as usize)
+    }
+
+    fn next_samples(&mut self) -> Option<&[f32]> {
+        self.next_chunk().map(|c| c.samples)
+    }
+}
+
+impl PcmSource for MfAudioReader {
+    fn format(&self) -> (u32, usize) {
+        (self.sample_rate, self.channels as usize)
+    }
+
+    fn next_samples(&mut self) -> Option<&[f32]> {
+        self.next_chunk()
+    }
+}
+
+/// Decodes with symphonia; files it can't open or decode go through Media Foundation, whose
+/// results depend on the system's decoders (still stable on one machine, which is what TC's
+/// duplicate search compares).
 pub fn analyze_audio(path: &Path, cancelled: &dyn Fn() -> bool) -> Result<AudioAnalysis, AudioError> {
-    let mut decoder = AudioDecoder::open(path).ok_or(AudioError::Unsupported)?;
-    let (rate, channels) = (decoder.sample_rate, decoder.channels as usize);
+    if let Some(mut decoder) = AudioDecoder::open(path) {
+        match analyze_source(&mut decoder, cancelled) {
+            Err(AudioError::Unsupported) => {}
+            result => return result,
+        }
+    }
+    let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
+    analyze_source(&mut reader, cancelled)
+}
+
+fn analyze_source(source: &mut dyn PcmSource, cancelled: &dyn Fn() -> bool) -> Result<AudioAnalysis, AudioError> {
+    let (rate, channels) = source.format();
     let mut pcm = PcmHash::new(rate, channels);
     let mut bands = BandAnalyzer::new(rate);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
-    while let Some(chunk) = decoder.next_chunk() {
+    while let Some(samples) = source.next_samples() {
         chunks += 1;
         if chunks.is_multiple_of(CANCEL_CHECK_EVERY) && cancelled() {
             return Err(AudioError::Cancelled);
         }
-        pcm.update(chunk.samples);
-        for frame in chunk.samples.chunks_exact(channels) {
+        pcm.update(samples);
+        for frame in samples.chunks_exact(channels) {
             bands.push(frame.iter().sum::<f32>() / channels as f32);
         }
-        frames_total += (chunk.samples.len() / channels) as u64;
+        frames_total += (samples.len() / channels) as u64;
     }
     if frames_total == 0 {
         return Err(AudioError::Unsupported);

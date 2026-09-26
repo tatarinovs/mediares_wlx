@@ -37,7 +37,7 @@ pub fn read_video_tags(path: &Path) -> VideoTags {
     let mut r = BufReader::new(file);
     let tags = match ext.as_str() {
         "mkv" | "webm" | "mka" | "mk3d" => read_matroska(&mut r),
-        "mp4" | "m4v" | "mov" | "3gp" | "3g2" => read_mp4(&mut r),
+        "mp4" | "m4v" | "mov" | "qt" | "3gp" | "3g2" => read_mp4(&mut r),
         _ => None,
     };
     tags.unwrap_or_default()
