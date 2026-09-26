@@ -1,20 +1,14 @@
 //! Photo view: zoom/pan/loupe geometry and GDI double-buffered rendering with the OSD overlay.
 
-use std::mem::size_of;
-
-use windows::core::PCWSTR;
-use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
+use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreateSolidBrush, DeleteDC,
-    DeleteObject, DrawTextW, FillRect, GetDeviceCaps, GetStockObject, SelectObject, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchDIBits, BITMAPINFO, BITMAPINFOHEADER,
-    BI_RGB, CLIP_DEFAULT_PRECIS, COLORONCOLOR, DEFAULT_CHARSET, DEFAULT_GUI_FONT, DEFAULT_QUALITY,
-    DIB_RGB_COLORS, DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX, DT_SINGLELINE,
-    DT_TOP, DT_VCENTER, FW_BOLD, HALFTONE, HDC, HFONT, LOGPIXELSY, OUT_DEFAULT_PRECIS, SRCCOPY,
-    TRANSPARENT,
+    GetDeviceCaps, GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, COLORONCOLOR,
+    DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX,
+    DT_SINGLELINE, DT_TOP, DT_VCENTER, HALFTONE, HDC, HFONT, LOGPIXELSY, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
+use crate::gdi::{self, Font};
 use crate::image_cache::{DecodedImage, BACKGROUND};
 use crate::osd_template;
 use crate::state::{Loupe, ViewerState, ZoomMode};
@@ -182,69 +176,39 @@ fn visible_span(
     Some((s0 as i32, (s1 - s0) as i32, d0, (d1 - d0).max(1)))
 }
 
-pub unsafe fn paint(hdc: HDC, state: Option<&mut ViewerState>, win_w: i32, win_h: i32) {
-    if win_w <= 0 || win_h <= 0 {
-        return;
-    }
-    let mem_dc = CreateCompatibleDC(Some(hdc));
-    if mem_dc.is_invalid() {
-        return;
-    }
-    let mem_bmp = CreateCompatibleBitmap(hdc, win_w, win_h);
-    if mem_bmp.is_invalid() {
-        let _ = DeleteDC(mem_dc);
-        return;
-    }
-    let old_bmp = SelectObject(mem_dc, mem_bmp.into());
-
+pub unsafe fn paint(
+    hdc: HDC,
+    state: Option<&mut ViewerState>,
+    win_w: i32,
+    win_h: i32,
+    dirty: RECT,
+) {
     let bg = state
         .as_ref()
         .map_or(BACKGROUND, |s| s.config.photo_background);
-    let bg_brush = CreateSolidBrush(COLORREF(bg));
-    FillRect(
-        mem_dc,
-        &RECT {
-            left: 0,
-            top: 0,
-            right: win_w,
-            bottom: win_h,
-        },
-        bg_brush,
-    );
-    let _ = DeleteObject(bg_brush.into());
-
-    if let Some(state) = state {
+    gdi::with_buffer(hdc, win_w, win_h, dirty, |dc| unsafe {
+        let window = gdi::rect(win_w, win_h);
+        gdi::fill(dc, window, bg);
+        let Some(state) = state else { return };
         if let Some(img) = state.image.clone() {
-            draw_image(mem_dc, state, &img, (win_w as f32, win_h as f32));
+            draw_image(dc, state, &img, (win_w as f32, win_h as f32));
         } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
-            draw_fitted(
-                mem_dc,
-                &prev,
-                RECT {
-                    left: 0,
-                    top: 0,
-                    right: win_w,
-                    bottom: win_h,
-                },
-            );
+            draw_fitted(dc, &prev, window);
         } else if state.load_failed {
-            draw_centered_text(
-                mem_dc,
+            let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
+            gdi::text(
+                dc,
+                window,
                 "Не удалось открыть изображение",
-                win_w,
-                win_h,
+                Some(font),
                 muted_text_color(bg),
+                DT_CENTER | DT_VCENTER | DT_SINGLELINE,
             );
         }
         if state.config.osd.photo() {
-            draw_osd(mem_dc, state);
+            draw_osd(dc, state);
         }
-    }
-
-    let _ = BitBlt(hdc, 0, 0, win_w, win_h, Some(mem_dc), 0, 0, SRCCOPY);
-    SelectObject(mem_dc, old_bmp);
-    let _ = DeleteObject(mem_bmp.into());
-    let _ = DeleteDC(mem_dc);
+    });
 }
 
 /// Gray text that stays readable on the COLORREF `background`.
@@ -260,26 +224,6 @@ fn muted_text_color(background: u32) -> u32 {
     } else {
         0x00A0_A0A0
     }
-}
-
-unsafe fn draw_centered_text(dc: HDC, text: &str, win_w: i32, win_h: i32, color: u32) {
-    let mut text: Vec<u16> = text.encode_utf16().collect();
-    let mut rc = RECT {
-        left: 0,
-        top: 0,
-        right: win_w,
-        bottom: win_h,
-    };
-    let old_font = SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, COLORREF(color));
-    DrawTextW(
-        dc,
-        &mut text,
-        &mut rc,
-        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
-    );
-    SelectObject(dc, old_font);
 }
 
 /// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio.
@@ -300,66 +244,36 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
         rect.left + (rw as i32 - dw) / 2,
         rect.top + (rh as i32 - dh) / 2,
     );
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: img.width as i32,
-            biHeight: -(img.height as i32),
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    SetStretchBltMode(dc, if s < 1.0 { HALFTONE } else { COLORONCOLOR });
-    let _ = SetBrushOrgEx(dc, 0, 0, None);
     let (w, h) = (img.width as i32, img.height as i32);
-    StretchDIBits(
-        dc,
-        dx,
-        dy,
-        dw,
-        dh,
-        0,
-        0,
-        w,
-        h,
-        Some(img.bgra.as_ptr() as *const _),
-        &bmi,
-        DIB_RGB_COLORS,
-        SRCCOPY,
-    );
+    stretch(dc, img, (0, w, dx, dw), (0, h, dy, dh), s < 1.0);
 }
 
 unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
     let s = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
-    let (Some((sx, sw, dx, dw)), Some((sy, sh, dy, dh))) = (
+    if let (Some(x), Some(y)) = (
         visible_span(ox, s, img.width, view.0),
         visible_span(oy, s, img.height, view.1),
-    ) else {
-        return;
-    };
+    ) {
+        stretch(dc, img, x, y, s < 1.0);
+    }
+}
 
+/// Copies source columns / rows `(start, len)` onto destination `(start, len)` spans.
+/// Shrinking uses HALFTONE (averaging), enlarging plain pixel replication.
+unsafe fn stretch(
+    dc: HDC,
+    img: &DecodedImage,
+    (sx, sw, dx, dw): (i32, i32, i32, i32),
+    (sy, sh, dy, dh): (i32, i32, i32, i32),
+    shrinking: bool,
+) {
     // Point the DIB at the first visible row instead of using ySrc: StretchDIBits interprets
     // ySrc of top-down DIBs inconsistently across Windows versions.
     let stride = img.width as usize * 4;
     let rows = &img.bgra[sy as usize * stride..(sy + sh) as usize * stride];
-    let bmi = BITMAPINFO {
-        bmiHeader: BITMAPINFOHEADER {
-            biSize: size_of::<BITMAPINFOHEADER>() as u32,
-            biWidth: img.width as i32,
-            biHeight: -sh,
-            biPlanes: 1,
-            biBitCount: 32,
-            biCompression: BI_RGB.0,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    if s < 1.0 {
+    let bmi = gdi::bitmap_info(img.width, -sh);
+    if shrinking {
         SetStretchBltMode(dc, HALFTONE);
         let _ = SetBrushOrgEx(dc, 0, 0, None);
     } else {
@@ -436,62 +350,37 @@ fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
 }
 
 unsafe fn osd_font(dc: HDC, state: &mut ViewerState) -> HFONT {
-    if let Some(font) = state.osd_font {
-        return font;
-    }
-    let font = create_osd_font(
-        &state.config.osd_font_name,
-        state.config.osd_font_size,
-        GetDeviceCaps(Some(dc), LOGPIXELSY),
-    );
-    state.osd_font = Some(font);
-    font
+    let config = &state.config;
+    state
+        .osd_font
+        .get_or_insert_with(|| unsafe {
+            create_osd_font(
+                &config.osd_font_name,
+                config.osd_font_size,
+                GetDeviceCaps(Some(dc), LOGPIXELSY),
+            )
+        })
+        .0
 }
 
 /// The OSD font (bold, `size_pt` points at `dpi`); shared by the photo and video OSD.
-pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> HFONT {
-    let height = -((size_pt * dpi + 36) / 72);
-    let face: Vec<u16> = face.encode_utf16().chain(Some(0)).collect();
-    CreateFontW(
-        height,
-        0,
-        0,
-        0,
-        FW_BOLD.0 as i32,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY,
-        0,
-        PCWSTR(face.as_ptr()),
-    )
+pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> Font {
+    gdi::create_font(face, -((size_pt * dpi + 36) / 72), true)
 }
 
 /// OSD text (may span lines) with a 1px black drop shadow, readable over any picture.
 pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
-    let mut text: Vec<u16> = text.encode_utf16().collect();
-    let old_font = SelectObject(dc, font.into());
-    SetBkMode(dc, TRANSPARENT);
     for (offset, color) in [(1, 0), (0, color)] {
-        SetTextColor(dc, COLORREF(color));
         let (x, y) = (OSD_MARGIN + offset, OSD_MARGIN + offset);
-        let mut rc = RECT {
+        let at = RECT {
             left: x,
             top: y,
             right: x + 1,
             bottom: y + 1,
         };
-        DrawTextW(
-            dc,
-            &mut text,
-            &mut rc,
-            DT_LEFT | DT_TOP | DT_NOCLIP | DT_NOPREFIX | DT_EXPANDTABS,
-        );
+        let flags = DT_LEFT | DT_TOP | DT_NOCLIP | DT_NOPREFIX | DT_EXPANDTABS;
+        gdi::text(dc, at, text, Some(font), color, flags);
     }
-    SelectObject(dc, old_font);
 }
 
 unsafe fn draw_osd(dc: HDC, state: &mut ViewerState) {

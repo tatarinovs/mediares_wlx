@@ -52,8 +52,8 @@ pub unsafe fn show(
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
-    let font = dialog::create_font(w!("Segoe UI"), -12);
-    let mono = dialog::create_font(w!("Consolas"), -14);
+    let font = crate::gdi::create_font("Segoe UI", -12, false);
+    let mono = crate::gdi::create_font("Consolas", -14, false);
     let tab = WS_TABSTOP.0;
     let hint =
         "{поле} — значение поля. <…> — блок, который скрывается, если в нём есть пустое поле.\n\

@@ -11,7 +11,6 @@
 ```
 mediares_wlx/
 ├── Cargo.toml                  # Workspace root
-├── PLAN.md                     # Дорожная карта и архитектурный план
 ├── core/                       # Общая библиотека (lib), без Win32-окон:
 │   ├── tc_api.rs               # WDX/WLX C ABI структуры и константы
 │   ├── ffi.rs                  # catch_unwind-обёртка и конвертация строк на границе с TC
@@ -25,7 +24,7 @@ mediares_wlx/
 │   ├── mf_init.rs              # Жизненный цикл COM / Media Foundation
 │   ├── video_frame.rs          # Кадры на 25/50/75% через IMFSourceReader и фингерпринт
 │   ├── audio_decode.rs         # Декодирование аудио в PCM (symphonia), точная перемотка — фича audio-decode
-│   ├── audio_tags.rs           # Теги и обложка (lofty) — фича tags
+│   ├── audio_tags.rs           # Теги и обложка (symphonia: ID3v1/v2, APE, Vorbis, MP4, RIFF; починка кодировки cp1251) — фича tags
 │   ├── audio_fingerprint.rs    # Поля аудио-дубликатов: отпечаток, хеш PCM, длительность
 │   ├── mf_audio.rs             # Аудио через Media Foundation (WMA, AC3, Opus): PCM и параметры потока
 │   ├── cache.rs                # Потокобезопасный LRU-кэш анализа (ключ: путь + размер + mtime)
@@ -48,12 +47,13 @@ mediares_wlx/
 │   ├── playback_video.rs       # IMFMediaEngine (frame-server) + D3D11 swap chain
 │   ├── video_view.rs           # Поверхность видео (letterbox), скорость, покадровый шаг, события
 │   ├── resume.rs               # Позиции остановки длинных видео (mediares_resume.txt)
-│   ├── playback_audio.rs       # Аудио: поток-декодер symphonia → источник rodio (WASAPI)
+│   ├── playback_audio.rs       # Аудио: поток-декодер symphonia → поток WASAPI (shared, конвертация формата силами Windows)
 │   ├── audio_view.rs           # Обложка + теги; fallback на Media Foundation (WMA, Opus, AC3)
 │   ├── playlist.rs             # Очередь: автопереход, повтор, случайный порядок, чтение M3U
 │   ├── transport_bar.rs        # Панель управления: ⏮ play/pause ⏭, время, таймлайн, звук
 │   ├── config.rs               # Настройки mediares.ini
 │   ├── dialog.rs               # Общие хелперы модальных диалогов
+│   ├── gdi.rs                  # Общие GDI-хелперы: двойная буферизация, шрифты, текст, заливки, DPI
 │   ├── exif_dialog.rs          # Окно EXIF-метаданных
 │   ├── settings_dialog.rs      # Окно настроек
 │   └── examples/lister_harness.rs  # Dev-стенд: хост-окно как у TC, сценарий и скриншоты
@@ -100,9 +100,9 @@ RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/
 MPEG-2 PS), декодирование через системные кодеки Media Foundation.
 
 **Аудио** — MP3, MP2, FLAC, WAV, OGG/OGA (Vorbis), M4A/M4B (AAC, ALAC), AAC, AIFF/AIFC, CAF, MKA декодируются
-на чистом Rust (`symphonia`, вывод через `rodio`/WASAPI) и не зависят от установленных кодеков. WMA, Opus и AC3,
+на чистом Rust (`symphonia`, вывод напрямую в WASAPI) и не зависят от установленных кодеков. WMA, Opus и AC3,
 которых нет в symphonia, играются через Media Foundation. Показываются обложка (встроенная или
-`cover`/`folder`/`front.jpg` из папки), название, исполнитель, альбом, год и параметры потока (`lofty`).
+`cover`/`folder`/`front.jpg` из папки), название, исполнитель, альбом, год и параметры потока (`symphonia`).
 
 Если файл не удаётся открыть, `ListLoad` возвращает NULL и TC пробует другой плагин.
 
@@ -117,7 +117,7 @@ MPEG-2 PS), декодирование через системные кодек�
 | Следующий / предыдущий ключевой кадр (аудио: ±1 с) | ↑ / ↓ |
 | Скорость видео 0,25×–2× / обычная | [ / ] / \ |
 | Кадр назад / вперёд (с паузой; удержание — несколько кадров). В MPG/MPEG/VOB — только вперёд: их источник Media Foundation не перематывает точно | , / . |
-| Громкость | + / −, колесо мыши, ползунок; M — без звука |
+| Громкость | + / −, колесо мыши над панелью управления или Ctrl+колесо, ползунок; M — без звука |
 | Следующий / предыдущий трек (только аудио/видео) | кнопки ⏭ / ⏮ на панели, мультимедийные клавиши |
 | Следующий / предыдущий файл | N / P, PgDn / PgUp, Backspace |
 | Полноэкранный режим | Enter, F, F11, двойной клик; Esc — выход |
@@ -171,19 +171,20 @@ EXIF берётся из того же чтения, что нужно для а
 | `Audio_Duration_Sec` | Длительность, округлённая до секунды |
 | `Audio_Artist_Title` | «исполнитель - название» из тегов: в нижнем регистре, без знаков препинания |
 
-Для колонок, подсказок и поиска по содержимому есть поля тегов (ID3, Vorbis comments, MP4, APE, RIFF INFO
-через `lofty`): `Audio_Artist`, `Audio_Title`, `Audio_Album`, `Audio_Album_Artist`, `Audio_Genre`,
+Для колонок, подсказок и поиска по содержимому есть поля тегов (ID3v1/v2, Vorbis comments, MP4, APE, RIFF INFO,
+Matroska — их читает тот же `symphonia`, что и декодирует; текст, записанный в cp1251 или UTF-8 под видом Latin-1,
+перекодируется): `Audio_Artist`, `Audio_Title`, `Audio_Album`, `Audio_Album_Artist`, `Audio_Genre`,
 `Audio_Comment`, `Audio_Year`, `Audio_Track`, `Audio_Disc`, `Audio_Length` (ч:мм:сс), `Audio_Bitrate_kbps`,
 `Audio_Sample_Rate_Hz`, `Audio_Channels`, `Audio_Bit_Depth`, `Audio_Has_Cover`, `Audio_Composer`,
-`Audio_Track_Total`, `Audio_Disc_Total`, `Audio_Codec` (MP3, AAC, ALAC, FLAC, Opus, Vorbis, Monkey's Audio,
-WavPack, PCM...) и `Audio_Lossless` (да/нет — удобно искать lossless-версии треков). Они читают только заголовки
+`Audio_Track_Total`, `Audio_Disc_Total`, `Audio_Codec` (MP3, AAC, ALAC, FLAC, Opus, Vorbis,
+PCM...) и `Audio_Lossless` (да/нет — удобно искать lossless-версии треков). Они читают только заголовки
 и теги, поэтому не требуют декодирования и не откладываются (кроме случая ниже); теги файла кэшируются, так что несколько
 колонок читают их один раз.
 
 Файлы, которые не открывает symphonia (WMA, Opus, AC3 и всё, для чего в системе есть декодер), для полей
 дубликатов декодируются через Media Foundation (`IMFSourceReader`). `Audio_PCM_Hash` у них зависит от
-установленных в системе декодеров: стабилен на одной машине, но может отличаться на другой. Если теги файла
-не читаются `lofty` (WMA, AC3), параметры потока (`Audio_Length`, `Audio_Bitrate_kbps`, `Audio_Sample_Rate_Hz`,
+установленных в системе декодеров: стабилен на одной машине, но может отличаться на другой. Если файл
+не открывается `symphonia` (WMA, AC3), параметры потока (`Audio_Length`, `Audio_Bitrate_kbps`, `Audio_Sample_Rate_Hz`,
 `Audio_Channels`, `Audio_Bit_Depth`, `Audio_Codec`, `Audio_Lossless`) берутся из Media Foundation — такие поля
 откладываются, как видео.
 

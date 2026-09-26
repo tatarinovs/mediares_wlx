@@ -5,15 +5,16 @@
 
 use std::sync::Mutex;
 
-use windows::Win32::Foundation::{COLORREF, POINT, RECT};
+use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreatePen, CreateSolidBrush, DeleteObject, DrawTextW, FillRect, Polygon, SelectObject,
-    SetBkMode, SetTextColor, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER, HDC,
-    HFONT, PS_NULL, TRANSPARENT,
+    SelectObject, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
+    HDC, HFONT,
 };
 
+use crate::gdi::{self, contains, fill, polygon};
+
 const BAR_HEIGHT: f32 = 40.0;
-const BG: u32 = 0x00202020;
+pub const BG: u32 = 0x00202020;
 const TRACK: u32 = 0x00505050;
 const FILL: u32 = 0x00E0A040; // COLORREF is BGR: a light blue
 const ICON: u32 = 0x00E8E8E8;
@@ -197,10 +198,6 @@ pub fn layout(width: i32, height_px: i32, dpi_scale: f32, skip: bool) -> Layout 
     }
 }
 
-fn contains(r: &RECT, x: i32, y: i32) -> bool {
-    x >= r.left && x < r.right && y >= r.top && y < r.bottom
-}
-
 fn fraction(r: &RECT, x: i32) -> f64 {
     let w = (r.right - r.left).max(1) as f64;
     ((x - r.left) as f64 / w).clamp(0.0, 1.0)
@@ -339,24 +336,6 @@ pub fn format_time(seconds: f64) -> String {
     }
 }
 
-unsafe fn fill(dc: HDC, r: RECT, color: u32) {
-    let brush = CreateSolidBrush(COLORREF(color));
-    FillRect(dc, &r, brush);
-    let _ = DeleteObject(brush.into());
-}
-
-unsafe fn polygon(dc: HDC, points: &[POINT], color: u32) {
-    let brush = CreateSolidBrush(COLORREF(color));
-    let pen = CreatePen(PS_NULL, 0, COLORREF(0));
-    let old_brush = SelectObject(dc, brush.into());
-    let old_pen = SelectObject(dc, pen.into());
-    let _ = Polygon(dc, points);
-    SelectObject(dc, old_pen);
-    SelectObject(dc, old_brush);
-    let _ = DeleteObject(pen.into());
-    let _ = DeleteObject(brush.into());
-}
-
 /// Thin horizontal track through the middle of `r`, filled up to `value` (0..=1).
 unsafe fn slider(dc: HDC, r: RECT, value: f64, thickness: i32) {
     let mid = (r.top + r.bottom) / 2;
@@ -389,17 +368,64 @@ unsafe fn slider(dc: HDC, r: RECT, value: f64, thickness: i32) {
     );
 }
 
-unsafe fn text(
-    dc: HDC,
-    r: RECT,
-    s: &str,
-    color: u32,
-    flags: windows::Win32::Graphics::Gdi::DRAW_TEXT_FORMAT,
-) {
-    let mut wide: Vec<u16> = s.encode_utf16().collect();
-    let mut rc = r;
-    SetTextColor(dc, COLORREF(color));
-    DrawTextW(dc, &mut wide, &mut rc, flags | DT_SINGLELINE | DT_VCENTER);
+unsafe fn text(dc: HDC, r: RECT, s: &str, color: u32, flags: DRAW_TEXT_FORMAT) {
+    gdi::text(dc, r, s, None, color, flags | DT_SINGLELINE | DT_VCENTER);
+}
+
+/// Play triangle, or pause bars while `playing`, centred in `r`.
+pub unsafe fn play_icon(dc: HDC, r: RECT, playing: bool, dpi_scale: f32) {
+    let s = |v: f32| (v * dpi_scale).round() as i32;
+    let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    let h = s(8.0);
+    if playing {
+        let (w, gap) = (s(4.0), s(3.0));
+        for left in [cx - gap - w, cx + gap] {
+            let bar = RECT {
+                left,
+                top: cy - h,
+                right: left + w,
+                bottom: cy + h,
+            };
+            fill(dc, bar, ICON);
+        }
+    } else {
+        let points = [
+            POINT {
+                x: cx - h * 2 / 3,
+                y: cy - h,
+            },
+            POINT {
+                x: cx - h * 2 / 3,
+                y: cy + h,
+            },
+            POINT { x: cx + h, y: cy },
+        ];
+        polygon(dc, &points, ICON);
+    }
+}
+
+/// Previous / next: a triangle pointing away from the play button, ending in a bar.
+pub unsafe fn skip_icon(dc: HDC, r: RECT, forward: bool, dpi_scale: f32) {
+    let s = |v: f32| (v * dpi_scale).round() as i32;
+    let dir = if forward { 1 } else { -1 };
+    let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+    let (h, w) = (s(6.0), s(7.0));
+    let tip = cx + dir * w / 2;
+    let base = cx - dir * w / 2;
+    let points = [
+        POINT { x: base, y: cy - h },
+        POINT { x: base, y: cy + h },
+        POINT { x: tip, y: cy },
+    ];
+    polygon(dc, &points, ICON);
+    let bar_x = if forward { tip } else { tip - s(2.0) };
+    let bar = RECT {
+        left: bar_x,
+        top: cy - h,
+        right: bar_x + s(2.0),
+        bottom: cy + h,
+    };
+    fill(dc, bar, ICON);
 }
 
 /// A text shown instead of the timeline.
@@ -420,83 +446,12 @@ pub unsafe fn paint(
     let s = |v: f32| (v * dpi_scale).round() as i32;
     fill(dc, l.bar, BG);
     let old_font = SelectObject(dc, font.into());
-    SetBkMode(dc, TRANSPARENT);
 
-    // Play / pause icon.
-    let (cx, cy) = (
-        (l.play.left + l.play.right) / 2,
-        (l.play.top + l.play.bottom) / 2,
-    );
-    let r = s(8.0);
-    if state.playing {
-        let (w, gap) = (s(4.0), s(3.0));
-        fill(
-            dc,
-            RECT {
-                left: cx - gap - w,
-                top: cy - r,
-                right: cx - gap,
-                bottom: cy + r,
-            },
-            ICON,
-        );
-        fill(
-            dc,
-            RECT {
-                left: cx + gap,
-                top: cy - r,
-                right: cx + gap + w,
-                bottom: cy + r,
-            },
-            ICON,
-        );
-    } else {
-        polygon(
-            dc,
-            &[
-                POINT {
-                    x: cx - r * 2 / 3,
-                    y: cy - r,
-                },
-                POINT {
-                    x: cx - r * 2 / 3,
-                    y: cy + r,
-                },
-                POINT { x: cx + r, y: cy },
-            ],
-            ICON,
-        );
-    }
-
-    // Previous / next: a triangle pointing away from the play button, ending in a bar.
-    for (r, dir) in [(l.prev, -1), (l.next, 1)] {
-        if r.right <= r.left {
-            continue;
+    play_icon(dc, l.play, state.playing, dpi_scale);
+    for (r, forward) in [(l.prev, false), (l.next, true)] {
+        if r.right > r.left {
+            skip_icon(dc, r, forward, dpi_scale);
         }
-        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-        let (h, w) = (s(6.0), s(7.0));
-        let tip = cx + dir * w / 2;
-        let base = cx - dir * w / 2;
-        polygon(
-            dc,
-            &[
-                POINT { x: base, y: cy - h },
-                POINT { x: base, y: cy + h },
-                POINT { x: tip, y: cy },
-            ],
-            ICON,
-        );
-        let bar_x = if dir > 0 { tip } else { tip - s(2.0) };
-        fill(
-            dc,
-            RECT {
-                left: bar_x,
-                top: cy - h,
-                right: bar_x + s(2.0),
-                bottom: cy + h,
-            },
-            ICON,
-        );
     }
 
     let time = format!(

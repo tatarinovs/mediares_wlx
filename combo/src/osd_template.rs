@@ -190,20 +190,8 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
     })
 }
 
-/// Video fields that need the file's stream properties or tags (read once per file, on demand).
-pub const VIDEO_DETAIL_KEYS: &[&str] = &[
-    "codec",
-    "bitrate",
-    "audio_codec",
-    "channels",
-    "sample_rate",
-    "title",
-    "artist",
-    "director",
-    "year",
-    "genre",
-    "comment",
-];
+/// Video fields that need the file's tags (read on demand).
+pub const VIDEO_TAG_KEYS: &[&str] = &["title", "artist", "director", "year", "genre", "comment"];
 
 /// Stream and tag fields of a video; `""` when unknown. `None`: not such a field.
 pub fn video_field(meta: Option<&VideoMeta>, tags: &VideoTags, key: &str) -> Option<String> {

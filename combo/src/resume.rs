@@ -63,7 +63,7 @@ fn update(mut entries: Vec<Entry>, video: &Path, position: Option<f64>) -> Vec<E
 
 /// NTFS names are case-insensitive, Cyrillic included.
 fn same(a: &Path, b: &Path) -> bool {
-    a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase()
+    crate::state::same_path(a, b)
 }
 
 #[cfg(test)]

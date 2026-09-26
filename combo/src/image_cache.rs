@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use mediares_core::cache::FileKey;
-use mediares_core::exif::{read_exif, ExifInfo};
+use mediares_core::exif::ExifInfo;
 use mediares_core::image::DynamicImage;
-use mediares_core::image_decode::{apply_exif_orientation, decode_bytes, decode_file};
+use mediares_core::image_decode::{decode_bytes, decode_oriented};
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -304,13 +304,7 @@ fn worker_loop() {
 }
 
 fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<DecodedImage> {
-    let mut img = decode_file(path, kind)?;
-    let exif = read_exif(path);
-    if options.auto_rotate {
-        if let Some(orientation) = exif.as_ref().and_then(|e| e.orientation) {
-            apply_exif_orientation(&mut img, orientation);
-        }
-    }
+    let (img, exif) = decode_oriented(path, kind, options.auto_rotate)?;
     Some(DecodedImage {
         exif,
         ..to_bgra(img, options.background, kind == MediaType::RawImage)

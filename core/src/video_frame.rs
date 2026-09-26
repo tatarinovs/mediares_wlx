@@ -18,7 +18,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
 
-use crate::mf_init::{ensure_mf_started, ComScope};
+use crate::mf_init::{mf_scope, ComScope};
 
 #[derive(Debug, Clone)]
 pub struct VideoAnalysis {
@@ -37,16 +37,6 @@ impl VideoAnalysis {
     pub fn dimensions_str(&self) -> String {
         format!("{}x{}", self.width, self.height)
     }
-}
-
-/// Basic stream properties, cheap to obtain (no decoding).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct VideoInfo {
-    pub width: u32,
-    pub height: u32,
-    pub duration_sec: f64,
-    /// Frames per second (0 if the stream doesn't say).
-    pub frame_rate: f64,
 }
 
 /// Stream properties for WDX columns: codecs, frame rate, bitrate, the audio track. No decoding.
@@ -117,46 +107,29 @@ pub(crate) unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
         .unwrap_or(0)
 }
 
-/// Checks that Media Foundation can open the file and has a video stream; returns its properties.
-pub fn probe_video(path: &Path) -> Option<VideoInfo> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return None;
-    }
-    unsafe {
-        let reader = open_reader(path, false).ok()?;
-        let native = reader.GetNativeMediaType(STREAM, 0).ok()?;
-        let frame_size = native.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-        // Packed as numerator << 32 | denominator.
-        let rate = native.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
-        let (num, den) = ((rate >> 32) as u32, rate as u32);
-        Some(VideoInfo {
-            width: (frame_size >> 32) as u32,
-            height: frame_size as u32,
-            duration_sec: duration_hns(&reader) as f64 / 10_000_000.0,
-            frame_rate: if den > 0 {
-                num as f64 / den as f64
-            } else {
-                0.0
-            },
-        })
-    }
+pub(crate) unsafe fn duration_sec(reader: &IMFSourceReader) -> f64 {
+    duration_hns(reader) as f64 / HNS_PER_SEC
+}
+
+/// Average bitrate of the whole file (size / duration), kbit/s.
+pub(crate) fn file_bitrate_kbps(path: &Path, duration_sec: f64) -> Option<u32> {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    (duration_sec >= 1.0 && size > 0)
+        .then(|| (size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32)
 }
 
 /// Reads [`VideoMeta`] from the native media types of the first video and audio streams.
+/// Also the check that Media Foundation can open the file and has a video stream.
 pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return None;
-    }
+    let _com = mf_scope()?;
     unsafe {
         let reader = open_reader(path, false).ok()?;
         let video = reader.GetNativeMediaType(STREAM, 0).ok()?;
         let frame_size = video.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        // Packed as numerator << 32 | denominator.
         let rate = video.GetUINT64(&MF_MT_FRAME_RATE).unwrap_or(0);
         let (num, den) = ((rate >> 32) as u32, rate as u32);
-        let duration_sec = duration_hns(&reader) as f64 / 10_000_000.0;
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let duration_sec = duration_sec(&reader);
         let audio = reader
             .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
             .ok();
@@ -174,8 +147,7 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
                 .GetGUID(&MF_MT_SUBTYPE)
                 .ok()
                 .and_then(|g| video_codec_name(&g)),
-            bitrate_kbps: (duration_sec >= 1.0 && file_size > 0)
-                .then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32),
+            bitrate_kbps: file_bitrate_kbps(path, duration_sec),
             audio_codec: audio
                 .as_ref()
                 .and_then(|a| a.GetGUID(&MF_MT_SUBTYPE).ok())
@@ -267,29 +239,12 @@ pub(crate) fn audio_codec_name(guid: &GUID) -> Option<String> {
     Some(name.into())
 }
 
-/// Checks that Media Foundation can open the file and has an audio stream; returns the duration
-/// in seconds.
-pub fn probe_audio(path: &Path) -> Option<f64> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return None;
-    }
-    unsafe {
-        let stream = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
-        let reader = open_reader_for(path, stream, false).ok()?;
-        reader.GetNativeMediaType(stream, 0).ok()?;
-        Some(duration_hns(&reader) as f64 / 10_000_000.0)
-    }
-}
-
 pub fn analyze_video(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<VideoAnalysis, VideoError> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return Err(VideoError::Failed("Media Foundation is unavailable".into()));
-    }
+    let _com =
+        mf_scope().ok_or_else(|| VideoError::Failed("Media Foundation is unavailable".into()))?;
     let check = || {
         if cancelled() {
             Err(VideoError::Cancelled)
@@ -309,18 +264,8 @@ pub fn analyze_video(
             PixelFormat::Nv12
         };
 
-        let current = reader.GetCurrentMediaType(STREAM)?;
-        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
-        let geometry = FrameGeometry {
-            width: (frame_size >> 32) as u32,
-            height: frame_size as u32,
-            // MF_MT_DEFAULT_STRIDE is a signed value stored as UINT32; negative means bottom-up.
-            default_stride: current
-                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
-                .map(|s| s as i32)
-                .unwrap_or(0),
-            format,
-        };
+        let geometry = FrameGeometry::current(&reader, format)
+            .ok_or_else(|| VideoError::Failed("no output media type".into()))?;
 
         let duration_hns = duration_hns(&reader);
         let duration_sec = (duration_hns / 10_000_000) as u32;
@@ -348,26 +293,18 @@ pub fn analyze_video(
 /// Decodes the frame at `fraction` (0..1) of the duration as RGBA — for thumbnails. The source
 /// reader lands on the key frame before that position, which is fine for a preview.
 pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return None;
-    }
+    let _com = mf_scope()?;
     unsafe {
         let reader = open_reader(path, true).ok()?;
         set_output_format(&reader, &MFVideoFormat_RGB32).ok()?;
-        let current = reader.GetCurrentMediaType(STREAM).ok()?;
-        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
-        let (width, height) = ((frame_size >> 32) as u32, frame_size as u32);
+        let geo = FrameGeometry::current(&reader, PixelFormat::Rgb32)?;
+        let (width, height) = (geo.width, geo.height);
         if width == 0
             || height == 0
             || (width as u64) * (height as u64) > crate::image_decode::MAX_PIXELS
         {
             return None;
         }
-        let stride = current
-            .GetUINT32(&MF_MT_DEFAULT_STRIDE)
-            .map(|s| s as i32)
-            .unwrap_or(width as i32 * 4);
         let at = (duration_hns(&reader) as f64 * fraction.clamp(0.0, 1.0)) as i64;
         set_position(&reader, at).ok()?;
 
@@ -383,38 +320,18 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
             sample.map(Some)
         })??;
         let buffer = sample.ConvertToContiguousBuffer().ok()?;
-        let mut ptr = std::ptr::null_mut();
-        let mut len = 0u32;
-        buffer.Lock(&mut ptr, None, Some(&mut len)).ok()?;
-        let image = (!ptr.is_null()).then(|| {
-            let data = std::slice::from_raw_parts(ptr, len as usize);
-            let row = width as usize * 4;
-            let pitch = if stride == 0 {
-                row as isize
-            } else {
-                stride as isize
-            };
-            // Bottom-up frames start with the last row.
-            let top = if pitch < 0 {
-                (height as usize - 1) * pitch.unsigned_abs()
-            } else {
-                0
-            };
-            let mut rgba = Vec::with_capacity(row * height as usize);
-            for y in 0..height as isize {
-                let start = top as isize + y * pitch;
-                let line = usize::try_from(start)
-                    .ok()
-                    .and_then(|s| data.get(s..s + row))?;
+        with_linear_frame(&buffer, &geo, |frame| {
+            let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+            for y in 0..height {
                 rgba.extend(
-                    line.chunks_exact(4)
+                    frame
+                        .row(y)?
+                        .chunks_exact(4)
                         .flat_map(|px| [px[2], px[1], px[0], 255]),
                 );
             }
             image::RgbaImage::from_raw(width, height, rgba)
-        });
-        let _ = buffer.Unlock();
-        image.flatten()
+        })
     }
 }
 
@@ -446,6 +363,24 @@ struct FrameGeometry {
     height: u32,
     default_stride: i32,
     format: PixelFormat,
+}
+
+impl FrameGeometry {
+    /// Size and stride of the reader's current output type.
+    unsafe fn current(reader: &IMFSourceReader, format: PixelFormat) -> Option<Self> {
+        let current = reader.GetCurrentMediaType(STREAM).ok()?;
+        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        Some(Self {
+            width: (frame_size >> 32) as u32,
+            height: frame_size as u32,
+            // MF_MT_DEFAULT_STRIDE is a signed value stored as UINT32; negative means bottom-up.
+            default_stride: current
+                .GetUINT32(&MF_MT_DEFAULT_STRIDE)
+                .map(|s| s as i32)
+                .unwrap_or(0),
+            format,
+        })
+    }
 }
 
 unsafe fn grab_frame_dhash(
@@ -495,14 +430,20 @@ unsafe fn grab_frame_dhash(
             return hash;
         }
     }
-    hash_linear_buffer(&buffer, geo)
+    with_linear_frame(&buffer, geo, |frame| frame.dhash())
 }
 
-unsafe fn hash_linear_buffer(buffer: &IMFMediaBuffer, geo: &FrameGeometry) -> Option<u64> {
+/// Locks a buffer without 2D access and hands its frame to `f`; rows are laid out by the
+/// default stride (the tightly packed row size if the type has none).
+unsafe fn with_linear_frame<T>(
+    buffer: &IMFMediaBuffer,
+    geo: &FrameGeometry,
+    f: impl FnOnce(&FrameView) -> Option<T>,
+) -> Option<T> {
     let mut ptr = std::ptr::null_mut();
     let mut cur_len = 0u32;
     buffer.Lock(&mut ptr, None, Some(&mut cur_len)).ok()?;
-    let hash = if ptr.is_null() {
+    let result = if ptr.is_null() {
         None
     } else {
         let data = std::slice::from_raw_parts(ptr, cur_len as usize);
@@ -518,16 +459,15 @@ unsafe fn hash_linear_buffer(buffer: &IMFMediaBuffer, geo: &FrameGeometry) -> Op
         } else {
             0
         };
-        FrameView {
+        f(&FrameView {
             data,
             top,
             pitch,
             geo,
-        }
-        .dhash()
+        })
     };
     let _ = buffer.Unlock();
-    hash
+    result
 }
 
 /// A locked frame: `data` is the whole buffer, `top` the offset of the top row, `pitch` the
@@ -540,18 +480,23 @@ struct FrameView<'a> {
 }
 
 impl FrameView<'_> {
+    /// Row `y` (0 = top) of `width` pixels.
+    fn row(&self, y: u32) -> Option<&[u8]> {
+        let start = usize::try_from(self.top as isize + y as isize * self.pitch).ok()?;
+        let len = self.geo.width as usize * self.geo.format.bytes_per_pixel();
+        self.data.get(start..start.checked_add(len)?)
+    }
+
     fn luma(&self, x: u32, y: u32) -> Option<u8> {
         let bpp = self.geo.format.bytes_per_pixel();
-        let offset = self.top as isize + y as isize * self.pitch + (x as usize * bpp) as isize;
-        let offset = usize::try_from(offset).ok()?;
-        match self.geo.format {
+        let px = self.row(y)?.get(x as usize * bpp..(x as usize + 1) * bpp)?;
+        Some(match self.geo.format {
             PixelFormat::Rgb32 => {
-                let px = self.data.get(offset..offset + 3)?;
                 let (b, g, r) = (px[0] as f32, px[1] as f32, px[2] as f32);
-                Some((0.299 * r + 0.587 * g + 0.114 * b) as u8)
+                (0.299 * r + 0.587 * g + 0.114 * b) as u8
             }
-            PixelFormat::Nv12 => self.data.get(offset).copied(),
-        }
+            PixelFormat::Nv12 => px[0],
+        })
     }
 
     /// dHash over a 9x8 grid of point samples.
@@ -596,10 +541,7 @@ pub struct KeyframeIndex {
 
 impl KeyframeIndex {
     pub fn open(path: &Path) -> Option<Self> {
-        let com = ComScope::new();
-        if !ensure_mf_started() {
-            return None;
-        }
+        let com = mf_scope()?;
         // No output type is set, so samples stay compressed.
         let reader = unsafe { open_reader(path, false) }.ok()?;
         Some(Self { reader, _com: com })
@@ -621,25 +563,19 @@ impl KeyframeIndex {
         Some((time, key))
     }
 
-    /// Seeks the reader to `seconds` and returns the first key frame at or after where it landed.
-    /// Sources position on the key frame preceding the requested time.
-    unsafe fn key_frame_from(&self, seconds: f64) -> Option<f64> {
+    /// Seeks the reader to `seconds` and returns the first key frame later than `after`, scanning
+    /// from where it landed (sources position on the key frame preceding the requested time).
+    unsafe fn key_frame_from(&self, seconds: f64, after: f64) -> Option<f64> {
         set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
         (0..MAX_SCAN_SAMPLES)
             .map_while(|_| self.read())
-            .find(|&(_, key)| key)
+            .find(|&(t, key)| key && t > after)
             .map(|(t, _)| t)
     }
 
     /// First key frame strictly after `seconds`.
     pub fn next_after(&self, seconds: f64) -> Option<f64> {
-        unsafe {
-            set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
-            (0..MAX_SCAN_SAMPLES)
-                .map_while(|_| self.read())
-                .find(|&(t, key)| key && t > seconds)
-                .map(|(t, _)| t)
-        }
+        unsafe { self.key_frame_from(seconds, seconds) }
     }
 
     /// Last key frame strictly before `seconds` (0 if there is none).
@@ -652,7 +588,7 @@ impl KeyframeIndex {
             if probe <= 0.0 {
                 return Some(0.0);
             }
-            let found = unsafe { self.key_frame_from(probe) }?;
+            let found = unsafe { self.key_frame_from(probe, f64::NEG_INFINITY) }?;
             if found < seconds {
                 return Some(found);
             }

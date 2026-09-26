@@ -155,7 +155,10 @@ fn parse_tiff(data: &[u8]) -> Option<ExifInfo> {
         b"MM\0*" => false,
         _ => return None,
     };
-    let tiff = Tiff { data, le };
+    let tiff = Tiff {
+        data,
+        rd: Endian(le),
+    };
     let ifd0 = tiff.u32(4)? as usize;
 
     let mut info = ExifInfo::default();
@@ -177,9 +180,33 @@ struct SubIfds {
     gps: Option<usize>,
 }
 
+/// Byte order of a TIFF structure: little-endian (`II`) when true.
+#[derive(Clone, Copy)]
+pub(crate) struct Endian(pub bool);
+
+impl Endian {
+    pub fn u16(self, b: &[u8]) -> u16 {
+        let v = [b[0], b[1]];
+        if self.0 {
+            u16::from_le_bytes(v)
+        } else {
+            u16::from_be_bytes(v)
+        }
+    }
+
+    pub fn u32(self, b: &[u8]) -> u32 {
+        let v = [b[0], b[1], b[2], b[3]];
+        if self.0 {
+            u32::from_le_bytes(v)
+        } else {
+            u32::from_be_bytes(v)
+        }
+    }
+}
+
 struct Tiff<'a> {
     data: &'a [u8],
-    le: bool,
+    rd: Endian,
 }
 
 struct Entry<'a> {
@@ -194,34 +221,16 @@ impl<'a> Tiff<'a> {
         self.data.get(offset..offset.checked_add(len)?)
     }
 
-    fn u16_at(&self, b: &[u8]) -> u16 {
-        let v = [b[0], b[1]];
-        if self.le {
-            u16::from_le_bytes(v)
-        } else {
-            u16::from_be_bytes(v)
-        }
-    }
-
-    fn u32_at(&self, b: &[u8]) -> u32 {
-        let v = [b[0], b[1], b[2], b[3]];
-        if self.le {
-            u32::from_le_bytes(v)
-        } else {
-            u32::from_be_bytes(v)
-        }
-    }
-
     fn u32(&self, offset: usize) -> Option<u32> {
-        self.bytes(offset, 4).map(|b| self.u32_at(b))
+        self.bytes(offset, 4).map(|b| self.rd.u32(b))
     }
 
     /// Decodes the 12-byte IFD entry at `offset`; values up to 4 bytes are stored inline.
     fn entry(&self, offset: usize) -> Option<Entry<'a>> {
         let raw = self.bytes(offset, 12)?;
-        let tag = self.u16_at(&raw[0..2]);
-        let typ = self.u16_at(&raw[2..4]);
-        let count = self.u32_at(&raw[4..8]);
+        let tag = self.rd.u16(&raw[0..2]);
+        let typ = self.rd.u16(&raw[2..4]);
+        let count = self.rd.u32(&raw[4..8]);
         let unit = match typ {
             TYPE_BYTE | TYPE_ASCII | TYPE_UNDEFINED => 1,
             TYPE_SHORT => 2,
@@ -240,7 +249,7 @@ impl<'a> Tiff<'a> {
         let value = if size <= 4 {
             &raw[8..8 + size]
         } else {
-            self.bytes(self.u32_at(&raw[8..12]) as usize, size)?
+            self.bytes(self.rd.u32(&raw[8..12]) as usize, size)?
         };
         Some(Entry {
             tag,
@@ -253,8 +262,8 @@ impl<'a> Tiff<'a> {
     fn uint(&self, e: &Entry) -> Option<u32> {
         match e.typ {
             TYPE_BYTE => e.value.first().map(|&b| b as u32),
-            TYPE_SHORT if e.value.len() >= 2 => Some(self.u16_at(e.value) as u32),
-            TYPE_LONG if e.value.len() >= 4 => Some(self.u32_at(e.value)),
+            TYPE_SHORT if e.value.len() >= 2 => Some(self.rd.u16(e.value) as u32),
+            TYPE_LONG if e.value.len() >= 4 => Some(self.rd.u32(e.value)),
             _ => None,
         }
     }
@@ -269,7 +278,7 @@ impl<'a> Tiff<'a> {
             return None;
         }
         let v = e.value.get(index * 8..index * 8 + 8)?;
-        Some((self.u32_at(&v[0..4]), self.u32_at(&v[4..8])))
+        Some((self.rd.u32(&v[0..4]), self.rd.u32(&v[4..8])))
     }
 
     fn ascii(&self, e: &Entry) -> Option<String> {
@@ -283,7 +292,7 @@ impl<'a> Tiff<'a> {
     }
 
     fn parse_ifd(&self, offset: usize, info: &mut ExifInfo, subs: &mut SubIfds) {
-        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else {
+        let Some(count) = self.bytes(offset, 2).map(|b| self.rd.u16(b)) else {
             return;
         };
         for i in 0..count as usize {
@@ -314,7 +323,7 @@ impl<'a> Tiff<'a> {
     }
 
     fn parse_gps_ifd(&self, offset: usize, info: &mut ExifInfo) {
-        let Some(count) = self.bytes(offset, 2).map(|b| self.u16_at(b)) else {
+        let Some(count) = self.bytes(offset, 2).map(|b| self.rd.u16(b)) else {
             return;
         };
         let (mut lat_ref, mut lon_ref, mut lat, mut lon) = (None, None, None, None);

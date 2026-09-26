@@ -7,18 +7,12 @@ use std::path::Path;
 use std::sync::Arc;
 
 use mediares_core::probe::MediaType;
-use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
-    EndPaint, FillRect, GetStockObject, IntersectClipRect, InvalidateRect, SelectObject,
-    BLACK_BRUSH, HBRUSH, HDC, PAINTSTRUCT, SRCCOPY,
-};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer};
 
 use crate::audio_view::{AudioView, PROGRESS_TIMER_ID};
-use crate::dialog::{self, Font};
+use crate::gdi::{self, Font};
 use crate::image_cache::DecodedImage;
 use crate::transport_bar::{self, BarControl, Click, Layout, Message, Transport};
 use crate::video_view::{VideoView, RENDER_TIMER_ID};
@@ -41,6 +35,15 @@ pub enum EventEffect {
 pub enum Content {
     Video(Box<VideoView>),
     Audio(Box<AudioView>),
+}
+
+impl Content {
+    fn transport(&self) -> &dyn Transport {
+        match self {
+            Content::Video(v) => v.transport(),
+            Content::Audio(a) => a.transport(),
+        }
+    }
 }
 
 pub struct MediaView {
@@ -100,10 +103,7 @@ impl MediaView {
     }
 
     pub fn transport(&self) -> &dyn Transport {
-        match &self.content {
-            Content::Video(v) => v.transport(),
-            Content::Audio(a) => a.transport(),
-        }
+        self.content.transport()
     }
 
     pub fn is_video(&self) -> bool {
@@ -132,10 +132,7 @@ impl MediaView {
     }
 
     fn dpi_scale(&self) -> f32 {
-        match unsafe { GetDpiForWindow(self.viewer) } {
-            0 => 1.0,
-            dpi => dpi as f32 / 96.0,
-        }
+        gdi::dpi_scale(self.viewer)
     }
 
     /// Moves the bar into an overlay window (`Some`) or back to the bottom of the viewer.
@@ -189,52 +186,18 @@ impl MediaView {
 
     /// Paints the part of the client area in `dirty` (a video surface is clipped out by the viewer).
     pub unsafe fn paint(&mut self, hdc: HDC, width: i32, height: i32, dirty: RECT) {
-        if width <= 0 || height <= 0 {
-            return;
-        }
-        let mem_dc = CreateCompatibleDC(Some(hdc));
-        let bmp = CreateCompatibleBitmap(hdc, width, height);
-        let old = SelectObject(mem_dc, bmp.into());
-        // Progress updates repaint only the bar: skip redrawing the cover then.
-        IntersectClipRect(mem_dc, dirty.left, dirty.top, dirty.right, dirty.bottom);
-
         let scale = self.dpi_scale();
         let area = self.content_area();
-        match &mut self.content {
-            Content::Video(_) => {
-                FillRect(
-                    mem_dc,
-                    &RECT {
-                        left: 0,
-                        top: 0,
-                        right: width,
-                        bottom: height,
-                    },
-                    HBRUSH(GetStockObject(BLACK_BRUSH).0),
-                );
+        // Progress updates repaint only the bar: the cover isn't redrawn then (clipped out).
+        gdi::with_buffer(hdc, width, height, dirty, |dc| unsafe {
+            match &mut self.content {
+                Content::Video(_) => gdi::fill(dc, gdi::rect(width, height), 0),
+                Content::Audio(a) => a.paint(dc, area, scale),
             }
-            Content::Audio(a) => a.paint(mem_dc, area, scale),
-        }
-
-        if self.bar_host.is_none() {
-            self.paint_bar(mem_dc, width, height, scale);
-        }
-
-        let (dw, dh) = (dirty.right - dirty.left, dirty.bottom - dirty.top);
-        let _ = BitBlt(
-            hdc,
-            dirty.left,
-            dirty.top,
-            dw,
-            dh,
-            Some(mem_dc),
-            dirty.left,
-            dirty.top,
-            SRCCOPY,
-        );
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(bmp.into());
-        let _ = DeleteDC(mem_dc);
+            if self.bar_host.is_none() {
+                self.paint_bar(dc, width, height, scale);
+            }
+        });
     }
 
     /// The bar along the bottom of a `width` x `height` surface.
@@ -246,7 +209,7 @@ impl MediaView {
         if self.font.as_ref().is_none_or(|(k, _)| *k != dpi_key) {
             self.font = Some((
                 dpi_key,
-                dialog::create_font(w!("Segoe UI"), -(13.0 * scale).round() as i32),
+                gdi::create_font("Segoe UI", -(13.0 * scale).round() as i32, false),
             ));
         }
         let font = self.font.as_ref().map(|(_, f)| f.0).unwrap_or_default();
@@ -269,10 +232,15 @@ impl MediaView {
         let mut rc = RECT::default();
         let _ = GetClientRect(host, &mut rc);
         let scale = self.dpi_scale();
-        crate::overlay::with_buffer(hdc, rc, |dc| unsafe {
+        gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
             self.paint_bar(dc, rc.right, rc.bottom, scale)
         });
         let _ = EndPaint(host, &ps);
+    }
+
+    /// The point (viewer client coordinates) is on the bar along the bottom of the viewer.
+    pub fn over_bar(&self, x: i32, y: i32) -> bool {
+        self.bar_host.is_none() && gdi::contains(&unsafe { self.bar_layout() }.bar, x, y)
     }
 
     /// A click in the viewer. With the bar in an overlay, the whole viewer is the picture.
@@ -287,13 +255,9 @@ impl MediaView {
     pub unsafe fn bar_mouse_down(&mut self, x: i32, y: i32) -> Click {
         let layout = self.bar_layout();
         let duration = self.known_duration();
-        let click = {
-            let transport = match &self.content {
-                Content::Video(v) => v.transport(),
-                Content::Audio(a) => a.transport(),
-            };
-            self.bar.mouse_down(transport, &layout, duration, x, y)
-        };
+        let click = self
+            .bar
+            .mouse_down(self.content.transport(), &layout, duration, x, y);
         if click == Click::Bar {
             self.invalidate_bar();
         }
@@ -308,11 +272,10 @@ impl MediaView {
     pub unsafe fn mouse_move(&mut self, x: i32) {
         let layout = self.bar_layout();
         let duration = self.known_duration();
-        let transport = match &self.content {
-            Content::Video(v) => v.transport(),
-            Content::Audio(a) => a.transport(),
-        };
-        if self.bar.mouse_move(transport, &layout, duration, x) {
+        if self
+            .bar
+            .mouse_move(self.content.transport(), &layout, duration, x)
+        {
             self.invalidate_bar();
         }
     }
@@ -320,11 +283,8 @@ impl MediaView {
     pub unsafe fn mouse_up(&mut self, x: i32) {
         let layout = self.bar_layout();
         let duration = self.known_duration();
-        let transport = match &self.content {
-            Content::Video(v) => v.transport(),
-            Content::Audio(a) => a.transport(),
-        };
-        self.bar.mouse_up(transport, &layout, duration, x);
+        self.bar
+            .mouse_up(self.content.transport(), &layout, duration, x);
         self.invalidate_bar();
     }
 

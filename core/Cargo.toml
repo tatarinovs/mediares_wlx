@@ -5,10 +5,8 @@ edition = "2021"
 
 [dependencies]
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff", "ico"] }
-lru = "0.18.4"
 memchr = "2.7"
-symphonia = { version = "0.6.1", optional = true, default-features = false, features = ["all-codecs", "all-formats"] }
-lofty = { version = "0.25.4", optional = true }
+symphonia = { version = "0.6.1", optional = true, default-features = false, features = ["all-codecs", "all-formats", "all-meta"] }
 windows = { version = "0.62.2", features = [
     "Win32_Media_MediaFoundation",
     "Win32_System_Com",
@@ -25,7 +23,7 @@ default = ["raw-preview", "psd-preview"]
 raw-preview = []
 psd-preview = []
 audio-decode = ["dep:symphonia"]
-tags = ["dep:lofty"]
+tags = ["audio-decode"]
 
 [[example]]
 name = "audio_fp"

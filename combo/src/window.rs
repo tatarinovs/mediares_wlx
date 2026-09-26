@@ -9,7 +9,8 @@ use std::sync::Once;
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, PAINTSTRUCT,
+    BeginPaint, ClientToScreen, EndPaint, InvalidateRect, ScreenToClient, UpdateWindow, HBRUSH,
+    PAINTSTRUCT,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
@@ -17,14 +18,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
     GetClassNameW, GetClientRect, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW,
-    RegisterClassExW, SetCursor, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow,
-    TrackPopupMenu, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, IDC_HAND, IDC_SIZEALL,
-    MENU_ITEM_FLAGS, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SW_PARENTCLOSING, SW_SHOW,
-    TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP,
-    WM_APPCOMMAND, WM_DESTROY, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR,
-    WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WNDCLASSEXW, WS_CHILD,
-    WS_CLIPCHILDREN,
+    SetCursor, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TrackPopupMenu, CS_DBLCLKS,
+    GWLP_USERDATA, GWL_STYLE, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MENU_ITEM_FLAGS, MF_CHECKED,
+    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND, WM_DESTROY, WM_ERASEBKGND,
+    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
+    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
 use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS};
@@ -39,8 +39,8 @@ use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
 use crate::{
-    config, dialog, exif_dialog, file_actions, fullscreen, module, osd_template, settings_dialog,
-    snapshot,
+    config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template,
+    settings_dialog, snapshot,
 };
 use mediares_core::exif::read_orientation;
 
@@ -149,10 +149,10 @@ impl Command {
         }
     }
 
-    /// Any command by its numeric value (posted messages).
+    /// Any command by its numeric value (posted messages, menu ids).
     fn from_raw(value: usize) -> Option<Command> {
         use Command::*;
-        [
+        const ALL: [Command; 40] = [
             ToggleFullscreen,
             ToggleOsd,
             ShowExif,
@@ -193,17 +193,18 @@ impl Command {
             NormalSpeed,
             FrameBack,
             FrameForward,
-        ]
-        .into_iter()
-        .find(|&c| c as usize == value)
+        ];
+        // Values start at 1 and follow the declaration order.
+        ALL.get(value.checked_sub(1)?).copied()
     }
 
-    fn from_id(id: i32) -> Option<Command> {
-        Command::MENU
-            .iter()
-            .flatten()
-            .map(|&(c, _)| c)
-            .find(|&c| c as i32 == id)
+    /// Previous / next file in the play queue.
+    fn track(forward: bool) -> Command {
+        if forward {
+            Command::NextTrack
+        } else {
+            Command::PreviousTrack
+        }
     }
 
     /// Hotkeys. With Ctrl held only zoom keys are ours; everything else goes to the Lister
@@ -279,17 +280,8 @@ const VK_ESCAPE: u16 = 0x1B;
 
 unsafe fn register_class() {
     static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            style: CS_DBLCLKS,
-            lpfnWndProc: Some(wnd_proc),
-            hInstance: module(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: CLASS_NAME,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
+    REGISTER.call_once(|| unsafe {
+        gdi::register_class(CLASS_NAME, Some(wnd_proc), CS_DBLCLKS, HBRUSH::default());
     });
 }
 
@@ -445,19 +437,17 @@ unsafe fn sync_video_osd(state: &mut ViewerState) {
     let position =
         (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
     let (width, height, fps) = (video.info.width, video.info.height, video.info.frame_rate);
-    let details =
-        osd_template::uses_any(&template, osd_template::VIDEO_DETAIL_KEYS).then(|| video.details());
-    let empty_tags = Default::default();
-    let (meta, tags) = match details {
-        Some(d) => (d.meta.as_ref(), &d.tags),
-        None => (None, &empty_tags),
-    };
+    let tags = osd_template::uses_any(&template, osd_template::VIDEO_TAG_KEYS)
+        .then(|| video.tags())
+        .flatten()
+        .unwrap_or_default();
+    let meta = Some(&video.info);
     let mut fields = std::collections::HashMap::new();
     for (_, group) in osd_template::VIDEO_FIELDS {
         for field in *group {
             let value =
                 osd_template::file_field(&state.file_path, state.file_size, position, field.key)
-                    .or_else(|| osd_template::video_field(meta, tags, field.key))
+                    .or_else(|| osd_template::video_field(meta, &tags, field.key))
                     .or_else(|| match field.key {
                         "width" => Some(width.to_string()),
                         "height" => Some(height.to_string()),
@@ -520,6 +510,7 @@ pub unsafe fn overlay_message(
     viewer: HWND,
     window: HWND,
     msg: u32,
+    wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
     let state = get_live_state(viewer)?;
@@ -536,9 +527,9 @@ pub unsafe fn overlay_message(
             let hdc = BeginPaint(window, &mut ps);
             let mut rc = RECT::default();
             let _ = GetClientRect(window, &mut rc);
-            let scale = overlay::dpi_scale(window);
+            let scale = gdi::dpi_scale(window);
             let playing = state.slideshow;
-            overlay::with_buffer(hdc, rc, |dc| unsafe {
+            gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
                 overlay::paint_photo_panel(dc, rc, scale, playing)
             });
             let _ = EndPaint(window, &ps);
@@ -551,11 +542,7 @@ pub unsafe fn overlay_message(
                     let _ = SetCapture(window);
                 }
                 Click::Skip(forward) => {
-                    let cmd = if forward {
-                        Command::NextTrack
-                    } else {
-                        Command::PreviousTrack
-                    };
+                    let cmd = Command::track(forward);
                     let _ = PostMessageW(
                         Some(viewer),
                         WM_OVERLAY_COMMAND,
@@ -567,12 +554,11 @@ pub unsafe fn overlay_message(
             }
         }
         (WM_LBUTTONDOWN, PanelKind::Photo) => {
-            let command =
-                overlay::hit_photo(overlay::dpi_scale(window), pt.x, pt.y).map(|b| match b {
-                    PhotoButton::Previous => Command::Previous,
-                    PhotoButton::Slideshow => Command::ToggleSlideshow,
-                    PhotoButton::Next => Command::Next,
-                });
+            let command = overlay::hit_photo(gdi::dpi_scale(window), pt.x, pt.y).map(|b| match b {
+                PhotoButton::Previous => Command::Previous,
+                PhotoButton::Slideshow => Command::ToggleSlideshow,
+                PhotoButton::Next => Command::Next,
+            });
             if let Some(cmd) = command {
                 let _ = PostMessageW(
                     Some(viewer),
@@ -592,6 +578,15 @@ pub unsafe fn overlay_message(
             }
         }
         (WM_MOUSEMOVE, _) => {}
+        // Wheel over the floating bar: volume (over the picture it pages through the files).
+        (WM_MOUSEWHEEL, PanelKind::Video) => {
+            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+            if delta != 0 {
+                let media = state.media.as_mut()?;
+                media.change_volume(delta > 0);
+                media.invalidate_bar();
+            }
+        }
         _ => return None,
     }
     Some(LRESULT(0))
@@ -1018,7 +1013,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     );
     let _ = DestroyMenu(menu);
 
-    if let Some(cmd) = Command::from_id(id.0) {
+    if let Some(cmd) = usize::try_from(id.0).ok().and_then(Command::from_raw) {
         execute(hwnd, cmd);
     }
 }
@@ -1048,7 +1043,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     Some(ViewerState {
                         media: Some(media), ..
                     }) => media.paint(hdc, w, h, ps.rcPaint),
-                    state => image_view::paint(hdc, state, w, h),
+                    state => image_view::paint(hdc, state, w, h, ps.rcPaint),
                 }
                 let _ = EndPaint(hwnd, &ps);
             }
@@ -1181,14 +1176,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                         let _ = SetCapture(hwnd);
                     }
                     Click::Bar => {}
-                    Click::Skip(forward) => execute(
-                        hwnd,
-                        if forward {
-                            Command::NextTrack
-                        } else {
-                            Command::PreviousTrack
-                        },
-                    ),
+                    Click::Skip(forward) => execute(hwnd, Command::track(forward)),
                 }
                 return LRESULT(0);
             }
@@ -1256,14 +1244,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                         let _ = SetCapture(hwnd);
                     }
                     Click::Bar => {}
-                    Click::Skip(forward) => execute(
-                        hwnd,
-                        if forward {
-                            Command::NextTrack
-                        } else {
-                            Command::PreviousTrack
-                        },
-                    ),
+                    Click::Skip(forward) => execute(hwnd, Command::track(forward)),
                 }
                 return LRESULT(0);
             }
@@ -1291,8 +1272,15 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_MOUSEWHEEL => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            if state.media.is_some() {
-                // Wheel = volume, as in common players.
+            let mut pt = point_from_lparam(lparam.0);
+            let _ = ScreenToClient(hwnd, &mut pt);
+            // Over the picture the wheel pages through the files whatever they are; volume is
+            // the wheel over the transport bar, or Ctrl+wheel.
+            let volume = state
+                .media
+                .as_ref()
+                .is_some_and(|m| ctrl_down() || m.over_bar(pt.x, pt.y));
+            if volume {
                 if delta != 0 {
                     execute(
                         hwnd,
@@ -1304,8 +1292,6 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     );
                 }
             } else if ctrl_down() {
-                let mut pt = point_from_lparam(lparam.0);
-                let _ = ScreenToClient(hwnd, &mut pt);
                 if let Some(view) = client_size(hwnd) {
                     zoom_at(state, view, delta > 0, (pt.x as f32, pt.y as f32));
                 }
@@ -1468,10 +1454,12 @@ mod tests {
     }
 
     #[test]
-    fn menu_ids_round_trip() {
-        for (cmd, _) in Command::MENU.iter().flatten() {
-            assert_eq!(Command::from_id(*cmd as i32), Some(*cmd));
+    fn raw_values_outside_the_commands() {
+        assert_eq!(Command::from_raw(0), None);
+        assert_eq!(Command::from_raw(Command::FrameForward as usize + 1), None);
+        assert_eq!(Command::from_raw(1), Some(Command::ToggleFullscreen));
+        for value in 1..=Command::FrameForward as usize {
+            assert_eq!(Command::from_raw(value).map(|c| c as usize), Some(value));
         }
-        assert_eq!(Command::from_id(0), None);
     }
 }

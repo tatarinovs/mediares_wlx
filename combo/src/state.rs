@@ -6,9 +6,9 @@ use std::sync::Arc;
 use mediares_core::image_decode::header_looks_decodable;
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{DeleteObject, HFONT};
 
 use crate::config::ViewerConfig;
+use crate::gdi::Font;
 use crate::image_cache::{self, DecodeOptions, DecodedImage, Request, Ticket};
 use crate::media_view::MediaView;
 use crate::overlay::Fullscreen;
@@ -73,7 +73,7 @@ pub struct ViewerState {
     /// Last TC show flags (`LCP_*`), to detect which option a `LC_NEWPARAMS` toggled.
     pub show_flags: i32,
     /// Lazily created OSD font; dropped whenever the config changes.
-    pub osd_font: Option<HFONT>,
+    pub osd_font: Option<Font>,
 }
 
 impl ViewerState {
@@ -238,7 +238,7 @@ impl ViewerState {
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
         self.config = config;
-        self.drop_osd_font();
+        self.osd_font = None;
         if old != self.decode_options() && self.shows_photo() {
             self.load_media();
         }
@@ -282,14 +282,6 @@ impl ViewerState {
     pub fn reload(&mut self) {
         let path = self.file_path.clone();
         self.show(&path);
-    }
-
-    pub fn drop_osd_font(&mut self) {
-        if let Some(font) = self.osd_font.take() {
-            unsafe {
-                let _ = DeleteObject(font.into());
-            }
-        }
     }
 
     fn load_media(&mut self) {
@@ -369,20 +361,26 @@ impl Drop for ViewerState {
         // Stop playback before the surface window goes away.
         self.overlay = None;
         self.media = None;
-        self.drop_osd_font();
     }
 }
 
 /// Case-insensitive, separator-agnostic (`/` vs `\`) path equality, as on NTFS.
-fn same_path(a: &Path, b: &Path) -> bool {
+pub fn same_path(a: &Path, b: &Path) -> bool {
     let (mut x, mut y) = (a.components(), b.components());
     loop {
         match (x.next(), y.next()) {
             (None, None) => return true,
-            (Some(p), Some(q)) if p.as_os_str().eq_ignore_ascii_case(q.as_os_str()) => {}
+            (Some(p), Some(q)) if same_name(p.as_os_str(), q.as_os_str()) => {}
             _ => return false,
         }
     }
+}
+
+/// Case-insensitive name comparison, Unicode included (NTFS ignores the case of Cyrillic too).
+fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    a.eq_ignore_ascii_case(b)
+        || (!a.is_ascii()
+            && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
 }
 
 /// Lists the viewable files (images, videos, audio) in the file's directory in natural ("file2" < "file10") order.
@@ -461,6 +459,10 @@ mod tests {
         assert!(!same_path(
             Path::new(r"C:\Media"),
             Path::new(r"C:\Media\a.mp4")
+        ));
+        assert!(same_path(
+            Path::new(r"D:\Видео\Фильм.mkv"),
+            Path::new(r"d:\видео\фильм.MKV")
         ));
     }
 

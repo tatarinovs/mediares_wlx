@@ -15,7 +15,7 @@ if errorlevel 1 (
 )
 
 :: Extract version from combo/Cargo.toml
-set "VERSION=0.1.0"
+set "VERSION=0.2.0"
 for /f "tokens=3 delims= " %%A in ('findstr /b "version" combo\Cargo.toml') do (
     set "VERSION=%%~A"
 )

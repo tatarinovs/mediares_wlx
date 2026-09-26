@@ -8,7 +8,7 @@ use std::path::Path;
 use symphonia::core::codecs::audio::{AudioDecoder as CodecDecoder, AudioDecoderOptions};
 use symphonia::core::errors::Error;
 use symphonia::core::formats::probe::Hint;
-use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
+use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, Track, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
@@ -42,32 +42,7 @@ pub struct Chunk<'a> {
 impl AudioDecoder {
     /// Opens the file; `None` if the container or codec is not supported.
     pub fn open(path: &Path) -> Option<Self> {
-        let mut file = File::open(path).ok()?;
-        let mut hint = Hint::new();
-        // MP3 wrapped in a WAV header (format tag 0x55): symphonia's WAV reader only takes PCM,
-        // so the MPEG stream inside the `data` chunk is handed over directly.
-        let source: Box<dyn MediaSource> = match riff_mp3_data(&mut file) {
-            Some((start, len)) => {
-                hint.with_extension("mp3");
-                Box::new(SubFile::new(file, start, len).ok()?)
-            }
-            None => {
-                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                    hint.with_extension(ext);
-                }
-                Box::new(file)
-            }
-        };
-        let mss = MediaSourceStream::new(source, Default::default());
-        let format = symphonia::default::get_probe()
-            .probe(
-                &hint,
-                mss,
-                FormatOptions::default(),
-                MetadataOptions::default(),
-            )
-            .ok()?;
-
+        let format = open_format(path)?;
         let track = format.default_track(TrackType::Audio)?;
         let params = track.codec_params.as_ref()?.audio()?;
         let decoder = symphonia::default::get_codecs()
@@ -80,10 +55,7 @@ impl AudioDecoder {
             .map_or(2, |c| c.count())
             .clamp(1, 8) as u16;
         let time_base = track.time_base;
-        let duration = match (time_base, track.duration) {
-            (Some(tb), Some(d)) => tb.calc_duration(d).map(|t| t.as_secs_f64()),
-            _ => track.num_frames.map(|n| n as f64 / sample_rate as f64),
-        };
+        let duration = track_duration(track, sample_rate);
         let track_id = track.id;
 
         Some(Self {
@@ -93,7 +65,7 @@ impl AudioDecoder {
             time_base,
             sample_rate,
             channels,
-            duration: duration.filter(|d| d.is_finite() && *d > 0.0),
+            duration,
             skip_until: None,
             decoded: Vec::new(),
             out: Vec::new(),
@@ -199,87 +171,154 @@ impl AudioDecoder {
     }
 }
 
-/// Offset and length of the `data` chunk of a RIFF/WAVE file whose format is MPEG Layer III.
-fn riff_mp3_data(file: &mut File) -> Option<(u64, u64)> {
-    let mut header = [0u8; 12];
-    file.read_exact(&mut header).ok()?;
-    let _ = file.seek(SeekFrom::Start(0));
-    if &header[0..4] != b"RIFF" || &header[8..12] != b"WAVE" {
+/// Probes the container of `path` (tags and pictures included). MP3 wrapped in a WAV header
+/// (format tag 0x55) is handed over as a plain MPEG stream — symphonia's WAV reader only takes
+/// PCM — keeping any tags in front of and behind the RIFF structure.
+pub(crate) fn open_format(path: &Path) -> Option<Box<dyn FormatReader>> {
+    let mut file = File::open(path).ok()?;
+    let mut hint = Hint::new();
+    let source: Box<dyn MediaSource> = match riff_mp3_ranges(&mut file) {
+        Some(ranges) => {
+            hint.with_extension("mp3");
+            Box::new(Spliced::new(file, ranges))
+        }
+        None => {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                hint.with_extension(ext);
+            }
+            Box::new(file)
+        }
+    };
+    let mss = MediaSourceStream::new(source, Default::default());
+    symphonia::default::get_probe()
+        .probe(
+            &hint,
+            mss,
+            FormatOptions::default(),
+            MetadataOptions::default(),
+        )
+        .ok()
+}
+
+/// Length of `track` in seconds, if the container declares it.
+pub(crate) fn track_duration(track: &Track, sample_rate: u32) -> Option<f64> {
+    let seconds = match (track.time_base, track.duration) {
+        (Some(tb), Some(d)) => tb.calc_duration(d).map(|t| t.as_secs_f64()),
+        _ => track.num_frames.map(|n| n as f64 / sample_rate as f64),
+    };
+    seconds.filter(|d| d.is_finite() && *d > 0.0)
+}
+
+/// For a RIFF/WAVE file (possibly behind an ID3v2 tag) whose format is MPEG audio: the byte
+/// ranges `(offset, length)` of everything except the RIFF structure around the `data` payload.
+fn riff_mp3_ranges(file: &mut File) -> Option<Vec<(u64, u64)>> {
+    let file_len = file.metadata().ok()?.len();
+    let mut read_at = |pos: u64, buf: &mut [u8]| {
+        file.seek(SeekFrom::Start(pos)).is_ok() && file.read_exact(buf).is_ok()
+    };
+    let mut head = [0u8; 12];
+    if !read_at(0, &mut head[..10]) {
         return None;
     }
-    let file_len = file.metadata().ok()?.len();
-    let mut pos = 12u64;
-    let mut is_mp3 = false;
-    let result = loop {
-        let mut chunk = [0u8; 8];
-        file.seek(SeekFrom::Start(pos)).ok()?;
-        if file.read_exact(&mut chunk).is_err() {
-            break None;
+    let riff = if &head[..3] == b"ID3" {
+        let size = head[6..10]
+            .iter()
+            .fold(0u64, |v, &b| v << 7 | (b & 0x7F) as u64);
+        let footer = if head[5] & 0x10 != 0 { 10 } else { 0 };
+        10 + size + footer
+    } else {
+        0
+    };
+    if !read_at(riff, &mut head) || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return None;
+    }
+    let riff_end = riff + 8 + u32::from_le_bytes([head[4], head[5], head[6], head[7]]) as u64;
+    let mut pos = riff + 12;
+    let mut is_mpeg = false;
+    let data = loop {
+        let mut chunk = [0u8; 10];
+        if pos + 8 > file_len || !read_at(pos, &mut chunk[..8]) {
+            return None;
         }
         let size = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]) as u64;
         match &chunk[0..4] {
             b"fmt " => {
-                let mut tag = [0u8; 2];
-                file.read_exact(&mut tag).ok()?;
-                is_mp3 = u16::from_le_bytes(tag) == 0x55;
-                if !is_mp3 {
-                    break None;
+                is_mpeg = read_at(pos + 8, &mut chunk[8..10])
+                    && u16::from_le_bytes([chunk[8], chunk[9]]) == 0x55;
+                if !is_mpeg {
+                    return None;
                 }
             }
             // Some writers leave the size at 0 or too large: the data runs to the end of the file.
-            b"data" if is_mp3 => {
+            b"data" if is_mpeg => {
                 let available = file_len.saturating_sub(pos + 8);
-                break Some((
-                    pos + 8,
-                    if size == 0 || size > available {
-                        available
-                    } else {
-                        size
-                    },
-                ));
+                let len = if size == 0 || size > available {
+                    available
+                } else {
+                    size
+                };
+                break (pos + 8, len);
             }
             _ => {}
         }
         pos += 8 + size + (size & 1);
-        if pos >= file_len {
-            break None;
-        }
     };
-    let _ = file.seek(SeekFrom::Start(0));
-    result
+    // Chunks after the data (LIST...) are skipped; a RIFF size past the end of the file is bogus,
+    // and whatever follows the data is kept then (an ID3v1 tag, typically).
+    let data_end = data.0 + data.1;
+    let tail = if riff_end <= file_len {
+        riff_end.max(data_end)
+    } else {
+        data_end
+    };
+    Some(
+        [(0, riff), data, (tail, file_len - tail)]
+            .into_iter()
+            .filter(|&(_, len)| len > 0)
+            .collect(),
+    )
 }
 
-/// A byte range of a file as a seekable media source.
-struct SubFile {
+/// Byte ranges of a file joined into one seekable media source.
+struct Spliced {
     file: File,
-    start: u64,
+    /// `(offset in the file, length)`.
+    ranges: Vec<(u64, u64)>,
     len: u64,
     pos: u64,
 }
 
-impl SubFile {
-    fn new(mut file: File, start: u64, len: u64) -> io::Result<Self> {
-        file.seek(SeekFrom::Start(start))?;
-        Ok(Self {
+impl Spliced {
+    fn new(file: File, ranges: Vec<(u64, u64)>) -> Self {
+        let len = ranges.iter().map(|&(_, len)| len).sum();
+        Self {
             file,
-            start,
+            ranges,
             len,
             pos: 0,
-        })
+        }
     }
 }
 
-impl Read for SubFile {
+impl Read for Spliced {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.len.saturating_sub(self.pos) as usize;
-        let take = buf.len().min(left);
-        let n = self.file.read(&mut buf[..take])?;
-        self.pos += n as u64;
-        Ok(n)
+        let mut start = 0;
+        for &(offset, len) in &self.ranges {
+            if self.pos < start + len {
+                let within = self.pos - start;
+                let take = buf.len().min((len - within) as usize);
+                self.file.seek(SeekFrom::Start(offset + within))?;
+                let n = self.file.read(&mut buf[..take])?;
+                self.pos += n as u64;
+                return Ok(n);
+            }
+            start += len;
+        }
+        Ok(0)
     }
 }
 
-impl Seek for SubFile {
+impl Seek for Spliced {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
             SeekFrom::Start(p) => p as i64,
@@ -293,12 +332,11 @@ impl Seek for SubFile {
             ));
         }
         self.pos = (target as u64).min(self.len);
-        self.file.seek(SeekFrom::Start(self.start + self.pos))?;
         Ok(self.pos)
     }
 }
 
-impl MediaSource for SubFile {
+impl MediaSource for Spliced {
     fn is_seekable(&self) -> bool {
         true
     }
@@ -326,38 +364,11 @@ fn remap_channels(src: &[f32], from: usize, to: usize, out: &mut Vec<f32>) {
 mod tests {
     use super::*;
 
-    /// 16-bit PCM WAV with a ramp so positions can be recognised by value.
-    fn write_wav(path: &Path, rate: u32, channels: u16, seconds: u32) {
-        let frames = rate * seconds;
-        let data_len = frames * channels as u32 * 2;
-        let mut b = Vec::new();
-        b.extend_from_slice(b"RIFF");
-        b.extend_from_slice(&(36 + data_len).to_le_bytes());
-        b.extend_from_slice(b"WAVEfmt ");
-        b.extend_from_slice(&16u32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&channels.to_le_bytes());
-        b.extend_from_slice(&rate.to_le_bytes());
-        b.extend_from_slice(&(rate * channels as u32 * 2).to_le_bytes());
-        b.extend_from_slice(&(channels * 2).to_le_bytes());
-        b.extend_from_slice(&16u16.to_le_bytes());
-        b.extend_from_slice(b"data");
-        b.extend_from_slice(&data_len.to_le_bytes());
-        for i in 0..frames {
-            // One step per 1/100 s: value encodes the position.
-            let v = ((i * 100 / rate) as i16).to_le_bytes();
-            for _ in 0..channels {
-                b.extend_from_slice(&v);
-            }
-        }
-        std::fs::write(path, b).unwrap();
-    }
-
+    /// 16-bit PCM with a ramp so positions can be recognised by value (one step per 1/100 s).
     fn temp_wav(name: &str, rate: u32, channels: u16, seconds: u32) -> std::path::PathBuf {
-        let path =
-            std::env::temp_dir().join(format!("mediares_{}_{}.wav", name, std::process::id()));
-        write_wav(&path, rate, channels, seconds);
-        path
+        crate::test_util::pcm16_wav(name, rate, channels, rate * seconds, |i| {
+            (i * 100 / rate) as i16
+        })
     }
 
     #[test]

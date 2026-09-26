@@ -1,4 +1,4 @@
-//! Video content: a child surface the media engine renders into, letterboxed into the area above
+//! Video content: a child surface the media engine renders into, filling the area above
 //! the transport bar (the bar itself belongs to [`crate::media_view`]).
 //!
 //! The surface is transparent to mouse input (`HTTRANSPARENT`), so the viewer window receives
@@ -6,12 +6,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
-use mediares_core::video_frame::{
-    probe_video, probe_video_meta, KeyframeIndex, VideoInfo, VideoMeta,
-};
-use mediares_core::video_tags::{read_video_tags, VideoTags};
+use mediares_core::cache::{get_video_meta, get_video_tags};
+use mediares_core::video_frame::{KeyframeIndex, VideoMeta};
+use mediares_core::video_tags::VideoTags;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
@@ -23,14 +22,14 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, KillTimer, MoveWindow,
-    RegisterClassExW, SetTimer, HTTRANSPARENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST,
-    WNDCLASSEXW, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, KillTimer, MoveWindow, SetTimer,
+    HTTRANSPARENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST, WS_CHILD, WS_CLIPSIBLINGS,
+    WS_VISIBLE,
 };
 
 use crate::media_view::EventEffect;
 use crate::module;
-use crate::playback_video::{Osd, VideoPlayer};
+use crate::playback_video::{Osd, VideoPlayer, FALLBACK_FRAME_SEC};
 use crate::resume;
 use crate::transport_bar::{self, format_time, Transport};
 
@@ -94,16 +93,9 @@ unsafe extern "system" fn surface_proc(
 
 unsafe fn register_surface_class() {
     static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(surface_proc),
-            hInstance: module(),
-            hbrBackground: HBRUSH(GetStockObject(BLACK_BRUSH).0),
-            lpszClassName: SURFACE_CLASS,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
+    REGISTER.call_once(|| unsafe {
+        let black = HBRUSH(GetStockObject(BLACK_BRUSH).0);
+        crate::gdi::register_class(SURFACE_CLASS, Some(surface_proc), Default::default(), black);
     });
 }
 
@@ -115,9 +107,8 @@ pub struct VideoView {
     path: PathBuf,
     /// Opened on first key-frame step; reset when the file changes.
     keyframes: Option<KeyframeIndex>,
-    pub info: VideoInfo,
-    /// Read on first use (OSD fields); reset when the file changes.
-    details: Option<VideoDetails>,
+    /// Stream properties; the size is updated once the engine knows it.
+    pub info: VideoMeta,
     error: Option<String>,
     osd: Option<VideoOsd>,
     rate: f64,
@@ -170,7 +161,7 @@ pub struct OsdStyle {
 
 struct VideoOsd {
     style: OsdStyle,
-    font: crate::dialog::Font,
+    font: crate::gdi::Font,
     text: OsdText,
 }
 
@@ -181,17 +172,11 @@ pub struct OsdText {
     pub fields: HashMap<&'static str, String>,
 }
 
-/// Stream properties and tags, beyond what playback needs.
-pub struct VideoDetails {
-    pub meta: Option<VideoMeta>,
-    pub tags: VideoTags,
-}
-
 impl VideoView {
     /// Creates the surface inside `viewer` and starts playing `path`. `None` if Media Foundation
     /// cannot open the file (so TC can fall back to another plugin).
     pub unsafe fn new(viewer: HWND, path: &Path, resume: bool) -> Option<Self> {
-        let info = probe_video(path)?;
+        let info = (*get_video_meta(path)?).clone();
         let surface = Surface::new(viewer, true)?;
         let player = VideoPlayer::new(surface.0, viewer).ok()?;
         transport_bar::restore_audio_level(&player);
@@ -206,7 +191,6 @@ impl VideoView {
             path: path.to_path_buf(),
             keyframes: None,
             info,
-            details: None,
             error: None,
             osd: None,
             rate: 1.0,
@@ -222,9 +206,10 @@ impl VideoView {
 
     /// Switches to another file, reusing the engine (and its speed).
     pub unsafe fn open(&mut self, path: &Path, resume: bool) -> bool {
-        let Some(info) = probe_video(path) else {
+        let Some(info) = get_video_meta(path) else {
             return false;
         };
+        let info = (*info).clone();
         self.remember_position();
         self.finish_step();
         if self.player.open(path).is_err() {
@@ -239,7 +224,6 @@ impl VideoView {
         self.info = info;
         self.path = path.to_path_buf();
         self.keyframes = None;
-        self.details = None;
         self.error = None;
         true
     }
@@ -358,13 +342,9 @@ impl VideoView {
         self.advance_step();
     }
 
-    /// Stream properties and tags of the current file, read on first call.
-    pub fn details(&mut self) -> &VideoDetails {
-        let path = &self.path;
-        self.details.get_or_insert_with(|| VideoDetails {
-            meta: probe_video_meta(path),
-            tags: read_video_tags(path),
-        })
+    /// Tags of the current file (read once, then cached).
+    pub fn tags(&self) -> Option<Arc<VideoTags>> {
+        get_video_tags(&self.path)
     }
 
     /// Shows (`Some`) or hides the OSD.
@@ -374,48 +354,22 @@ impl VideoView {
             Some(style) => match self.osd.take() {
                 Some(osd) if osd.style == style => Some(VideoOsd { text, ..osd }),
                 _ => {
-                    let dpi = match windows::Win32::UI::HiDpi::GetDpiForWindow(self.viewer) {
-                        0 => 96,
-                        dpi => dpi as i32,
-                    };
-                    let font = crate::dialog::GdiObject(crate::image_view::create_osd_font(
-                        &style.face,
-                        style.size_pt,
-                        dpi,
-                    ));
+                    let dpi = (crate::gdi::dpi_scale(self.viewer) * 96.0).round() as i32;
+                    let font = crate::image_view::create_osd_font(&style.face, style.size_pt, dpi);
                     Some(VideoOsd { style, font, text })
                 }
             },
         };
     }
 
-    /// Letterboxes the surface into `area` (viewer client coordinates).
+    /// Stretches the surface over `area` (viewer client coordinates). The engine letterboxes the
+    /// frame inside it, so the OSD sits in the corner of the area, on the black bars if any.
     pub unsafe fn layout(&self, area: RECT) {
-        let (area_w, area_h) = (
+        let (w, h) = (
             (area.right - area.left).max(1),
             (area.bottom - area.top).max(1),
         );
-        let (vw, vh) = self
-            .player
-            .native_size()
-            .unwrap_or((self.info.width, self.info.height));
-        let (w, h) = if vw > 0 && vh > 0 {
-            let scale = (area_w as f64 / vw as f64).min(area_h as f64 / vh as f64);
-            (
-                ((vw as f64 * scale).round() as i32).max(1),
-                ((vh as f64 * scale).round() as i32).max(1),
-            )
-        } else {
-            (area_w, area_h)
-        };
-        let _ = MoveWindow(
-            self.surface.0,
-            area.left + (area_w - w) / 2,
-            area.top + (area_h - h) / 2,
-            w,
-            h,
-            true,
-        );
+        let _ = MoveWindow(self.surface.0, area.left, area.top, w, h, true);
         self.player.resize(w, h);
     }
 
@@ -464,7 +418,7 @@ impl VideoView {
                 let frame = if self.info.frame_rate > 0.0 {
                     1.0 / self.info.frame_rate
                 } else {
-                    0.04
+                    FALLBACK_FRAME_SEC
                 };
                 if (self.player.position() - target).abs() > 1.5 * frame {
                     self.precise_seek = false;
@@ -501,7 +455,7 @@ impl VideoView {
     }
 }
 
-fn resume_point(path: &Path, info: &VideoInfo, enabled: bool) -> Option<f64> {
+fn resume_point(path: &Path, info: &VideoMeta, enabled: bool) -> Option<f64> {
     (enabled && info.duration_sec >= resume::MIN_DURATION_SEC)
         .then(|| resume::load(path))
         .flatten()

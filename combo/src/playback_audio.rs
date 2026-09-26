@@ -1,25 +1,41 @@
-//! Audio-only playback, pure Rust: `core::audio_decode` (symphonia) on a decoder thread feeds a
-//! rodio source on the default output device (WASAPI via cpal). Media Foundation is not involved.
+//! Audio-only playback, pure Rust decoding: `core::audio_decode` (symphonia) on a decoder thread
+//! feeds a WASAPI shared-mode stream on the default output device. The stream is opened in the
+//! track's own format and Windows converts the rate and channels (`AUTOCONVERTPCM`). Media
+//! Foundation is not involved.
 //!
-//! The decoder thread pushes chunks into a bounded channel; the source, running on the audio
-//! callback thread, only takes ready chunks and never waits for disk I/O. Seeks bump an epoch:
-//! chunks decoded before the seek are recognised by their old epoch and dropped.
+//! The decoder thread pushes chunks into a bounded channel; the render thread only takes ready
+//! chunks and never waits for disk I/O. Seeks bump an epoch: chunks decoded before the seek are
+//! recognised by their old epoch and dropped.
 
-use std::num::NonZero;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
+use std::time::Duration;
 
 use mediares_core::audio_decode::AudioDecoder;
-use rodio::{ChannelCount, DeviceSinkBuilder, MixerDeviceSink, SampleRate, Source};
+use mediares_core::mf_init::ComScope;
+use windows::core::GUID;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Media::Audio::{
+    eConsole, eRender, IAudioClient, IAudioRenderClient, IMMDevice, IMMDeviceEnumerator,
+    MMDeviceEnumerator, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
+    AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, WAVEFORMATEX,
+    WAVEFORMATEXTENSIBLE, WAVEFORMATEXTENSIBLE_0,
+};
+use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use crate::transport_bar::Transport;
 
 /// Decoded chunks buffered ahead of the output (a packet is ~20–100 ms of audio).
 const CHUNKS_AHEAD: usize = 32;
+/// Device buffer (100 ns units): rides out scheduling hiccups, short enough for a quick pause.
+const DEVICE_BUFFER_HNS: i64 = 1_000_000;
+/// A lost device (unplugged) is looked for again this often.
+const REOPEN_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Player-wide controls, read by the source on the audio thread.
+/// Player-wide controls, read on the render thread.
 struct Levels {
     paused: AtomicBool,
     muted: AtomicBool,
@@ -27,14 +43,14 @@ struct Levels {
     volume: AtomicU32,
 }
 
-/// State of one opened file, shared between the UI, the decoder thread and the source.
+/// State of one opened file, shared between the UI, the decoder thread and the render thread.
 struct TrackState {
     /// Incremented by every seek.
     epoch: AtomicU64,
     /// Seconds, `f64` bits.
     position: AtomicU64,
     ended: AtomicBool,
-    /// Set when the track is replaced or the player dropped: the source leaves the mixer.
+    /// Set when the track is replaced or the player dropped: the render thread closes its stream.
     stopped: AtomicBool,
 }
 
@@ -64,47 +80,41 @@ struct Track {
 
 impl Drop for Track {
     fn drop(&mut self) {
-        // The source leaves the mixer on its next sample; dropping `commands` ends the decoder.
+        // The render thread stops on its next wake-up; dropping `commands` ends the decoder.
         self.state.stopped.store(true, Ordering::Relaxed);
     }
 }
 
-/// Field order matters: the track stops before the output device closes.
 pub struct AudioPlayer {
     track: Option<Track>,
     levels: Arc<Levels>,
-    sink: MixerDeviceSink,
 }
 
 impl AudioPlayer {
-    /// Opens the default output device; `None` if there is none.
+    /// `None` if there is no output device.
     pub fn new() -> Option<Self> {
-        let mut sink = DeviceSinkBuilder::open_default_sink().ok()?;
-        sink.log_on_drop(false);
-        let levels = Arc::new(Levels {
-            paused: AtomicBool::new(false),
-            muted: AtomicBool::new(false),
-            volume: AtomicU32::new(1.0f32.to_bits()),
-        });
+        let _com = ComScope::new();
+        unsafe { default_device() }.ok()?;
         Some(Self {
             track: None,
-            levels,
-            sink,
+            levels: Arc::new(Levels {
+                paused: AtomicBool::new(false),
+                muted: AtomicBool::new(false),
+                volume: AtomicU32::new(1.0f32.to_bits()),
+            }),
         })
     }
 
     /// Replaces the current track with `path` and starts playing it. False if the file can't be
-    /// decoded (the previous track keeps playing then).
+    /// decoded or played (the previous track keeps playing then).
     pub fn open(&mut self, path: &Path) -> bool {
         let Some(decoder) = AudioDecoder::open(path) else {
             return false;
         };
-        let (Some(channels), Some(rate)) = (
-            NonZero::new(decoder.channels),
-            NonZero::new(decoder.sample_rate),
-        ) else {
+        let (channels, rate) = (decoder.channels, decoder.sample_rate);
+        if channels == 0 || rate == 0 {
             return false;
-        };
+        }
         let duration = decoder.duration.unwrap_or(0.0);
         let state = Arc::new(TrackState {
             epoch: AtomicU64::new(0),
@@ -121,27 +131,34 @@ impl AudioPlayer {
             return false;
         }
 
-        self.track = Some(Track {
-            state: state.clone(),
-            commands,
-            duration,
-        });
-        self.levels.paused.store(false, Ordering::Relaxed);
-        self.sink.mixer().add(TrackSource {
+        let source = TrackSource {
             levels: self.levels.clone(),
-            state,
+            state: state.clone(),
             chunks,
-            channels,
+            channels: channels as usize,
             rate,
             buf: Vec::new(),
             pos: 0,
             buf_epoch: 0,
             buf_start: 0.0,
             frames_played: 0,
-            phase: 0,
-            silent: true,
-            gain: 1.0,
+        };
+        let (ready_tx, ready) = mpsc::sync_channel(1);
+        let spawned = std::thread::Builder::new()
+            .name("mediares-audio-output".into())
+            .spawn(move || output_loop(source, ready_tx));
+        // Without an output stream the decoder ends too: its channel is dropped.
+        if spawned.is_err() || ready.recv() != Ok(true) {
+            state.stopped.store(true, Ordering::Relaxed);
+            return false;
+        }
+
+        self.track = Some(Track {
+            state,
+            commands,
+            duration,
         });
+        self.levels.paused.store(false, Ordering::Relaxed);
         true
     }
 
@@ -263,36 +280,182 @@ fn decode_loop(mut decoder: AudioDecoder, commands: Receiver<Command>, chunks: S
                 }
             }
         };
-        // Blocks while the buffer is full; the source drains stale chunks even when paused, so a
-        // pending seek is never stuck behind them.
+        // Blocks while the buffer is full; the render thread drains stale chunks even when paused,
+        // so a pending seek is never stuck behind them.
         if chunks.send(chunk).is_err() {
             return;
         }
     }
 }
 
-/// The rodio source of one track. It never ends by itself (paused / finished = silence), so
-/// playback can resume after the end; it leaves the mixer once the track is stopped.
+/// Render thread of one track: keeps the device buffer filled until the track is stopped. The
+/// source never ends by itself (paused / finished = silence), so playback can resume after the
+/// end. `ready` reports whether the first stream could be opened.
+fn output_loop(mut source: TrackSource, ready: SyncSender<bool>) {
+    let _com = ComScope::new();
+    let (channels, rate) = (source.channels as u16, source.rate);
+    let mut stream = unsafe { Stream::open(channels, rate) }.ok();
+    let _ = ready.send(stream.is_some());
+    while stream.is_some() && !source.state.stopped.load(Ordering::Relaxed) {
+        let alive = stream
+            .as_ref()
+            .is_some_and(|s| unsafe { s.render(&mut source) });
+        if !alive {
+            // The device went away: silence until the (new) default device can be opened.
+            stream = None;
+            while stream.is_none() && !source.state.stopped.load(Ordering::Relaxed) {
+                std::thread::sleep(REOPEN_INTERVAL);
+                stream = unsafe { Stream::open(channels, rate) }.ok();
+            }
+        }
+    }
+}
+
+unsafe fn default_device() -> windows::core::Result<IMMDevice> {
+    let devices: IMMDeviceEnumerator = CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
+    devices.GetDefaultAudioEndpoint(eRender, eConsole)
+}
+
+/// An event-driven shared-mode stream of interleaved `f32` samples.
+struct Stream {
+    client: IAudioClient,
+    render: IAudioRenderClient,
+    event: HANDLE,
+    buffer_frames: u32,
+    channels: usize,
+}
+
+impl Stream {
+    unsafe fn open(channels: u16, rate: u32) -> windows::core::Result<Self> {
+        let client: IAudioClient = default_device()?.Activate(CLSCTX_ALL, None)?;
+        let block_align = channels * 4;
+        let format = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+                nChannels: channels,
+                nSamplesPerSec: rate,
+                nAvgBytesPerSec: rate * block_align as u32,
+                nBlockAlign: block_align,
+                wBitsPerSample: 32,
+                cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 32,
+            },
+            dwChannelMask: channel_mask(channels),
+            // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            SubFormat: GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71),
+        };
+        let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        let format_ptr = &format as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+        client.Initialize(
+            AUDCLNT_SHAREMODE_SHARED,
+            flags,
+            DEVICE_BUFFER_HNS,
+            0,
+            format_ptr,
+            None,
+        )?;
+        let event = CreateEventW(None, false, false, None)?;
+        let stream = Self {
+            render: client.GetService()?,
+            buffer_frames: client.GetBufferSize()?,
+            client,
+            event,
+            channels: channels as usize,
+        };
+        stream.client.SetEventHandle(event)?;
+        stream.client.Start()?;
+        Ok(stream)
+    }
+
+    /// Waits until the device wants data and fills what it can take. False once the device is
+    /// gone.
+    unsafe fn render(&self, source: &mut TrackSource) -> bool {
+        WaitForSingleObject(self.event, 200);
+        let Ok(padding) = self.client.GetCurrentPadding() else {
+            return false;
+        };
+        let frames = self.buffer_frames.saturating_sub(padding);
+        if frames == 0 {
+            return true;
+        }
+        let Ok(data) = self.render.GetBuffer(frames) else {
+            return false;
+        };
+        // The engine's buffers are aligned for the sample type.
+        let samples =
+            std::slice::from_raw_parts_mut(data as *mut f32, frames as usize * self.channels);
+        source.fill(samples);
+        self.render.ReleaseBuffer(frames, 0).is_ok()
+    }
+}
+
+impl Drop for Stream {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.client.Stop();
+            let _ = CloseHandle(self.event);
+        }
+    }
+}
+
+/// Speaker positions of the usual layouts (mono, stereo, 5.1, 7.1); others are left unassigned.
+fn channel_mask(channels: u16) -> u32 {
+    match channels {
+        1 => 0x4,
+        2 => 0x3,
+        3 => 0x7,
+        4 => 0x33,
+        6 => 0x3F,
+        8 => 0x63F,
+        _ => 0,
+    }
+}
+
+/// Samples of one track for the render thread.
 struct TrackSource {
     levels: Arc<Levels>,
     state: Arc<TrackState>,
     chunks: Receiver<Chunk>,
-    channels: ChannelCount,
-    rate: SampleRate,
+    channels: usize,
+    rate: u32,
     buf: Vec<f32>,
     pos: usize,
     buf_epoch: u64,
     buf_start: f64,
     frames_played: u64,
-    /// Index of the next sample within its frame: decisions are made on frame boundaries only,
-    /// so channels never get shifted.
-    phase: u16,
-    /// The current frame is silence rather than data.
-    silent: bool,
-    gain: f32,
 }
 
 impl TrackSource {
+    /// Fills whole frames of `out` with decoded audio, or silence while paused or waiting.
+    fn fill(&mut self, out: &mut [f32]) {
+        let gain = if self.levels.muted.load(Ordering::Relaxed) {
+            0.0
+        } else {
+            f32::from_bits(self.levels.volume.load(Ordering::Relaxed))
+        };
+        let mut played = false;
+        for frame in out.chunks_exact_mut(self.channels) {
+            if !self.next_frame_has_data() {
+                frame.fill(0.0);
+                continue;
+            }
+            played = true;
+            for sample in frame {
+                *sample = self.buf.get(self.pos).copied().unwrap_or(0.0) * gain;
+                self.pos += 1;
+            }
+            self.frames_played += 1;
+        }
+        if played {
+            self.state
+                .set_position(self.buf_start + self.frames_played as f64 / self.rate as f64);
+        }
+    }
+
     /// Decides whether the next frame comes from decoded data (true) or is silence.
     fn next_frame_has_data(&mut self) -> bool {
         let epoch = self.state.epoch.load(Ordering::Acquire);
@@ -300,7 +463,6 @@ impl TrackSource {
             self.buf.clear();
             self.pos = 0;
         }
-        let paused = self.levels.paused.load(Ordering::Relaxed);
         if self.pos >= self.buf.len() {
             loop {
                 match self.chunks.try_recv() {
@@ -323,55 +485,6 @@ impl TrackSource {
                 }
             }
         }
-        if paused || self.buf.is_empty() {
-            return false;
-        }
-        self.frames_played += 1;
-        self.state
-            .set_position(self.buf_start + self.frames_played as f64 / self.rate.get() as f64);
-        true
-    }
-}
-
-impl Iterator for TrackSource {
-    type Item = f32;
-
-    fn next(&mut self) -> Option<f32> {
-        if self.phase == 0 {
-            if self.state.stopped.load(Ordering::Relaxed) {
-                return None;
-            }
-            self.silent = !self.next_frame_has_data();
-            self.gain = if self.levels.muted.load(Ordering::Relaxed) {
-                0.0
-            } else {
-                f32::from_bits(self.levels.volume.load(Ordering::Relaxed))
-            };
-        }
-        self.phase = (self.phase + 1) % self.channels.get();
-        if self.silent {
-            return Some(0.0);
-        }
-        let sample = self.buf.get(self.pos).copied().unwrap_or(0.0);
-        self.pos += 1;
-        Some(sample * self.gain)
-    }
-}
-
-impl Source for TrackSource {
-    fn current_span_len(&self) -> Option<usize> {
-        None
-    }
-
-    fn channels(&self) -> ChannelCount {
-        self.channels
-    }
-
-    fn sample_rate(&self) -> SampleRate {
-        self.rate
-    }
-
-    fn total_duration(&self) -> Option<std::time::Duration> {
-        None
+        !self.levels.paused.load(Ordering::Relaxed) && !self.buf.is_empty()
     }
 }

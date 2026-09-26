@@ -2,69 +2,23 @@
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    CreateFontW, DeleteObject, CLIP_DEFAULT_PRECIS, COLOR_BTNFACE, DEFAULT_CHARSET,
-    DEFAULT_QUALITY, FW_NORMAL, HBRUSH, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS,
-};
+use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetMessageW, GetWindow,
-    GetWindowRect, IsDialogMessageW, IsWindow, LoadCursorW, PostQuitMessage, RegisterClassExW,
-    SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW,
-    GA_ROOT, GW_OWNER, HMENU, IDC_ARROW, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT,
-    WNDCLASSEXW, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU,
-    WS_VISIBLE,
+    GetWindowRect, IsDialogMessageW, IsWindow, PostQuitMessage, SendMessageW, SetForegroundWindow,
+    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
+    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::module;
 
-/// Owned GDI object, deleted on drop.
-pub struct GdiObject<T: Into<HGDIOBJ> + Copy>(pub T);
-
-impl<T: Into<HGDIOBJ> + Copy> Drop for GdiObject<T> {
-    fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(self.0.into());
-        }
-    }
-}
-
-pub type Font = GdiObject<HFONT>;
-pub type Brush = GdiObject<HBRUSH>;
-
 /// Registers a dialog window class on this DLL. Repeated calls fail harmlessly.
 pub unsafe fn register_class(name: PCWSTR, proc: WNDPROC) {
-    let wc = WNDCLASSEXW {
-        cbSize: size_of::<WNDCLASSEXW>() as u32,
-        style: CS_HREDRAW | CS_VREDRAW,
-        lpfnWndProc: proc,
-        hInstance: module(),
-        hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-        // System color index + 1: never deleted, unlike a brush we create ourselves.
-        hbrBackground: HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut _),
-        lpszClassName: name,
-        ..Default::default()
-    };
-    RegisterClassExW(&wc);
-}
-
-pub unsafe fn create_font(face: PCWSTR, height: i32) -> Font {
-    GdiObject(CreateFontW(
-        height,
-        0,
-        0,
-        0,
-        FW_NORMAL.0 as i32,
-        0,
-        0,
-        0,
-        DEFAULT_CHARSET,
-        OUT_DEFAULT_PRECIS,
-        CLIP_DEFAULT_PRECIS,
-        DEFAULT_QUALITY,
-        0,
-        face,
-    ))
+    // System color index + 1: never deleted, unlike a brush we create ourselves.
+    let background = HBRUSH((COLOR_BTNFACE.0 + 1) as usize as *mut _);
+    crate::gdi::register_class(name, proc, CS_HREDRAW | CS_VREDRAW, background);
 }
 
 /// The top-level window a dialog opened from `hwnd` should be modal to.

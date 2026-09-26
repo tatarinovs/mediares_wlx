@@ -5,15 +5,13 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use mediares_core::audio_tags::read_tags;
-use mediares_core::exif::read_orientation;
-use mediares_core::image::DynamicImage;
-use mediares_core::image_decode::{apply_exif_orientation, decode_bytes, decode_file};
+use mediares_core::image::codecs::png::PngEncoder;
+use mediares_core::image::{DynamicImage, ExtendedColorType, ImageEncoder};
+use mediares_core::image_decode::{decode_bytes, decode_oriented};
 use mediares_core::probe::{probe_file, MediaType};
 use mediares_core::video_frame::video_frame_rgba;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::Graphics::Gdi::{
-    CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, HBITMAP,
-};
+use windows::Win32::Graphics::Gdi::{CreateDIBSection, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -32,18 +30,6 @@ const CF_HDROP: u32 = 15;
 const THUMBNAIL_AT: f64 = 0.1;
 /// TC shows thumbnails on the window background: transparency is flattened onto white.
 const THUMBNAIL_BACKGROUND: u32 = 0x00FF_FFFF;
-
-fn header(width: u32, height: i32) -> BITMAPINFOHEADER {
-    BITMAPINFOHEADER {
-        biSize: size_of::<BITMAPINFOHEADER>() as u32,
-        biWidth: width as i32,
-        biHeight: height,
-        biPlanes: 1,
-        biBitCount: 32,
-        biCompression: BI_RGB.0,
-        ..Default::default()
-    }
-}
 
 /// A global memory block for the clipboard filled by `fill`.
 unsafe fn global_block(size: usize, fill: impl FnOnce(*mut u8)) -> Option<HGLOBAL> {
@@ -116,7 +102,7 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -
 /// and `file` as `CF_HDROP` so that pasting into a folder creates a file.
 pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&Path>) -> bool {
     let row = img.width as usize * 4;
-    let head = header(img.width, img.height as i32);
+    let head = crate::gdi::bitmap_info(img.width, img.height as i32).bmiHeader;
     let dib = global_block(
         size_of::<BITMAPINFOHEADER>() + row * img.height as usize,
         |dest| unsafe {
@@ -171,32 +157,25 @@ pub fn frame_file_name(video: &Path, position: f64) -> PathBuf {
         .expect("an unused name exists")
 }
 
+/// PNG without alpha: pictures on screen are always opaque.
 pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
-    let rgba: Vec<u8> = img
+    let rgb: Vec<u8> = img
         .bgra
         .chunks_exact(4)
-        .flat_map(|px| [px[2], px[1], px[0], 255])
+        .flat_map(|px| [px[2], px[1], px[0]])
         .collect();
-    mediares_core::image::save_buffer(
-        path,
-        &rgba,
-        img.width,
-        img.height,
-        mediares_core::image::ExtendedColorType::Rgba8,
-    )
-    .is_ok()
+    let Ok(file) = std::fs::File::create(path) else {
+        return false;
+    };
+    PngEncoder::new(std::io::BufWriter::new(file))
+        .write_image(&rgb, img.width, img.height, ExtendedColorType::Rgb8)
+        .is_ok()
 }
 
 /// Picture representing the file: the photo, a video frame, or the album art.
 fn source_picture(path: &Path) -> Option<DynamicImage> {
     match probe_file(path) {
-        kind if kind.is_image_kind() => {
-            let mut img = decode_file(path, kind)?;
-            if let Some(orientation) = read_orientation(path) {
-                apply_exif_orientation(&mut img, orientation);
-            }
-            Some(img)
-        }
+        kind if kind.is_image_kind() => decode_oriented(path, kind, true).map(|(img, _)| img),
         MediaType::Video => video_frame_rgba(path, THUMBNAIL_AT).map(DynamicImage::ImageRgba8),
         MediaType::Audio => {
             let embedded = read_tags(path, true)
@@ -227,10 +206,7 @@ pub fn thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<DecodedImage> {
 
 /// A top-down 32-bit DIB section with the picture; the caller (TC) owns it.
 pub unsafe fn to_hbitmap(img: &DecodedImage) -> Option<HBITMAP> {
-    let bmi = BITMAPINFO {
-        bmiHeader: header(img.width, -(img.height as i32)),
-        ..Default::default()
-    };
+    let bmi = crate::gdi::bitmap_info(img.width, -(img.height as i32));
     let mut bits = std::ptr::null_mut();
     let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
     if bits.is_null() {

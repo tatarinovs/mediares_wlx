@@ -102,7 +102,7 @@ enum Source {
     Constant,
     /// The file extension.
     Probe,
-    /// Audio tags: headers only. Delayed only for stream properties of files lofty can't parse,
+    /// Audio tags: headers only. Delayed only for stream properties of files symphonia can't parse,
     /// which come from Media Foundation.
     Tags,
     /// EXIF block: a small read, never delayed.
@@ -580,7 +580,7 @@ fn local_to_filetime(t: crate::exif::ExifDateTime) -> Option<u64> {
 }
 
 impl Field {
-    /// Stream properties, which Media Foundation can supply when lofty can't parse the file.
+    /// Stream properties, which Media Foundation can supply when symphonia can't parse the file.
     fn is_audio_stream_property(self) -> bool {
         use Field::*;
         matches!(
@@ -596,7 +596,7 @@ impl Field {
     }
 }
 
-/// The field has to come from Media Foundation: an audio file lofty doesn't recognize (WMA, AC3...).
+/// The field has to come from Media Foundation: an audio file symphonia doesn't recognize (WMA, AC3...).
 fn needs_audio_meta(path: &Path, field: Field, kind: MediaType) -> bool {
     kind == MediaType::Audio && field.is_audio_stream_property() && !has_tags(path)
 }
@@ -618,7 +618,7 @@ fn tag_value(path: &Path, field: Field) -> Option<Value> {
     if needs_audio_meta(path, field, MediaType::Audio) {
         return audio_meta_value(path, field);
     }
-    lofty_value(path, field)
+    tags_value(path, field)
 }
 
 fn audio_meta_value(path: &Path, field: Field) -> Option<Value> {
@@ -640,7 +640,7 @@ fn audio_meta_value(path: &Path, field: Field) -> Option<Value> {
 }
 
 #[cfg(feature = "tags")]
-fn lofty_value(path: &Path, field: Field) -> Option<Value> {
+fn tags_value(path: &Path, field: Field) -> Option<Value> {
     use Field::*;
     let tags = crate::cache::get_tags(path)?;
     let text = |s: &Option<String>| s.clone().map(Value::Text);
@@ -674,7 +674,7 @@ fn lofty_value(path: &Path, field: Field) -> Option<Value> {
 }
 
 #[cfg(not(feature = "tags"))]
-fn lofty_value(_path: &Path, _field: Field) -> Option<Value> {
+fn tags_value(_path: &Path, _field: Field) -> Option<Value> {
     None
 }
 

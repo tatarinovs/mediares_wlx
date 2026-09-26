@@ -1,12 +1,10 @@
 //! MediaCache: in-memory LRU cache of image, video and audio analysis results.
 
+use std::collections::HashMap;
 use std::fs;
-use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
-
-use lru::LruCache;
 
 use crate::hashing::{analyze, ImageAnalysis};
 use crate::image_decode::decode_file;
@@ -14,6 +12,7 @@ use crate::probe::{probe_file, MediaType};
 use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoError, VideoMeta};
 
 const CAPACITY: usize = 1024;
+const META_CAPACITY: usize = 512;
 
 #[derive(Debug, Clone)]
 pub enum CachedMedia {
@@ -52,91 +51,132 @@ impl FileKey {
     }
 }
 
-pub struct MediaCache {
-    cache: Mutex<LruCache<FileKey, CachedMedia>>,
+/// Least-recently-used map from file versions to values, shared between threads.
+struct FileCache<V> {
+    inner: Mutex<Lru<V>>,
 }
 
-impl MediaCache {
-    fn new(capacity: NonZeroUsize) -> Self {
+struct Lru<V> {
+    /// Value and the tick it was last used at.
+    map: HashMap<FileKey, (V, u64)>,
+    clock: u64,
+    capacity: usize,
+}
+
+impl<V: Clone> FileCache<V> {
+    fn new(capacity: usize) -> Self {
         Self {
-            cache: Mutex::new(LruCache::new(capacity)),
+            inner: Mutex::new(Lru {
+                map: HashMap::new(),
+                clock: 0,
+                capacity,
+            }),
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, CachedMedia>> {
-        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    fn lock(&self) -> MutexGuard<'_, Lru<V>> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// The cached value for the current version of `path`, or `compute`'s result (cached unless
+    /// it is `None`). `None` also if the file is gone.
+    fn get_or_compute(&self, path: &Path, compute: impl FnOnce(&Path) -> Option<V>) -> Option<V> {
+        let key = FileKey::for_path(path)?;
+        {
+            let mut lru = self.lock();
+            lru.clock += 1;
+            let now = lru.clock;
+            if let Some((value, used)) = lru.map.get_mut(&key) {
+                *used = now;
+                return Some(value.clone());
+            }
+        }
+        let value = compute(path)?;
+        let mut lru = self.lock();
+        lru.clock += 1;
+        let now = lru.clock;
+        lru.map.insert(key, (value.clone(), now));
+        if lru.map.len() > lru.capacity {
+            // Only when full: a scan over at most `capacity` entries.
+            let oldest = lru
+                .map
+                .iter()
+                .min_by_key(|(_, (_, used))| *used)
+                .map(|(k, _)| k.clone());
+            if let Some(oldest) = oldest {
+                lru.map.remove(&oldest);
+            }
+        }
+        Some(value)
+    }
+
+    fn contains(&self, path: &Path) -> bool {
+        FileKey::for_path(path).is_some_and(|key| self.lock().map.contains_key(&key))
+    }
+
+    fn clear(&self) {
+        self.lock().map.clear();
+    }
+}
+
+pub struct MediaCache(FileCache<CachedMedia>);
+
+impl MediaCache {
     /// Returns the cached analysis or computes it. A cancelled analysis is returned as
     /// `Unsupported` but not cached, so the next request recomputes it.
     pub fn get_or_analyze(&self, path: &Path, cancelled: &dyn Fn() -> bool) -> CachedMedia {
-        let Some(key) = FileKey::for_path(path) else {
-            return CachedMedia::Unsupported;
-        };
-        if let Some(hit) = self.lock().get(&key) {
-            return hit.clone();
-        }
-
-        let result = match probe_file(path) {
-            kind if kind.is_image_kind() => decode_file(path, kind)
-                .map(|img| CachedMedia::Image(Arc::new(analyze(&img))))
-                .unwrap_or(CachedMedia::Unsupported),
-            MediaType::Video => match analyze_video(path, cancelled) {
-                Ok(v) => CachedMedia::Video(Arc::new(v)),
-                Err(VideoError::Cancelled) => return CachedMedia::Unsupported,
-                Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
-            },
-            #[cfg(feature = "audio-decode")]
-            MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
-                Ok(a) => CachedMedia::Audio(Arc::new(a)),
-                Err(crate::audio_fingerprint::AudioError::Cancelled) => {
-                    return CachedMedia::Unsupported
-                }
-                Err(crate::audio_fingerprint::AudioError::Unsupported) => CachedMedia::Unsupported,
-            },
-            _ => CachedMedia::Unsupported,
-        };
-
-        self.lock().put(key, result.clone());
-        result
+        self.0
+            .get_or_compute(path, |path| analyze_file(path, cancelled))
+            .unwrap_or(CachedMedia::Unsupported)
     }
 
     pub fn is_cached(&self, path: &Path) -> bool {
-        FileKey::for_path(path).is_some_and(|key| self.lock().contains(&key))
+        self.0.contains(path)
     }
 
     pub fn clear(&self) {
-        self.lock().clear();
+        self.0.clear();
     }
+}
+
+/// `None` if the host cancelled the analysis.
+fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia> {
+    Some(match probe_file(path) {
+        kind if kind.is_image_kind() => decode_file(path, kind)
+            .map(|img| CachedMedia::Image(Arc::new(analyze(&img))))
+            .unwrap_or(CachedMedia::Unsupported),
+        MediaType::Video => match analyze_video(path, cancelled) {
+            Ok(v) => CachedMedia::Video(Arc::new(v)),
+            Err(VideoError::Cancelled) => return None,
+            Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
+        },
+        #[cfg(feature = "audio-decode")]
+        MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
+            Ok(a) => CachedMedia::Audio(Arc::new(a)),
+            Err(crate::audio_fingerprint::AudioError::Cancelled) => return None,
+            Err(crate::audio_fingerprint::AudioError::Unsupported) => CachedMedia::Unsupported,
+        },
+        _ => CachedMedia::Unsupported,
+    })
 }
 
 /// Cheap per-file metadata (tags, EXIF, stream properties) keyed by file version: TC asks for
 /// every column separately, and each file is read once. Failed reads are cached too.
-struct MetaCache<T>(Mutex<LruCache<FileKey, Option<Arc<T>>>>);
+struct MetaCache<T>(FileCache<Option<Arc<T>>>);
 
 impl<T> MetaCache<T> {
     fn new() -> Self {
-        MetaCache(Mutex::new(LruCache::new(
-            NonZeroUsize::new(512).expect("non-zero capacity"),
-        )))
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, LruCache<FileKey, Option<Arc<T>>>> {
-        self.0.lock().unwrap_or_else(|e| e.into_inner())
+        MetaCache(FileCache::new(META_CAPACITY))
     }
 
     fn get_or_read(&self, path: &Path, read: impl FnOnce(&Path) -> Option<T>) -> Option<Arc<T>> {
-        let key = FileKey::for_path(path)?;
-        if let Some(hit) = self.lock().get(&key) {
-            return hit.clone();
-        }
-        let value = read(path).map(Arc::new);
-        self.lock().put(key, value.clone());
-        value
+        self.0
+            .get_or_compute(path, |p| Some(read(p).map(Arc::new)))
+            .flatten()
     }
 
     fn contains(&self, path: &Path) -> bool {
-        FileKey::for_path(path).is_some_and(|key| self.lock().contains(&key))
+        self.0.contains(path)
     }
 }
 
@@ -173,7 +213,7 @@ fn audio_meta_cache() -> &'static MetaCache<crate::mf_audio::AudioStreamMeta> {
     AUDIO.get_or_init(MetaCache::new)
 }
 
-/// Audio stream properties via Media Foundation, for files lofty can't parse (WMA, AC3...).
+/// Audio stream properties via Media Foundation, for files symphonia can't parse (WMA, AC3...).
 pub fn get_audio_meta(path: &Path) -> Option<Arc<crate::mf_audio::AudioStreamMeta>> {
     audio_meta_cache().get_or_read(path, crate::mf_audio::probe_audio_meta)
 }
@@ -194,6 +234,35 @@ pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> 
 
 pub fn get_cache() -> &'static MediaCache {
     static GLOBAL_CACHE: OnceLock<MediaCache> = OnceLock::new();
-    GLOBAL_CACHE
-        .get_or_init(|| MediaCache::new(NonZeroUsize::new(CAPACITY).expect("non-zero capacity")))
+    GLOBAL_CACHE.get_or_init(|| MediaCache(FileCache::new(CAPACITY)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn least_recently_used_goes_first() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (a, b, c) = (
+            dir.join("Cargo.toml"),
+            dir.join("src/lib.rs"),
+            dir.join("src/cache.rs"),
+        );
+        let cache = FileCache::new(2);
+        let computed = std::cell::Cell::new(0);
+        let get = |p: &Path| {
+            cache.get_or_compute(p, |_| {
+                computed.set(computed.get() + 1);
+                Some(computed.get())
+            })
+        };
+        assert_eq!(get(&a), Some(1));
+        assert_eq!(get(&b), Some(2));
+        assert_eq!(get(&a), Some(1)); // hit: `a` is now the most recent
+        assert_eq!(get(&c), Some(3)); // evicts `b`
+        assert!(cache.contains(&a) && cache.contains(&c) && !cache.contains(&b));
+        assert_eq!(cache.get_or_compute(&b, |_| None), None);
+        assert!(!cache.contains(&b));
+    }
 }

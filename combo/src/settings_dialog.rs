@@ -5,7 +5,7 @@ use std::sync::Mutex;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, InvalidateRect, SetBkColor, SetBkMode, SetTextColor, HDC, OPAQUE,
+    InvalidateRect, SetBkColor, SetBkMode, SetTextColor, HDC, OPAQUE,
 };
 use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_FILEMUSTEXIST,
@@ -21,8 +21,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::{OsdMode, ViewerConfig};
-use crate::dialog::{self, Brush, GdiObject};
+use crate::dialog;
 use crate::file_actions::show_error;
+use crate::gdi::{self, Brush};
 use crate::playlist::Repeat;
 use crate::tc_register::Registration;
 use crate::{osd_template, osd_template_dialog};
@@ -114,13 +115,13 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         slideshow_seconds: with_current(SLIDESHOW_SECONDS, current.slideshow_seconds, |a, b| {
             a == b
         }),
-        background_brush: GdiObject(CreateSolidBrush(COLORREF(current.photo_background))),
+        background_brush: gdi::solid_brush(current.photo_background),
         registration: Registration::find(),
         result: None,
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
-    let font = dialog::create_font(w!("Segoe UI"), -12);
+    let font = gdi::create_font("Segoe UI", -12, false);
     let ok = build_controls(dlg, &*ctx, font.0);
     dialog::run_modal(dlg, ok);
 
@@ -650,7 +651,7 @@ unsafe fn choose_color(dlg: HWND, ctx: &mut Context) {
 unsafe fn choose_background(dlg: HWND, ctx: &mut Context) {
     if let Some(color) = pick_color(dlg, ctx.background) {
         ctx.background = color;
-        ctx.background_brush = GdiObject(CreateSolidBrush(COLORREF(color)));
+        ctx.background_brush = gdi::solid_brush(color);
         repaint_previews(dlg);
     }
 }

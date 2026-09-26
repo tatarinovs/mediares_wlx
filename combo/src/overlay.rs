@@ -11,21 +11,17 @@ use std::sync::Once;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{
-    BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreatePen, CreateRoundRectRgn,
-    CreateSolidBrush, DeleteDC, DeleteObject, FillRect, Polygon, SelectObject, SetWindowRgn, HDC,
-    PS_NULL, SRCCOPY,
-};
-use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn, HDC};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
-    GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, RegisterClassExW,
-    SetCursor, SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow, GUITHREADINFO,
+    GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, SetCursor,
+    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow, GUITHREADINFO,
     GUI_INMENUMODE, GUI_POPUPMENUMODE, GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WNDCLASSEXW, WS_EX_LAYERED,
-    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
+use crate::gdi;
 use crate::module;
 use crate::transport_bar;
 
@@ -34,8 +30,6 @@ const CLASS_NAME: PCWSTR = w!("MediaresOverlay");
 pub const OVERLAY_TIMER_ID: usize = 0x4D55;
 const IDLE_MS: u32 = 2500;
 const OPACITY: u8 = 215;
-const BG: u32 = 0x00202020;
-const ICON: u32 = 0x00E8E8E8;
 /// The panel appears when the cursor is this many panel heights from the bottom edge.
 const APPROACH_HEIGHTS: i32 = 3;
 
@@ -79,15 +73,8 @@ pub fn hit_photo(dpi_scale: f32, x: i32, y: i32) -> Option<PhotoButton> {
     let (_, buttons) = photo_layout(dpi_scale);
     buttons
         .iter()
-        .find(|(_, r)| x >= r.left && x < r.right && y >= r.top && y < r.bottom)
+        .find(|(_, r)| gdi::contains(r, x, y))
         .map(|(b, _)| *b)
-}
-
-pub fn dpi_scale(hwnd: HWND) -> f32 {
-    match unsafe { GetDpiForWindow(hwnd) } {
-        0 => 1.0,
-        dpi => dpi as f32 / 96.0,
-    }
 }
 
 /// The floating panel window.
@@ -131,7 +118,7 @@ unsafe extern "system" fn panel_proc(
         let handled = if viewer.is_invalid() {
             None
         } else {
-            crate::window::overlay_message(viewer, hwnd, msg, lparam)
+            crate::window::overlay_message(viewer, hwnd, msg, wparam, lparam)
         };
         handled.unwrap_or_else(|| DefWindowProcW(hwnd, msg, wparam, lparam))
     })
@@ -139,22 +126,19 @@ unsafe extern "system" fn panel_proc(
 
 unsafe fn register_class() {
     static REGISTER: Once = Once::new();
-    REGISTER.call_once(|| {
-        let wc = WNDCLASSEXW {
-            cbSize: size_of::<WNDCLASSEXW>() as u32,
-            lpfnWndProc: Some(panel_proc),
-            hInstance: module(),
-            hCursor: LoadCursorW(None, IDC_ARROW).unwrap_or_default(),
-            lpszClassName: CLASS_NAME,
-            ..Default::default()
-        };
-        RegisterClassExW(&wc);
+    REGISTER.call_once(|| unsafe {
+        gdi::register_class(
+            CLASS_NAME,
+            Some(panel_proc),
+            Default::default(),
+            Default::default(),
+        );
     });
 }
 
 unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<Panel> {
     register_class();
-    let scale = dpi_scale(viewer);
+    let scale = gdi::dpi_scale(viewer);
     let h = transport_bar::height(scale);
     let rect = match kind {
         PanelKind::Video => RECT {
@@ -267,7 +251,7 @@ impl Fullscreen {
         }
         self.last_cursor = pt;
         self.cursor_hidden = false;
-        let zone = transport_bar::height(dpi_scale(viewer)) * APPROACH_HEIGHTS;
+        let zone = transport_bar::height(gdi::dpi_scale(viewer)) * APPROACH_HEIGHTS;
         if pt.y >= self.monitor.bottom - zone {
             self.show_panel();
         }
@@ -320,7 +304,7 @@ impl Fullscreen {
         let _ = GetCursorPos(&mut pt);
         let mut rc = RECT::default();
         let _ = GetWindowRect(panel.hwnd, &mut rc);
-        pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom
+        gdi::contains(&rc, pt.x, pt.y)
     }
 
     pub unsafe fn invalidate_panel(&self) {
@@ -346,93 +330,17 @@ unsafe fn ui_elsewhere(viewer: HWND) -> bool {
     in_menu || GetForegroundWindow() != viewer
 }
 
-/// Double-buffered painting of a whole window.
-pub unsafe fn with_buffer(hdc: HDC, rc: RECT, paint: impl FnOnce(HDC)) {
-    let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
-    if w <= 0 || h <= 0 {
-        return;
-    }
-    let mem = CreateCompatibleDC(Some(hdc));
-    let bmp = CreateCompatibleBitmap(hdc, w, h);
-    let old = SelectObject(mem, bmp.into());
-    paint(mem);
-    let _ = BitBlt(hdc, 0, 0, w, h, Some(mem), 0, 0, SRCCOPY);
-    SelectObject(mem, old);
-    let _ = DeleteObject(bmp.into());
-    let _ = DeleteDC(mem);
-}
-
 /// Paints the photo box; `playing`: the slideshow runs (the middle button shows pause).
 pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool) {
-    let brush = CreateSolidBrush(COLORREF(BG));
-    FillRect(dc, &rc, brush);
-    let _ = DeleteObject(brush.into());
-
-    let icon = CreateSolidBrush(COLORREF(ICON));
-    let pen = CreatePen(PS_NULL, 0, COLORREF(0));
-    let (ob, op) = (SelectObject(dc, icon.into()), SelectObject(dc, pen.into()));
-    let u = (7.0 * dpi_scale).round() as i32;
-    let bar = (2.0 * dpi_scale).round().max(1.0) as i32;
-    let block = |l: i32, t: i32, r: i32, b: i32| {
-        FillRect(
-            dc,
-            &RECT {
-                left: l,
-                top: t,
-                right: r,
-                bottom: b,
-            },
-            icon,
-        );
-    };
+    gdi::fill(dc, rc, transport_bar::BG);
     let (_, buttons) = photo_layout(dpi_scale);
     for (button, r) in buttons {
-        let (cx, cy) = ((r.left + r.right) / 2, (r.top + r.bottom) / 2);
-        let p = |x: i32, y: i32| POINT { x, y };
         match button {
-            // Previous / next: a triangle ending in a bar, as on the transport bar.
-            PhotoButton::Previous => {
-                let _ = Polygon(
-                    dc,
-                    &[
-                        p(cx + u / 2, cy - u),
-                        p(cx + u / 2, cy + u),
-                        p(cx - u / 2, cy),
-                    ],
-                );
-                block(cx - u / 2 - bar, cy - u, cx - u / 2, cy + u);
-            }
-            PhotoButton::Next => {
-                let _ = Polygon(
-                    dc,
-                    &[
-                        p(cx - u / 2, cy - u),
-                        p(cx - u / 2, cy + u),
-                        p(cx + u / 2, cy),
-                    ],
-                );
-                block(cx + u / 2, cy - u, cx + u / 2 + bar, cy + u);
-            }
-            PhotoButton::Slideshow if playing => {
-                block(cx - u * 2 / 3, cy - u, cx - u / 5, cy + u);
-                block(cx + u / 5, cy - u, cx + u * 2 / 3, cy + u);
-            }
-            PhotoButton::Slideshow => {
-                let _ = Polygon(
-                    dc,
-                    &[
-                        p(cx - u * 2 / 3, cy - u),
-                        p(cx - u * 2 / 3, cy + u),
-                        p(cx + u, cy),
-                    ],
-                );
-            }
+            PhotoButton::Previous => transport_bar::skip_icon(dc, r, false, dpi_scale),
+            PhotoButton::Slideshow => transport_bar::play_icon(dc, r, playing, dpi_scale),
+            PhotoButton::Next => transport_bar::skip_icon(dc, r, true, dpi_scale),
         }
     }
-    SelectObject(dc, op);
-    SelectObject(dc, ob);
-    let _ = DeleteObject(pen.into());
-    let _ = DeleteObject(icon.into());
 }
 
 #[cfg(test)]

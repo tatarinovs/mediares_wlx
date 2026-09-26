@@ -11,7 +11,7 @@
 use std::cell::RefCell;
 use std::path::Path;
 
-use mediares_core::mf_init::{ComScope, MfSession};
+use mediares_core::mf_init::{mf_scope, ComScope};
 use windows::core::{implement, Interface, BSTR};
 use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{
@@ -160,23 +160,22 @@ unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
     Ok(device)
 }
 
-const FALLBACK_FRAME_SEC: f64 = 0.04;
+/// Frame length when the stream doesn't state its rate (25 fps).
+pub const FALLBACK_FRAME_SEC: f64 = 0.04;
 
-/// Field order matters: the engine is released before the output, MF and COM.
+/// Field order matters: the engine is released before the output and COM.
 pub struct VideoPlayer {
     engine: IMFMediaEngine,
     engine_ex: Option<IMFMediaEngineEx>,
     output: RefCell<Output>,
     _manager: IMFDXGIDeviceManager,
-    _mf: MfSession,
     _com: ComScope,
 }
 
 impl VideoPlayer {
     /// Creates an engine rendering into `surface` and notifying `events_to`.
     pub unsafe fn new(surface: HWND, events_to: HWND) -> windows::core::Result<Self> {
-        let com = ComScope::new();
-        let mf = MfSession::start().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
+        let com = mf_scope().ok_or_else(|| windows::core::Error::from(E_FAIL))?;
         let output = Output::new(surface)?;
 
         let mut reset_token = 0u32;
@@ -209,7 +208,6 @@ impl VideoPlayer {
             engine_ex,
             output: RefCell::new(output),
             _manager: manager,
-            _mf: mf,
             _com: com,
         })
     }

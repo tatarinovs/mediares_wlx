@@ -9,20 +9,17 @@ use std::sync::Arc;
 
 use mediares_core::audio_tags::{read_tags, AudioTags};
 use mediares_core::probe::MediaType;
-use mediares_core::video_frame::probe_audio;
-use windows::core::w;
-use windows::Win32::Foundation::{COLORREF, HWND, RECT};
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    CreateSolidBrush, DeleteObject, DrawTextW, FillRect, SelectObject, SetBkMode, SetTextColor,
     DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    HDC, HFONT, TRANSPARENT,
+    HDC, HFONT,
 };
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA,
 };
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
-use crate::dialog::{self, Font};
+use crate::gdi::{self, fill, Font};
 use crate::image_cache::{self, DecodeOptions, DecodedImage, BACKGROUND};
 use crate::image_view::draw_fitted;
 use crate::media_view::EventEffect;
@@ -63,7 +60,7 @@ impl Backend {
                 return Some(Backend::Native(player));
             }
         }
-        let duration = probe_audio(path)?;
+        let duration = mediares_core::cache::get_audio_meta(path)?.duration_sec;
         let surface = Surface::new(viewer, false)?;
         let player = VideoPlayer::new(surface.0, viewer).ok()?;
         transport_bar::restore_audio_level(&player);
@@ -244,10 +241,10 @@ impl AudioView {
             self.fonts = Some(unsafe {
                 Fonts {
                     dpi_key: key,
-                    title: dialog::create_font(w!("Segoe UI Semibold"), px(24.0)),
-                    text: dialog::create_font(w!("Segoe UI"), px(17.0)),
-                    small: dialog::create_font(w!("Segoe UI"), px(13.0)),
-                    note: dialog::create_font(w!("Segoe UI Symbol"), px(96.0)),
+                    title: gdi::create_font("Segoe UI Semibold", px(24.0), false),
+                    text: gdi::create_font("Segoe UI", px(17.0), false),
+                    small: gdi::create_font("Segoe UI", px(13.0), false),
+                    note: gdi::create_font("Segoe UI Symbol", px(96.0), false),
                 }
             });
         }
@@ -425,23 +422,7 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
     )
 }
 
-unsafe fn fill(dc: HDC, r: RECT, color: u32) {
-    let brush = CreateSolidBrush(COLORREF(color));
-    FillRect(dc, &r, brush);
-    let _ = DeleteObject(brush.into());
-}
-
 unsafe fn text(dc: HDC, r: RECT, s: &str, font: HFONT, color: u32, align: DRAW_TEXT_FORMAT) {
-    let mut wide: Vec<u16> = s.encode_utf16().collect();
-    let mut rc = r;
-    let old = SelectObject(dc, font.into());
-    SetBkMode(dc, TRANSPARENT);
-    SetTextColor(dc, COLORREF(color));
-    DrawTextW(
-        dc,
-        &mut wide,
-        &mut rc,
-        align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
-    );
-    SelectObject(dc, old);
+    let flags = align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
+    gdi::text(dc, r, s, Some(font), color, flags);
 }

@@ -1,4 +1,4 @@
-//! Audio through Media Foundation (`IMFSourceReader`) for files symphonia and lofty can't open
+//! Audio through Media Foundation (`IMFSourceReader`) for files symphonia can't open
 //! (WMA, AC3, ... — whatever decoders the system has): decoding to `f32` PCM for the duplicate
 //! detection fields, and stream properties for WDX columns. The output depends on the installed
 //! decoders, so the pure-Rust path stays the first choice.
@@ -13,8 +13,8 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SOURCE_READERF_ERROR, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
 };
 
-use crate::mf_init::{ensure_mf_started, ComScope};
-use crate::video_frame::{audio_codec_name, duration_hns, open_reader_for};
+use crate::mf_init::{mf_scope, ComScope};
+use crate::video_frame::{audio_codec_name, duration_sec, file_bitrate_kbps, open_reader_for};
 
 const STREAM: u32 = MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32;
 /// Consecutive reads without samples (stream ticks, gaps) after which the stream is treated as finished.
@@ -34,10 +34,7 @@ pub struct MfAudioReader {
 impl MfAudioReader {
     /// `None` if Media Foundation can't open the file or decode its audio to float PCM.
     pub fn open(path: &Path) -> Option<Self> {
-        let com = ComScope::new();
-        if !ensure_mf_started() {
-            return None;
-        }
+        let com = mf_scope()?;
         unsafe {
             let reader = open_reader_for(path, STREAM, false).ok()?;
             let wanted = MFCreateMediaType().ok()?;
@@ -137,10 +134,7 @@ pub struct AudioStreamMeta {
 }
 
 pub fn probe_audio_meta(path: &Path) -> Option<AudioStreamMeta> {
-    let _com = ComScope::new();
-    if !ensure_mf_started() {
-        return None;
-    }
+    let _com = mf_scope()?;
     unsafe {
         let reader = open_reader_for(path, STREAM, false).ok()?;
         let native = reader.GetNativeMediaType(STREAM, 0).ok()?;
@@ -150,14 +144,10 @@ pub fn probe_audio_meta(path: &Path) -> Option<AudioStreamMeta> {
             .ok()
             .and_then(|g| audio_codec_name(&g));
         let lossless = codec.as_deref().and_then(is_lossless);
-        let duration_sec = duration_hns(&reader) as f64 / 10_000_000.0;
-        let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let duration_sec = duration_sec(&reader);
         let bitrate_kbps = positive(native.GetUINT32(&MF_MT_AUDIO_AVG_BYTES_PER_SECOND))
             .map(|b| (b as f64 * 8.0 / 1000.0).round() as u32)
-            .or_else(|| {
-                (duration_sec >= 1.0 && file_size > 0)
-                    .then(|| (file_size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32)
-            })
+            .or_else(|| file_bitrate_kbps(path, duration_sec))
             .filter(|&k| k > 0);
         Some(AudioStreamMeta {
             codec,
@@ -201,24 +191,7 @@ mod tests {
     fn decodes_pcm_wav() {
         let rate = 8000u32;
         let frames = rate * 2;
-        let mut b = Vec::new();
-        b.extend_from_slice(b"RIFF");
-        b.extend_from_slice(&(36 + frames * 2).to_le_bytes());
-        b.extend_from_slice(b"WAVEfmt ");
-        b.extend_from_slice(&16u32.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&1u16.to_le_bytes());
-        b.extend_from_slice(&rate.to_le_bytes());
-        b.extend_from_slice(&(rate * 2).to_le_bytes());
-        b.extend_from_slice(&2u16.to_le_bytes());
-        b.extend_from_slice(&16u16.to_le_bytes());
-        b.extend_from_slice(b"data");
-        b.extend_from_slice(&(frames * 2).to_le_bytes());
-        for i in 0..frames {
-            b.extend_from_slice(&((i % 1000) as i16 * 16).to_le_bytes());
-        }
-        let path = std::env::temp_dir().join(format!("mediares_mf_{}.wav", std::process::id()));
-        std::fs::write(&path, b).unwrap();
+        let path = crate::test_util::pcm16_wav("mf", rate, 1, frames, |i| (i % 1000) as i16 * 16);
 
         let mut reader = MfAudioReader::open(&path).expect("open");
         assert_eq!((reader.sample_rate, reader.channels), (rate, 1));

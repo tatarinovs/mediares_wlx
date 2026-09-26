@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+use crate::exif::Endian;
 use crate::jpeg;
 
 const MIN_PREVIEW_LEN: usize = 32 * 1024;
@@ -101,35 +102,12 @@ fn signature_preview(file: &mut File) -> Option<Vec<u8>> {
     jpeg::find_largest(&data, MIN_PREVIEW_LEN).map(<[u8]>::to_vec)
 }
 
-#[derive(Clone, Copy)]
-struct Endian(bool);
-
-impl Endian {
-    fn u16(self, b: &[u8]) -> u16 {
-        let v = [b[0], b[1]];
-        if self.0 {
-            u16::from_le_bytes(v)
-        } else {
-            u16::from_be_bytes(v)
-        }
-    }
-
-    fn u32(self, b: &[u8]) -> u32 {
-        let v = [b[0], b[1], b[2], b[3]];
-        if self.0 {
-            u32::from_le_bytes(v)
-        } else {
-            u32::from_be_bytes(v)
-        }
-    }
-
-    /// First value of a SHORT/LONG entry stored inline in the 4-byte value field.
-    fn inline_uint(self, typ: u16, value: &[u8]) -> Option<u64> {
-        match typ {
-            3 => Some(self.u16(value) as u64),
-            4 | 13 => Some(self.u32(value) as u64),
-            _ => None,
-        }
+/// First value of a SHORT/LONG entry stored inline in the 4-byte value field.
+fn inline_uint(rd: Endian, typ: u16, value: &[u8]) -> Option<u64> {
+    match typ {
+        3 => Some(rd.u16(value) as u64),
+        4 | 13 => Some(rd.u32(value) as u64),
+        _ => None,
     }
 }
 
@@ -169,7 +147,7 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
         // Multi-valued strip tables mean a tiled/multi-strip image, not a single JPEG.
         let single = || {
             if n == 1 {
-                rd.inline_uint(typ, value)
+                inline_uint(rd, typ, value)
             } else {
                 None
             }
@@ -180,7 +158,7 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
             0x0117 => ifd.strip_length = single(),
             0x0201 => ifd.jpeg_offset = single(),
             0x0202 => ifd.jpeg_length = single(),
-            0x014A if n == 1 => ifd.sub_ifds.extend(rd.inline_uint(typ, value)),
+            0x014A if n == 1 => ifd.sub_ifds.extend(inline_uint(rd, typ, value)),
             0x014A if n > 1 => {
                 sub_ifd_array = Some((rd.u32(value) as u64, (n as usize).min(MAX_SUB_IFDS)))
             }

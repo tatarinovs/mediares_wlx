@@ -9,6 +9,7 @@ mod dialog;
 mod exif_dialog;
 mod file_actions;
 mod fullscreen;
+mod gdi;
 mod image_cache;
 mod image_view;
 mod media_view;
