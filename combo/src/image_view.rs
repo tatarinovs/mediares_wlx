@@ -12,6 +12,7 @@ use crate::gdi::{self, Font};
 use crate::i18n::tr;
 use crate::image_cache::{DecodedImage, BACKGROUND};
 use crate::osd_template;
+use crate::smooth;
 use crate::state::{Loupe, ViewerState, ZoomMode};
 
 const MIN_ZOOM: f32 = 0.05;
@@ -19,6 +20,9 @@ const MAX_ZOOM: f32 = 50.0;
 const ZOOM_STEP: f32 = 1.25;
 /// Zooming out to within this fraction of the fit scale snaps back to Fit.
 const FIT_SNAP: f32 = 0.04;
+/// Manual zoom and the loupe beyond this show the pixels as they are (to judge sharpness);
+/// fitting a small image into the window is smoothed at any scale.
+const MAX_SMOOTH_ZOOM: f32 = 4.0;
 const OSD_MARGIN: i32 = 10;
 
 pub unsafe fn client_size(hwnd: HWND) -> Option<(f32, f32)> {
@@ -199,7 +203,7 @@ pub unsafe fn paint(
         if let Some(img) = state.image.clone() {
             draw_image(dc, state, &img, (win_w as f32, win_h as f32));
         } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
-            draw_fitted(dc, &prev, window);
+            draw_fitted(dc, &prev, window, state.config.smooth_zoom);
         } else if state.load_failed {
             let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
             gdi::text(
@@ -232,8 +236,9 @@ fn muted_text_color(background: u32) -> u32 {
     }
 }
 
-/// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio.
-pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
+/// Draws the whole image scaled to fit `rect`, centered, keeping its aspect ratio; `smooth`:
+/// enlarge with bicubic filtering.
+pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT, smooth: bool) {
     let (rw, rh) = (
         (rect.right - rect.left) as f32,
         (rect.bottom - rect.top) as f32,
@@ -251,7 +256,14 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT) {
         rect.top + (rh as i32 - dh) / 2,
     );
     let (w, h) = (img.width as i32, img.height as i32);
-    stretch(dc, img, (0, w, dx, dw), (0, h, dy, dh), s < 1.0);
+    stretch(
+        dc,
+        img,
+        (0, w, dx, dw),
+        (0, h, dy, dh),
+        filter(s, smooth),
+        rect,
+    );
 }
 
 unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
@@ -261,25 +273,53 @@ unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f3
         visible_span(ox, s, img.width, view.0),
         visible_span(oy, s, img.height, view.1),
     ) {
-        stretch(dc, img, x, y, s < 1.0);
+        let smooth =
+            state.config.smooth_zoom && (state.zoom == ZoomMode::Fit || s <= MAX_SMOOTH_ZOOM);
+        let window = gdi::rect(view.0 as i32, view.1 as i32);
+        stretch(dc, img, x, y, filter(s, smooth), window);
     }
 }
 
-/// Copies source columns / rows `(start, len)` onto destination `(start, len)` spans.
-/// Shrinking uses HALFTONE (averaging), enlarging plain pixel replication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    /// GDI HALFTONE: averages the pixels that merge.
+    Shrink,
+    /// Each pixel becomes a sharp square.
+    Pixels,
+    /// Bicubic enlarging (Direct2D).
+    Smooth,
+}
+
+fn filter(scale: f32, smooth: bool) -> Filter {
+    if scale < 1.0 {
+        Filter::Shrink
+    } else if smooth && scale > 1.0 {
+        Filter::Smooth
+    } else {
+        Filter::Pixels
+    }
+}
+
+/// Copies source columns / rows `(start, len)` onto destination `(start, len)` spans; `bounds`:
+/// the area being painted.
 unsafe fn stretch(
     dc: HDC,
     img: &DecodedImage,
     (sx, sw, dx, dw): (i32, i32, i32, i32),
     (sy, sh, dy, dh): (i32, i32, i32, i32),
-    shrinking: bool,
+    filter: Filter,
+    bounds: RECT,
 ) {
+    if filter == Filter::Smooth && smooth::draw(dc, img, (sx, sw, dx, dw), (sy, sh, dy, dh), bounds)
+    {
+        return;
+    }
     // Point the DIB at the first visible row instead of using ySrc: StretchDIBits interprets
     // ySrc of top-down DIBs inconsistently across Windows versions.
     let stride = img.width as usize * 4;
     let rows = &img.bgra[sy as usize * stride..(sy + sh) as usize * stride];
     let bmi = gdi::bitmap_info(img.width, -sh);
-    if shrinking {
+    if filter == Filter::Shrink {
         SetStretchBltMode(dc, HALFTONE);
         let _ = SetBrushOrgEx(dc, 0, 0, None);
     } else {

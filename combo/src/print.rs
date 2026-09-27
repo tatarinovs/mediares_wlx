@@ -65,7 +65,7 @@ unsafe fn print_page(dc: HDC, img: &DecodedImage, doc_name: &str, margins: RECT)
     }
     let area = printable_rect(dc, margins);
     let ok = StartPage(dc) > 0 && {
-        draw_fitted(dc, img, area);
+        draw_fitted(dc, img, area, false);
         EndPage(dc) > 0
     };
     EndDoc(dc) > 0 && ok

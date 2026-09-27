@@ -254,7 +254,7 @@ impl AudioView {
     }
 
     /// Paints art and tags into `area`: side by side in a wide window, stacked in a tall one.
-    pub unsafe fn paint(&mut self, dc: HDC, area: RECT, scale: f32) {
+    pub unsafe fn paint(&mut self, dc: HDC, area: RECT, scale: f32, smooth: bool) {
         fill(dc, area, BACKGROUND);
         let s = |v: f32| (v * scale).round() as i32;
         let m = s(24.0);
@@ -329,7 +329,7 @@ impl AudioView {
 
         if art.right > art.left {
             match &cover {
-                Some(img) => draw_fitted(dc, img, art),
+                Some(img) => draw_fitted(dc, img, art, smooth),
                 None => {
                     fill(dc, art, PLACEHOLDER);
                     text(dc, art, "♫", note_font, DIM_COLOR, DT_CENTER);

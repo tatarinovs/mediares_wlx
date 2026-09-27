@@ -24,6 +24,7 @@ mod print;
 mod resume;
 mod save_as;
 mod settings_dialog;
+mod smooth;
 mod snapshot;
 mod state;
 mod tc_register;

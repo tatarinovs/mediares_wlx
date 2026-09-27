@@ -35,6 +35,7 @@ mediares_wlx/
 │   ├── window.rs               # Окно Lister, обработка сообщений, команды и горячие клавиши
 │   ├── state.rs                # Per-HWND состояние, список файлов папки (натуральная сортировка)
 │   ├── image_view.rs           # Масштаб/панорама/лупа, GDI double buffering, OSD
+│   ├── smooth.rs               # Бикубическое увеличение через Direct2D в буфер GDI
 │   ├── osd_template.rs         # Шаблоны OSD: поля, скрываемые блоки, значения EXIF/видео
 │   ├── osd_template_dialog.rs  # Редактор шаблона OSD с меню полей
 │   ├── image_cache.rs          # BGRA-кэш (LRU по байтам) + пул фоновых декодеров, поворот на 90°
@@ -107,6 +108,11 @@ RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/
 **Цвет фона** вокруг фото (и под прозрачностью PNG/GIF) выбирается в настройках; в палитре заготовлены
 чёрный, тёмный, средне-серый, светлый и белый. Там же — **«Не растягивать маленькие изображения»**: в режиме
 «вписать» картинка меньше окна показывается в 100 %, а не увеличивается.
+
+**Сглаживание при увеличении** (включено по умолчанию): увеличенное фото и обложка аудио рисуются бикубически
+через Direct2D прямо в буфер GDI, а не квадратными пикселями. В режиме «вписать» — при любом масштабе; при ручном
+зуме и лупе — до 400 %, дальше видны настоящие пиксели, чтобы оценивать резкость. Уменьшение, как и раньше, —
+GDI HALFTONE. Если Direct2D недоступен, картинка рисуется обычным GDI.
 
 ### Видео и аудио
 
@@ -360,7 +366,7 @@ Media Foundation, и такие поля откладываются, как ви
 2 — на видео, 3 — везде), `Repeat` (0 — нет, 1 — список, 2 — файл), `FrameFormat` (`png` / `jpg`),
 `PhotoEditor` / `VideoEditor` / `AudioEditor` (путь к программе, можно с аргументами и `%1`),
 `PhotoOSDTemplate` / `VideoOSDTemplate` (см. OSD). Флаги — 0/1: `StartFullscreen`, `AutoRotateExif`,
-`NoUpscale`, `ConfirmDelete`, `ResumeVideo`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`, `OverlayVideo`,
+`NoUpscale`, `SmoothZoom`, `ConfirmDelete`, `ResumeVideo`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`, `OverlayVideo`,
 `OverlayAutoHide`.
 
 Интерфейс на русском и английском. `auto` берёт язык Total Commander (`LanguageIni` в `wincmd.ini`:

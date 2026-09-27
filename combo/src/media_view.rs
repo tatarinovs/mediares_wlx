@@ -185,15 +185,16 @@ impl MediaView {
         }
     }
 
-    /// Paints the part of the client area in `dirty` (a video surface is clipped out by the viewer).
-    pub unsafe fn paint(&mut self, hdc: HDC, width: i32, height: i32, dirty: RECT) {
+    /// Paints the part of the client area in `dirty` (a video surface is clipped out by the viewer);
+    /// `smooth`: enlarge album art with bicubic filtering.
+    pub unsafe fn paint(&mut self, hdc: HDC, width: i32, height: i32, dirty: RECT, smooth: bool) {
         let scale = self.dpi_scale();
         let area = self.content_area();
         // Progress updates repaint only the bar: the cover isn't redrawn then (clipped out).
         gdi::with_buffer(hdc, width, height, dirty, |dc| unsafe {
             match &mut self.content {
                 Content::Video(_) => gdi::fill(dc, gdi::rect(width, height), 0),
-                Content::Audio(a) => a.paint(dc, area, scale),
+                Content::Audio(a) => a.paint(dc, area, scale, smooth),
             }
             if self.bar_host.is_none() {
                 self.paint_bar(dc, width, height, scale);

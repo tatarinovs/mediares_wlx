@@ -62,6 +62,7 @@ const IDC_VIDEO_OSD: i32 = 127;
 const IDC_NO_UPSCALE: i32 = 128;
 const IDC_LANGUAGE: i32 = 129;
 const IDC_FRAME_FORMAT: i32 = 130;
+const IDC_SMOOTH_ZOOM: i32 = 131;
 
 const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
@@ -112,7 +113,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         CLASS_NAME,
         tr("Настройки Mediares", "Mediares Settings"),
         850,
-        600,
+        625,
     )?;
 
     let ctx = Box::into_raw(Box::new(Context {
@@ -241,7 +242,7 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("Просмотр фото", "Photos"),
         BS_GROUPBOX as u32,
-        (15, 72, 395, 147),
+        (15, 72, 395, 172),
         0,
     );
     control(
@@ -293,11 +294,17 @@ unsafe fn build_controls(
         cfg.no_upscale,
     );
     checkbox(
+        tr("Сглаживание при увеличении", "Smooth enlarged images"),
+        (28, 188, 365, 22),
+        IDC_SMOOTH_ZOOM,
+        cfg.smooth_zoom,
+    );
+    checkbox(
         tr(
             "Спрашивать перед удалением в корзину (Del)",
             "Confirm moving to Recycle Bin (Del)",
         ),
-        (28, 188, 365, 22),
+        (28, 213, 365, 22),
         IDC_CONFIRM_DELETE,
         cfg.confirm_delete,
     );
@@ -306,19 +313,19 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("Информационная строка (OSD)", "Info line (OSD)"),
         BS_GROUPBOX as u32,
-        (15, 229, 395, 170),
+        (15, 254, 395, 170),
         0,
     );
     control(
         w!("STATIC"),
         tr("Показывать OSD:", "Show OSD:"),
         SS_LEFT,
-        (28, 257, 140, 20),
+        (28, 282, 140, 20),
         0,
     );
     let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
     combo(
-        (175, 254, 190, 150),
+        (175, 279, 190, 150),
         IDC_SHOW_OSD,
         osd_labels,
         cfg.osd.index() as usize,
@@ -327,7 +334,7 @@ unsafe fn build_controls(
         w!("STATIC"),
         tr("Размер шрифта:", "Font size:"),
         SS_LEFT,
-        (28, 289, 140, 20),
+        (28, 314, 140, 20),
         0,
     );
     let size_labels = ctx.font_sizes.iter().map(|s| format!("{} pt", s)).collect();
@@ -336,48 +343,48 @@ unsafe fn build_controls(
         .iter()
         .position(|&s| s == cfg.osd_font_size)
         .unwrap_or(0);
-    combo((175, 286, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
+    combo((175, 311, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
 
     control(
         w!("STATIC"),
         tr("Цвет шрифта:", "Font color:"),
         SS_LEFT,
-        (28, 325, 140, 20),
+        (28, 350, 140, 20),
         0,
     );
     control(
         w!("BUTTON"),
         tr("Выбрать цвет...", "Choose color..."),
         tab | BS_PUSHBUTTON as u32,
-        (175, 322, 130, 26),
+        (175, 347, 130, 26),
         IDC_CHOOSE_COLOR,
     );
     control(
         w!("STATIC"),
         "Aa",
         SS_CENTER | SS_CENTERIMAGE,
-        (320, 322, 45, 26),
+        (320, 347, 45, 26),
         IDC_COLOR_PREVIEW,
     );
     control(
         w!("STATIC"),
         tr("Что показывать:", "Contents:"),
         SS_LEFT,
-        (28, 362, 140, 20),
+        (28, 387, 140, 20),
         0,
     );
     control(
         w!("BUTTON"),
         tr("Для фото...", "Photos..."),
         tab | BS_PUSHBUTTON as u32,
-        (175, 359, 105, 26),
+        (175, 384, 105, 26),
         IDC_PHOTO_OSD,
     );
     control(
         w!("BUTTON"),
         tr("Для видео...", "Videos..."),
         tab | BS_PUSHBUTTON as u32,
-        (290, 359, 105, 26),
+        (290, 384, 105, 26),
         IDC_VIDEO_OSD,
     );
 
@@ -385,24 +392,24 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("Полноэкранный режим", "Full screen"),
         BS_GROUPBOX as u32,
-        (15, 409, 395, 140),
+        (15, 434, 395, 140),
         0,
     );
     checkbox(
         tr("Кнопки ⏮ ⏯ ⏭ поверх фото", "⏮ ⏯ ⏭ buttons over photos"),
-        (28, 432, 365, 22),
+        (28, 457, 365, 22),
         IDC_OVERLAY_PHOTO,
         cfg.overlay_photo,
     );
     checkbox(
         tr("Панель управления поверх видео", "Control bar over videos"),
-        (28, 457, 365, 22),
+        (28, 482, 365, 22),
         IDC_OVERLAY_VIDEO,
         cfg.overlay_video,
     );
     checkbox(
         tr("Скрывать панель при бездействии", "Hide the bar when idle"),
-        (28, 482, 365, 22),
+        (28, 507, 365, 22),
         IDC_OVERLAY_AUTOHIDE,
         cfg.overlay_autohide,
     );
@@ -410,7 +417,7 @@ unsafe fn build_controls(
         w!("STATIC"),
         tr("Интервал слайд-шоу (F5):", "Slideshow interval (F5):"),
         SS_LEFT,
-        (28, 515, 170, 20),
+        (28, 540, 170, 20),
         0,
     );
     let slide_labels = ctx
@@ -423,7 +430,7 @@ unsafe fn build_controls(
         .iter()
         .position(|&s| s == cfg.slideshow_seconds)
         .unwrap_or(0);
-    combo((205, 512, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
+    combo((205, 537, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
 
     // Right column: audio / video, external editors.
     control(
@@ -573,14 +580,14 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("ОК", "OK"),
         tab | BS_DEFPUSHBUTTON as u32,
-        (615, 521, 95, 28),
+        (615, 546, 95, 28),
         IDOK.0,
     );
     control(
         w!("BUTTON"),
         tr("Отмена", "Cancel"),
         tab | BS_PUSHBUTTON as u32,
-        (725, 521, 95, 28),
+        (725, 546, 95, 28),
         IDCANCEL.0,
     );
     ok
@@ -678,6 +685,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
         selected(dlg, IDC_SLIDESHOW, &ctx.slideshow_seconds).unwrap_or(cfg.slideshow_seconds);
     cfg.photo_background = ctx.background;
     cfg.no_upscale = is_checked(dlg, IDC_NO_UPSCALE);
+    cfg.smooth_zoom = is_checked(dlg, IDC_SMOOTH_ZOOM);
     cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
     cfg.frame_format =

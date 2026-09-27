@@ -139,6 +139,8 @@ pub struct ViewerConfig {
     pub photo_background: u32,
     /// Fit mode shows images smaller than the window at 100% instead of enlarging them.
     pub no_upscale: bool,
+    /// Enlarged photos and album art are smoothed (bicubic) instead of showing square pixels.
+    pub smooth_zoom: bool,
     /// Ask before Del moves the file to the Recycle Bin.
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
@@ -171,6 +173,7 @@ impl Default for ViewerConfig {
             slideshow_seconds: 4,
             photo_background: crate::image_cache::BACKGROUND,
             no_upscale: false,
+            smooth_zoom: true,
             confirm_delete: true,
             resume_video: true,
             frame_format: FrameFormat::Png,
@@ -265,6 +268,7 @@ impl ViewerConfig {
             photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32
                 & 0x00FF_FFFF,
             no_upscale: int(w!("NoUpscale"), d.no_upscale as i32) != 0,
+            smooth_zoom: int(w!("SmoothZoom"), d.smooth_zoom as i32) != 0,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
             frame_format: FrameFormat::from_ini(&string(w!("FrameFormat"), "")),
@@ -308,6 +312,7 @@ impl ViewerConfig {
             write(w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
             write(w!("PhotoBackground"), self.photo_background.to_string()),
             write(w!("NoUpscale"), flag(self.no_upscale)),
+            write(w!("SmoothZoom"), flag(self.smooth_zoom)),
             write(w!("ConfirmDelete"), flag(self.confirm_delete)),
             write(w!("ResumeVideo"), flag(self.resume_video)),
             write(w!("FrameFormat"), self.frame_format.extension().to_string()),

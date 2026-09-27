@@ -282,6 +282,9 @@ the right-click menu. You can set:
   * auto-rotating photos by the camera data;
   * the loupe zoom, the background color around photos;
   * "Don't enlarge small images";
+  * "Smooth enlarged images": enlarged photos and album art look smooth
+    instead of made of square pixels (zooming in beyond 400% shows the 
+    pixels as they are);
   * confirmation before moving to the Recycle Bin;
   * the OSD: where to show it, font, color and contents;
   * full screen: buttons and panels over the picture, hiding them;

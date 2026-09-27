@@ -1141,8 +1141,10 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 let (w, h) = (rc.right - rc.left, rc.bottom - rc.top);
                 match get_state(hwnd) {
                     Some(ViewerState {
-                        media: Some(media), ..
-                    }) => media.paint(hdc, w, h, ps.rcPaint),
+                        media: Some(media),
+                        config,
+                        ..
+                    }) => media.paint(hdc, w, h, ps.rcPaint, config.smooth_zoom),
                     state => image_view::paint(hdc, state, w, h, ps.rcPaint),
                 }
                 let _ = EndPaint(hwnd, &ps);
