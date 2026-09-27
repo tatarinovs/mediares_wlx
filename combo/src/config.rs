@@ -134,6 +134,8 @@ pub struct ViewerConfig {
     pub slideshow_seconds: u32,
     /// COLORREF around photos (and under their transparency).
     pub photo_background: u32,
+    /// Fit mode shows images smaller than the window at 100% instead of enlarging them.
+    pub no_upscale: bool,
     /// Ask before Del moves the file to the Recycle Bin.
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
@@ -163,6 +165,7 @@ impl Default for ViewerConfig {
             overlay_autohide: true,
             slideshow_seconds: 4,
             photo_background: crate::image_cache::BACKGROUND,
+            no_upscale: false,
             confirm_delete: true,
             resume_video: true,
             photo_editor: String::new(),
@@ -254,6 +257,7 @@ impl ViewerConfig {
                 .clamp(1, 3600) as u32,
             photo_background: int(w!("PhotoBackground"), d.photo_background as i32) as u32
                 & 0x00FF_FFFF,
+            no_upscale: int(w!("NoUpscale"), d.no_upscale as i32) != 0,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
@@ -294,6 +298,7 @@ impl ViewerConfig {
             write(w!("OverlayAutoHide"), flag(self.overlay_autohide)),
             write(w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
             write(w!("PhotoBackground"), self.photo_background.to_string()),
+            write(w!("NoUpscale"), flag(self.no_upscale)),
             write(w!("ConfirmDelete"), flag(self.confirm_delete)),
             write(w!("ResumeVideo"), flag(self.resume_video)),
             write(w!("PhotoEditor"), self.photo_editor.clone()),

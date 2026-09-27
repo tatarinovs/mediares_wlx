@@ -27,14 +27,19 @@ pub unsafe fn client_size(hwnd: HWND) -> Option<(f32, f32)> {
     (w > 0.0 && h > 0.0).then_some((w, h))
 }
 
-fn fit_scale(img: &DecodedImage, (w, h): (f32, f32)) -> f32 {
-    (w / img.width as f32).min(h / img.height as f32)
+fn fit_scale(state: &ViewerState, img: &DecodedImage, (w, h): (f32, f32)) -> f32 {
+    let s = (w / img.width as f32).min(h / img.height as f32);
+    if state.config.no_upscale {
+        s.min(1.0)
+    } else {
+        s
+    }
 }
 
 /// Current display scale (1.0 = 100%).
 pub fn scale(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> f32 {
     match state.zoom {
-        ZoomMode::Fit => fit_scale(img, view),
+        ZoomMode::Fit => fit_scale(state, img, view),
         ZoomMode::Custom(s) => s,
     }
 }
@@ -43,7 +48,7 @@ pub fn scale(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> f32 {
 fn origin(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> (f32, f32) {
     match state.zoom {
         ZoomMode::Fit => {
-            let s = fit_scale(img, view);
+            let s = fit_scale(state, img, view);
             (
                 ((view.0 - img.width as f32 * s) / 2.0).round(),
                 ((view.1 - img.height as f32 * s) / 2.0).round(),
@@ -82,7 +87,7 @@ pub fn zoom_step(
     state.loupe = None;
     let current = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
-    let fit = fit_scale(img, view);
+    let fit = fit_scale(state, img, view);
     let new_scale = if zoom_in {
         current * ZOOM_STEP
     } else {
