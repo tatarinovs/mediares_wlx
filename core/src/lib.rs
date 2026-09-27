@@ -13,7 +13,7 @@ pub mod ffi;
 pub mod hashing;
 pub mod image_decode;
 #[cfg(any(feature = "raw-preview", feature = "psd-preview"))]
-mod jpeg;
+pub mod jpeg;
 pub mod mf_audio;
 pub mod mf_init;
 pub mod probe;

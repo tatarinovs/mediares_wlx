@@ -5,6 +5,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use mediares_core::audio_tags::read_tags;
+use mediares_core::image::codecs::jpeg::JpegEncoder;
 use mediares_core::image::codecs::png::PngEncoder;
 use mediares_core::image::{DynamicImage, ExtendedColorType, ImageEncoder};
 use mediares_core::image_decode::{decode_bytes, decode_oriented};
@@ -21,6 +22,7 @@ use windows::Win32::System::Memory::{
 use windows::Win32::UI::Shell::DROPFILES;
 
 use crate::audio_view::folder_cover;
+use crate::i18n::tr;
 use crate::image_cache::{self, DecodedImage};
 use crate::transport_bar::format_time;
 
@@ -91,7 +93,9 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -
     }
     std::fs::create_dir_all(&dir).ok()?;
     let name = match position {
-        Some(t) => frame_file_name(source, t).file_name()?.to_os_string(),
+        Some(t) => frame_file_name(source, t, FrameFormat::Png)
+            .file_name()?
+            .to_os_string(),
         None => format!("{}_cover.png", source.file_stem()?.to_string_lossy()).into(),
     };
     let path = dir.join(name);
@@ -136,7 +140,7 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
 }
 
 /// "clip_0-01-23.456.png" next to the video; " (2)", " (3)"... if taken.
-pub fn frame_file_name(video: &Path, position: f64) -> PathBuf {
+pub fn frame_file_name(video: &Path, position: f64, format: FrameFormat) -> PathBuf {
     let stem = video
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -148,17 +152,56 @@ pub fn frame_file_name(video: &Path, position: f64) -> PathBuf {
     (1..)
         .map(|n| {
             dir.join(if n == 1 {
-                format!("{}.png", base)
+                format!("{}.{}", base, format.extension())
             } else {
-                format!("{} ({}).png", base, n)
+                format!("{} ({}).{}", base, n, format.extension())
             })
         })
         .find(|p| !p.exists())
         .expect("an unused name exists")
 }
 
+/// How video frames are saved (Shift+S).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameFormat {
+    Png,
+    Jpeg,
+}
+
+impl FrameFormat {
+    pub const ALL: [FrameFormat; 2] = [FrameFormat::Png, FrameFormat::Jpeg];
+
+    pub fn from_ini(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "jpg" | "jpeg" => FrameFormat::Jpeg,
+            _ => FrameFormat::Png,
+        }
+    }
+
+    pub fn extension(self) -> &'static str {
+        match self {
+            FrameFormat::Png => "png",
+            FrameFormat::Jpeg => "jpg",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            FrameFormat::Png => tr("PNG — без потерь", "PNG — lossless"),
+            FrameFormat::Jpeg => tr("JPEG — компактнее", "JPEG — smaller"),
+        }
+    }
+}
+
+/// JPEG quality of saved frames: artifacts are hard to see, files are several times smaller than PNG.
+pub const JPEG_QUALITY: u8 = 92;
+
 /// PNG without alpha: pictures on screen are always opaque.
 pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
+    save_picture(img, path, FrameFormat::Png)
+}
+
+pub fn save_picture(img: &DecodedImage, path: &Path, format: FrameFormat) -> bool {
     let rgb: Vec<u8> = img
         .bgra
         .chunks_exact(4)
@@ -167,9 +210,19 @@ pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
     let Ok(file) = std::fs::File::create(path) else {
         return false;
     };
-    PngEncoder::new(std::io::BufWriter::new(file))
-        .write_image(&rgb, img.width, img.height, ExtendedColorType::Rgb8)
-        .is_ok()
+    let out = std::io::BufWriter::new(file);
+    let (w, h, color) = (img.width, img.height, ExtendedColorType::Rgb8);
+    let ok = match format {
+        FrameFormat::Png => PngEncoder::new(out).write_image(&rgb, w, h, color),
+        FrameFormat::Jpeg => {
+            JpegEncoder::new_with_quality(out, JPEG_QUALITY).write_image(&rgb, w, h, color)
+        }
+    }
+    .is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(path);
+    }
+    ok
 }
 
 /// Picture representing the file: the photo, a video frame, or the album art.
@@ -225,12 +278,20 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mediares_snap_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mp4");
-        let first = frame_file_name(&video, 83.4567);
+        let first = frame_file_name(&video, 83.4567, FrameFormat::Png);
         assert_eq!(first.file_name().unwrap(), "clip_1-23.457.png");
         std::fs::write(&first, b"x").unwrap();
         assert_eq!(
-            frame_file_name(&video, 83.4567).file_name().unwrap(),
+            frame_file_name(&video, 83.4567, FrameFormat::Png)
+                .file_name()
+                .unwrap(),
             "clip_1-23.457 (2).png"
+        );
+        assert_eq!(
+            frame_file_name(&video, 83.4567, FrameFormat::Jpeg)
+                .file_name()
+                .unwrap(),
+            "clip_1-23.457.jpg"
         );
         let _ = std::fs::remove_dir_all(dir);
     }

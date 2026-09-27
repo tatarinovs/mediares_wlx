@@ -15,7 +15,7 @@ if errorlevel 1 (
 )
 
 :: Extract version from combo/Cargo.toml
-set "VERSION=0.2.0"
+set "VERSION=0.3.0"
 for /f "tokens=3 delims= " %%A in ('findstr /b "version" combo\Cargo.toml') do (
     set "VERSION=%%~A"
 )
@@ -77,59 +77,38 @@ echo [INFO] Copying standalone binaries to dist...
 copy /y "%COMBO_DLL%" "%DIST_DIR%\mediares.wlx64" >nul
 copy /y "%WDX_DLL%" "%DIST_DIR%\mediares_wdx_only.wdx64" >nul
 
-if exist "pluginst\pluginst-combo.inf" (
-    copy /y "pluginst\pluginst-combo.inf" "%DIST_DIR%\pluginst.inf" >nul
-)
+copy /y "pluginst\pluginst-wlx.inf" "%DIST_DIR%\pluginst.inf" >nul
 
-:: Ensure default mediares.ini exists in dist
-if not exist "%DIST_DIR%\mediares.ini" (
-    (
-        echo [Settings]
-        echo StartFullscreen=0
-        echo AutoRotateExif=1
-        echo LoupeScale=1.0
-        echo ShowOSD=1
-        echo OSDFontSize=14
-        echo OSDFontColor=16777215
-        echo OSDFontName=Segoe UI
-    ) > "%DIST_DIR%\mediares.ini"
-)
+:: No mediares.ini in the archives: next to the DLL it would force portable mode (settings written into
+:: the plugin folder, often read-only); without it the plugin uses TC's plugin settings folder and its defaults.
+if exist "%DIST_DIR%\mediares.ini" del "%DIST_DIR%\mediares.ini"
 
 :: Packaging Archives
 echo:
 echo [4/4] Packaging Total Commander plugin zip archives...
 
-:: Package 1: Mediares Combo (WLX + WDX 2-in-1): one binary, installed as the Lister plugin;
-:: its content-plugin functions are registered manually (see README)
-echo   - Packaging mediares-combo-v!VERSION!.zip ...
-set "STAGE_COMBO=%STAGING_DIR%\combo"
-mkdir "%STAGE_COMBO%"
-copy /y "%COMBO_DLL%" "%STAGE_COMBO%\mediares.wlx64" >nul
-copy /y "%DIST_DIR%\mediares.ini" "%STAGE_COMBO%\mediares.ini" >nul
-copy /y "pluginst\pluginst-combo.inf" "%STAGE_COMBO%\pluginst.inf" >nul
-
-pushd "%STAGE_COMBO%"
-tar -a -c -f "%DIST_DIR%\mediares-combo-v!VERSION!.zip" *
-popd
-
-:: Package 2: Mediares WDX (Standalone duplicate finder)
+:: Package 1: Mediares WDX (fields only, no viewer)
 echo   - Packaging mediares-wdx-v!VERSION!.zip ...
 set "STAGE_WDX=%STAGING_DIR%\wdx"
 mkdir "%STAGE_WDX%"
 copy /y "%WDX_DLL%" "%STAGE_WDX%\mediares.wdx64" >nul
 copy /y "pluginst\pluginst-wdx.inf" "%STAGE_WDX%\pluginst.inf" >nul
+copy /y "docs\readme_rus.txt" "%STAGE_WDX%\readme_rus.txt" >nul
+copy /y "docs\readme_eng.txt" "%STAGE_WDX%\readme_eng.txt" >nul
 
 pushd "%STAGE_WDX%"
 tar -a -c -f "%DIST_DIR%\mediares-wdx-v!VERSION!.zip" *
 popd
 
-:: Package 3: Mediares WLX (Standalone Lister viewer)
+:: Package 2: Mediares WLX: the viewer, installed as the Lister plugin; the same file also
+:: carries the content-plugin fields, connected from its settings ("Register WDX")
 echo   - Packaging mediares-wlx-v!VERSION!.zip ...
 set "STAGE_WLX=%STAGING_DIR%\wlx"
 mkdir "%STAGE_WLX%"
 copy /y "%COMBO_DLL%" "%STAGE_WLX%\mediares.wlx64" >nul
-copy /y "%DIST_DIR%\mediares.ini" "%STAGE_WLX%\mediares.ini" >nul
 copy /y "pluginst\pluginst-wlx.inf" "%STAGE_WLX%\pluginst.inf" >nul
+copy /y "docs\readme_rus.txt" "%STAGE_WLX%\readme_rus.txt" >nul
+copy /y "docs\readme_eng.txt" "%STAGE_WLX%\readme_eng.txt" >nul
 
 pushd "%STAGE_WLX%"
 tar -a -c -f "%DIST_DIR%\mediares-wlx-v!VERSION!.zip" *

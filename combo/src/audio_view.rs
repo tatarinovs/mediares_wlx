@@ -20,9 +20,11 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::UI::WindowsAndMessaging::{KillTimer, SetTimer};
 
 use crate::gdi::{self, fill, Font};
+use crate::i18n::{self, tr};
 use crate::image_cache::{self, DecodeOptions, DecodedImage, BACKGROUND};
 use crate::image_view::draw_fitted;
 use crate::media_view::EventEffect;
+use crate::osd_template;
 use crate::playback_audio::AudioPlayer;
 use crate::playback_video::VideoPlayer;
 use crate::transport_bar::{self, format_time, Transport};
@@ -178,7 +180,7 @@ impl AudioView {
     pub fn title_info(&self) -> String {
         let mut parts = vec![self.format.clone()];
         if let Some(kbps) = self.tags.bitrate_kbps {
-            parts.push(format!("{} кбит/с", kbps));
+            parts.push(format!("{} {}", kbps, tr("кбит/с", "kbps")));
         }
         parts.push(format_time(
             self.transport().duration().max(self.known_duration()),
@@ -371,7 +373,7 @@ impl AudioView {
         if let Some(album) = album {
             lines.push((album, LineKind::Text));
         }
-        let format = [self.format.clone(), t.format_line()]
+        let format = [self.format.clone(), format_line(t)]
             .into_iter()
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
@@ -425,4 +427,52 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
 unsafe fn text(dc: HDC, r: RECT, s: &str, font: HFONT, color: u32, align: DRAW_TEXT_FORMAT) {
     let flags = align | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX;
     gdi::text(dc, r, s, Some(font), color, flags);
+}
+
+/// e.g. "44,1 кГц · 16 бит · стерео · 320 кбит/с".
+fn format_line(t: &AudioTags) -> String {
+    let mut parts = Vec::new();
+    if let Some(rate) = t.sample_rate {
+        let khz = if rate % 1000 == 0 {
+            (rate / 1000).to_string()
+        } else {
+            i18n::decimal(format!("{:.1}", rate as f64 / 1000.0))
+        };
+        parts.push(format!("{} {}", khz, tr("кГц", "kHz")));
+    }
+    if let Some(bits) = t.bit_depth {
+        parts.push(format!("{} {}", bits, tr("бит", "bit")));
+    }
+    if let Some(ch) = t.channels {
+        parts.push(match ch {
+            1 | 2 => osd_template::channels(ch.into()),
+            n => format!("{} {}", n, tr("кан.", "ch")),
+        });
+    }
+    if let Some(kbps) = t.bitrate_kbps {
+        parts.push(format!("{} {}", kbps, tr("кбит/с", "kbps")));
+    }
+    parts.join(" · ")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_format_line() {
+        let t = AudioTags {
+            sample_rate: Some(44100),
+            bit_depth: Some(16),
+            channels: Some(2),
+            bitrate_kbps: Some(1411),
+            ..Default::default()
+        };
+        assert_eq!(format_line(&t), "44,1 кГц · 16 бит · стерео · 1411 кбит/с");
+        let t = AudioTags {
+            sample_rate: Some(48000),
+            ..Default::default()
+        };
+        assert_eq!(format_line(&t), "48 кГц");
+    }
 }

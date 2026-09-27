@@ -12,6 +12,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::dialog;
+use crate::i18n::tr;
 use crate::osd_template::FieldGroups;
 
 const CLASS_NAME: PCWSTR = w!("MediaresOsdTemplateDialogClass");
@@ -55,9 +56,12 @@ pub unsafe fn show(
     let font = crate::gdi::create_font("Segoe UI", -12, false);
     let mono = crate::gdi::create_font("Consolas", -14, false);
     let tab = WS_TABSTOP.0;
-    let hint =
+    let hint = tr(
         "{поле} — значение поля. <…> — блок, который скрывается, если в нём есть пустое поле.\n\
-                {{ }} << >> — сами символы. Enter — новая строка OSD.";
+                {{ }} << >> — сами символы. Enter — новая строка OSD.",
+        "{field} — the field's value. <…> — a block hidden when a field in it is empty.\n\
+                {{ }} << >> — the characters themselves. Enter — a new OSD line.",
+    );
     dialog::control(
         dlg,
         w!("STATIC"),
@@ -95,15 +99,27 @@ pub unsafe fn show(
         );
     };
     button(
-        "Добавить поле...",
+        tr("Добавить поле...", "Add field..."),
         15,
         140,
         IDC_ADD_FIELD,
         BS_PUSHBUTTON as u32,
     );
-    button("По умолчанию", 165, 125, IDC_DEFAULT, BS_PUSHBUTTON as u32);
-    button("ОК", 425, 95, IDOK.0, BS_DEFPUSHBUTTON as u32);
-    button("Отмена", 535, 95, IDCANCEL.0, BS_PUSHBUTTON as u32);
+    button(
+        tr("По умолчанию", "Default"),
+        165,
+        125,
+        IDC_DEFAULT,
+        BS_PUSHBUTTON as u32,
+    );
+    button(tr("ОК", "OK"), 425, 95, IDOK.0, BS_DEFPUSHBUTTON as u32);
+    button(
+        tr("Отмена", "Cancel"),
+        535,
+        95,
+        IDCANCEL.0,
+        BS_PUSHBUTTON as u32,
+    );
 
     dialog::run_modal(dlg, edit);
     // run_modal returns only after the window is destroyed, so nothing references `ctx` anymore.
@@ -127,7 +143,7 @@ unsafe fn add_field(dlg: HWND, ctx: &Context) {
     for (g, (group, fields)) in ctx.fields.iter().enumerate() {
         let Ok(sub) = CreatePopupMenu() else { continue };
         for (i, field) in fields.iter().enumerate() {
-            let label = HSTRING::from(format!("{}\t{{{}}}", field.label, field.key));
+            let label = HSTRING::from(format!("{}\t{{{}}}", field.label(), field.key));
             let _ = AppendMenuW(
                 sub,
                 MF_STRING,
@@ -136,7 +152,12 @@ unsafe fn add_field(dlg: HWND, ctx: &Context) {
             );
         }
         // The submenu is destroyed with its parent.
-        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &HSTRING::from(*group));
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            sub.0 as usize,
+            &HSTRING::from(tr(group.0, group.1)),
+        );
     }
 
     let mut rc = RECT::default();

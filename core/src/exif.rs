@@ -389,6 +389,196 @@ fn format_exposure((num, den): (u32, u32)) -> Option<String> {
     })
 }
 
+/// A little-endian TIFF block (the payload of a JPEG `Exif` APP1 segment) with the fields of
+/// `info` a photo library cares about. `orientation` replaces the source's value: pixels that were
+/// already turned upright must be saved with 1.
+pub fn build_exif(info: &ExifInfo, orientation: u16) -> Vec<u8> {
+    let mut ifd0 = Vec::new();
+    let mut exif = Vec::new();
+    let mut gps = Vec::new();
+    ascii_entry(&mut ifd0, 0x010F, &info.make);
+    ascii_entry(&mut ifd0, 0x0110, &info.model);
+    ifd0.push(short_entry(0x0112, orientation));
+    ascii_entry(&mut ifd0, 0x0131, &info.software);
+    ascii_entry(&mut ifd0, 0x0132, &info.date_time);
+
+    if let Some(r) = info.exposure_time.as_deref().and_then(parse_exposure) {
+        exif.push(rational_entry(0x829A, &[r]));
+    }
+    if let Some(f) = info.f_number {
+        exif.push(rational_entry(0x829D, &[tenths(f)]));
+    }
+    if let Some(iso) = info.iso {
+        exif.push(match u16::try_from(iso) {
+            Ok(v) => short_entry(0x8827, v),
+            Err(_) => long_entry(0x8827, iso),
+        });
+    }
+    ascii_entry(&mut exif, 0x9003, &info.date_time_original);
+    if let Some(fired) = info.flash_fired {
+        exif.push(short_entry(0x9209, fired as u16));
+    }
+    if let Some(f) = info.focal_length {
+        exif.push(rational_entry(0x920A, &[tenths(f)]));
+    }
+    if let Some(f) = info.focal_length_35mm.and_then(|f| u16::try_from(f).ok()) {
+        exif.push(short_entry(0xA405, f));
+    }
+    ascii_entry(&mut exif, 0xA434, &info.lens_model);
+
+    if let Some((lat, lon)) = info.gps_latitude.zip(info.gps_longitude) {
+        let reference =
+            |v: f64, pos: &str, neg: &str| Some(if v < 0.0 { neg } else { pos }.to_string());
+        ascii_entry(&mut gps, 0x0001, &reference(lat, "N", "S"));
+        gps.push(rational_entry(0x0002, &dms(lat.abs())));
+        ascii_entry(&mut gps, 0x0003, &reference(lon, "E", "W"));
+        gps.push(rational_entry(0x0004, &dms(lon.abs())));
+    }
+
+    // Sub-IFD pointers are inline LONGs, so every IFD's size is known before their values.
+    if !exif.is_empty() {
+        ifd0.push(long_entry(0x8769, 0));
+    }
+    if !gps.is_empty() {
+        ifd0.push(long_entry(0x8825, 0));
+    }
+    let ifd0_at = 8;
+    let exif_at = ifd0_at + ifd_size(&ifd0);
+    let gps_at = exif_at + if exif.is_empty() { 0 } else { ifd_size(&exif) };
+    for e in &mut ifd0 {
+        match e.tag {
+            0x8769 => e.value = (exif_at as u32).to_le_bytes().to_vec(),
+            0x8825 => e.value = (gps_at as u32).to_le_bytes().to_vec(),
+            _ => {}
+        }
+    }
+
+    let mut out = b"II*\0".to_vec();
+    out.extend_from_slice(&(ifd0_at as u32).to_le_bytes());
+    write_ifd(&mut out, ifd0);
+    if !exif.is_empty() {
+        write_ifd(&mut out, exif);
+    }
+    if !gps.is_empty() {
+        write_ifd(&mut out, gps);
+    }
+    out
+}
+
+struct OutEntry {
+    tag: u16,
+    typ: u16,
+    count: u32,
+    /// Little-endian value bytes.
+    value: Vec<u8>,
+}
+
+fn ascii_entry(ifd: &mut Vec<OutEntry>, tag: u16, text: &Option<String>) {
+    if let Some(text) = text.as_deref().filter(|t| !t.is_empty()) {
+        let mut value = text.as_bytes()[..text.len().min(MAX_STRING_LEN)].to_vec();
+        value.push(0);
+        ifd.push(OutEntry {
+            tag,
+            typ: TYPE_ASCII,
+            count: value.len() as u32,
+            value,
+        });
+    }
+}
+
+fn short_entry(tag: u16, v: u16) -> OutEntry {
+    OutEntry {
+        tag,
+        typ: TYPE_SHORT,
+        count: 1,
+        value: v.to_le_bytes().to_vec(),
+    }
+}
+
+fn long_entry(tag: u16, v: u32) -> OutEntry {
+    OutEntry {
+        tag,
+        typ: TYPE_LONG,
+        count: 1,
+        value: v.to_le_bytes().to_vec(),
+    }
+}
+
+fn rational_entry(tag: u16, values: &[(u32, u32)]) -> OutEntry {
+    OutEntry {
+        tag,
+        typ: TYPE_RATIONAL,
+        count: values.len() as u32,
+        value: values
+            .iter()
+            .flat_map(|&(n, d)| n.to_le_bytes().into_iter().chain(d.to_le_bytes()))
+            .collect(),
+    }
+}
+
+/// Values over 4 bytes go after the entries, each at an even offset.
+fn external_len(e: &OutEntry) -> usize {
+    if e.value.len() > 4 {
+        e.value.len().next_multiple_of(2)
+    } else {
+        0
+    }
+}
+
+fn ifd_size(entries: &[OutEntry]) -> usize {
+    2 + entries.len() * 12 + 4 + entries.iter().map(external_len).sum::<usize>()
+}
+
+/// Appends an IFD (entries sorted by tag, as TIFF requires) and its values; no next IFD.
+fn write_ifd(out: &mut Vec<u8>, mut entries: Vec<OutEntry>) {
+    entries.sort_by_key(|e| e.tag);
+    let mut data_at = out.len() + 2 + entries.len() * 12 + 4;
+    let mut data = Vec::new();
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for e in &entries {
+        out.extend_from_slice(&e.tag.to_le_bytes());
+        out.extend_from_slice(&e.typ.to_le_bytes());
+        out.extend_from_slice(&e.count.to_le_bytes());
+        if e.value.len() <= 4 {
+            let mut inline = [0u8; 4];
+            inline[..e.value.len()].copy_from_slice(&e.value);
+            out.extend_from_slice(&inline);
+        } else {
+            out.extend_from_slice(&(data_at as u32).to_le_bytes());
+            data.extend_from_slice(&e.value);
+            data.resize(data.len().next_multiple_of(2), 0);
+            data_at += external_len(e);
+        }
+    }
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&data);
+}
+
+/// Back from the display form of [`format_exposure`]: "1/250" or "2.5" (seconds).
+fn parse_exposure(s: &str) -> Option<(u32, u32)> {
+    match s.split_once('/') {
+        Some((n, d)) => Some((n.trim().parse().ok()?, d.trim().parse().ok()?)),
+        None => Some(tenths(s.trim().parse().ok()?)),
+    }
+    .filter(|&(n, d)| n > 0 && d > 0)
+}
+
+fn tenths(v: f64) -> (u32, u32) {
+    ((v * 10.0).round().clamp(0.0, u32::MAX as f64) as u32, 10)
+}
+
+/// Decimal degrees as degrees / minutes / hundredths of a second.
+fn dms(v: f64) -> [(u32, u32); 3] {
+    let degrees = v.trunc();
+    let minutes = ((v - degrees) * 60.0).trunc();
+    let seconds = ((v - degrees) * 60.0 - minutes) * 60.0;
+    [
+        (degrees as u32, 1),
+        (minutes as u32, 1),
+        ((seconds * 100.0).round() as u32, 100),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,5 +663,54 @@ mod tests {
         for len in 0..t.len() {
             let _ = parse_tiff(&t[..len]);
         }
+    }
+
+    #[test]
+    fn written_exif_reads_back() {
+        let info = ExifInfo {
+            make: Some("SONY".into()),
+            model: Some("ILCE-7RM4".into()),
+            date_time: Some("2024:09:02 14:33:10".into()),
+            date_time_original: Some("2024:09:02 14:33:09".into()),
+            exposure_time: Some("1/250".into()),
+            f_number: Some(2.8),
+            iso: Some(400),
+            focal_length: Some(50.0),
+            focal_length_35mm: Some(75),
+            lens_model: Some("FE 50mm F1.8".into()),
+            flash_fired: Some(false),
+            orientation: Some(6),
+            software: Some("ILCE-7RM4 v2.0".into()),
+            gps_latitude: Some(55.751244),
+            gps_longitude: Some(-37.618423),
+            ..Default::default()
+        };
+        let back = parse_tiff(&build_exif(&info, 1)).unwrap();
+        let lat = back.gps_latitude.unwrap();
+        let lon = back.gps_longitude.unwrap();
+        assert!((lat - 55.751244).abs() < 1e-5 && (lon + 37.618423).abs() < 1e-5);
+        assert_eq!(
+            back,
+            ExifInfo {
+                orientation: Some(1),
+                gps_latitude: back.gps_latitude,
+                gps_longitude: back.gps_longitude,
+                ..info
+            }
+        );
+    }
+
+    #[test]
+    fn minimal_exif_has_only_orientation() {
+        let back = parse_tiff(&build_exif(&ExifInfo::default(), 3)).unwrap();
+        assert_eq!(
+            back,
+            ExifInfo {
+                orientation: Some(3),
+                ..Default::default()
+            }
+        );
+        assert_eq!(parse_exposure("2.5"), Some((25, 10)));
+        assert_eq!(parse_exposure("0"), None);
     }
 }

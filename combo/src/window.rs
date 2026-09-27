@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS};
 
 use crate::config::ViewerConfig;
+use crate::i18n::tr;
 use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, client_size, point_from_lparam};
 use crate::media_view::EventEffect;
@@ -39,7 +40,7 @@ use crate::playlist::Repeat;
 use crate::state::{Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
 use crate::{
-    config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template,
+    config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template, save_as,
     settings_dialog, snapshot,
 };
 use mediares_core::exif::read_orientation;
@@ -88,43 +89,103 @@ enum Command {
     NormalSpeed,
     FrameBack,
     FrameForward,
+    SaveAs,
 }
 
 impl Command {
-    const MENU: &[Option<(Command, &'static str)>] = &[
-        Some((Command::TogglePlay, "Воспроизведение / пауза\tПробел")),
-        Some((Command::ToggleMute, "Без звука\tM")),
-        Some((Command::ToggleFullscreen, "Полноэкранный режим\tEnter / F")),
-        Some((Command::Copy, "Копировать изображение\tCtrl+C")),
-        Some((Command::SaveFrame, "Сохранить кадр рядом с видео\tShift+S")),
-        Some((Command::ToggleOsd, "Отображать OSD\tO")),
-        Some((Command::ToggleSlideshow, "Слайд-шоу\tF5")),
-        Some((Command::RotateLeft, "Повернуть влево\tL")),
-        Some((Command::RotateRight, "Повернуть вправо\tR")),
+    /// Menu items with their Russian / English labels.
+    const MENU: &[Option<(Command, (&'static str, &'static str))>] = &[
+        Some((
+            Command::TogglePlay,
+            ("Воспроизведение / пауза\tПробел", "Play / pause\tSpace"),
+        )),
+        Some((Command::ToggleMute, ("Без звука\tM", "Mute\tM"))),
+        Some((
+            Command::ToggleFullscreen,
+            ("Полноэкранный режим\tEnter / F", "Full screen\tEnter / F"),
+        )),
+        Some((
+            Command::Copy,
+            ("Копировать изображение\tCtrl+C", "Copy image\tCtrl+C"),
+        )),
+        Some((
+            Command::SaveAs,
+            ("Сохранить как...\tCtrl+S", "Save as...\tCtrl+S"),
+        )),
+        Some((
+            Command::SaveFrame,
+            (
+                "Сохранить кадр рядом с видео\tShift+S",
+                "Save frame next to the video\tShift+S",
+            ),
+        )),
+        Some((Command::ToggleOsd, ("Отображать OSD\tO", "Show OSD\tO"))),
+        Some((Command::ToggleSlideshow, ("Слайд-шоу\tF5", "Slideshow\tF5"))),
+        Some((
+            Command::RotateLeft,
+            ("Повернуть влево\tL", "Rotate left\tL"),
+        )),
+        Some((
+            Command::RotateRight,
+            ("Повернуть вправо\tR", "Rotate right\tR"),
+        )),
         None,
-        Some((Command::Slower, "Медленнее\t[")),
-        Some((Command::Faster, "Быстрее\t]")),
-        Some((Command::NormalSpeed, "Обычная скорость\t\\")),
-        Some((Command::FrameBack, "Кадр назад\t,")),
-        Some((Command::FrameForward, "Кадр вперёд\t.")),
+        Some((Command::Slower, ("Медленнее\t[", "Slower\t["))),
+        Some((Command::Faster, ("Быстрее\t]", "Faster\t]"))),
+        Some((
+            Command::NormalSpeed,
+            ("Обычная скорость\t\\", "Normal speed\t\\"),
+        )),
+        Some((Command::FrameBack, ("Кадр назад\t,", "Previous frame\t,"))),
+        Some((Command::FrameForward, ("Кадр вперёд\t.", "Next frame\t."))),
         None,
-        Some((Command::ToggleAutoAdvance, "Автопереход к следующему файлу")),
-        Some((Command::RepeatOff, "Без повтора")),
-        Some((Command::RepeatAll, "Повторять список")),
-        Some((Command::RepeatOne, "Повторять файл")),
-        Some((Command::ToggleShuffle, "Случайный порядок")),
+        Some((
+            Command::ToggleAutoAdvance,
+            (
+                "Автопереход к следующему файлу",
+                "Auto-advance to the next file",
+            ),
+        )),
+        Some((Command::RepeatOff, ("Без повтора", "No repeat"))),
+        Some((Command::RepeatAll, ("Повторять список", "Repeat list"))),
+        Some((Command::RepeatOne, ("Повторять файл", "Repeat file"))),
+        Some((Command::ToggleShuffle, ("Случайный порядок", "Shuffle"))),
         None,
-        Some((Command::ShowExif, "Просмотр EXIF...\tE")),
-        Some((Command::OpenInEditor, "Открыть в редакторе")),
-        Some((Command::ShowInFolder, "Показать в папке")),
-        Some((Command::SetWallpaper, "Сделать обоями рабочего стола")),
-        Some((Command::Print, "Печать...\tCtrl+P")),
-        Some((Command::Delete, "Удалить в корзину\tDel")),
+        Some((
+            Command::ShowExif,
+            ("Просмотр EXIF...\tE", "EXIF info...\tE"),
+        )),
+        Some((
+            Command::OpenInEditor,
+            ("Открыть в редакторе\tF4", "Open in editor\tF4"),
+        )),
+        Some((
+            Command::ShowInFolder,
+            ("Показать в папке\tCtrl+Enter", "Show in folder\tCtrl+Enter"),
+        )),
+        Some((
+            Command::SetWallpaper,
+            ("Сделать обоями рабочего стола", "Set as desktop background"),
+        )),
+        Some((Command::Print, ("Печать...\tCtrl+P", "Print...\tCtrl+P"))),
+        Some((
+            Command::Delete,
+            ("Удалить в корзину\tDel", "Move to Recycle Bin\tDel"),
+        )),
         None,
-        Some((Command::ShowSettings, "Настройки...\tS")),
+        Some((Command::ShowSettings, ("Настройки...\tS", "Settings...\tS"))),
         None,
-        Some((Command::Next, "Следующий файл\tПробел / Right")),
-        Some((Command::Previous, "Предыдущий файл\tBackspace / Left")),
+        Some((
+            Command::Next,
+            ("Следующий файл\tПробел / Right", "Next file\tSpace / Right"),
+        )),
+        Some((
+            Command::Previous,
+            (
+                "Предыдущий файл\tBackspace / Left",
+                "Previous file\tBackspace / Left",
+            ),
+        )),
     ];
 
     /// Whether the item applies to the current content (photo, or audio/video).
@@ -134,7 +195,7 @@ impl Command {
             SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward => video,
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
             | ToggleShuffle => media,
-            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SetWallpaper => !media,
+            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SetWallpaper | SaveAs => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
         }
@@ -152,7 +213,7 @@ impl Command {
     /// Any command by its numeric value (posted messages, menu ids).
     fn from_raw(value: usize) -> Option<Command> {
         use Command::*;
-        const ALL: [Command; 40] = [
+        const ALL: [Command; 41] = [
             ToggleFullscreen,
             ToggleOsd,
             ShowExif,
@@ -193,6 +254,7 @@ impl Command {
             NormalSpeed,
             FrameBack,
             FrameForward,
+            SaveAs,
         ];
         // Values start at 1 and follow the declaration order.
         ALL.get(value.checked_sub(1)?).copied()
@@ -213,6 +275,15 @@ impl Command {
         use Command::*;
         if ctrl && !shift && vk == 0x43 {
             return Some(Copy); // Ctrl+C: the picture, not the file (TC copies files in its panels)
+        }
+        if !ctrl && !shift && vk == 0x73 {
+            return Some(OpenInEditor); // F4, like Edit in TC
+        }
+        if ctrl && !shift && vk == 0x0D {
+            return Some(ShowInFolder); // Ctrl+Enter
+        }
+        if !media && ctrl && !shift && vk == 0x53 {
+            return Some(SaveAs); // Ctrl+S
         }
         if media && shift && !ctrl && vk == 0x53 {
             return Some(SaveFrame); // Shift+S, as in VLC
@@ -496,7 +567,7 @@ unsafe fn caption(state: &ViewerState) -> String {
         );
     }
     if state.slideshow {
-        title += " [слайд-шоу]";
+        title += tr(" [слайд-шоу]", " [slideshow]");
     }
     title
 }
@@ -657,28 +728,32 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
             if let Some(media) = state.media.as_mut() {
                 let text = if copied {
-                    "Изображение скопировано в буфер обмена"
+                    tr(
+                        "Изображение скопировано в буфер обмена",
+                        "Image copied to the clipboard",
+                    )
                 } else {
-                    "Нечего копировать"
+                    tr("Нечего копировать", "Nothing to copy")
                 };
                 media.show_status(text.to_string());
             }
         }
         Command::SaveFrame => {
-            let path = state.file_path.clone();
+            let (path, format) = (state.file_path.clone(), state.config.frame_format);
             let Some(media) = state.media.as_mut().filter(|m| m.is_video()) else {
                 return;
             };
             let saved = media.current_picture().and_then(|frame| {
-                let target = snapshot::frame_file_name(&path, media.position());
-                snapshot::save_png(&frame, &target).then_some(target)
+                let target = snapshot::frame_file_name(&path, media.position(), format);
+                snapshot::save_picture(&frame, &target, format).then_some(target)
             });
             let text = match saved {
                 Some(target) => format!(
-                    "Кадр сохранён: {}",
+                    "{}: {}",
+                    tr("Кадр сохранён", "Frame saved"),
                     target.file_name().unwrap_or_default().to_string_lossy()
                 ),
-                None => "Не удалось сохранить кадр".to_string(),
+                None => tr("Не удалось сохранить кадр", "Could not save the frame").to_string(),
             };
             media.show_status(text);
         }
@@ -704,11 +779,23 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let path = state.file_path.clone();
             if !file_actions::open_in_editor(hwnd, &path, &editor) {
                 let text = if editor.is_empty() {
-                    "Не удалось открыть файл во внешней программе.".to_string()
+                    tr(
+                        "Не удалось открыть файл во внешней программе.",
+                        "Could not open the file in an external program.",
+                    )
+                    .to_string()
                 } else {
                     format!(
-                        "Не удалось запустить редактор:\n{}\n\nПуть задаётся в настройках (S).",
-                        editor
+                        "{}:\n{}\n\n{}",
+                        tr(
+                            "Не удалось запустить редактор",
+                            "Could not start the editor"
+                        ),
+                        editor,
+                        tr(
+                            "Путь задаётся в настройках (S).",
+                            "The path is set in Settings (S)."
+                        ),
                     )
                 };
                 file_actions::show_error(dialog::modal_owner(hwnd), &text);
@@ -722,6 +809,13 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         Command::SetWallpaper => set_wallpaper(hwnd),
         Command::Print => {
             print(hwnd, None);
+        }
+        Command::SaveAs => {
+            if state.media.is_none() && state.image.is_some() {
+                let (path, turns) = (state.file_path.clone(), state.quarter_turns);
+                let auto_rotate = state.config.auto_rotate_exif;
+                save_as::save_as(dialog::modal_owner(hwnd), &path, turns, auto_rotate);
+            }
         }
         Command::Slower | Command::Faster | Command::NormalSpeed => {
             if let Some(media) = state.media.as_mut() {
@@ -864,7 +958,7 @@ unsafe fn set_wallpaper(hwnd: HWND) {
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let as_is = !state.turned
+    let as_is = state.quarter_turns == 0
         && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp")
         && read_orientation(&path).is_none_or(|o| o == 1);
     let source = if as_is {
@@ -874,7 +968,13 @@ unsafe fn set_wallpaper(hwnd: HWND) {
         snapshot::save_png(&img, &target).then_some(target)
     };
     if !source.is_some_and(|s| file_actions::set_wallpaper(&s)) {
-        file_actions::show_error(dialog::modal_owner(hwnd), "Не удалось установить обои.");
+        file_actions::show_error(
+            dialog::modal_owner(hwnd),
+            tr(
+                "Не удалось установить обои.",
+                "Could not set the desktop background.",
+            ),
+        );
     }
 }
 
@@ -994,7 +1094,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
                     menu,
                     MF_STRING | flags,
                     *cmd as usize,
-                    &HSTRING::from(*label),
+                    &HSTRING::from(tr(label.0, label.1)),
                 );
             }
             None => {
@@ -1366,6 +1466,20 @@ mod tests {
             Command::from_key(0xBB, true, false, false),
             Some(Command::ZoomIn)
         );
+        for media in [false, true] {
+            assert_eq!(
+                Command::from_key(0x73, false, false, media),
+                Some(Command::OpenInEditor)
+            ); // F4
+            assert_eq!(
+                Command::from_key(0x0D, true, false, media),
+                Some(Command::ShowInFolder)
+            ); // Ctrl+Enter
+        }
+        assert_eq!(
+            Command::from_key(0x0D, false, false, false),
+            Some(Command::ToggleFullscreen)
+        ); // Enter
     }
 
     #[test]
@@ -1456,9 +1570,9 @@ mod tests {
     #[test]
     fn raw_values_outside_the_commands() {
         assert_eq!(Command::from_raw(0), None);
-        assert_eq!(Command::from_raw(Command::FrameForward as usize + 1), None);
+        assert_eq!(Command::from_raw(Command::SaveAs as usize + 1), None);
         assert_eq!(Command::from_raw(1), Some(Command::ToggleFullscreen));
-        for value in 1..=Command::FrameForward as usize {
+        for value in 1..=Command::SaveAs as usize {
             assert_eq!(Command::from_raw(value).map(|c| c as usize), Some(value));
         }
     }

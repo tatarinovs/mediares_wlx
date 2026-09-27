@@ -9,6 +9,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use crate::gdi::{self, Font};
+use crate::i18n::tr;
 use crate::image_cache::{DecodedImage, BACKGROUND};
 use crate::osd_template;
 use crate::state::{Loupe, ViewerState, ZoomMode};
@@ -204,7 +205,7 @@ pub unsafe fn paint(
             gdi::text(
                 dc,
                 window,
-                "Не удалось открыть изображение",
+                tr("Не удалось открыть изображение", "Cannot open the image"),
                 Some(font),
                 muted_text_color(bg),
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE,
@@ -343,7 +344,7 @@ fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
                     "zoom" => zoom.map(|z| z.to_string()).unwrap_or_default(),
                     "preview" => {
                         if img.is_preview {
-                            "превью RAW".to_string()
+                            tr("превью RAW", "RAW preview").to_string()
                         } else {
                             String::new()
                         }

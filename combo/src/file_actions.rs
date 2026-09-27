@@ -21,7 +21,10 @@ fn file_name(path: &Path) -> String {
 }
 
 pub unsafe fn confirm_delete(owner: HWND, path: &Path) -> bool {
-    let text = HSTRING::from(format!("Удалить «{}» в корзину?", file_name(path)));
+    let text = HSTRING::from(match crate::i18n::current() {
+        crate::i18n::Lang::Ru => format!("Удалить «{}» в корзину?", file_name(path)),
+        crate::i18n::Lang::En => format!("Move \"{}\" to the Recycle Bin?", file_name(path)),
+    });
     MessageBoxW(
         Some(owner),
         &text,

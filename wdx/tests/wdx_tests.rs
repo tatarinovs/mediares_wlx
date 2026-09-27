@@ -3,109 +3,72 @@ use mediares_wdx::*;
 use std::os::raw::{c_char, c_void};
 use std::path::PathBuf;
 
+/// Name and type of the field at `index`; `None` past the end.
+fn field_info(index: i32) -> Option<(String, i32)> {
+    let mut name = [0 as c_char; 128];
+    let mut units = [0 as c_char; 128];
+    let kind =
+        unsafe { ContentGetSupportedField(index, name.as_mut_ptr(), units.as_mut_ptr(), 128) };
+    (kind != FT_NOMOREFIELDS).then(|| {
+        let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
+        (name.to_str().unwrap().to_string(), kind)
+    })
+}
+
+/// Index of a field by name, so the tests don't depend on the order of the list.
+fn field(name: &str) -> i32 {
+    (0..)
+        .map_while(|i| field_info(i).map(|(n, _)| (i, n)))
+        .find(|(_, n)| n == name)
+        .unwrap_or_else(|| panic!("no field {}", name))
+        .0
+}
+
 #[test]
 fn test_supported_fields_enumeration() {
-    let mut field_name = [0 as c_char; 128];
-    let mut units = [0 as c_char; 128];
+    let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
+    assert_eq!(fields.len(), 68);
+    let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
+    // Hashes for duplicate search come first.
+    assert_eq!(
+        names[..7],
+        [
+            "Image_dHash",
+            "Image_pHash",
+            "Image_CoarseHash",
+            "Video_Fingerprint",
+            "Video_dHash_Mid",
+            "Audio_Fingerprint",
+            "Audio_PCM_Hash",
+        ]
+    );
+    assert_eq!(names.last(), Some(&"Plugin_Version"));
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 68, "names are unique");
 
-    // Field 0: Image_dHash
-    let f0 =
-        unsafe { ContentGetSupportedField(0, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f0, FT_STRINGW);
-    let name0 = unsafe {
-        std::ffi::CStr::from_ptr(field_name.as_ptr())
-            .to_str()
-            .unwrap()
-    };
-    assert_eq!(name0, "Image_dHash");
-
-    // Field 7: Video_Duration_Sec
-    let f7 =
-        unsafe { ContentGetSupportedField(7, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f7, FT_NUMERIC_32);
-    let name7 = unsafe {
-        std::ffi::CStr::from_ptr(field_name.as_ptr())
-            .to_str()
-            .unwrap()
-    };
-    assert_eq!(name7, "Video_Duration_Sec");
-
-    // Field 9: Media_Type
-    let f9 =
-        unsafe { ContentGetSupportedField(9, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f9, FT_STRINGW);
-    let name9 = unsafe {
-        std::ffi::CStr::from_ptr(field_name.as_ptr())
-            .to_str()
-            .unwrap()
-    };
-    assert_eq!(name9, "Media_Type");
-
-    // Field 10: Plugin_Version
-    let f10 =
-        unsafe { ContentGetSupportedField(10, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f10, FT_STRINGW);
-    let name10 = unsafe {
-        std::ffi::CStr::from_ptr(field_name.as_ptr())
-            .to_str()
-            .unwrap()
-    };
-    assert_eq!(name10, "Plugin_Version");
-
-    // Fields 11..14: audio, appended after the original ones (indices are stored by TC).
-    for (index, name, kind) in [
-        (11, "Audio_Fingerprint", FT_STRINGW),
-        (12, "Audio_PCM_Hash", FT_STRINGW),
-        (13, "Audio_Duration_Sec", FT_NUMERIC_32),
-        (14, "Audio_Artist_Title", FT_STRINGW),
+    for (name, kind) in [
+        ("Image_dHash", FT_STRINGW),
+        ("Media_Type", FT_STRINGW),
+        ("Plugin_Version", FT_STRINGW),
+        ("Video_Duration_Sec", FT_NUMERIC_32),
+        ("Audio_Duration_Sec", FT_NUMERIC_32),
+        ("Audio_Artist_Title", FT_STRINGW),
+        ("Image_Width", FT_NUMERIC_32),
+        ("Photo_Date_Taken", FT_DATETIME),
+        ("Photo_FNumber", FT_NUMERIC_FLOATING),
+        ("Photo_Has_GPS", FT_BOOLEAN),
+        ("Video_Length", FT_TIME),
+        ("Video_Codec", FT_STRINGW),
+        ("Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32),
+        ("Audio_Codec", FT_STRINGW),
+        ("Audio_Lossless", FT_BOOLEAN),
+        ("Audio_Length", FT_TIME),
+        ("Audio_Track_Total", FT_NUMERIC_32),
+        ("Video_Year", FT_NUMERIC_32),
     ] {
-        let f = unsafe {
-            ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128)
-        };
-        assert_eq!(f, kind);
-        let got = unsafe {
-            std::ffi::CStr::from_ptr(field_name.as_ptr())
-                .to_str()
-                .unwrap()
-        };
-        assert_eq!(got, name);
+        assert_eq!(field_info(field(name)).unwrap().1, kind, "{}", name);
     }
-
-    // Photo/video metadata fields, appended after the audio ones.
-    for (index, name, kind) in [
-        (30, "Image_Width", FT_NUMERIC_32),
-        (35, "Photo_Date_Taken", FT_DATETIME),
-        (37, "Photo_FNumber", FT_NUMERIC_FLOATING),
-        (46, "Photo_Has_GPS", FT_BOOLEAN),
-        (49, "Video_Length", FT_TIME),
-        (51, "Video_Codec", FT_STRINGW),
-        (55, "Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32),
-        (56, "Audio_Codec", FT_STRINGW),
-        (57, "Audio_Lossless", FT_BOOLEAN),
-        (58, "Audio_Composer", FT_STRINGW),
-        (59, "Audio_Track_Total", FT_NUMERIC_32),
-        (60, "Audio_Disc_Total", FT_NUMERIC_32),
-        (61, "Video_Title", FT_STRINGW),
-        (64, "Video_Date", FT_STRINGW),
-        (65, "Video_Year", FT_NUMERIC_32),
-        (67, "Video_Comment", FT_STRINGW),
-    ] {
-        let f = unsafe {
-            ContentGetSupportedField(index, field_name.as_mut_ptr(), units.as_mut_ptr(), 128)
-        };
-        assert_eq!(f, kind);
-        let got = unsafe {
-            std::ffi::CStr::from_ptr(field_name.as_ptr())
-                .to_str()
-                .unwrap()
-        };
-        assert_eq!(got, name);
-    }
-
-    // Out of bounds
-    let f15 =
-        unsafe { ContentGetSupportedField(68, field_name.as_mut_ptr(), units.as_mut_ptr(), 128) };
-    assert_eq!(f15, FT_NOMOREFIELDS);
 }
 
 #[test]
@@ -194,9 +157,9 @@ fn test_image_hashes_and_duplicate_matching() {
         (res, s)
     };
 
-    let (res1, dhash1) = read_field(&img1_path, 0);
-    let (res2, dhash2) = read_field(&img2_path, 0);
-    let (res3, dhash3) = read_field(&img3_path, 0);
+    let (res1, dhash1) = read_field(&img1_path, field("Image_dHash"));
+    let (res2, dhash2) = read_field(&img2_path, field("Image_dHash"));
+    let (res3, dhash3) = read_field(&img3_path, field("Image_dHash"));
 
     assert_eq!(res1, FT_STRINGW);
     assert_eq!(res2, FT_STRINGW);
@@ -208,16 +171,16 @@ fn test_image_hashes_and_duplicate_matching() {
     );
     assert_ne!(dhash1, dhash3, "Different images must not match dHash");
 
-    let (_, dim1) = read_field(&img1_path, 3);
+    let (_, dim1) = read_field(&img1_path, field("Image_Dimensions"));
     assert_eq!(dim1, "120x120");
 
-    let (_, dim2) = read_field(&img2_path, 3);
+    let (_, dim2) = read_field(&img2_path, field("Image_Dimensions"));
     assert_eq!(dim2, "60x60");
 
-    let (_, asp1) = read_field(&img1_path, 4);
+    let (_, asp1) = read_field(&img1_path, field("Image_AspectRatio"));
     assert_eq!(asp1, "1:1");
 
-    let (_, mtype) = read_field(&img1_path, 9);
+    let (_, mtype) = read_field(&img1_path, field("Media_Type"));
     assert_eq!(mtype, "Image");
 
     let _ = fs::remove_dir_all(&test_dir);
@@ -238,7 +201,7 @@ fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
         let res = unsafe {
             ContentGetValueW(
                 wide.as_ptr(),
-                0, // dHash
+                field("Image_dHash"),
                 0,
                 buf.as_mut_ptr() as *mut c_void,
                 256,
@@ -277,8 +240,16 @@ fn test_corrupt_and_invalid_files_safety() {
         .collect();
 
     let mut buf = [0u16; 128];
-    let res =
-        unsafe { ContentGetValueW(wide.as_ptr(), 0, 0, buf.as_mut_ptr() as *mut c_void, 256, 0) };
+    let res = unsafe {
+        ContentGetValueW(
+            wide.as_ptr(),
+            field("Image_dHash"),
+            0,
+            buf.as_mut_ptr() as *mut c_void,
+            256,
+            0,
+        )
+    };
 
     assert!(res == FT_FIELDEMPTY || res == FT_FILEERROR);
 }
@@ -397,17 +368,26 @@ fn test_audio_fields() {
         )
     };
 
-    let (res, fp) = read(&a, 11);
+    let (res, fp) = read(&a, field("Audio_Fingerprint"));
     assert_eq!(res, FT_STRINGW);
     assert!(fp.starts_with("40s_"), "{}", fp);
-    assert_eq!(read(&a, 13), (FT_NUMERIC_32, "40".to_string()));
-    assert_eq!(read(&a, 9).1, "Audio");
+    assert_eq!(
+        read(&a, field("Audio_Duration_Sec")),
+        (FT_NUMERIC_32, "40".to_string())
+    );
+    assert_eq!(read(&a, field("Media_Type")).1, "Audio");
     // Leading silence changes neither the PCM hash nor the fingerprint windows' content.
-    assert_eq!(read(&a, 12), read(&padded, 12));
-    assert_ne!(read(&a, 12), read(&other, 12));
-    assert_ne!(fp, read(&other, 11).1);
+    assert_eq!(
+        read(&a, field("Audio_PCM_Hash")),
+        read(&padded, field("Audio_PCM_Hash"))
+    );
+    assert_ne!(
+        read(&a, field("Audio_PCM_Hash")),
+        read(&other, field("Audio_PCM_Hash"))
+    );
+    assert_ne!(fp, read(&other, field("Audio_Fingerprint")).1);
     // Untagged: no artist/title.
-    assert_eq!(read(&a, 14).0, FT_FIELDEMPTY);
+    assert_eq!(read(&a, field("Audio_Artist_Title")).0, FT_FIELDEMPTY);
 }
 
 #[test]
@@ -448,43 +428,76 @@ fn test_audio_tag_fields() {
         )
     };
     // Tag fields are never delayed, unlike the decoding-based ones.
-    assert_eq!(raw(15, CONTENT_DELAYIFSLOW).0, FT_STRINGW);
-    assert_eq!(raw(11, CONTENT_DELAYIFSLOW).0, FT_DELAYED);
+    assert_eq!(
+        raw(field("Audio_Artist"), CONTENT_DELAYIFSLOW).0,
+        FT_STRINGW
+    );
+    assert_eq!(
+        raw(field("Audio_Fingerprint"), CONTENT_DELAYIFSLOW).0,
+        FT_DELAYED
+    );
 
-    assert_eq!(text(15), (FT_STRINGW, "Пикник".to_string()));
-    assert_eq!(text(16), (FT_STRINGW, "Остров".to_string()));
-    assert_eq!(text(17), (FT_STRINGW, "Иероглиф".to_string()));
-    assert_eq!(text(22), (FT_STRINGW, "Rock".to_string()));
-    assert_eq!(text(14), (FT_STRINGW, "пикник - остров".to_string()));
-    let (res, buf) = raw(19, 0);
+    assert_eq!(
+        text(field("Audio_Artist")),
+        (FT_STRINGW, "Пикник".to_string())
+    );
+    assert_eq!(
+        text(field("Audio_Title")),
+        (FT_STRINGW, "Остров".to_string())
+    );
+    assert_eq!(
+        text(field("Audio_Album")),
+        (FT_STRINGW, "Иероглиф".to_string())
+    );
+    assert_eq!(text(field("Audio_Genre")), (FT_STRINGW, "Rock".to_string()));
+    assert_eq!(
+        text(field("Audio_Artist_Title")),
+        (FT_STRINGW, "пикник - остров".to_string())
+    );
+    let (res, buf) = raw(field("Audio_Year"), 0);
     assert_eq!(
         (res, buf[0] as u32 | (buf[1] as u32) << 16),
         (FT_NUMERIC_32, 1986)
     );
     // Length 75 s as ttimeformat (h, m, s).
-    let (res, buf) = raw(24, 0);
+    let (res, buf) = raw(field("Audio_Length"), 0);
     assert_eq!((res, &buf[..3]), (FT_TIME, &[0u16, 1, 15][..]));
-    let (res, buf) = raw(26, 0);
+    let (res, buf) = raw(field("Audio_Sample_Rate_Hz"), 0);
     assert_eq!(
         (res, buf[0] as u32 | (buf[1] as u32) << 16),
         (FT_NUMERIC_32, 22050)
     );
-    assert_eq!(raw(29, 0).0, FT_BOOLEAN);
-    assert_eq!(raw(29, 0).1[0], 0, "no cover");
-    assert_eq!(raw(20, 0).0, FT_FIELDEMPTY, "no track number");
-    let (res, buf) = raw(56, CONTENT_DELAYIFSLOW);
+    assert_eq!(raw(field("Audio_Has_Cover"), 0).0, FT_BOOLEAN);
+    assert_eq!(raw(field("Audio_Has_Cover"), 0).1[0], 0, "no cover");
+    assert_eq!(
+        raw(field("Audio_Track"), 0).0,
+        FT_FIELDEMPTY,
+        "no track number"
+    );
+    let (res, buf) = raw(field("Audio_Codec"), CONTENT_DELAYIFSLOW);
     assert_eq!(
         (res, String::from_utf16_lossy(&buf[..3])),
         (FT_STRINGW, "PCM".to_string())
     );
     assert_eq!(buf[3], 0);
     assert_eq!(
-        (raw(57, 0).0, raw(57, 0).1[0]),
+        (
+            raw(field("Audio_Lossless"), 0).0,
+            raw(field("Audio_Lossless"), 0).1[0]
+        ),
         (FT_BOOLEAN, 1),
         "PCM is lossless"
     );
-    assert_eq!(raw(58, 0).0, FT_FIELDEMPTY, "no composer");
-    assert_eq!(raw(59, 0).0, FT_FIELDEMPTY, "no track total");
+    assert_eq!(
+        raw(field("Audio_Composer"), 0).0,
+        FT_FIELDEMPTY,
+        "no composer"
+    );
+    assert_eq!(
+        raw(field("Audio_Track_Total"), 0).0,
+        FT_FIELDEMPTY,
+        "no track total"
+    );
     // Not audio: tag fields are empty.
     let img: Vec<u16> = std::path::Path::new("Cargo.toml")
         .as_os_str()
@@ -493,7 +506,16 @@ fn test_audio_tag_fields() {
         .collect();
     let mut buf = [0u16; 64];
     assert_eq!(
-        unsafe { ContentGetValueW(img.as_ptr(), 15, 0, buf.as_mut_ptr() as *mut c_void, 128, 0) },
+        unsafe {
+            ContentGetValueW(
+                img.as_ptr(),
+                field("Audio_Artist"),
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                128,
+                0,
+            )
+        },
         FT_FIELDEMPTY
     );
 }
@@ -653,41 +675,64 @@ fn test_photo_exif_fields() {
     };
 
     // EXIF and header sizes are cheap: never delayed.
-    assert_eq!(raw(&jpg, 32, CONTENT_DELAYIFSLOW).0, FT_STRINGW);
-    assert_eq!(raw(&jpg, 30, CONTENT_DELAYIFSLOW).0, FT_NUMERIC_32);
+    assert_eq!(
+        raw(&jpg, field("Photo_Make"), CONTENT_DELAYIFSLOW).0,
+        FT_STRINGW
+    );
+    assert_eq!(
+        raw(&jpg, field("Image_Width"), CONTENT_DELAYIFSLOW).0,
+        FT_NUMERIC_32
+    );
 
-    assert_eq!(int(&jpg, 30), (FT_NUMERIC_32, 64));
-    assert_eq!(int(&jpg, 31), (FT_NUMERIC_32, 48));
-    assert_eq!(int(&png, 30), (FT_NUMERIC_32, 64));
-    assert_eq!(text(32), (FT_STRINGW, "Canon".to_string()));
-    assert_eq!(text(33), (FT_STRINGW, "EOS R5".to_string()));
-    assert_eq!(text(34).0, FT_FIELDEMPTY, "no lens");
-    assert_eq!(text(36), (FT_STRINGW, "1/250".to_string()));
-    assert_eq!(float(37), (FT_NUMERIC_FLOATING, 2.8));
-    assert_eq!(int(&jpg, 38), (FT_NUMERIC_32, 400));
-    assert_eq!(float(39), (FT_NUMERIC_FLOATING, 50.0));
-    assert_eq!(raw(&jpg, 41, 0).0, FT_FIELDEMPTY, "flash not recorded");
-    assert_eq!(int(&jpg, 42), (FT_NUMERIC_32, 6));
+    assert_eq!(int(&jpg, field("Image_Width")), (FT_NUMERIC_32, 64));
+    assert_eq!(int(&jpg, field("Image_Height")), (FT_NUMERIC_32, 48));
+    assert_eq!(int(&png, field("Image_Width")), (FT_NUMERIC_32, 64));
+    assert_eq!(text(field("Photo_Make")), (FT_STRINGW, "Canon".to_string()));
+    assert_eq!(
+        text(field("Photo_Model")),
+        (FT_STRINGW, "EOS R5".to_string())
+    );
+    assert_eq!(text(field("Photo_Lens")).0, FT_FIELDEMPTY, "no lens");
+    assert_eq!(
+        text(field("Photo_Exposure")),
+        (FT_STRINGW, "1/250".to_string())
+    );
+    assert_eq!(float(field("Photo_FNumber")), (FT_NUMERIC_FLOATING, 2.8));
+    assert_eq!(int(&jpg, field("Photo_ISO")), (FT_NUMERIC_32, 400));
+    assert_eq!(
+        float(field("Photo_Focal_Length_mm")),
+        (FT_NUMERIC_FLOATING, 50.0)
+    );
+    assert_eq!(
+        raw(&jpg, field("Photo_Flash"), 0).0,
+        FT_FIELDEMPTY,
+        "flash not recorded"
+    );
+    assert_eq!(int(&jpg, field("Photo_Orientation")), (FT_NUMERIC_32, 6));
 
-    let (res, lat) = float(44);
+    let (res, lat) = float(field("Photo_GPS_Latitude"));
     assert_eq!(res, FT_NUMERIC_FLOATING);
     assert!(
         (lat - -(33.0 + 51.0 / 60.0 + 35.9 / 3600.0)).abs() < 1e-9,
         "{}",
         lat
     );
-    let (_, lon) = float(45);
+    let (_, lon) = float(field("Photo_GPS_Longitude"));
     assert!(
         (lon - (151.0 + 12.0 / 60.0 + 40.0 / 3600.0)).abs() < 1e-9,
         "{}",
         lon
     );
-    assert_eq!(int(&jpg, 46), (FT_BOOLEAN, 1));
-    assert_eq!(int(&png, 46), (FT_BOOLEAN, 0), "no EXIF means no GPS");
-    assert_eq!(raw(&png, 32, 0).0, FT_FIELDEMPTY);
+    assert_eq!(int(&jpg, field("Photo_Has_GPS")), (FT_BOOLEAN, 1));
+    assert_eq!(
+        int(&png, field("Photo_Has_GPS")),
+        (FT_BOOLEAN, 0),
+        "no EXIF means no GPS"
+    );
+    assert_eq!(raw(&png, field("Photo_Make"), 0).0, FT_FIELDEMPTY);
 
     // Camera local time converted to UTC: within a day of the naive value.
-    let (res, buf) = raw(&jpg, 35, 0);
+    let (res, buf) = raw(&jpg, field("Photo_Date_Taken"), 0);
     assert_eq!(res, FT_DATETIME);
     let filetime = u64::from_le_bytes(buf[..8].try_into().unwrap()) as i64;
     let naive = ((days_since_1601(2024, 5, 1) * 86_400) + 12 * 3600 + 34 * 60 + 56) * 10_000_000;
@@ -723,18 +768,48 @@ fn test_video_meta_fields_delay_and_scope() {
             )
         }
     };
-    for field in 47..=55 {
+    for name in [
+        "Video_Width",
+        "Video_Height",
+        "Video_Length",
+        "Video_Frame_Rate",
+        "Video_Codec",
+        "Video_Bitrate_kbps",
+        "Video_Audio_Codec",
+        "Video_Audio_Channels",
+        "Video_Audio_Sample_Rate_Hz",
+    ] {
+        let field = field(name);
         assert_eq!(
             call("target/test_dummy_meta.mp4", field, CONTENT_DELAYIFSLOW),
             FT_DELAYED,
             "field {}",
-            field
+            name
         );
         assert_eq!(
             call("Cargo.toml", field, 0),
             FT_FIELDEMPTY,
             "field {}",
-            field
+            name
         );
+    }
+}
+
+/// The user guides shipped in the archives describe every field.
+#[test]
+fn test_readmes_list_every_field() {
+    let docs = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../docs");
+    let fields: Vec<String> = (0..).map_while(field_info).map(|(n, _)| n).collect();
+    for readme in ["readme_rus.txt", "readme_eng.txt"] {
+        let text = std::fs::read_to_string(docs.join(readme)).unwrap();
+        // A whole word: "Audio_Track" must not count as found inside "Audio_Track_Total".
+        let mentions = |name: &str| {
+            text.match_indices(name).any(|(i, _)| {
+                let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+                !text[..i].ends_with(word) && !text[i + name.len()..].starts_with(word)
+            })
+        };
+        let missing: Vec<&String> = fields.iter().filter(|f| !mentions(f)).collect();
+        assert!(missing.is_empty(), "{} lacks {:?}", readme, missing);
     }
 }

@@ -13,6 +13,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer
 
 use crate::audio_view::{AudioView, PROGRESS_TIMER_ID};
 use crate::gdi::{self, Font};
+use crate::i18n::{self, tr};
 use crate::image_cache::DecodedImage;
 use crate::transport_bar::{self, BarControl, Click, Layout, Message, Transport};
 use crate::video_view::{VideoView, RENDER_TIMER_ID};
@@ -354,14 +355,22 @@ impl MediaView {
             return;
         };
         let rate = v.change_rate(faster);
-        self.show_status(format!("Скорость {}×", rate.to_string().replace('.', ",")));
+        self.show_status(format!(
+            "{} {}×",
+            tr("Скорость", "Speed"),
+            i18n::decimal(rate.to_string())
+        ));
     }
 
     pub unsafe fn frame_step(&mut self, forward: bool) {
         if let Content::Video(v) = &mut self.content {
             if !v.frame_step(forward) {
                 self.show_status(
-                    "Шаг назад недоступен для этого файла (неточная перемотка)".to_string(),
+                    tr(
+                        "Шаг назад недоступен для этого файла (неточная перемотка)",
+                        "Stepping back is not available for this file (inexact seeking)",
+                    )
+                    .to_string(),
                 );
             }
         }
@@ -381,7 +390,11 @@ impl MediaView {
             Content::Video(v) => {
                 let effect = v.on_event(event, param1);
                 if let Some(t) = v.take_resumed() {
-                    self.show_status(format!("Продолжение с {}", transport_bar::format_time(t)));
+                    self.show_status(format!(
+                        "{} {}",
+                        tr("Продолжение с", "Resuming from"),
+                        transport_bar::format_time(t)
+                    ));
                 }
                 effect
             }

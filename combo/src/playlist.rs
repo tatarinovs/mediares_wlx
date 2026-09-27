@@ -10,6 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use mediares_core::ffi::ansi_to_os_string;
 use mediares_core::probe::probe_file;
 
+use crate::i18n::tr;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Repeat {
     #[default]
@@ -33,9 +35,9 @@ impl Repeat {
 
     pub fn label(self) -> &'static str {
         match self {
-            Repeat::Off => "Без повтора",
-            Repeat::All => "Повторять список",
-            Repeat::One => "Повторять файл",
+            Repeat::Off => tr("Без повтора", "No repeat"),
+            Repeat::All => tr("Повторять список", "Repeat list"),
+            Repeat::One => tr("Повторять файл", "Repeat file"),
         }
     }
 }

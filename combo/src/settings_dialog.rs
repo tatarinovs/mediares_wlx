@@ -24,7 +24,9 @@ use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog;
 use crate::file_actions::show_error;
 use crate::gdi::{self, Brush};
+use crate::i18n::{tr, LangSetting};
 use crate::playlist::Repeat;
+use crate::snapshot::FrameFormat;
 use crate::tc_register::Registration;
 use crate::{osd_template, osd_template_dialog};
 
@@ -58,6 +60,8 @@ const IDC_REGISTER_WDX: i32 = 125;
 const IDC_PHOTO_OSD: i32 = 126;
 const IDC_VIDEO_OSD: i32 = 127;
 const IDC_NO_UPSCALE: i32 = 128;
+const IDC_LANGUAGE: i32 = 129;
+const IDC_FRAME_FORMAT: i32 = 130;
 
 const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
@@ -103,7 +107,13 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, "Настройки Mediares", 850, 600)?;
+    let dlg = dialog::create_frame(
+        owner,
+        CLASS_NAME,
+        tr("Настройки Mediares", "Mediares Settings"),
+        850,
+        600,
+    )?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
@@ -192,12 +202,15 @@ unsafe fn build_controls(
         );
         control(
             w!("BUTTON"),
-            "Обзор...",
+            tr("Обзор...", "Browse..."),
             tab | BS_PUSHBUTTON as u32,
             (738, y - 4, 72, 26),
             browse_id,
         );
-        let hint = w!("программа, назначенная в Windows");
+        let hint = HSTRING::from(tr(
+            "программа, назначенная в Windows",
+            "the program assigned in Windows",
+        ));
         SendDlgItemMessageW(
             dlg,
             edit_id,
@@ -209,13 +222,16 @@ unsafe fn build_controls(
 
     // Left column: photos, OSD, fullscreen.
     checkbox(
-        "Запускать в полноэкранном режиме",
+        tr("Запускать в полноэкранном режиме", "Start in full screen"),
         (20, 15, 380, 22),
         IDC_START_FULLSCREEN,
         cfg.start_fullscreen,
     );
     checkbox(
-        "Автоповорот по ориентации EXIF",
+        tr(
+            "Автоповорот по ориентации EXIF",
+            "Auto-rotate by EXIF orientation",
+        ),
         (20, 42, 380, 22),
         IDC_AUTO_ROTATE_EXIF,
         cfg.auto_rotate_exif,
@@ -223,14 +239,14 @@ unsafe fn build_controls(
 
     control(
         w!("BUTTON"),
-        "Просмотр фото",
+        tr("Просмотр фото", "Photos"),
         BS_GROUPBOX as u32,
         (15, 72, 395, 147),
         0,
     );
     control(
         w!("STATIC"),
-        "Масштаб лупы (ЛКМ):",
+        tr("Масштаб лупы (ЛКМ):", "Loupe zoom (left click):"),
         SS_LEFT,
         (28, 98, 145, 20),
         0,
@@ -246,10 +262,16 @@ unsafe fn build_controls(
         .position(|s| (s - cfg.loupe_scale).abs() < 0.05)
         .unwrap_or(0);
     combo((175, 95, 90, 160), IDC_LOUPE_SCALE, loupe_labels, loupe_sel);
-    control(w!("STATIC"), "Цвет фона:", SS_LEFT, (28, 133, 140, 20), 0);
+    control(
+        w!("STATIC"),
+        tr("Цвет фона:", "Background:"),
+        SS_LEFT,
+        (28, 133, 140, 20),
+        0,
+    );
     control(
         w!("BUTTON"),
-        "Выбрать цвет...",
+        tr("Выбрать цвет...", "Choose color..."),
         tab | BS_PUSHBUTTON as u32,
         (175, 130, 130, 26),
         IDC_CHOOSE_BACKGROUND,
@@ -262,13 +284,19 @@ unsafe fn build_controls(
         IDC_BACKGROUND_PREVIEW,
     );
     checkbox(
-        "Не растягивать маленькие изображения",
+        tr(
+            "Не растягивать маленькие изображения",
+            "Don't enlarge small images",
+        ),
         (28, 163, 365, 22),
         IDC_NO_UPSCALE,
         cfg.no_upscale,
     );
     checkbox(
-        "Спрашивать перед удалением в корзину (Del)",
+        tr(
+            "Спрашивать перед удалением в корзину (Del)",
+            "Confirm moving to Recycle Bin (Del)",
+        ),
         (28, 188, 365, 22),
         IDC_CONFIRM_DELETE,
         cfg.confirm_delete,
@@ -276,14 +304,14 @@ unsafe fn build_controls(
 
     control(
         w!("BUTTON"),
-        "Информационная строка (OSD)",
+        tr("Информационная строка (OSD)", "Info line (OSD)"),
         BS_GROUPBOX as u32,
         (15, 229, 395, 170),
         0,
     );
     control(
         w!("STATIC"),
-        "Показывать OSD:",
+        tr("Показывать OSD:", "Show OSD:"),
         SS_LEFT,
         (28, 257, 140, 20),
         0,
@@ -297,7 +325,7 @@ unsafe fn build_controls(
     );
     control(
         w!("STATIC"),
-        "Размер шрифта:",
+        tr("Размер шрифта:", "Font size:"),
         SS_LEFT,
         (28, 289, 140, 20),
         0,
@@ -310,10 +338,16 @@ unsafe fn build_controls(
         .unwrap_or(0);
     combo((175, 286, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
 
-    control(w!("STATIC"), "Цвет шрифта:", SS_LEFT, (28, 325, 140, 20), 0);
+    control(
+        w!("STATIC"),
+        tr("Цвет шрифта:", "Font color:"),
+        SS_LEFT,
+        (28, 325, 140, 20),
+        0,
+    );
     control(
         w!("BUTTON"),
-        "Выбрать цвет...",
+        tr("Выбрать цвет...", "Choose color..."),
         tab | BS_PUSHBUTTON as u32,
         (175, 322, 130, 26),
         IDC_CHOOSE_COLOR,
@@ -327,21 +361,21 @@ unsafe fn build_controls(
     );
     control(
         w!("STATIC"),
-        "Что показывать:",
+        tr("Что показывать:", "Contents:"),
         SS_LEFT,
         (28, 362, 140, 20),
         0,
     );
     control(
         w!("BUTTON"),
-        "Для фото...",
+        tr("Для фото...", "Photos..."),
         tab | BS_PUSHBUTTON as u32,
         (175, 359, 105, 26),
         IDC_PHOTO_OSD,
     );
     control(
         w!("BUTTON"),
-        "Для видео...",
+        tr("Для видео...", "Videos..."),
         tab | BS_PUSHBUTTON as u32,
         (290, 359, 105, 26),
         IDC_VIDEO_OSD,
@@ -349,32 +383,32 @@ unsafe fn build_controls(
 
     control(
         w!("BUTTON"),
-        "Полноэкранный режим",
+        tr("Полноэкранный режим", "Full screen"),
         BS_GROUPBOX as u32,
         (15, 409, 395, 140),
         0,
     );
     checkbox(
-        "Кнопки ⏮ ⏯ ⏭ поверх фото",
+        tr("Кнопки ⏮ ⏯ ⏭ поверх фото", "⏮ ⏯ ⏭ buttons over photos"),
         (28, 432, 365, 22),
         IDC_OVERLAY_PHOTO,
         cfg.overlay_photo,
     );
     checkbox(
-        "Панель управления поверх видео",
+        tr("Панель управления поверх видео", "Control bar over videos"),
         (28, 457, 365, 22),
         IDC_OVERLAY_VIDEO,
         cfg.overlay_video,
     );
     checkbox(
-        "Скрывать панель при бездействии",
+        tr("Скрывать панель при бездействии", "Hide the bar when idle"),
         (28, 482, 365, 22),
         IDC_OVERLAY_AUTOHIDE,
         cfg.overlay_autohide,
     );
     control(
         w!("STATIC"),
-        "Интервал слайд-шоу (F5):",
+        tr("Интервал слайд-шоу (F5):", "Slideshow interval (F5):"),
         SS_LEFT,
         (28, 515, 170, 20),
         0,
@@ -382,7 +416,7 @@ unsafe fn build_controls(
     let slide_labels = ctx
         .slideshow_seconds
         .iter()
-        .map(|s| format!("{} с", s))
+        .map(|s| format!("{} {}", s, tr("с", "s")))
         .collect();
     let slide_sel = ctx
         .slideshow_seconds
@@ -394,18 +428,27 @@ unsafe fn build_controls(
     // Right column: audio / video, external editors.
     control(
         w!("BUTTON"),
-        "Аудио и видео",
+        tr("Аудио и видео", "Audio and video"),
         BS_GROUPBOX as u32,
-        (425, 15, 395, 140),
+        (425, 15, 395, 165),
         0,
     );
     checkbox(
-        "Автопереход к следующему файлу",
+        tr(
+            "Автопереход к следующему файлу",
+            "Auto-advance to the next file",
+        ),
         (438, 40, 365, 22),
         IDC_AUTO_ADVANCE,
         cfg.queue.auto_advance,
     );
-    control(w!("STATIC"), "Повтор:", SS_LEFT, (438, 72, 140, 20), 0);
+    control(
+        w!("STATIC"),
+        tr("Повтор:", "Repeat:"),
+        SS_LEFT,
+        (438, 72, 140, 20),
+        0,
+    );
     let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
     combo(
         (585, 69, 190, 120),
@@ -414,42 +457,69 @@ unsafe fn build_controls(
         cfg.queue.repeat.index() as usize,
     );
     checkbox(
-        "Случайный порядок",
+        tr("Случайный порядок", "Shuffle"),
         (438, 100, 365, 22),
         IDC_SHUFFLE,
         cfg.queue.shuffle,
     );
     checkbox(
-        "Продолжать видео длиннее 5 мин с места остановки",
+        tr(
+            "Продолжать видео длиннее 5 мин с места остановки",
+            "Resume videos longer than 5 min where they stopped",
+        ),
         (438, 125, 375, 22),
         IDC_RESUME_VIDEO,
         cfg.resume_video,
     );
+    control(
+        w!("STATIC"),
+        tr("Кадры (Shift+S):", "Frames (Shift+S):"),
+        SS_LEFT,
+        (438, 153, 140, 20),
+        0,
+    );
+    let frame_labels = FrameFormat::ALL
+        .iter()
+        .map(|f| f.label().to_string())
+        .collect();
+    let frame_sel = FrameFormat::ALL
+        .iter()
+        .position(|&f| f == cfg.frame_format)
+        .unwrap_or(0);
+    combo(
+        (585, 150, 190, 80),
+        IDC_FRAME_FORMAT,
+        frame_labels,
+        frame_sel,
+    );
 
     control(
         w!("BUTTON"),
-        "Внешние редакторы («Открыть в редакторе»)",
+        tr(
+            "Внешние редакторы («Открыть в редакторе»)",
+            "External editors (\"Open in editor\")",
+        ),
         BS_GROUPBOX as u32,
-        (425, 165, 395, 125),
+        (425, 190, 395, 125),
         0,
     );
     program_row(
-        193,
-        "Фото:",
+        218,
+        tr("Фото:", "Photo:"),
         &cfg.photo_editor,
         IDC_PHOTO_EDITOR,
         IDC_BROWSE_PHOTO_EDITOR,
     );
     program_row(
-        225,
-        "Видео:",
+        250,
+        tr("Видео:", "Video:"),
         &cfg.video_editor,
         IDC_VIDEO_EDITOR,
         IDC_BROWSE_VIDEO_EDITOR,
     );
     program_row(
-        257,
-        "Аудио:",
+        282,
+        tr("Аудио:", "Audio:"),
         &cfg.audio_editor,
         IDC_AUDIO_EDITOR,
         IDC_BROWSE_AUDIO_EDITOR,
@@ -457,38 +527,58 @@ unsafe fn build_controls(
 
     control(
         w!("BUTTON"),
-        "Контентный плагин (WDX)",
+        tr("Контентный плагин (WDX)", "Content plugin (WDX)"),
         BS_GROUPBOX as u32,
-        (425, 300, 395, 102),
+        (425, 325, 395, 102),
         0,
     );
-    let hint = "Поля mediares для колонок, поиска дубликатов и группового переименования в TC";
-    control(w!("STATIC"), hint, SS_LEFT, (438, 323, 370, 36), 0);
+    let hint = tr(
+        "Поля mediares для колонок, поиска дубликатов и группового переименования в TC",
+        "mediares fields for TC columns, duplicate search and multi-rename",
+    );
+    control(w!("STATIC"), hint, SS_LEFT, (438, 348, 370, 36), 0);
     let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
     let label = if registered {
-        REGISTERED_LABEL
+        registered_label()
     } else {
-        "Зарегистрировать WDX"
+        tr("Зарегистрировать WDX", "Register WDX")
     };
     let button = control(
         w!("BUTTON"),
         label,
         tab | BS_PUSHBUTTON as u32,
-        (438, 363, 200, 26),
+        (438, 388, 200, 26),
         IDC_REGISTER_WDX,
     );
     let _ = EnableWindow(button, !registered);
 
+    control(
+        w!("STATIC"),
+        "Язык / Language:",
+        SS_LEFT,
+        (438, 450, 140, 20),
+        0,
+    );
+    let lang_labels = LangSetting::ALL
+        .iter()
+        .map(|l| l.label().to_string())
+        .collect();
+    let lang_sel = LangSetting::ALL
+        .iter()
+        .position(|&l| l == cfg.language)
+        .unwrap_or(0);
+    combo((585, 447, 225, 120), IDC_LANGUAGE, lang_labels, lang_sel);
+
     let ok = control(
         w!("BUTTON"),
-        "ОК",
+        tr("ОК", "OK"),
         tab | BS_DEFPUSHBUTTON as u32,
         (615, 521, 95, 28),
         IDOK.0,
     );
     control(
         w!("BUTTON"),
-        "Отмена",
+        tr("Отмена", "Cancel"),
         tab | BS_PUSHBUTTON as u32,
         (725, 521, 95, 28),
         IDCANCEL.0,
@@ -501,14 +591,14 @@ unsafe fn edit_osd_template(dlg: HWND, ctx: &mut Context, video: bool) {
     let cfg = &mut ctx.config;
     let (title, template, default, fields) = if video {
         (
-            "OSD для видео",
+            tr("OSD для видео", "Video OSD"),
             &mut cfg.video_osd,
             osd_template::DEFAULT_VIDEO,
             osd_template::VIDEO_FIELDS,
         )
     } else {
         (
-            "OSD для фото",
+            tr("OSD для фото", "Photo OSD"),
             &mut cfg.photo_osd,
             osd_template::DEFAULT_PHOTO,
             osd_template::PHOTO_FIELDS,
@@ -519,12 +609,20 @@ unsafe fn edit_osd_template(dlg: HWND, ctx: &mut Context, video: bool) {
     }
 }
 
-const REGISTERED_LABEL: &str = "WDX зарегистрирован";
+fn registered_label() -> &'static str {
+    tr("WDX зарегистрирован", "WDX registered")
+}
 
 /// Adds this DLL to `[ContentPlugins]` right away (independent of OK / Cancel), then greys the button.
 unsafe fn register_wdx(dlg: HWND, ctx: &mut Context) {
     let Some(registration) = ctx.registration.as_mut() else {
-        show_error(dlg, "Не найден wincmd.ini. Подключите плагин вручную: Конфигурация → Настройка → Плагины → Контентные плагины → Добавить, выбрать mediares.wlx64.");
+        show_error(
+            dlg,
+            tr(
+                "Не найден wincmd.ini. Подключите плагин вручную: Конфигурация → Настройка → Плагины → Контентные плагины → Добавить, выбрать mediares.wlx64.",
+                "wincmd.ini not found. Add the plugin manually: Configuration → Options → Plugins → Content plugins → Add, select mediares.wlx64.",
+            ),
+        );
         return;
     };
     if let Err(message) = registration.register() {
@@ -533,12 +631,15 @@ unsafe fn register_wdx(dlg: HWND, ctx: &mut Context) {
     }
     MessageBoxW(
         Some(dlg),
-        w!("WDX зарегистрирован, перезапустите Total Commander."),
+        &HSTRING::from(tr(
+            "WDX зарегистрирован, перезапустите Total Commander.",
+            "WDX registered, restart Total Commander.",
+        )),
         w!("Mediares"),
         MB_OK | MB_ICONINFORMATION,
     );
     if let Ok(button) = GetDlgItem(Some(dlg), IDC_REGISTER_WDX) {
-        let _ = SetDlgItemTextW(dlg, IDC_REGISTER_WDX, &HSTRING::from(REGISTERED_LABEL));
+        let _ = SetDlgItemTextW(dlg, IDC_REGISTER_WDX, &HSTRING::from(registered_label()));
         let _ = EnableWindow(button, false);
     }
     // The disabled button can't keep the keyboard focus.
@@ -560,6 +661,7 @@ unsafe fn selected<T: Copy>(dlg: HWND, id: i32, options: &[T]) -> Option<T> {
 
 unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     let cfg = &mut ctx.config;
+    cfg.language = selected(dlg, IDC_LANGUAGE, &LangSetting::ALL).unwrap_or(cfg.language);
     cfg.start_fullscreen = is_checked(dlg, IDC_START_FULLSCREEN);
     cfg.auto_rotate_exif = is_checked(dlg, IDC_AUTO_ROTATE_EXIF);
     cfg.osd = selected(dlg, IDC_SHOW_OSD, &OsdMode::ALL).unwrap_or(cfg.osd);
@@ -578,6 +680,8 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.no_upscale = is_checked(dlg, IDC_NO_UPSCALE);
     cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
+    cfg.frame_format =
+        selected(dlg, IDC_FRAME_FORMAT, &FrameFormat::ALL).unwrap_or(cfg.frame_format);
     cfg.photo_editor = edit_text(dlg, IDC_PHOTO_EDITOR);
     cfg.video_editor = edit_text(dlg, IDC_VIDEO_EDITOR);
     cfg.audio_editor = edit_text(dlg, IDC_AUDIO_EDITOR);
@@ -634,13 +738,18 @@ unsafe fn browse_program(dlg: HWND, edit_id: i32) {
         .take(file.len() - 1)
         .collect();
     file[..current.len()].copy_from_slice(&current);
+    let filter = HSTRING::from(tr(
+        "Программы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0",
+        "Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0",
+    ));
+    let title = HSTRING::from(tr("Выберите редактор", "Choose an editor"));
     let mut ofn = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: dlg,
-        lpstrFilter: w!("Программы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0"),
+        lpstrFilter: PCWSTR(filter.as_ptr()),
         lpstrFile: PWSTR(file.as_mut_ptr()),
         nMaxFile: file.len() as u32,
-        lpstrTitle: w!("Выберите редактор"),
+        lpstrTitle: PCWSTR(title.as_ptr()),
         Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
         ..Default::default()
     };

@@ -9,8 +9,10 @@ use std::sync::Mutex;
 
 use windows::core::{w, HSTRING, PCWSTR};
 
+use crate::i18n::{tr, LangSetting};
 use crate::osd_template;
 use crate::playlist::{QueueOptions, Repeat};
+use crate::snapshot::FrameFormat;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::WindowsProgramming::{
     GetPrivateProfileIntW, GetPrivateProfileStringW, WritePrivateProfileStringW,
@@ -85,10 +87,10 @@ impl OsdMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            OsdMode::Off => "Не показывать",
-            OsdMode::Photo => "На фото",
-            OsdMode::Video => "На видео",
-            OsdMode::Both => "На фото и видео",
+            OsdMode::Off => tr("Не показывать", "Hidden"),
+            OsdMode::Photo => tr("На фото", "On photos"),
+            OsdMode::Video => tr("На видео", "On videos"),
+            OsdMode::Both => tr("На фото и видео", "On photos and videos"),
         }
     }
 
@@ -116,6 +118,7 @@ pub const FONT_SIZE_RANGE: (i32, i32) = (8, 72);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerConfig {
+    pub language: LangSetting,
     pub start_fullscreen: bool,
     pub osd: OsdMode,
     pub osd_font_size: i32,
@@ -140,6 +143,7 @@ pub struct ViewerConfig {
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
     pub resume_video: bool,
+    pub frame_format: FrameFormat,
     /// Programs for "Открыть в редакторе"; empty = the file type's Edit verb or default program.
     pub photo_editor: String,
     pub video_editor: String,
@@ -152,6 +156,7 @@ pub struct ViewerConfig {
 impl Default for ViewerConfig {
     fn default() -> Self {
         Self {
+            language: LangSetting::Auto,
             start_fullscreen: false,
             osd: OsdMode::Photo,
             osd_font_size: 14,
@@ -168,6 +173,7 @@ impl Default for ViewerConfig {
             no_upscale: false,
             confirm_delete: true,
             resume_video: true,
+            frame_format: FrameFormat::Png,
             photo_editor: String::new(),
             video_editor: String::new(),
             audio_editor: String::new(),
@@ -224,6 +230,7 @@ impl ViewerConfig {
             .ok();
 
         Self {
+            language: LangSetting::from_ini(&string(w!("Language"), "")),
             start_fullscreen: int(w!("StartFullscreen"), d.start_fullscreen as i32) != 0,
             // Older configs only had ShowOSD (photos).
             osd: OsdMode::from_index(int(w!("OSDMode"), -1)).unwrap_or(
@@ -260,6 +267,7 @@ impl ViewerConfig {
             no_upscale: int(w!("NoUpscale"), d.no_upscale as i32) != 0,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
+            frame_format: FrameFormat::from_ini(&string(w!("FrameFormat"), "")),
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
             audio_editor: string(w!("AudioEditor"), "").trim().to_string(),
@@ -283,6 +291,7 @@ impl ViewerConfig {
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
 
         [
+            write(w!("Language"), self.language.to_ini().to_string()),
             write(w!("StartFullscreen"), flag(self.start_fullscreen)),
             write(w!("OSDMode"), self.osd.index().to_string()),
             write(w!("OSDFontSize"), self.osd_font_size.to_string()),
@@ -301,6 +310,7 @@ impl ViewerConfig {
             write(w!("NoUpscale"), flag(self.no_upscale)),
             write(w!("ConfirmDelete"), flag(self.confirm_delete)),
             write(w!("ResumeVideo"), flag(self.resume_video)),
+            write(w!("FrameFormat"), self.frame_format.extension().to_string()),
             write(w!("PhotoEditor"), self.photo_editor.clone()),
             write(w!("VideoEditor"), self.video_editor.clone()),
             write(w!("AudioEditor"), self.audio_editor.clone()),

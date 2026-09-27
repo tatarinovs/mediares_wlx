@@ -11,6 +11,8 @@ use windows::Win32::System::WindowsProgramming::{
     GetPrivateProfileStringW, WritePrivateProfileStringW,
 };
 
+use crate::i18n::tr;
+
 const SECTION: PCWSTR = w!("ContentPlugins");
 
 /// Where our entry would go, and whether it is already there.
@@ -62,8 +64,13 @@ impl Registration {
         .is_err()
         {
             return Err(format!(
-                "Не удалось записать в {}.\n\nДобавьте вручную в секцию [ContentPlugins]:\n{}={}",
+                "{} {}.\n\n{} [ContentPlugins]:\n{}={}",
+                tr("Не удалось записать в", "Could not write to"),
                 self.ini.display(),
+                tr(
+                    "Добавьте вручную в секцию",
+                    "Add it manually to the section"
+                ),
                 index,
                 value
             ));
@@ -74,7 +81,7 @@ impl Registration {
 }
 
 /// TC puts its INI path into its own environment; failing that, it sits next to the plugin INI.
-fn wincmd_ini() -> Option<PathBuf> {
+pub fn wincmd_ini() -> Option<PathBuf> {
     if let Some(ini) = std::env::var_os("COMMANDER_INI")
         .map(PathBuf::from)
         .filter(|p| p.is_file())

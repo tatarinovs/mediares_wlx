@@ -27,6 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WS_VISIBLE,
 };
 
+use crate::i18n::tr;
 use crate::media_view::EventEffect;
 use crate::module;
 use crate::playback_video::{Osd, VideoPlayer, FALLBACK_FRAME_SEC};
@@ -487,10 +488,19 @@ pub fn is_progress_event(event: i32) -> bool {
 
 pub fn engine_error_text(code: u16) -> String {
     let reason = match code {
-        3 => "ошибка декодирования",
-        4 => "формат или кодек не поддерживается",
-        5 => "файл зашифрован",
-        _ => "ошибка воспроизведения",
+        3 => tr("ошибка декодирования", "decoding error"),
+        4 => tr(
+            "формат или кодек не поддерживается",
+            "format or codec not supported",
+        ),
+        5 => tr("файл зашифрован", "file is encrypted"),
+        _ => tr("ошибка воспроизведения", "playback error"),
     };
-    format!("Не удалось воспроизвести: {} (код {})", reason, code)
+    format!(
+        "{}: {} ({} {})",
+        tr("Не удалось воспроизвести", "Cannot play"),
+        reason,
+        tr("код", "code"),
+        code
+    )
 }

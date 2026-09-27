@@ -490,33 +490,6 @@ impl AudioTags {
         let (artist, title) = (norm(self.any_artist()?), norm(self.title.as_deref()?));
         (!artist.is_empty() && !title.is_empty()).then(|| format!("{} - {}", artist, title))
     }
-
-    /// e.g. "44.1 кГц · 16 бит · стерео · 320 кбит/с".
-    pub fn format_line(&self) -> String {
-        let mut parts = Vec::new();
-        if let Some(rate) = self.sample_rate {
-            let khz = rate as f64 / 1000.0;
-            parts.push(if rate % 1000 == 0 {
-                format!("{} кГц", rate / 1000)
-            } else {
-                format!("{:.1} кГц", khz).replace('.', ",")
-            });
-        }
-        if let Some(bits) = self.bit_depth {
-            parts.push(format!("{} бит", bits));
-        }
-        if let Some(ch) = self.channels {
-            parts.push(match ch {
-                1 => "моно".to_string(),
-                2 => "стерео".to_string(),
-                n => format!("{} кан.", n),
-            });
-        }
-        if let Some(kbps) = self.bitrate_kbps {
-            parts.push(format!("{} кбит/с", kbps));
-        }
-        parts.join(" · ")
-    }
 }
 
 #[cfg(test)]
@@ -524,7 +497,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn titles_and_format_line() {
+    fn titles() {
         let t = AudioTags {
             title: Some("Song".into()),
             artist: Some("Band".into()),
@@ -535,16 +508,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(t.display_title().as_deref(), Some("Band — Song"));
-        assert_eq!(t.format_line(), "44,1 кГц · 16 бит · стерео · 1411 кбит/с");
         assert_eq!(AudioTags::default().display_title(), None);
-        assert_eq!(
-            AudioTags {
-                sample_rate: Some(48000),
-                ..Default::default()
-            }
-            .format_line(),
-            "48 кГц"
-        );
     }
 
     #[test]

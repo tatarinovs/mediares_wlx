@@ -73,6 +73,45 @@ pub fn find_largest(data: &[u8], min_len: usize) -> Option<&[u8]> {
     best
 }
 
+/// The JPEG with its `Exif` APP1 segments replaced by one holding `tiff`, placed right after SOI
+/// as the EXIF standard wants. The image data is copied untouched. `None` if the stream is not a
+/// JPEG or `tiff` does not fit into one segment.
+pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
+    const EXIF_HEADER: &[u8] = b"Exif\0\0";
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let segment_len = u16::try_from(2 + EXIF_HEADER.len() + tiff.len()).ok()?;
+    let mut out = Vec::with_capacity(jpeg.len() + tiff.len() + 10);
+    out.extend_from_slice(&[0xFF, 0xD8, 0xFF, 0xE1]);
+    out.extend_from_slice(&segment_len.to_be_bytes());
+    out.extend_from_slice(EXIF_HEADER);
+    out.extend_from_slice(tiff);
+
+    // Header segments up to the first scan; everything from there on is copied as is.
+    let mut i = 2;
+    loop {
+        let (marker, next) = read_marker(jpeg, i)?;
+        match marker {
+            0x01 | 0xD0..=0xD7 => out.extend_from_slice(&jpeg[i..next]),
+            0xDA | 0xD9 => {
+                out.extend_from_slice(&jpeg[i..]);
+                return Some(out);
+            }
+            _ => {
+                let end = skip_segment(jpeg, next)?;
+                let is_exif = marker == 0xE1 && jpeg[next + 2..end].starts_with(EXIF_HEADER);
+                if !is_exif {
+                    out.extend_from_slice(&jpeg[i..end]);
+                }
+                i = end;
+                continue;
+            }
+        }
+        i = next;
+    }
+}
+
 /// Reads the marker at `i` (skipping fill bytes); returns the marker code and the index after it.
 fn read_marker(data: &[u8], mut i: usize) -> Option<(u8, usize)> {
     if *data.get(i)? != 0xFF {
@@ -130,5 +169,22 @@ mod tests {
     fn lossless_jpeg_is_rejected() {
         let j = [0xFF, 0xD8, 0xFF, 0xC3, 0x00, 0x02, 0xFF, 0xD9];
         assert!(!is_decodable(&j));
+    }
+
+    #[test]
+    fn exif_is_replaced_and_image_data_kept() {
+        let mut j = vec![0xFF, 0xD8];
+        j.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0xAA, 0xBB]); // APP0
+        j.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x0A]); // old Exif
+        j.extend_from_slice(b"Exif\0\0MM");
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
+
+        let out = with_exif(&j, b"II*\0TIFF").unwrap();
+        let mut expected = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x10];
+        expected.extend_from_slice(b"Exif\0\0II*\0TIFF");
+        expected.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0xAA, 0xBB]);
+        expected.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
+        assert_eq!(out, expected);
+        assert_eq!(with_exif(b"not a jpeg", b""), None);
     }
 }

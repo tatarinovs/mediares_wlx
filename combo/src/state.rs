@@ -9,6 +9,7 @@ use windows::Win32::Foundation::{HWND, RECT};
 
 use crate::config::ViewerConfig;
 use crate::gdi::Font;
+use crate::i18n;
 use crate::image_cache::{self, DecodeOptions, DecodedImage, Request, Ticket};
 use crate::media_view::MediaView;
 use crate::overlay::Fullscreen;
@@ -47,8 +48,8 @@ pub struct ViewerState {
     pub previous: Option<Arc<DecodedImage>>,
     /// The current photo could not be decoded.
     pub load_failed: bool,
-    /// The photo was turned with R / L (the picture on screen differs from the file).
-    pub turned: bool,
+    /// Quarter turns clockwise made with R / L (the picture on screen differs from the file).
+    pub quarter_turns: u8,
     /// Present while a video or audio file is shown (then `image` is `None`).
     pub media: Option<MediaView>,
     pub zoom: ZoomMode,
@@ -79,6 +80,7 @@ pub struct ViewerState {
 impl ViewerState {
     /// Loads `path` into the viewer window `hwnd`; `None` if it cannot be displayed.
     pub fn new(hwnd: HWND, lister: HWND, path: &Path, config: ViewerConfig) -> Option<Self> {
+        i18n::set(config.language.resolve());
         let mut state = Self {
             hwnd,
             lister,
@@ -88,7 +90,7 @@ impl ViewerState {
             pending: None,
             previous: None,
             load_failed: false,
-            turned: false,
+            quarter_turns: 0,
             media: None,
             zoom: ZoomMode::Fit,
             offset: (0.0, 0.0),
@@ -140,7 +142,7 @@ impl ViewerState {
         self.offset = (0.0, 0.0);
         self.drag = None;
         self.loupe = None;
-        self.turned = false;
+        self.quarter_turns = 0;
         self.load_media();
         self.has_content()
     }
@@ -237,6 +239,7 @@ impl ViewerState {
 
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
+        i18n::set(config.language.resolve());
         self.config = config;
         self.osd_font = None;
         if old != self.decode_options() && self.shows_photo() {
@@ -255,7 +258,7 @@ impl ViewerState {
     pub fn rotate(&mut self, clockwise: bool) -> bool {
         let Some(img) = &self.image else { return false };
         self.image = Some(Arc::new(image_cache::rotated(img, clockwise)));
-        self.turned = true;
+        self.quarter_turns = (self.quarter_turns + if clockwise { 1 } else { 3 }) % 4;
         self.zoom = ZoomMode::Fit;
         self.loupe = None;
         self.drag = None;
