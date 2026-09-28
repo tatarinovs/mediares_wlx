@@ -427,9 +427,15 @@ fn test_audio_tag_fields() {
             String::from_utf16_lossy(&buf).trim_matches(' ').to_string(),
         )
     };
-    // Tag fields are never delayed, unlike the decoding-based ones.
+    // Tags are delayed until read once (a disk seek per file on a cold folder), then served
+    // from the cache at once; the decoding-based fields stay delayed until analyzed.
     assert_eq!(
         raw(field("Audio_Artist"), CONTENT_DELAYIFSLOW).0,
+        FT_DELAYED
+    );
+    assert_eq!(raw(field("Audio_Artist"), 0).0, FT_STRINGW);
+    assert_eq!(
+        raw(field("Audio_Title"), CONTENT_DELAYIFSLOW).0,
         FT_STRINGW
     );
     assert_eq!(

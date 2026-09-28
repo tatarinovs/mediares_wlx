@@ -30,7 +30,24 @@ const DPI: f32 = 96.0;
 
 thread_local! {
     /// Painting happens on the window's thread; the target is reused between paints.
-    static TARGET: RefCell<Option<ID2D1DCRenderTarget>> = const { RefCell::new(None) };
+    static TARGET: RefCell<Target> = const { RefCell::new(Target(None)) };
+}
+
+struct Target(Option<ID2D1DCRenderTarget>);
+
+impl Drop for Target {
+    /// Thread-local destructors run when TC unloads the DLL, under the loader lock: releasing
+    /// Direct2D there calls into the graphics driver, which waits for its own threads, which wait
+    /// for the loader lock — TC hangs on exit. [`release`] frees the target before that; whatever
+    /// is left at unload is leaked.
+    fn drop(&mut self) {
+        std::mem::forget(self.0.take());
+    }
+}
+
+/// Frees this thread's render target; called when a viewer window closes.
+pub fn release() {
+    let _ = TARGET.try_with(|target| target.borrow_mut().0 = None);
 }
 
 fn create_target() -> Option<ID2D1DCRenderTarget> {
@@ -69,7 +86,7 @@ pub unsafe fn draw(
     if bound.right <= bound.left || bound.bottom <= bound.top || sw <= 0 || sh <= 0 {
         return true;
     }
-    let ok = TARGET.with_borrow_mut(|target| {
+    let ok = TARGET.with_borrow_mut(|Target(target)| {
         if target.is_none() {
             *target = create_target();
         }

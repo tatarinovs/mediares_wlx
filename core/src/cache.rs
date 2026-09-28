@@ -180,12 +180,21 @@ impl<T> MetaCache<T> {
     }
 }
 
+#[cfg(feature = "tags")]
+fn tags_cache() -> &'static MetaCache<crate::audio_tags::AudioTags> {
+    static TAGS: OnceLock<MetaCache<crate::audio_tags::AudioTags>> = OnceLock::new();
+    TAGS.get_or_init(MetaCache::new)
+}
+
 /// Audio tags without pictures.
 #[cfg(feature = "tags")]
 pub fn get_tags(path: &Path) -> Option<Arc<crate::audio_tags::AudioTags>> {
-    static TAGS: OnceLock<MetaCache<crate::audio_tags::AudioTags>> = OnceLock::new();
-    TAGS.get_or_init(MetaCache::new)
-        .get_or_read(path, |p| crate::audio_tags::read_tags(p, false))
+    tags_cache().get_or_read(path, |p| crate::audio_tags::read_tags(p, false))
+}
+
+#[cfg(feature = "tags")]
+pub fn is_tags_cached(path: &Path) -> bool {
+    tags_cache().contains(path)
 }
 
 pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
@@ -222,14 +231,20 @@ pub fn is_audio_meta_cached(path: &Path) -> bool {
     audio_meta_cache().contains(path)
 }
 
+fn video_tags_cache() -> &'static MetaCache<crate::video_tags::VideoTags> {
+    static VIDEO_TAGS: OnceLock<MetaCache<crate::video_tags::VideoTags>> = OnceLock::new();
+    VIDEO_TAGS.get_or_init(MetaCache::new)
+}
+
 /// Title, artist... of MKV/WebM and MP4/MOV: header reads only.
 pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> {
-    static VIDEO_TAGS: OnceLock<MetaCache<crate::video_tags::VideoTags>> = OnceLock::new();
-    VIDEO_TAGS
-        .get_or_init(MetaCache::new)
-        .get_or_read(path, |p| {
-            Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty())
-        })
+    video_tags_cache().get_or_read(path, |p| {
+        Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty())
+    })
+}
+
+pub fn is_video_tags_cached(path: &Path) -> bool {
+    video_tags_cache().contains(path)
 }
 
 pub fn get_cache() -> &'static MediaCache {

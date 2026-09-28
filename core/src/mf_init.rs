@@ -5,9 +5,7 @@
 
 use std::sync::Mutex;
 
-use windows::Win32::Media::MediaFoundation::{
-    MFShutdown, MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION,
-};
+use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
 
 /// Initializes COM on the current thread for the lifetime of the value.
@@ -47,19 +45,14 @@ pub fn mf_scope() -> Option<ComScope> {
 static MF_STARTED: Mutex<bool> = Mutex::new(false);
 
 /// Starts Media Foundation once per process. Returns false if it cannot be started.
+///
+/// Never shut down: `MFShutdown` while another host thread is inside Media Foundation (TC's
+/// delayed-field thread when TC exits) leaves that thread blocked forever, and the host process
+/// with it. At process exit there is nothing left to release.
 pub fn ensure_mf_started() -> bool {
     let mut started = MF_STARTED.lock().unwrap_or_else(|e| e.into_inner());
     if !*started {
         *started = unsafe { MFStartup(MF_VERSION, MFSTARTUP_NOSOCKET) }.is_ok();
     }
     *started
-}
-
-/// Balances [`ensure_mf_started`]; called when the plugin is unloaded.
-pub fn shutdown_mf() {
-    let mut started = MF_STARTED.lock().unwrap_or_else(|e| e.into_inner());
-    if *started {
-        let _ = unsafe { MFShutdown() };
-        *started = false;
-    }
 }

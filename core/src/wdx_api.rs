@@ -102,16 +102,17 @@ enum Source {
     Constant,
     /// The file extension.
     Probe,
-    /// Audio tags: headers only. Delayed only for stream properties of files symphonia can't parse,
-    /// which come from Media Foundation.
+    /// Audio tags: headers only, but trailing tags (ID3v1, APE) mean a seek to the end, which costs
+    /// a disk head move per file. Stream properties of files symphonia can't parse come from
+    /// Media Foundation.
     Tags,
     /// EXIF block: a small read, never delayed.
     Exif,
-    /// Image header for standard formats, the full analysis for RAW/PSD.
+    /// Image header for standard formats, EXIF for RAW, the full analysis as a fallback.
     ImageSize,
     /// Media Foundation stream properties: no decoding, but slow to open.
     VideoMeta,
-    /// Video container tags: headers only, never delayed.
+    /// Video container tags: headers only, but MP4 keeps them in `moov`, often at the end of the file.
     VideoTags,
     /// Decoding and hashing.
     Analysis,
@@ -123,7 +124,7 @@ impl Field {
         match self {
             PluginVersion => Source::Constant,
             MediaTypeName => Source::Probe,
-            ImageWidth | ImageHeight => Source::ImageSize,
+            ImageWidth | ImageHeight | ImageDimensions | ImageAspectRatio => Source::ImageSize,
             PhotoMake | PhotoModel | PhotoLens | PhotoDateTaken | PhotoExposure | PhotoFNumber
             | PhotoIso | PhotoFocalLength | PhotoFocalLength35 | PhotoFlash | PhotoOrientation
             | PhotoSoftware | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
@@ -364,7 +365,6 @@ pub unsafe fn content_get_detect_string(detect_string: *mut c_char, max_len: c_i
 
 pub fn content_plugin_unloading() {
     get_cache().clear();
-    crate::mf_init::shutdown_mf();
 }
 
 unsafe fn get_value(
@@ -412,11 +412,21 @@ unsafe fn get_value(
 fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || kind.is_slow_kind() && !get_cache().is_cached(path);
     match field.source() {
-        Source::Constant | Source::Probe | Source::Exif | Source::VideoTags => false,
+        Source::Constant | Source::Probe | Source::Exif => false,
         Source::Tags => {
-            needs_audio_meta(path, field, kind) && !crate::cache::is_audio_meta_cached(path)
+            kind == MediaType::Audio
+                && (!tags_cached(path)
+                    || needs_audio_meta(path, field, kind)
+                        && !crate::cache::is_audio_meta_cached(path))
         }
-        Source::ImageSize => kind != MediaType::StandardImage && analysis_pending(),
+        Source::VideoTags => {
+            kind == MediaType::Video
+                && crate::video_tags::has_tag_reader(path)
+                && !crate::cache::is_video_tags_cached(path)
+        }
+        Source::ImageSize => {
+            kind != MediaType::StandardImage && analysis_pending() && header_size(path, kind).is_none()
+        }
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::Analysis => analysis_pending(),
     }
@@ -455,11 +465,20 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
-        Source::ImageSize if kind == MediaType::StandardImage => {
-            let (w, h) = crate::image_decode::header_dimensions(path)?;
-            return Some(int(if field == ImageWidth { w } else { h }));
+        Source::ImageSize => {
+            if let Some((w, h)) = header_size(path, kind) {
+                return match field {
+                    ImageWidth => Some(int(w)),
+                    ImageHeight => Some(int(h)),
+                    ImageDimensions => text(format!("{w}x{h}")),
+                    _ => text(crate::hashing::compute_aspect_ratio(w, h)),
+                };
+            }
+            if kind == MediaType::StandardImage {
+                return None;
+            }
         }
-        Source::ImageSize | Source::Analysis => {}
+        Source::Analysis => {}
     }
     match (field, get_cache().get_or_analyze(path, &is_stop_requested)) {
         (ImageWidth, CachedMedia::Image(img)) => Some(int(img.width)),
@@ -476,6 +495,19 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         (AudioFingerprint, CachedMedia::Audio(a)) => a.fingerprint.clone().map(Value::Text),
         (AudioPcmHash, CachedMedia::Audio(a)) => text(a.pcm_hash.clone()),
         (AudioDurationSec, CachedMedia::Audio(a)) => Some(int(a.duration_sec)),
+        _ => None,
+    }
+}
+
+/// Image size without decoding: the header of a standard image, the EXIF of a RAW (its embedded
+/// preview is often downscaled, e.g. 1616x1080 for a 6000x4000 Sony ARW).
+fn header_size(path: &Path, kind: MediaType) -> Option<(u32, u32)> {
+    match kind {
+        MediaType::StandardImage => crate::image_decode::header_dimensions(path),
+        MediaType::RawImage => {
+            let exif = crate::cache::get_exif(path)?;
+            exif.width.zip(exif.height).filter(|&(w, h)| w > 0 && h > 0)
+        }
         _ => None,
     }
 }
@@ -616,6 +648,17 @@ fn has_tags(path: &Path) -> bool {
 #[cfg(not(feature = "tags"))]
 fn has_tags(_path: &Path) -> bool {
     false
+}
+
+#[cfg(feature = "tags")]
+fn tags_cached(path: &Path) -> bool {
+    crate::cache::is_tags_cached(path)
+}
+
+/// Without tag support there is nothing to read.
+#[cfg(not(feature = "tags"))]
+fn tags_cached(_path: &Path) -> bool {
+    true
 }
 
 fn tag_value(path: &Path, field: Field) -> Option<Value> {

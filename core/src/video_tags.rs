@@ -35,20 +35,38 @@ impl VideoTags {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Container {
+    Matroska,
+    Mp4,
+}
+
+fn container(path: &Path) -> Option<Container> {
+    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
+    match ext.as_str() {
+        "mkv" | "webm" | "mka" | "mk3d" => Some(Container::Matroska),
+        "mp4" | "m4v" | "mov" | "qt" | "3gp" | "3g2" => Some(Container::Mp4),
+        _ => None,
+    }
+}
+
+/// Whether tags are parsed for this file's container (by extension; nothing is read).
+pub fn has_tag_reader(path: &Path) -> bool {
+    container(path).is_some()
+}
+
 /// Tags of `path`; empty if the container has none or isn't supported.
 pub fn read_video_tags(path: &Path) -> VideoTags {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
+    let Some(container) = container(path) else {
+        return VideoTags::default();
+    };
     let Ok(file) = File::open(path) else {
         return VideoTags::default();
     };
     let mut r = BufReader::new(file);
-    let tags = match ext.as_str() {
-        "mkv" | "webm" | "mka" | "mk3d" => read_matroska(&mut r),
-        "mp4" | "m4v" | "mov" | "qt" | "3gp" | "3g2" => read_mp4(&mut r),
-        _ => None,
+    let tags = match container {
+        Container::Matroska => read_matroska(&mut r),
+        Container::Mp4 => read_mp4(&mut r),
     };
     tags.unwrap_or_default()
 }

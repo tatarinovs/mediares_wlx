@@ -402,6 +402,7 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
 
 pub unsafe fn close_viewer(hwnd: HWND) {
     let _ = DestroyWindow(hwnd);
+    crate::smooth::release();
 }
 
 /// `ListLoadNext`: shows `path` in the existing window. False if it can't be displayed.

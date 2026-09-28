@@ -1,4 +1,47 @@
-//! Minimal JPEG stream inspection used to locate embedded previews inside RAW/PSD files.
+//! Minimal JPEG stream inspection: embedded previews inside RAW/PSD files, image size.
+
+use std::io::{BufRead, Seek, SeekFrom};
+
+/// Width and height from the SOF segment of a baseline/extended/progressive JPEG, reading only the
+/// header segments: the `image` decoder loads the whole file just to report them.
+pub fn read_dimensions(r: &mut (impl BufRead + Seek)) -> Option<(u32, u32)> {
+    let mut word = [0u8; 2];
+    r.read_exact(&mut word).ok()?;
+    if word != [0xFF, 0xD8] {
+        return None;
+    }
+    loop {
+        let mut byte = [0u8; 1];
+        r.read_exact(&mut byte).ok()?;
+        if byte[0] != 0xFF {
+            return None;
+        }
+        while byte[0] == 0xFF {
+            r.read_exact(&mut byte).ok()?;
+        }
+        match byte[0] {
+            0x01 | 0xD0..=0xD7 => continue,
+            0xC0..=0xC2 => {
+                // Length, precision, height, width.
+                let mut sof = [0u8; 7];
+                r.read_exact(&mut sof).ok()?;
+                let h = u16::from_be_bytes([sof[3], sof[4]]);
+                let w = u16::from_be_bytes([sof[5], sof[6]]);
+                // Height 0 means it comes later in a DNL segment.
+                return (w > 0 && h > 0).then_some((w.into(), h.into()));
+            }
+            0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xDA | 0xD9 => return None,
+            _ => {
+                r.read_exact(&mut word).ok()?;
+                let len = u16::from_be_bytes(word);
+                if len < 2 {
+                    return None;
+                }
+                r.seek(SeekFrom::Current(i64::from(len) - 2)).ok()?;
+            }
+        }
+    }
+}
 
 /// Length of the JPEG stream that starts at `data[0]` (SOI).
 ///
@@ -163,6 +206,22 @@ mod tests {
         blob.extend_from_slice(&j);
         blob.extend_from_slice(&[1, 2, 3]);
         assert_eq!(find_largest(&blob, 1), Some(&j[..]));
+    }
+
+    #[test]
+    fn dimensions_from_sof_past_app_segments() {
+        let mut j = vec![0xFF, 0xD8];
+        j.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x06, 0xFF, 0xC0, 0x00, 0x00]); // APP1, fake SOF inside
+        j.extend_from_slice(&[0xFF, 0xFF, 0xC2, 0x00, 0x0B, 0x08, 0x0F, 0xA0, 0x17, 0x70]);
+        j.extend_from_slice(&[0x03, 0x01, 0x22, 0x00]);
+        assert_eq!(
+            read_dimensions(&mut std::io::Cursor::new(&j)),
+            Some((6000, 4000))
+        );
+
+        let lossless = [0xFF, 0xD8, 0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10];
+        assert_eq!(read_dimensions(&mut std::io::Cursor::new(&lossless)), None);
+        assert_eq!(read_dimensions(&mut std::io::Cursor::new(b"GIF89a")), None);
     }
 
     #[test]
