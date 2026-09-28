@@ -104,6 +104,8 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
     // Comments with a description ("ID3v1 Comment", "iTunNORM"...) only when there is no plain one.
     let mut described_comment = None;
     for rev in &revisions {
+        // The only tags symphonia decodes as Latin-1 — where old taggers wrote cp1251.
+        let latin1 = matches!(rev.info.short_name, "id3v1" | "id3v2");
         let per_track = rev
             .per_track
             .iter()
@@ -111,7 +113,7 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
             .map(|t| &t.metadata);
         for container in std::iter::once(&rev.media).chain(per_track) {
             for tag in &container.tags {
-                tags.apply(tag, &mut described_comment);
+                tags.apply(tag, latin1, &mut described_comment);
             }
             let visuals = &container.visuals;
             pictures += visuals.iter().map(|v| v.data.len()).sum::<usize>();
@@ -297,14 +299,17 @@ fn codec_name(id: AudioCodecId) -> Option<(&'static str, bool)> {
     })
 }
 
-/// Keeps the first non-blank value found for a field (repaired if garbled), unless it stays
-/// unreadable and a readable one turns up.
-fn fill(slot: &mut Option<String>, value: &str) {
+/// Keeps the first non-blank value found for a field, unless it stays unreadable and a readable
+/// one turns up. `latin1`: the tag format decoded the text as Latin-1, so it may need [`repair`].
+fn fill(slot: &mut Option<String>, value: &str, latin1: bool) {
     let value = value.trim();
     if value.is_empty() {
         return;
     }
-    let value = repair(value).unwrap_or_else(|| value.to_string());
+    let value = latin1
+        .then(|| repair(value))
+        .flatten()
+        .unwrap_or_else(|| value.to_string());
     if slot
         .as_deref()
         .is_none_or(|old| unreadable(old) && !unreadable(&value))
@@ -317,20 +322,34 @@ fn unreadable(s: &str) -> bool {
     looks_garbled(s) || s.contains('\u{FFFD}')
 }
 
-/// Garbled text decoded again from its original bytes: as UTF-8 if they are valid UTF-8,
-/// otherwise in the system ANSI code page (cp1251 on a Russian Windows).
+/// Latin-1 text decoded again from its original bytes: as UTF-8 if they are valid UTF-8,
+/// otherwise in the system ANSI code page (cp1251 on a Russian Windows). Old taggers wrote cp1251
+/// into ID3 frames marked Latin-1, and Windows itself shows those in the ANSI code page. The ANSI
+/// reading is kept if most letters were garbled, or if its non-ASCII letters make whole words
+/// ("Live In Ôàêåë" → "Live In Факел"); real Latin-1 ("Motörhead", "Café") would get Cyrillic
+/// letters inside Latin words and stays as is.
 fn repair(s: &str) -> Option<String> {
-    if !looks_garbled(s) {
+    if s.is_ascii() || s.chars().any(|c| c as u32 > 0xFF) {
         return None;
     }
     let bytes: Vec<u8> = s.chars().map(|c| c as u8).collect();
     let text = match String::from_utf8(bytes) {
-        Ok(utf8) => utf8,
+        Ok(utf8) => return (!looks_garbled(&utf8)).then_some(utf8),
         Err(e) => crate::ffi::ansi_to_os_string(e.as_bytes())?
             .to_string_lossy()
             .into_owned(),
     };
-    (!looks_garbled(&text)).then_some(text)
+    let accepted = text != s
+        && !text.contains('\u{FFFD}')
+        && (looks_garbled(s) || whole_words(&text));
+    accepted.then_some(text)
+}
+
+/// No word mixes ASCII letters with non-ASCII characters.
+fn whole_words(text: &str) -> bool {
+    text.split(|c: char| !c.is_alphanumeric()).all(|word| {
+        !(word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().any(|c| !c.is_ascii()))
+    })
 }
 
 /// Text decoded with the wrong code page: Latin-1 letters where cp1251 or UTF-8 bytes were meant
@@ -391,24 +410,25 @@ fn sub_field<'a>(tag: &'a Tag, name: &str) -> Option<&'a str> {
 }
 
 impl AudioTags {
-    fn apply(&mut self, tag: &Tag, described_comment: &mut Option<String>) {
+    fn apply(&mut self, tag: &Tag, latin1: bool, described_comment: &mut Option<String>) {
         use StandardTag::*;
         let Some(std) = &tag.std else {
-            self.apply_unmapped(tag);
+            self.apply_unmapped(tag, latin1);
             return;
         };
+        let text = |slot: &mut Option<String>, v: &str| fill(slot, v, latin1);
         match std {
-            TrackTitle(v) => fill(&mut self.title, v),
-            Artist(v) => fill(&mut self.artist, v),
-            Album(v) => fill(&mut self.album, v),
-            AlbumArtist(v) => fill(&mut self.album_artist, v),
-            Genre(v) if !is_genre_number(v) => fill(&mut self.genre, v),
+            TrackTitle(v) => text(&mut self.title, v),
+            Artist(v) => text(&mut self.artist, v),
+            Album(v) => text(&mut self.album, v),
+            AlbumArtist(v) => text(&mut self.album_artist, v),
+            Genre(v) if !is_genre_number(v) => text(&mut self.genre, v),
             Comment(v) if sub_field(tag, "SHORT_DESCRIPTION").is_some() => {
-                fill(described_comment, v)
+                text(described_comment, v)
             }
-            Comment(v) => fill(&mut self.comment, v),
+            Comment(v) => text(&mut self.comment, v),
             // MP4 keeps the composer in ©wrt.
-            Composer(v) | Writer(v) => fill(&mut self.composer, v),
+            Composer(v) | Writer(v) => text(&mut self.composer, v),
             RecordingYear(y) | ReleaseYear(y) => fill_year(&mut self.year, u64::from(*y)),
             RecordingDate(d) | ReleaseDate(d) => {
                 if let Some(y) = year_of(d) {
@@ -424,7 +444,7 @@ impl AudioTags {
     }
 
     /// Text tags symphonia leaves without a standard meaning.
-    fn apply_unmapped(&mut self, tag: &Tag) {
+    fn apply_unmapped(&mut self, tag: &Tag, latin1: bool) {
         let text = match &tag.raw.value {
             RawValue::String(v) => v.to_string(),
             // ID3v2 frames padded with NULs come out as a list of one value and empty strings.
@@ -453,7 +473,7 @@ impl AudioTags {
             }
             _ => return,
         };
-        fill(slot, &text);
+        fill(slot, &text, latin1);
     }
 
     /// The track's artist, or the album artist.
@@ -528,13 +548,35 @@ mod tests {
         assert!(looks_garbled("Ð»ÐµÐºÑ"));
         assert!(!looks_garbled("Motörhead"));
         assert!(!looks_garbled("Ария"));
+        // Real Latin-1 is left alone whatever the system code page.
+        assert_eq!(repair("Motörhead"), None);
+        assert_eq!(repair("Café de Flore"), None);
+        assert_eq!(repair("Plain ASCII"), None);
         // UTF-8 bytes shown as Latin-1 come back whatever the system code page.
         assert_eq!(repair("Ð\u{90}Ñ\u{80}Ð¸Ñ\u{8f}").as_deref(), Some("Ария"));
         let mut slot = None;
-        fill(&mut slot, " Ð\u{90}Ñ\u{80}Ð\u{FFFD} ");
-        fill(&mut slot, "Ария");
-        fill(&mut slot, "Другое");
+        fill(&mut slot, " Ð\u{90}Ñ\u{80}Ð\u{FFFD} ", true);
+        fill(&mut slot, "Ария", false);
+        fill(&mut slot, "Другое", false);
         assert_eq!(slot.as_deref(), Some("Ария"));
+    }
+
+    #[test]
+    fn cp1251_in_latin1_frames_on_a_russian_system() {
+        let cp1251 = crate::ffi::ansi_to_os_string(&[0xD4]).is_some_and(|s| s == "Ф");
+        if !cp1251 {
+            return;
+        }
+        assert_eq!(repair("Live In Ôàêåë").as_deref(), Some("Live In Факел"));
+        assert_eq!(
+            repair("Óìêà & \"Áðîíåâè÷îê\"").as_deref(),
+            Some("Умка & \"Броневичок\"")
+        );
+        assert_eq!(repair("Motörhead"), None);
+        // Only text a tag format decoded as Latin-1 is reinterpreted; UTF-8 formats keep theirs.
+        let mut slot = None;
+        fill(&mut slot, "À bout de souffle", false);
+        assert_eq!(slot.as_deref(), Some("À bout de souffle"));
     }
 
     #[test]
