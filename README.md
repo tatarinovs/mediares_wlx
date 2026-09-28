@@ -1,9 +1,20 @@
-# Mediares — Total Commander WDX + Combo (WDX+WLX) Plugin
+# Mediares — мультимедийный просмотрщик и контентный плагин для Total Commander (WLX + WDX)
 
-Высокопроизводительный 64-битный плагин для **Total Commander** на языке **Rust**:
+**Русский** | [English](README.en.md)
 
-1. **`mediares_wlx`** — плагин 2-в-1 (WLX + WDX) в одном файле: полный функционал поиска дубликатов **плюс** быстрый встроенный просмотр по клавише **F3** (Lister) с поддержкой двойной буферизации GDI и тёмного интерфейса.
-2. **`mediares_wdx`** — облегчённый Content-плагин (WDX) для мгновенного поиска дубликатов (фото, RAW, PSD, видео, аудио) с помощью перцептивных хешей (dHash, pHash, CoarseHash, Video/Audio Fingerprint).
+[![Rust](https://img.shields.io/badge/Rust-stable-DE6E39?logo=rust&logoColor=white)](https://www.rust-lang.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Total Commander](https://img.shields.io/badge/Total%20Commander-WDX%20%2B%20WLX-1f6feb)](https://www.ghisler.com/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/tatarinovs/mediares_wlx)](https://github.com/tatarinovs/mediares_wlx/releases/latest)
+[![Last commit](https://img.shields.io/github/last-commit/tatarinovs/mediares_wlx)](https://github.com/tatarinovs/mediares_wlx/commits)
+[![Repo size](https://img.shields.io/github/repo-size/tatarinovs/mediares_wlx)](https://github.com/tatarinovs/mediares_wlx)
+
+Высокопроизводительный 64-битный плагин для **Total Commander** на языке **Rust**. Готовые архивы —
+на странице [Releases](https://github.com/tatarinovs/mediares_wlx/releases/latest).
+
+1. **`mediares_wlx`** — плагин 2-в-1 (WLX + WDX) в одном файле: все поля WDX (см. п. 2) **плюс** быстрый встроенный просмотр **изображений, аудио и видео** по клавише **F3** (Lister) с поддержкой двойной буферизации GDI и тёмного интерфейса.
+2. **`mediares_wdx`** — облегчённый Content-плагин (WDX) без просмотрщика: поля EXIF, тегов и параметров потока для колонок, поиска и группового переименования (готовые наборы — [ниже](#готовые-наборы-колонок)), плюс перцептивные хеши (dHash, pHash, CoarseHash, Video/Audio Fingerprint) для поиска дубликатов.
 ---
 
 ## Архитектура воркспейса
@@ -329,6 +340,35 @@ EXIF читается из JPEG, TIFF и TIFF-подобных RAW (CR2, NEF, AR
 `Audio_Sample_Rate_Hz`, `Audio_Channels`, `Audio_Bit_Depth`, `Audio_Codec`, `Audio_Lossless`) берутся из
 Media Foundation, и такие поля откладываются, как видео.
 
+### Готовые наборы колонок
+
+Ниже — три набора для Вид → Настройка колонок панели → Новый: вставляются в поля `Headers` (заголовки) и
+`Contents` (значения) через диалог редактирования набора, либо напрямую строками в `wincmd.ini`
+(`[Columns0]`, `[Columns1]`... секции с `Headers0`/`Contents0` и т. д. — номер подставьте по своим наборам).
+`mediares` — имя, под которым плагин зарегистрирован в TC (по умолчанию совпадает с именем файла); если при
+установке ввели другое, замените префикс на него. `tc.size` — родное поле TC, не из этого плагина.
+
+**Фото** (EXIF):
+
+```
+Headers=Разрешение\nКамера\nМодель\nВыдержка\nДиафрагма\nISO\nGPS Широта\nGPS Долгота\nДата снимка\nРазмер
+Contents=[=mediares.Image_Dimensions]\n[=mediares.Photo_Make]\n[=mediares.Photo_Model]\n[=mediares.Photo_Exposure]\n[=mediares.Photo_FNumber]\n[=mediares.Photo_ISO]\n[=mediares.Photo_GPS_Latitude]\n[=mediares.Photo_GPS_Longitude]\n[=mediares.Photo_Date_Taken]\n[=tc.size]
+```
+
+**Аудио** (теги и параметры потока):
+
+```
+Headers=Исполнитель\nНазвание\nАльбом\nДата\nЖанр\nНомер\nБитрейт\nЧастота\nКаналы\nКодек\nПродолжительность\nРазмер
+Contents=[=mediares.Audio_Artist]\n[=mediares.Audio_Title]\n[=mediares.Audio_Album]\n[=mediares.Audio_Year]\n[=mediares.Audio_Genre]\n[=mediares.Audio_Track]\n[=mediares.Audio_Bitrate_kbps]\n[=mediares.Audio_Sample_Rate_Hz]\n[=mediares.Audio_Channels]\n[=mediares.Audio_Codec]\n[=mediares.Audio_Length]\n[=tc.size]
+```
+
+**Видео** (параметры потока):
+
+```
+Headers=Название\nШирина\nВысота\nБитрейт\nКадры\nКодек\nПродолжительность\nРазмер
+Contents=[=mediares.Video_Title]\n[=mediares.Video_Width]\n[=mediares.Video_Height]\n[=mediares.Video_Bitrate_kbps]\n[=mediares.Video_Frame_Rate]\n[=mediares.Video_Codec]\n[=mediares.Video_Length]\n[=tc.size]
+```
+
 ## Установка и настройки
 
 ### Установка
@@ -402,3 +442,7 @@ cargo run -p mediares_core --features tags --example audio_tags -- <файлы..
 cargo run -p mediares_core --example video_meta -- <файлы...>
 cargo run -p mediares_combo --example lister_harness -- <файл> <папка_скриншотов> key:4D wait:1500 shot:a key:0D wait:1000 shot:fs
 ```
+
+## Лицензия
+
+[MIT](LICENSE).
