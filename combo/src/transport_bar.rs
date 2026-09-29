@@ -4,6 +4,7 @@
 //! mouse input into calls on any [`Transport`] (the video engine or the audio player).
 
 use std::sync::Mutex;
+use std::time::Duration;
 
 use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -21,6 +22,9 @@ const ICON: u32 = 0x00E8E8E8;
 const TEXT: u32 = 0x00D0D0D0;
 const ERROR_TEXT: u32 = 0x006060FF;
 const SEEK_STEP_SEC: f64 = 5.0;
+const SEEK_END_MARGIN_SEC: f64 = 1.0;
+/// Key auto-repeat of the ±5 s step is cut down to one step per this interval.
+pub const SEEK_REPEAT_INTERVAL: Duration = Duration::from_millis(80);
 const VOLUME_STEP: f64 = 0.05;
 
 /// Volume and mute survive switching between files and between audio and video; the volume
@@ -111,17 +115,30 @@ pub fn toggle_mute(t: &dyn Transport) {
     remember_audio_level(t);
 }
 
-/// ±5 s.
-pub fn seek_by(t: &dyn Transport, forward: bool) {
-    let delta = if forward {
-        SEEK_STEP_SEC
+/// `base` ± 5 s, kept within the stream (`duration` 0 = unknown). Stepping forward stops
+/// [`SEEK_END_MARGIN_SEC`] short of the end: reaching it would end the file and let the play queue
+/// move on to the next one while the key is still held.
+pub fn step_target(base: f64, duration: f64, forward: bool) -> f64 {
+    if !forward {
+        return (base - SEEK_STEP_SEC).max(0.0);
+    }
+    let target = base + SEEK_STEP_SEC;
+    if duration > 0.0 {
+        // Never backwards when already inside the margin.
+        target.min((duration - SEEK_END_MARGIN_SEC).max(base))
     } else {
-        -SEEK_STEP_SEC
-    };
-    t.seek(
-        (t.position() + delta).clamp(0.0, t.duration().max(0.0)),
-        false,
-    );
+        target
+    }
+}
+
+/// ±5 s. For a player whose position follows a seek at once (audio; video has its own).
+pub fn seek_by(t: &dyn Transport, forward: bool) {
+    let base = t.position();
+    let target = step_target(base, t.duration(), forward);
+    // Already at the start / end: seeking there again would only restart the seek.
+    if target != base {
+        t.seek(target, false);
+    }
 }
 
 pub fn bar_state(t: &dyn Transport, known_duration: f64) -> BarState {
@@ -607,5 +624,16 @@ mod tests {
         let l = layout(150, 100, 1.0, true);
         assert!(l.timeline.right >= l.timeline.left);
         assert!(l.volume.right >= l.volume.left);
+    }
+
+    #[test]
+    fn step_target_bounds() {
+        assert_eq!(step_target(10.0, 100.0, true), 15.0);
+        assert_eq!(step_target(10.0, 100.0, false), 5.0);
+        assert_eq!(step_target(2.0, 100.0, false), 0.0);
+        assert_eq!(step_target(97.0, 100.0, true), 99.0);
+        assert_eq!(step_target(99.5, 100.0, true), 99.5);
+        assert_eq!(step_target(99.5, 100.0, false), 94.5);
+        assert_eq!(step_target(10.0, 0.0, true), 15.0);
     }
 }

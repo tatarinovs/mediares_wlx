@@ -259,11 +259,12 @@ fn decode_loop(mut decoder: AudioDecoder, commands: Receiver<Command>, chunks: S
                 (seconds, latest) = (s, e);
             }
             epoch = latest;
-            decoder.seek(seconds);
-            finished = false;
+            // A seek to the very end may fail: decoding would then go on from the old place.
+            let near_end = decoder.duration.is_some_and(|d| seconds >= d - 1.0);
+            finished = decoder.seek(seconds).is_none() && near_end;
         }
 
-        let chunk = match decoder.next_chunk() {
+        let chunk = match (!finished).then(|| decoder.next_chunk()).flatten() {
             Some(c) => Chunk {
                 epoch,
                 start: c.start,
@@ -450,7 +451,8 @@ impl TrackSource {
             }
             self.frames_played += 1;
         }
-        if played {
+        // A seek during this call already set its own position: don't overwrite it with the old one.
+        if played && self.buf_epoch == self.state.epoch.load(Ordering::Acquire) {
             self.state
                 .set_position(self.buf_start + self.frames_played as f64 / self.rate as f64);
         }

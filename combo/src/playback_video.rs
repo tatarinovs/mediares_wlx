@@ -378,6 +378,11 @@ impl VideoPlayer {
         self.engine.IsPaused().as_bool() || self.engine.IsEnded().as_bool()
     }
 
+    /// A seek is still in progress.
+    pub unsafe fn is_seeking(&self) -> bool {
+        self.engine.IsSeeking().as_bool()
+    }
+
     /// Timestamp of the frame last put on screen.
     pub fn presented_pts(&self) -> Option<i64> {
         self.output.try_borrow().ok()?.last_pts

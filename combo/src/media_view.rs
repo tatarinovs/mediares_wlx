@@ -5,6 +5,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Instant;
 
 use mediares_core::probe::MediaType;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -59,6 +60,8 @@ pub struct MediaView {
     status: Option<String>,
     /// Fullscreen: the bar lives in this overlay window and the content takes the whole viewer.
     bar_host: Option<HWND>,
+    /// Last ±5 s step (key auto-repeat is thinned out).
+    last_seek_step: Option<Instant>,
 }
 
 impl MediaView {
@@ -98,6 +101,7 @@ impl MediaView {
             font: None,
             status: None,
             bar_host: None,
+            last_seek_step: None,
         };
         view.layout();
         Some(view)
@@ -255,6 +259,9 @@ impl MediaView {
 
     /// A click in the window showing the bar, in its coordinates.
     pub unsafe fn bar_mouse_down(&mut self, x: i32, y: i32) -> Click {
+        if let Content::Video(v) = &mut self.content {
+            v.cancel_key_seek();
+        }
         let layout = self.bar_layout();
         let duration = self.known_duration();
         let click = self
@@ -332,8 +339,19 @@ impl MediaView {
         t.play();
     }
 
-    pub fn seek_by(&self, forward: bool) {
-        transport_bar::seek_by(self.transport(), forward);
+    pub unsafe fn seek_by(&mut self, forward: bool) {
+        let now = Instant::now();
+        if self
+            .last_seek_step
+            .is_some_and(|t| now - t < transport_bar::SEEK_REPEAT_INTERVAL)
+        {
+            return;
+        }
+        self.last_seek_step = Some(now);
+        match &mut self.content {
+            Content::Video(v) => v.seek_by(forward),
+            Content::Audio(a) => transport_bar::seek_by(a.transport(), forward),
+        }
     }
 
     pub unsafe fn seek_keyframe(&mut self, forward: bool) {
