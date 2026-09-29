@@ -46,6 +46,26 @@ pub fn data_file(name: &str) -> PathBuf {
     ini_path().with_file_name(name)
 }
 
+/// Player volume (0..=1) left by the previous session; full volume if none was saved.
+pub fn load_volume() -> f64 {
+    let ini = HSTRING::from(ini_path().as_os_str());
+    let percent = unsafe { GetPrivateProfileIntW(SECTION, w!("Volume"), 100, &ini) };
+    f64::from(percent.clamp(0, 100)) / 100.0
+}
+
+pub fn save_volume(volume: f64) {
+    let ini = HSTRING::from(ini_path().as_os_str());
+    let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as i32;
+    unsafe {
+        let _ = WritePrivateProfileStringW(
+            SECTION,
+            w!("Volume"),
+            &HSTRING::from(percent.to_string()),
+            &ini,
+        );
+    }
+}
+
 /// Directory of TC's default plugin INI — normally the one holding `wincmd.ini` too.
 pub fn tc_ini_dir() -> Option<PathBuf> {
     TC_INI_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()

@@ -1164,6 +1164,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             if let Some(state) = get_state(hwnd) {
                 state.media = None;
             }
+            crate::transport_bar::save_audio_level();
             return LRESULT(0);
         }
         _ => {}

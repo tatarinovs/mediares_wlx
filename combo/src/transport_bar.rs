@@ -23,8 +23,34 @@ const ERROR_TEXT: u32 = 0x006060FF;
 const SEEK_STEP_SEC: f64 = 5.0;
 const VOLUME_STEP: f64 = 0.05;
 
-/// Volume and mute survive switching between files and between audio and video.
-static AUDIO_LEVEL: Mutex<(f64, bool)> = Mutex::new((1.0, false));
+/// Volume and mute survive switching between files and between audio and video; the volume
+/// also survives restarting TC (mute doesn't, so a new session never starts silent).
+struct AudioLevel {
+    volume: f64,
+    muted: bool,
+    /// Volume changed since it was last written to the INI.
+    dirty: bool,
+}
+
+/// `None` until the saved volume is first needed.
+static AUDIO_LEVEL: Mutex<Option<AudioLevel>> = Mutex::new(None);
+
+fn with_audio_level<R>(f: impl FnOnce(&mut AudioLevel) -> R) -> R {
+    let mut level = AUDIO_LEVEL.lock().unwrap_or_else(|e| e.into_inner());
+    f(level.get_or_insert_with(|| AudioLevel {
+        volume: crate::config::load_volume(),
+        muted: false,
+        dirty: false,
+    }))
+}
+
+/// Writes the volume to the INI if it changed; called when the viewer window closes.
+pub fn save_audio_level() {
+    let volume = with_audio_level(|l| std::mem::take(&mut l.dirty).then_some(l.volume));
+    if let Some(volume) = volume {
+        crate::config::save_volume(volume);
+    }
+}
 
 /// Playback controls shared by the video engine and the audio player.
 pub trait Transport {
@@ -54,13 +80,18 @@ pub trait Transport {
 
 /// Applies the remembered volume / mute to a freshly created player.
 pub fn restore_audio_level(t: &dyn Transport) {
-    let (volume, muted) = *AUDIO_LEVEL.lock().unwrap_or_else(|e| e.into_inner());
+    let (volume, muted) = with_audio_level(|l| (l.volume, l.muted));
     t.set_volume(volume);
     t.set_muted(muted);
 }
 
 fn remember_audio_level(t: &dyn Transport) {
-    *AUDIO_LEVEL.lock().unwrap_or_else(|e| e.into_inner()) = (t.volume(), t.is_muted());
+    let (volume, muted) = (t.volume(), t.is_muted());
+    with_audio_level(|l| {
+        l.dirty |= l.volume != volume;
+        l.volume = volume;
+        l.muted = muted;
+    });
 }
 
 pub fn set_volume(t: &dyn Transport, volume: f64) {
