@@ -410,7 +410,10 @@ unsafe fn get_value(
 /// Whether computing the field now would stall TC's file list (not cached yet and needs decoding
 /// or Media Foundation).
 fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
-    let analysis_pending = || kind.is_slow_kind() && !get_cache().is_cached(path);
+    let needs_codec =
+        || kind == MediaType::StandardImage && crate::image_decode::header_needs_codec(path);
+    let analysis_pending =
+        || (kind.is_slow_kind() || needs_codec()) && !get_cache().is_cached(path);
     match field.source() {
         Source::Constant | Source::Probe | Source::Exif => false,
         Source::Tags => {
@@ -424,8 +427,11 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && crate::video_tags::has_tag_reader(path)
                 && !crate::cache::is_video_tags_cached(path)
         }
+        Source::ImageSize if needs_codec() => !crate::cache::is_codec_image_size_cached(path),
         Source::ImageSize => {
-            kind != MediaType::StandardImage && analysis_pending() && header_size(path, kind).is_none()
+            kind != MediaType::StandardImage
+                && analysis_pending()
+                && header_size(path, kind).is_none()
         }
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::Analysis => analysis_pending(),
@@ -503,6 +509,9 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
 /// preview is often downscaled, e.g. 1616x1080 for a 6000x4000 Sony ARW).
 fn header_size(path: &Path, kind: MediaType) -> Option<(u32, u32)> {
     match kind {
+        MediaType::StandardImage if crate::image_decode::header_needs_codec(path) => {
+            crate::cache::get_codec_image_size(path)
+        }
         MediaType::StandardImage => crate::image_decode::header_dimensions(path),
         MediaType::RawImage => {
             let exif = crate::cache::get_exif(path)?;

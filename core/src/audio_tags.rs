@@ -348,7 +348,7 @@ fn repair(s: &str) -> Option<String> {
 /// No word mixes ASCII letters with non-ASCII characters.
 fn whole_words(text: &str) -> bool {
     text.split(|c: char| !c.is_alphanumeric()).all(|word| {
-        !(word.chars().any(|c| c.is_ascii_alphabetic()) && word.chars().any(|c| !c.is_ascii()))
+        !(word.chars().any(|c| c.is_ascii_alphabetic()) && !word.is_ascii())
     })
 }
 

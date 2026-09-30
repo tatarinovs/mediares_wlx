@@ -1,4 +1,4 @@
-//! EXIF metadata reader for JPEG and TIFF-based (TIFF/RAW) files.
+//! EXIF metadata reader for JPEG, TIFF-based (TIFF/RAW) and HEIF-family (HEIC/AVIF) files.
 //!
 //! The metadata block is read into memory once and parsed from a slice, so every access is
 //! bounds-checked and malformed offsets simply yield missing fields.
@@ -91,12 +91,21 @@ pub fn parse_exif_datetime(s: &str) -> Option<ExifDateTime> {
 
 pub fn read_exif(path: &Path) -> Option<ExifInfo> {
     let mut file = File::open(path).ok()?;
-    let mut magic = [0u8; 4];
-    file.read_exact(&mut magic).ok()?;
+    let mut head = [0u8; 12];
+    let head_len = file.read(&mut head).ok()?;
+    let head = &head[..head_len];
+    let magic = head.get(..4)?;
 
+    if crate::heif::is_heif(head) {
+        // The container's own rotation (`irot` / `imir`) is authoritative and already applied by
+        // the decoder; the EXIF tag only mirrors it.
+        let mut info = parse_tiff(&crate::heif::read_exif_tiff(&mut file)?)?;
+        info.orientation = None;
+        return Some(info);
+    }
     let block = if magic.starts_with(&[0xFF, 0xD8]) {
         read_jpeg_app1(&mut file)?
-    } else if &magic == b"II*\0" || &magic == b"MM\0*" {
+    } else if magic == b"II*\0" || magic == b"MM\0*" {
         let mut data = Vec::new();
         file.seek(SeekFrom::Start(0)).ok()?;
         file.take(TIFF_SCAN_BYTES).read_to_end(&mut data).ok()?;

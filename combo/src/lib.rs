@@ -41,8 +41,12 @@ use mediares_core::ffi::{guard, pstr_to_path, pwstr_to_path, write_ansi};
 use mediares_core::probe::{detect_extensions, MediaType};
 use mediares_core::tc_api::*;
 use windows::core::BOOL;
+use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Gdi::HBITMAP;
+use windows::Win32::System::LibraryLoader::{
+    GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_PIN,
+};
 
 const DLL_PROCESS_ATTACH: u32 = 1;
 
@@ -57,6 +61,16 @@ pub(crate) fn module() -> HINSTANCE {
 pub unsafe extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {
         MODULE.store(hinst.0, Ordering::Relaxed);
+        // Never unmapped: Media Foundation finishes a media engine's shutdown on its own threads and
+        // calls back into our notify object after the Lister closed, and the decoder pool threads
+        // stay parked in our code. If TC's `FreeLibrary` unmapped the DLL, those threads would
+        // execute freed memory — an access violation that leaves TC hanging in error reporting.
+        let mut pinned = HMODULE::default();
+        let _ = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_PIN | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            PCWSTR(DllMain as *const () as *const u16),
+            &mut pinned,
+        );
     }
     BOOL(1)
 }

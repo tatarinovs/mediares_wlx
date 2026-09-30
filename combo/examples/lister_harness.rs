@@ -13,6 +13,8 @@
 //! ```
 //! Screenshots cover the host window, or the whole monitor once the viewer went fullscreen.
 //! With `HARNESS_QUICKVIEW=1` the plugin is hosted in a child panel, like TC's Quick View (Ctrl+Q).
+//! With `HARNESS_SHOW_AFTER_LOAD=1` the host is an ordinary (not topmost) window shown only after
+//! `ListLoad`, the order TC uses; the start of fullscreen mode looks as in TC then.
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -232,11 +234,17 @@ fn main() {
             ..Default::default()
         };
         RegisterClassExW(&wc);
+        let show_after_load = std::env::var_os("HARNESS_SHOW_AFTER_LOAD").is_some();
+        let (ex_style, visible) = if show_after_load {
+            (WINDOW_EX_STYLE(0), WINDOW_STYLE(0))
+        } else {
+            (WS_EX_TOPMOST, WS_VISIBLE)
+        };
         let host = CreateWindowExW(
-            WS_EX_TOPMOST,
+            ex_style,
             class,
             w!("Harness"),
-            WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN,
+            WS_OVERLAPPEDWINDOW | visible | WS_CLIPCHILDREN,
             100,
             100,
             1280,
@@ -281,6 +289,10 @@ fn main() {
         if viewer.is_invalid() {
             let _ = DestroyWindow(host);
             return;
+        }
+        if show_after_load {
+            let _ = ShowWindow(host, SW_SHOWMAXIMIZED); // TC opens the Lister maximized (with its DWM animation)
+            let _ = SetForegroundWindow(host);
         }
 
         for step in &args[2..] {

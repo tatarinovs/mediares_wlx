@@ -11,20 +11,24 @@ pub mod cache;
 pub mod exif;
 pub mod ffi;
 pub mod hashing;
+pub mod heif;
 pub mod image_decode;
-#[cfg(any(feature = "raw-preview", feature = "psd-preview"))]
 pub mod jpeg;
 pub mod mf_audio;
 pub mod mf_init;
+pub mod orientation;
 pub mod probe;
 #[cfg(feature = "psd-preview")]
 pub mod psd_preview;
 #[cfg(feature = "raw-preview")]
 pub mod raw_preview;
+pub mod svg;
+mod svg_css;
 pub mod tc_api;
 pub mod video_frame;
 pub mod video_tags;
 pub mod wdx_api;
+pub mod wic_decode;
 
 pub use image;
 

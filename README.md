@@ -26,8 +26,13 @@ mediares_wlx/
 │   ├── tc_api.rs               # WDX/WLX C ABI структуры и константы
 │   ├── ffi.rs                  # catch_unwind-обёртка и конвертация строк на границе с TC
 │   ├── probe.rs                # Тип медиа по расширению + единый источник строк детекта
-│   ├── image_decode.rs         # Декодирование фото (`image` + RAW/PSD превью) с лимитами памяти
-│   ├── exif.rs                 # Разбор EXIF (JPEG, TIFF/RAW) и запись основных полей для «Сохранить как»
+│   ├── image_decode.rs         # Декодирование фото (`image`, WIC, SVG + RAW/PSD превью) с лимитами памяти
+│   ├── wic_decode.rs           # HEIC/HEIF, AVIF, JPEG XL, JPEG XR, DDS через кодеки Windows (WIC)
+│   ├── svg.rs                  # SVG/SVGZ через Direct2D (ID2D1SvgDocument)
+│   ├── svg_css.rs              # Перенос правил <style> в атрибуты style (Direct2D таблицы стилей не читает)
+│   ├── heif.rs                 # EXIF из контейнера HEIF (HEIC/AVIF): элемент Exif по iinf/iloc
+│   ├── exif.rs                 # Разбор EXIF (JPEG, TIFF/RAW, HEIF) и запись основных полей для «Сохранить как»
+│   ├── orientation.rs          # Поворот JPEG без потерь: запись тега EXIF Orientation
 │   ├── jpeg.rs                 # Поиск/проверка встроенных JPEG-потоков, замена EXIF-сегмента
 │   ├── raw_preview.rs          # Встроенный JPEG из RAW (IFD/SubIFD/strip + сигнатурный fallback)
 │   ├── psd_preview.rs          # Композит PSD/PSB (8/16 бит) или миниатюра 0x0409/0x0410
@@ -80,8 +85,21 @@ mediares_wlx/
 
 ### Фото
 
-JPEG (JPG, JPEG, JPE; THM — миниатюры Canon), PNG, GIF, WEBP, BMP, TIFF, ICO; RAW (CR2, CR3, CRW, NEF, ARW, ORF,
-RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/PSB — по композиту.
+JPEG (JPG, JPEG, JPE; THM — миниатюры Canon), PNG, GIF, WEBP, BMP, TIFF, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
+CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/PSB — по композиту.
+
+Через кодеки Windows (WIC), ничего не добавляя к размеру плагина: **HEIC/HEIF/HIF** и **AVIF** — нужны
+расширения из Microsoft Store «HEIF Image Extensions» и «HEVC Video Extensions» (для HEIC) или «AV1 Video
+Extension» (для AVIF); **JXL** — «JPEG XL Image Extension»; **JXR/WDP/HDP** (JPEG XR) и **DDS** (BC1–BC3, без
+сжатия) — встроены в Windows. Поворот из контейнера HEIF (`irot`/`imir`) применяется, EXIF (дата, камера, GPS)
+читается. Если у формата в стандартном декодере что-то не получилось (например, TIFF со старым JPEG-сжатием),
+файл пробуется ещё раз через WIC.
+
+**SVG/SVGZ** рисуется движком Direct2D (Windows 10 1703+): фигуры, контуры, градиенты, обтравка, `use`,
+стили — в том числе из `<style>` по простым селекторам (`.класс`, `#id`, `тег`). Не рисуются `<text>`, фильтры и
+маски. Маленькие рисунки растеризуются со стороной 1024 px, чтобы оставаться чёткими в режиме «вписать».
+
+OpenEXR подключается cargo-фичей `exr` (`mediares_core`) и по умолчанию выключен: он добавляет к плагину ≈0,5 МБ.
 
 **Скорость.** Окно открывается сразу (`ListLoad` ≈ 3 мс), фото декодируется в фоне. Пока новый кадр готовится,
 на экране остаётся предыдущий. Соседние фото (два вперёд по направлению листания и одно назад) заранее
@@ -94,6 +112,7 @@ RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/
 | Масштаб | + / −, Ctrl+колесо (к курсору); 1 — 100 %; 0, *, / — вписать |
 | Панорама / лупа | перетаскивание при увеличении / удержание ЛКМ в режиме «вписать» |
 | Повернуть влево / вправо (только просмотр, файл не меняется) | L / R |
+| Записать поворот в JPEG без потерь | Ctrl+R (или меню) |
 | Полноэкранный режим | Enter, F, F11, двойной клик; Esc — выход |
 | OSD вкл/выкл / слайд-шоу | O или I / F5 |
 | Удалить в корзину и показать следующее | Del (подтверждение отключается в настройках) |

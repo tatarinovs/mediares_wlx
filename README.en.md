@@ -26,8 +26,13 @@ mediares_wlx/
 │   ├── tc_api.rs               # WDX/WLX C ABI structs and constants
 │   ├── ffi.rs                  # catch_unwind wrapper and string conversion at the TC boundary
 │   ├── probe.rs                # Media type by extension + the single source of detect strings
-│   ├── image_decode.rs         # Photo decoding (`image` + RAW/PSD previews) with memory limits
-│   ├── exif.rs                 # EXIF parsing (JPEG, TIFF/RAW) and writing core fields for "Save as"
+│   ├── image_decode.rs         # Photo decoding (`image`, WIC, SVG + RAW/PSD previews) with memory limits
+│   ├── wic_decode.rs           # HEIC/HEIF, AVIF, JPEG XL, JPEG XR, DDS via Windows codecs (WIC)
+│   ├── svg.rs                  # SVG/SVGZ via Direct2D (ID2D1SvgDocument)
+│   ├── svg_css.rs              # Copies <style> rules into style attributes (Direct2D ignores style sheets)
+│   ├── heif.rs                 # EXIF from the HEIF container (HEIC/AVIF): the Exif item via iinf/iloc
+│   ├── exif.rs                 # EXIF parsing (JPEG, TIFF/RAW, HEIF) and writing core fields for "Save as"
+│   ├── orientation.rs          # Lossless JPEG rotation: writing the EXIF Orientation tag
 │   ├── jpeg.rs                 # Finding/validating embedded JPEG streams, replacing the EXIF segment
 │   ├── raw_preview.rs          # Embedded JPEG from RAW (IFD/SubIFD/strip + signature fallback)
 │   ├── psd_preview.rs          # PSD/PSB composite (8/16-bit) or the 0x0409/0x0410 thumbnail
@@ -80,8 +85,20 @@ mediares_wlx/
 
 ### Photos
 
-JPEG (JPG, JPEG, JPE; THM — Canon thumbnails), PNG, GIF, WEBP, BMP, TIFF, ICO; RAW (CR2, CR3, CRW, NEF, ARW, ORF,
-RW2, DNG, RAF, PEF, RAW) — via the embedded JPEG preview; PSD/PSB — via the composite.
+JPEG (JPG, JPEG, JPE; THM — Canon thumbnails), PNG, GIF, WEBP, BMP, TIFF, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
+CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — via the embedded JPEG preview; PSD/PSB — via the composite.
+
+Through Windows codecs (WIC), adding nothing to the plugin size: **HEIC/HEIF/HIF** and **AVIF** — need the
+Microsoft Store extensions "HEIF Image Extensions" plus "HEVC Video Extensions" (for HEIC) or "AV1 Video Extension"
+(for AVIF); **JXL** — "JPEG XL Image Extension"; **JXR/WDP/HDP** (JPEG XR) and **DDS** (BC1–BC3, uncompressed) —
+built into Windows. The HEIF container's rotation (`irot`/`imir`) is applied and its EXIF (date, camera, GPS) is
+read. A file the standard decoder fails on (e.g. TIFF with old-style JPEG compression) gets a second try via WIC.
+
+**SVG/SVGZ** is drawn by the Direct2D engine (Windows 10 1703+): shapes, paths, gradients, clipping, `use`, styles —
+including `<style>` sheets with simple selectors (`.class`, `#id`, `tag`). `<text>`, filters and masks are not drawn.
+Small drawings are rasterized at 1024 px so they stay sharp when fitted to the window.
+
+OpenEXR is behind the `exr` cargo feature of `mediares_core` and off by default: it adds ≈0.5 MB to the plugin.
 
 **Speed.** The window opens instantly (`ListLoad` ≈ 3 ms), the photo decodes in the background. While a new
 frame is being prepared, the previous one stays on screen. Neighbouring photos (two ahead in the paging
@@ -95,6 +112,7 @@ decode later, the window shows a message.
 | Zoom | + / −, Ctrl+wheel (towards the cursor); 1 — 100%; 0, *, / — fit to window |
 | Pan / loupe | drag while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
+| Write the rotation into the JPEG losslessly | Ctrl+R (or the menu) |
 | Fullscreen | Enter, F, F11, double-click; Esc to exit |
 | OSD on/off / slideshow | O or I / F5 |
 | Delete to recycle bin and show the next one | Del (confirmation can be turned off in settings) |

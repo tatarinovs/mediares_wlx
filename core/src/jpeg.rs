@@ -155,6 +155,30 @@ pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
     }
 }
 
+/// Where the TIFF payload of the first `Exif` APP1 segment lies in `jpeg` (header segments only).
+pub fn exif_range(jpeg: &[u8]) -> Option<std::ops::Range<usize>> {
+    const EXIF_HEADER: &[u8] = b"Exif\0\0";
+    if !jpeg.starts_with(&[0xFF, 0xD8]) {
+        return None;
+    }
+    let mut i = 2;
+    loop {
+        let (marker, next) = read_marker(jpeg, i)?;
+        match marker {
+            0x01 | 0xD0..=0xD7 => i = next,
+            0xDA | 0xD9 => return None,
+            _ => {
+                let end = skip_segment(jpeg, next)?;
+                let payload = next + 2..end;
+                if marker == 0xE1 && jpeg[payload.clone()].starts_with(EXIF_HEADER) {
+                    return Some(payload.start + EXIF_HEADER.len()..end);
+                }
+                i = end;
+            }
+        }
+    }
+}
+
 /// Reads the marker at `i` (skipping fill bytes); returns the marker code and the index after it.
 fn read_marker(data: &[u8], mut i: usize) -> Option<(u8, usize)> {
     if *data.get(i)? != 0xFF {

@@ -4,16 +4,24 @@
 //!
 //! TC keeps resizing the plugin window to the Lister's client area (`MoveWindow` in client
 //! coordinates); while fullscreen, [`pin`] overrides every such move with the monitor rectangle.
+//!
+//! DWM draws a window's show / maximize / close animation above all other windows, topmost ones
+//! included. When the viewer starts fullscreen, TC shows its (white) Lister window only after
+//! `ListLoad`, and that animation would play over the picture; so the Lister's DWM transitions are
+//! off while fullscreen.
 
+use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_TRANSITIONS_FORCEDISABLED};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent, SetWindowLongPtrW,
-    SetWindowPos, GWLP_HWNDPARENT, GWL_STYLE, HWND_NOTOPMOST, HWND_TOPMOST, SWP_FRAMECHANGED,
-    SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD, WS_POPUP,
+    GetAncestor, GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent,
+    SetWindowLongPtrW, SetWindowPos, GA_ROOT, GWLP_HWNDPARENT, GWL_STYLE, HWND_NOTOPMOST,
+    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    WINDOWPOS, WS_CHILD, WS_POPUP,
 };
 
 use crate::overlay::{Fullscreen, PanelKind};
@@ -39,6 +47,7 @@ unsafe fn enter(state: &mut ViewerState) {
     }
     let rc = info.rcMonitor;
     state.fullscreen = Some(rc);
+    set_lister_transitions(state.lister, false);
 
     // Detach first, then switch WS_CHILD -> WS_POPUP (order required by SetParent docs).
     let _ = SetParent(hwnd, None);
@@ -121,6 +130,22 @@ unsafe fn exit(state: &mut ViewerState) {
     );
     let _ = SetForegroundWindow(state.lister);
     let _ = SetFocus(Some(hwnd));
+    set_lister_transitions(state.lister, true);
+}
+
+/// Turns the DWM animations of the Lister's top-level window on or off.
+unsafe fn set_lister_transitions(lister: HWND, enabled: bool) {
+    let top = GetAncestor(lister, GA_ROOT);
+    if top.is_invalid() {
+        return;
+    }
+    let disabled = BOOL::from(!enabled);
+    let _ = DwmSetWindowAttribute(
+        top,
+        DWMWA_TRANSITIONS_FORCEDISABLED,
+        (&disabled as *const BOOL).cast(),
+        size_of::<BOOL>() as u32,
+    );
 }
 
 /// `WM_WINDOWPOSCHANGING`: keeps a fullscreen viewer covering its monitor.

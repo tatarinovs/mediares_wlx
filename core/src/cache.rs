@@ -203,6 +203,23 @@ pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
         .get_or_read(path, crate::exif::read_exif)
 }
 
+fn codec_size_cache() -> &'static MetaCache<(u32, u32)> {
+    static SIZES: OnceLock<MetaCache<(u32, u32)>> = OnceLock::new();
+    SIZES.get_or_init(MetaCache::new)
+}
+
+/// Size of a picture whose header is read by a system codec (see `header_needs_codec`): cheap
+/// once the codec is loaded, but not free like a JPEG header.
+pub fn get_codec_image_size(path: &Path) -> Option<(u32, u32)> {
+    codec_size_cache()
+        .get_or_read(path, crate::image_decode::header_dimensions)
+        .map(|s| *s)
+}
+
+pub fn is_codec_image_size_cached(path: &Path) -> bool {
+    codec_size_cache().contains(path)
+}
+
 fn video_meta_cache() -> &'static MetaCache<VideoMeta> {
     static VIDEO: OnceLock<MetaCache<VideoMeta>> = OnceLock::new();
     VIDEO.get_or_init(MetaCache::new)

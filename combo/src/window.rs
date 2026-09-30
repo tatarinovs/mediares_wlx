@@ -90,6 +90,7 @@ enum Command {
     FrameBack,
     FrameForward,
     SaveAs,
+    SaveRotation,
 }
 
 impl Command {
@@ -128,6 +129,13 @@ impl Command {
         Some((
             Command::RotateRight,
             ("Повернуть вправо\tR", "Rotate right\tR"),
+        )),
+        Some((
+            Command::SaveRotation,
+            (
+                "Записать поворот в файл (JPEG, без потерь)\tCtrl+R",
+                "Save rotation to file (JPEG, lossless)\tCtrl+R",
+            ),
         )),
         None,
         Some((Command::Slower, ("Медленнее\t[", "Slower\t["))),
@@ -195,7 +203,8 @@ impl Command {
             SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward => video,
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
             | ToggleShuffle => media,
-            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SetWallpaper | SaveAs => !media,
+            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SaveRotation | SetWallpaper
+            | SaveAs => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
         }
@@ -213,7 +222,7 @@ impl Command {
     /// Any command by its numeric value (posted messages, menu ids).
     fn from_raw(value: usize) -> Option<Command> {
         use Command::*;
-        const ALL: [Command; 41] = [
+        const ALL: [Command; 42] = [
             ToggleFullscreen,
             ToggleOsd,
             ShowExif,
@@ -255,6 +264,7 @@ impl Command {
             FrameBack,
             FrameForward,
             SaveAs,
+            SaveRotation,
         ];
         // Values start at 1 and follow the declaration order.
         ALL.get(value.checked_sub(1)?).copied()
@@ -284,6 +294,9 @@ impl Command {
         }
         if !media && ctrl && !shift && vk == 0x53 {
             return Some(SaveAs); // Ctrl+S
+        }
+        if !media && ctrl && !shift && vk == 0x52 {
+            return Some(SaveRotation); // Ctrl+R
         }
         if media && shift && !ctrl && vk == 0x53 {
             return Some(SaveFrame); // Shift+S, as in VLC
@@ -395,6 +408,9 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
     let state = get_state(hwnd)?;
     if start_fullscreen {
         fullscreen::toggle(state);
+        // Paint the popup before returning: TC shows its (white) Lister window right after
+        // `ListLoad`, and an unpainted popup would let it show through until the first WM_PAINT.
+        redraw(hwnd);
     }
     update_title(state);
     Some(hwnd)
@@ -808,6 +824,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             file_actions::show_in_folder(hwnd, &path);
         }
         Command::SetWallpaper => set_wallpaper(hwnd),
+        Command::SaveRotation => save_rotation(hwnd),
         Command::Print => {
             print(hwnd, None);
         }
@@ -945,6 +962,77 @@ unsafe fn delete_current(hwnd: HWND) {
             LPARAM(0),
         );
     }
+}
+
+/// Writes the turn made with L / R into the JPEG as its EXIF orientation: lossless, the image data
+/// stays byte for byte. Other formats are pointed to "Save as".
+unsafe fn save_rotation(hwnd: HWND) {
+    let Some(state) = get_state(hwnd) else { return };
+    if state.media.is_some() || state.image.is_none() {
+        return;
+    }
+    let owner = dialog::modal_owner(hwnd);
+    let path = state.file_path.clone();
+    if state.quarter_turns == 0 {
+        file_actions::show_error(
+            owner,
+            tr(
+                "Сначала поверните фото клавишами L / R.",
+                "Turn the photo with L / R first.",
+            ),
+        );
+        return;
+    }
+    if !is_jpeg_file(&path) {
+        file_actions::show_error(
+            owner,
+            tr(
+                "Поворот без потерь записывается только в JPEG.\nДля других форматов используйте «Сохранить как» (Ctrl+S).",
+                "Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S).",
+            ),
+        );
+        return;
+    }
+    // With auto-rotation off the screen shows the stored pixels, so the turn counts from them.
+    let auto_rotate = state.config.auto_rotate_exif;
+    let current = if auto_rotate {
+        read_orientation(&path).unwrap_or(1)
+    } else {
+        1
+    };
+    let orientation = mediares_core::orientation::turned(current, state.quarter_turns);
+    if let Err(e) = mediares_core::orientation::set_jpeg_orientation(&path, orientation) {
+        file_actions::show_error(
+            owner,
+            &format!(
+                "{}:\n{}\n\n{}",
+                tr("Не удалось записать поворот", "Could not save the rotation"),
+                path.display(),
+                e
+            ),
+        );
+        return;
+    }
+    if auto_rotate {
+        // The file now shows upright by itself; the turned picture stays until it is re-read.
+        state.reload();
+        refresh(state);
+    } else {
+        file_actions::show_error(
+            owner,
+            tr(
+                "Поворот записан. Автоповорот по EXIF выключен в настройках, поэтому здесь фото показано без него.",
+                "Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it.",
+            ),
+        );
+    }
+}
+
+fn is_jpeg_file(path: &Path) -> bool {
+    let mut magic = [0u8; 3];
+    std::fs::File::open(path)
+        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
+        .is_ok_and(|_| magic == [0xFF, 0xD8, 0xFF])
 }
 
 /// The photo as the desktop wallpaper: the file itself when Windows can show it as is, otherwise
@@ -1574,9 +1662,9 @@ mod tests {
     #[test]
     fn raw_values_outside_the_commands() {
         assert_eq!(Command::from_raw(0), None);
-        assert_eq!(Command::from_raw(Command::SaveAs as usize + 1), None);
+        assert_eq!(Command::from_raw(Command::SaveRotation as usize + 1), None);
         assert_eq!(Command::from_raw(1), Some(Command::ToggleFullscreen));
-        for value in 1..=Command::SaveAs as usize {
+        for value in 1..=Command::SaveRotation as usize {
             assert_eq!(Command::from_raw(value).map(|c| c as usize), Some(value));
         }
     }

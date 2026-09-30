@@ -14,9 +14,33 @@ pub enum MediaType {
     Unsupported,
 }
 
+/// Decoded by the `image` crate.
 const STANDARD_IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "tiff", "tif", "ico",
+    "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "tiff", "tif", "ico", "tga", "hdr",
 ];
+/// Decoded by Windows Imaging Component (HEIF/AV1/JPEG XL extensions, built-in JPEG XR and DDS).
+pub const WIC_IMAGE_EXTS: &[&str] = &[
+    "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp", "hdp", "dds",
+];
+/// Rendered by Direct2D.
+pub const SVG_EXTS: &[&str] = &["svg", "svgz"];
+#[cfg(feature = "exr")]
+const EXR_EXTS: &[&str] = &["exr"];
+#[cfg(not(feature = "exr"))]
+const EXR_EXTS: &[&str] = &[];
+
+/// Every still-image extension shown as `StandardImage`, whatever decodes it.
+fn standard_image_exts() -> &'static [&'static str] {
+    static ALL: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    ALL.get_or_init(|| [STANDARD_IMAGE_EXTS, WIC_IMAGE_EXTS, SVG_EXTS, EXR_EXTS].concat())
+}
+
+/// Whether the extension of `path` is one of `exts` (ASCII case-insensitive).
+pub fn has_extension(path: &Path, exts: &[&str]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| exts.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
 const RAW_EXTS: &[&str] = &[
     "cr2", "cr3", "crw", "nef", "arw", "orf", "rw2", "dng", "raf", "pef", "raw",
 ];
@@ -43,7 +67,7 @@ impl MediaType {
 
     pub fn extensions(self) -> &'static [&'static str] {
         match self {
-            MediaType::StandardImage => STANDARD_IMAGE_EXTS,
+            MediaType::StandardImage => standard_image_exts(),
             MediaType::RawImage => RAW_EXTS,
             MediaType::PsdImage => PSD_EXTS,
             MediaType::Video => VIDEO_EXTS,
@@ -110,6 +134,11 @@ mod tests {
         assert_eq!(probe_file(Path::new("noext")), MediaType::Unsupported);
         assert_eq!(probe_file(Path::new("x.FLAC")), MediaType::Audio);
         assert_eq!(probe_file(Path::new("list.m3u8")), MediaType::Playlist);
+        assert_eq!(
+            probe_file(Path::new("IMG_1.HEIC")),
+            MediaType::StandardImage
+        );
+        assert_eq!(probe_file(Path::new("t.tga")), MediaType::StandardImage);
     }
 
     #[test]

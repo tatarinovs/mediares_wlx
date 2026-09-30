@@ -1,5 +1,6 @@
 //! Photo decoding shared by WDX hashing and the WLX viewer: the `image` crate for standard
-//! formats plus embedded previews for RAW/PSD. All paths go through the same memory limits.
+//! formats, WIC for HEIC/AVIF/JXL/JXR/DDS (and whatever `image` fails on), Direct2D for SVG, plus
+//! embedded previews for RAW/PSD. All paths go through the same memory limits.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
@@ -12,7 +13,7 @@ use crate::probe::MediaType;
 
 /// Largest decoded image we accept (pixels). Bounds memory inside the host process.
 pub const MAX_PIXELS: u64 = 64_000_000;
-const MAX_DIMENSION: u32 = 16_384;
+pub const MAX_DIMENSION: u32 = 16_384;
 const MAX_DECODER_ALLOC: u64 = 512 * 1024 * 1024;
 
 /// Files and in-memory pictures (RAW/PSD previews, album art) behind one reader type, so `image`
@@ -82,6 +83,48 @@ fn decode(reader: ImageReader<Source<'_>>) -> Option<DynamicImage> {
         .decode()
         .ok()
         .filter(|img| (img.width() as u64) * (img.height() as u64) <= MAX_PIXELS)
+        .map(to_display_range)
+}
+
+/// Floating-point pictures (Radiance HDR, OpenEXR) hold linear light; everything downstream
+/// expects 8-bit sRGB, so encode them with the sRGB curve (values above white clip).
+fn to_display_range(img: DynamicImage) -> DynamicImage {
+    if !matches!(
+        img,
+        DynamicImage::ImageRgb32F(_) | DynamicImage::ImageRgba32F(_)
+    ) {
+        return img;
+    }
+    let mut rgba = img.into_rgba32f();
+    for px in rgba.pixels_mut() {
+        for c in &mut px.0[..3] {
+            *c = linear_to_srgb(*c);
+        }
+    }
+    DynamicImage::ImageRgba32F(rgba).into_rgba8().into()
+}
+
+fn linear_to_srgb(v: f32) -> f32 {
+    let v = if v.is_nan() { 0.0 } else { v.clamp(0.0, 1.0) };
+    if v <= 0.003_130_8 {
+        v * 12.92
+    } else {
+        1.055 * v.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+/// A standard image by whichever decoder owns its format; files the `image` crate cannot read
+/// (JPEG-in-TIFF, unusual BMP variants, ...) get a second chance through WIC.
+fn decode_standard(path: &Path) -> Option<DynamicImage> {
+    if crate::svg::handles(path) {
+        return crate::svg::decode(path);
+    }
+    if crate::wic_decode::handles(path) {
+        return crate::wic_decode::decode(path);
+    }
+    open(path)
+        .and_then(decode)
+        .or_else(|| crate::wic_decode::decode(path))
 }
 
 /// Decodes an in-memory image (format detected from content) under the shared limits.
@@ -93,7 +136,7 @@ pub fn decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
 /// PSD via the merged composite (or its thumbnail).
 pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
     match kind {
-        MediaType::StandardImage => decode(open(path)?),
+        MediaType::StandardImage => decode_standard(path),
         #[cfg(feature = "raw-preview")]
         MediaType::RawImage => decode_bytes(&crate::raw_preview::extract_raw_preview(path)?),
         #[cfg(feature = "psd-preview")]
@@ -106,6 +149,7 @@ pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
 /// the limits. RAW/PSD are accepted as is (their previews are found only by a full parse).
 pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
     match kind {
+        MediaType::StandardImage if crate::svg::handles(path) => header_dimensions(path).is_some(),
         MediaType::StandardImage => header_dimensions(path).is_some_and(|(w, h)| {
             w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
         }),
@@ -114,9 +158,21 @@ pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
     }
 }
 
+/// Whether the header of this standard image is read through Direct2D / WIC rather than parsed
+/// directly: slower, so the WDX defers it like RAW.
+pub fn header_needs_codec(path: &Path) -> bool {
+    crate::svg::handles(path) || crate::wic_decode::handles(path)
+}
+
 /// Width and height of a standard image from its header, without decoding (EXIF rotation not
 /// applied — the same sizes the analysis reports).
 pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if crate::svg::handles(path) {
+        return crate::svg::dimensions(path);
+    }
+    if crate::wic_decode::handles(path) {
+        return crate::wic_decode::dimensions(path);
+    }
     let mut file = BufReader::new(File::open(path).ok()?);
     if let Some(size) = crate::jpeg::read_dimensions(&mut file) {
         return Some(size);
@@ -125,6 +181,7 @@ pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
     reader(Source::File(file), Some(path))?
         .into_dimensions()
         .ok()
+        .or_else(|| crate::wic_decode::dimensions(path))
 }
 
 /// Applies an EXIF orientation code (1..=8); other values leave the image untouched.
