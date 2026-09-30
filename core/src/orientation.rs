@@ -154,7 +154,10 @@ pub fn set_jpeg_orientation(path: &Path, orientation: u16) -> io::Result<()> {
             file.write_all(&bytes)?;
             file.sync_all()?;
             drop(file);
-            std::fs::remove_file(&backup)
+            // The photo is already safely written; a backup briefly held open by an antivirus
+            // or the indexer is left behind rather than reported as a failed rotation.
+            let _ = std::fs::remove_file(&backup);
+            Ok(())
         }
     }
 }

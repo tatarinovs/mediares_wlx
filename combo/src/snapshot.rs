@@ -82,12 +82,22 @@ fn temp_dir() -> PathBuf {
     std::env::temp_dir().join("Mediares")
 }
 
-/// Saves `img` as "<name>_<time>.png" (or "<name>_cover.png") in the temp folder, replacing the
-/// previous ones. Returns the file for `CF_HDROP`.
+/// Saves `img` as "<name>_<time>.png" (or "<name>_cover.png") in the temp folder, clearing out
+/// earlier ones. Returns the file for `CF_HDROP`.
 pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -> Option<PathBuf> {
     let dir = temp_dir();
+    // Files from the last minute are kept: a paste of them may still be in progress, possibly
+    // from another Total Commander instance sharing the folder.
+    let stale = |entry: &std::fs::DirEntry| {
+        entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.elapsed().ok())
+            .is_some_and(|age| age.as_secs() > 60)
+    };
     if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten() {
+        for entry in entries.flatten().filter(stale) {
             let _ = std::fs::remove_file(entry.path());
         }
     }

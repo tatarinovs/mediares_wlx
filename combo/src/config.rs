@@ -4,6 +4,7 @@
 //! otherwise in the directory of TC's plugin INI passed via `ListSetDefaultParams` — the plugin
 //! folder is often read-only (Program Files).
 
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -78,7 +79,7 @@ pub fn dll_path() -> Option<PathBuf> {
     if len == 0 || len >= buf.len() {
         return None;
     }
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
 }
 
 fn dll_dir() -> Option<PathBuf> {
