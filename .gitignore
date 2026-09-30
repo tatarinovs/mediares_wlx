@@ -7,3 +7,4 @@ Cargo.lock
 *.wdx64
 *.wlx64
 dist/
+/libmpv-2.dll

@@ -1,6 +1,7 @@
 //! Media type detection by file extension — the single source of truth for supported formats.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MediaType {
@@ -53,7 +54,29 @@ const AUDIO_EXTS: &[&str] = &[
     "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff",
     "aifc", "caf", "mka", "ac3",
 ];
+/// Audio only libmpv plays (FFmpeg decoders); counted as audio once it is found, see
+/// [`enable_mpv_formats`].
+const MPV_AUDIO_EXTS: &[&str] = &[
+    "ape", "wv", "dsf", "dff", "tta", "mpc", "tak", "dts", "eac3", "thd", "mlp", "spx", "shn",
+    "w64", "amr", "au", "ra",
+];
 const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
+
+static MPV_FORMATS: AtomicBool = AtomicBool::new(false);
+
+/// libmpv is installed: the formats only it plays are recognized from now on.
+pub fn enable_mpv_formats() {
+    MPV_FORMATS.store(true, Ordering::Relaxed);
+}
+
+fn audio_exts() -> &'static [&'static str] {
+    static WITH_MPV: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    if MPV_FORMATS.load(Ordering::Relaxed) {
+        WITH_MPV.get_or_init(|| [AUDIO_EXTS, MPV_AUDIO_EXTS].concat())
+    } else {
+        AUDIO_EXTS
+    }
+}
 
 impl MediaType {
     const ALL: [MediaType; 6] = [
@@ -71,7 +94,7 @@ impl MediaType {
             MediaType::RawImage => RAW_EXTS,
             MediaType::PsdImage => PSD_EXTS,
             MediaType::Video => VIDEO_EXTS,
-            MediaType::Audio => AUDIO_EXTS,
+            MediaType::Audio => audio_exts(),
             MediaType::Playlist => PLAYLIST_EXTS,
             MediaType::Unsupported => &[],
         }

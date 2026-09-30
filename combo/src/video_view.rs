@@ -32,6 +32,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::i18n::tr;
 use crate::media_view::EventEffect;
 use crate::module;
+use crate::playback_mpv::{self, MpvPlayer};
 use crate::playback_video::{Osd, VideoPlayer, FALLBACK_FRAME_SEC};
 use crate::resume;
 use crate::transport_bar::{self, format_time, Transport};
@@ -102,9 +103,151 @@ unsafe fn register_surface_class() {
     });
 }
 
+/// The media engine, or libmpv when it is installed.
+enum Player {
+    Mf(VideoPlayer),
+    Mpv(MpvPlayer),
+}
+
+impl Player {
+    unsafe fn new(surface: HWND, viewer: HWND) -> Option<Self> {
+        if playback_mpv::available() {
+            if let Some(p) = MpvPlayer::new(surface, viewer) {
+                return Some(Self::Mpv(p));
+            }
+        }
+        VideoPlayer::new(surface, viewer).ok().map(Self::Mf)
+    }
+
+    fn transport(&self) -> &dyn Transport {
+        match self {
+            Self::Mf(p) => p,
+            Self::Mpv(p) => p,
+        }
+    }
+
+    unsafe fn open(&self, path: &Path) -> bool {
+        match self {
+            Self::Mf(p) => p.open(path).is_ok(),
+            Self::Mpv(p) => p.open(path),
+        }
+    }
+
+    unsafe fn render(&self, osd: Option<Osd<'_>>) {
+        match self {
+            Self::Mf(p) => p.render(osd),
+            Self::Mpv(p) => p.render(osd),
+        }
+    }
+
+    unsafe fn resize(&self, width: i32, height: i32) {
+        match self {
+            Self::Mf(p) => p.resize(width, height),
+            Self::Mpv(p) => p.resize(width, height),
+        }
+    }
+
+    unsafe fn native_size(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Mf(p) => p.native_size(),
+            Self::Mpv(p) => p.native_size(),
+        }
+    }
+
+    unsafe fn capture_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
+        match self {
+            Self::Mf(p) => p.capture_frame(),
+            Self::Mpv(p) => p.capture_frame(),
+        }
+    }
+
+    unsafe fn set_rate(&self, rate: f64) {
+        match self {
+            Self::Mf(p) => p.set_rate(rate),
+            Self::Mpv(p) => p.set_rate(rate),
+        }
+    }
+
+    unsafe fn set_current_rate(&self, rate: f64) {
+        match self {
+            Self::Mf(p) => p.set_current_rate(rate),
+            Self::Mpv(p) => p.set_rate(rate),
+        }
+    }
+
+    unsafe fn is_paused(&self) -> bool {
+        match self {
+            Self::Mf(p) => p.is_paused(),
+            Self::Mpv(p) => p.is_paused(),
+        }
+    }
+
+    unsafe fn is_seeking(&self) -> bool {
+        match self {
+            Self::Mf(p) => p.is_seeking(),
+            Self::Mpv(p) => p.is_seeking(),
+        }
+    }
+
+    fn presented_pts(&self) -> Option<i64> {
+        match self {
+            Self::Mf(p) => p.presented_pts(),
+            Self::Mpv(_) => None,
+        }
+    }
+
+    unsafe fn step_back(&self, frame_rate: f64) -> f64 {
+        match self {
+            Self::Mf(p) => p.step_back(frame_rate),
+            Self::Mpv(p) => {
+                p.frame_step(false);
+                p.position()
+            }
+        }
+    }
+
+    unsafe fn error_code(&self) -> Option<u16> {
+        match self {
+            Self::Mf(p) => p.error_code(),
+            Self::Mpv(p) => p.error_code(),
+        }
+    }
+
+    fn is_playing(&self) -> bool {
+        self.transport().is_playing()
+    }
+    fn play(&self) {
+        self.transport().play()
+    }
+    fn pause(&self) {
+        self.transport().pause()
+    }
+    fn position(&self) -> f64 {
+        self.transport().position()
+    }
+    fn duration(&self) -> f64 {
+        self.transport().duration()
+    }
+    fn seek(&self, seconds: f64, approximate: bool) {
+        self.transport().seek(seconds, approximate)
+    }
+    fn volume(&self) -> f64 {
+        self.transport().volume()
+    }
+    fn set_volume(&self, volume: f64) {
+        self.transport().set_volume(volume)
+    }
+    fn is_muted(&self) -> bool {
+        self.transport().is_muted()
+    }
+    fn set_muted(&self, muted: bool) {
+        self.transport().set_muted(muted)
+    }
+}
+
 /// Field order matters: the player (engine) shuts down before its surface window is destroyed.
 pub struct VideoView {
-    player: VideoPlayer,
+    player: Player,
     surface: Surface,
     viewer: HWND,
     path: PathBuf,
@@ -197,11 +340,13 @@ impl VideoView {
     /// Creates the surface inside `viewer` and starts playing `path`. `None` if Media Foundation
     /// cannot open the file (so TC can fall back to another plugin).
     pub unsafe fn new(viewer: HWND, path: &Path, resume: bool) -> Option<Self> {
-        let info = (*get_video_meta(path)?).clone();
+        let info = video_meta(path)?;
         let surface = Surface::new(viewer, true)?;
-        let player = VideoPlayer::new(surface.0, viewer).ok()?;
-        transport_bar::restore_audio_level(&player);
-        player.open(path).ok()?;
+        let player = Player::new(surface.0, viewer)?;
+        transport_bar::restore_audio_level(player.transport());
+        if !player.open(path) {
+            return None;
+        }
 
         SetTimer(Some(viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
         let resume_at = resume_point(path, &info, resume);
@@ -228,13 +373,12 @@ impl VideoView {
 
     /// Switches to another file, reusing the engine (and its speed).
     pub unsafe fn open(&mut self, path: &Path, resume: bool) -> bool {
-        let Some(info) = get_video_meta(path) else {
+        let Some(info) = video_meta(path) else {
             return false;
         };
-        let info = (*info).clone();
         self.remember_position();
         self.finish_step();
-        if self.player.open(path).is_err() {
+        if !self.player.open(path) {
             return false;
         }
         self.precise_seek = seeks_precisely(path);
@@ -282,6 +426,10 @@ impl VideoView {
     /// One frame forward / back, ending paused. False if this file can't step back.
     pub unsafe fn frame_step(&mut self, forward: bool) -> bool {
         self.key_seek = None;
+        if let Player::Mpv(p) = &self.player {
+            p.frame_step(forward);
+            return true;
+        }
         if !forward {
             if !self.precise_seek {
                 return false;
@@ -539,6 +687,16 @@ impl VideoView {
             e if is_progress_event(e) => EventEffect::RepaintBar,
             _ => EventEffect::None,
         }
+    }
+}
+
+/// Stream properties from Media Foundation. mpv plays containers Media Foundation can't read;
+/// their size and duration come from the player once the file is open.
+fn video_meta(path: &Path) -> Option<VideoMeta> {
+    match get_video_meta(path) {
+        Some(info) => Some((*info).clone()),
+        None if playback_mpv::available() => Some(VideoMeta::default()),
+        None => None,
     }
 }
 

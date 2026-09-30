@@ -339,17 +339,15 @@ fn repair(s: &str) -> Option<String> {
             .to_string_lossy()
             .into_owned(),
     };
-    let accepted = text != s
-        && !text.contains('\u{FFFD}')
-        && (looks_garbled(s) || whole_words(&text));
+    let accepted =
+        text != s && !text.contains('\u{FFFD}') && (looks_garbled(s) || whole_words(&text));
     accepted.then_some(text)
 }
 
 /// No word mixes ASCII letters with non-ASCII characters.
 fn whole_words(text: &str) -> bool {
-    text.split(|c: char| !c.is_alphanumeric()).all(|word| {
-        !(word.chars().any(|c| c.is_ascii_alphabetic()) && !word.is_ascii())
-    })
+    text.split(|c: char| !c.is_alphanumeric())
+        .all(|word| !(word.chars().any(|c| c.is_ascii_alphabetic()) && !word.is_ascii()))
 }
 
 /// Text decoded with the wrong code page: Latin-1 letters where cp1251 or UTF-8 bytes were meant

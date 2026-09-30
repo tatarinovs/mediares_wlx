@@ -434,10 +434,7 @@ fn test_audio_tag_fields() {
         FT_DELAYED
     );
     assert_eq!(raw(field("Audio_Artist"), 0).0, FT_STRINGW);
-    assert_eq!(
-        raw(field("Audio_Title"), CONTENT_DELAYIFSLOW).0,
-        FT_STRINGW
-    );
+    assert_eq!(raw(field("Audio_Title"), CONTENT_DELAYIFSLOW).0, FT_STRINGW);
     assert_eq!(
         raw(field("Audio_Fingerprint"), CONTENT_DELAYIFSLOW).0,
         FT_DELAYED

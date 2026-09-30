@@ -210,6 +210,18 @@ impl Command {
         }
     }
 
+    /// For audio/video, where Space plays / pauses and Left / Right seek (see [`Self::from_key`]).
+    fn media_label(self, media: bool) -> Option<(&'static str, &'static str)> {
+        match self {
+            Command::Next if media => Some(("Следующий файл\tN / PgDn", "Next file\tN / PgDn")),
+            Command::Previous if media => Some((
+                "Предыдущий файл\tBackspace / PgUp",
+                "Previous file\tBackspace / PgUp",
+            )),
+            _ => None,
+        }
+    }
+
     fn repeat_mode(self) -> Option<Repeat> {
         match self {
             Command::RepeatOff => Some(Repeat::Off),
@@ -417,6 +429,12 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
 }
 
 pub unsafe fn close_viewer(hwnd: HWND) {
+    // The player goes first, while the viewer is still whole: libmpv's window lives on its own
+    // thread, and if that thread ended in the middle of destroying the active (fullscreen)
+    // viewer, Windows would activate nothing and TC's panel would be left without the focus.
+    if let Some(state) = get_live_state(hwnd) {
+        state.media = None;
+    }
     let _ = DestroyWindow(hwnd);
     crate::smooth::release();
 }
@@ -1179,6 +1197,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
                         .repeat_mode()
                         .map_or(MENU_ITEM_FLAGS(0), |r| checked(r == queue.repeat)),
                 };
+                let label = cmd.media_label(media).unwrap_or(*label);
                 let _ = AppendMenuW(
                     menu,
                     MF_STRING | flags,

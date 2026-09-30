@@ -243,7 +243,9 @@ mod tests {
             Some((6000, 4000))
         );
 
-        let lossless = [0xFF, 0xD8, 0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10];
+        let lossless = [
+            0xFF, 0xD8, 0xFF, 0xC3, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10,
+        ];
         assert_eq!(read_dimensions(&mut std::io::Cursor::new(&lossless)), None);
         assert_eq!(read_dimensions(&mut std::io::Cursor::new(b"GIF89a")), None);
     }

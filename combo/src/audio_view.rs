@@ -1,8 +1,9 @@
 //! Audio content: album art (embedded, or cover.jpg / folder.jpg next to the file) and tags,
 //! painted into the area above the transport bar.
 //!
-//! Playback is pure Rust ([`AudioPlayer`]); formats symphonia can't decode (WMA, Opus, AC3) fall back to
-//! the Media Foundation engine with a hidden surface.
+//! Playback is pure Rust ([`AudioPlayer`]); formats symphonia can't decode (WMA, Opus, AC3, and
+//! with libmpv APE, WavPack, DSD...) fall back to libmpv if installed, otherwise to the Media
+//! Foundation engine with a hidden surface.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ use crate::image_view::draw_fitted;
 use crate::media_view::EventEffect;
 use crate::osd_template;
 use crate::playback_audio::AudioPlayer;
+use crate::playback_mpv::{self, MpvPlayer};
 use crate::playback_video::VideoPlayer;
 use crate::transport_bar::{self, format_time, Transport};
 use crate::video_view::{engine_error_text, is_progress_event, Surface};
@@ -45,6 +47,7 @@ const PLACEHOLDER: u32 = 0x00282828;
 
 enum Backend {
     Native(AudioPlayer),
+    Mpv(MpvPlayer),
     /// Field order matters: the engine shuts down before its surface is destroyed.
     Engine {
         player: VideoPlayer,
@@ -54,13 +57,18 @@ enum Backend {
 }
 
 impl Backend {
-    /// The pure-Rust player first, Media Foundation for what it can't decode.
+    /// The pure-Rust player first, then libmpv or Media Foundation for what it can't decode.
     unsafe fn create(viewer: HWND, path: &Path) -> Option<Self> {
         if let Some(mut player) = AudioPlayer::new() {
             transport_bar::restore_audio_level(&player);
             if player.open(path) {
                 return Some(Backend::Native(player));
             }
+        }
+        if playback_mpv::available() {
+            let player = MpvPlayer::new_audio(viewer)?;
+            transport_bar::restore_audio_level(&player);
+            return player.open(path).then_some(Backend::Mpv(player));
         }
         let duration = mediares_core::cache::get_audio_meta(path)?.duration_sec;
         let surface = Surface::new(viewer, false)?;
@@ -77,6 +85,7 @@ impl Backend {
     fn transport(&self) -> &dyn Transport {
         match self {
             Backend::Native(p) => p,
+            Backend::Mpv(p) => p,
             Backend::Engine { player, .. } => player,
         }
     }
@@ -127,7 +136,7 @@ impl AudioView {
     pub unsafe fn open(&mut self, path: &Path) -> bool {
         let reused = match &mut self.backend {
             Backend::Native(player) => player.open(path),
-            Backend::Engine { .. } => false,
+            Backend::Mpv(_) | Backend::Engine { .. } => false,
         };
         if !reused {
             match Backend::create(self.viewer, path) {
@@ -168,7 +177,7 @@ impl AudioView {
     pub fn known_duration(&self) -> f64 {
         match &self.backend {
             Backend::Engine { duration, .. } => duration.max(self.tags.duration_sec),
-            Backend::Native(_) => self.tags.duration_sec,
+            Backend::Native(_) | Backend::Mpv(_) => self.tags.duration_sec,
         }
     }
 
@@ -217,20 +226,26 @@ impl AudioView {
         }
     }
 
-    /// Media Foundation events (engine backend only).
+    /// Media Foundation events (engine and libmpv backends).
     pub fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
-        let Backend::Engine { player, .. } = &self.backend else {
-            return EventEffect::None;
+        let error_code = match &self.backend {
+            Backend::Native(_) => return EventEffect::None,
+            Backend::Mpv(player) => player.error_code(),
+            Backend::Engine { player, .. } => unsafe { player.error_code() },
         };
         match event {
             e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => EventEffect::Ended,
             e if e == MF_MEDIA_ENGINE_EVENT_ERROR.0 => {
-                let code = unsafe { player.error_code() }.unwrap_or(param1 as u16);
-                self.error = Some(engine_error_text(code));
+                self.error = Some(engine_error_text(error_code.unwrap_or(param1 as u16)));
                 EventEffect::RepaintBar
             }
             // The caption shows the duration.
-            e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 => EventEffect::Relayout,
+            e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 => {
+                if let Backend::Mpv(player) = &self.backend {
+                    player.fill_tags(&mut self.tags);
+                }
+                EventEffect::Relayout
+            }
             e if is_progress_event(e) => EventEffect::RepaintBar,
             _ => EventEffect::None,
         }

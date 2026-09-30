@@ -18,6 +18,7 @@ mod osd_template;
 mod osd_template_dialog;
 mod overlay;
 mod playback_audio;
+mod playback_mpv;
 mod playback_video;
 mod playlist;
 mod print;
@@ -85,9 +86,25 @@ mediares_core::export_content_plugin!();
 // Total Commander WLX (Lister Plugin) API
 // ==========================================
 
+/// With libmpv installed (before any file is probed): the formats only it plays are recognized,
+/// and it decodes the photos WIC has no Store extension for.
+fn init_formats() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if playback_mpv::dll_found() {
+            mediares_core::probe::enable_mpv_formats();
+            mediares_core::image_decode::set_fallback_decoder(
+                playback_mpv::PICTURE_EXTS,
+                playback_mpv::picture,
+            );
+        }
+    });
+}
+
 /// Photos, video, audio and M3U playlists.
 fn wlx_detect_string() -> &'static str {
     static S: OnceLock<String> = OnceLock::new();
+    init_formats();
     S.get_or_init(|| {
         let exts = detect_extensions(&[
             MediaType::StandardImage,
@@ -259,12 +276,14 @@ unsafe fn preview_bitmap(path: Option<PathBuf>, width: c_int, height: c_int) -> 
     let (Some(path), Ok(w), Ok(h)) = (path, u32::try_from(width), u32::try_from(height)) else {
         return HBITMAP::default();
     };
+    init_formats();
     snapshot::thumbnail(&path, w, h)
         .and_then(|img| snapshot::to_hbitmap(&img))
         .unwrap_or_default()
 }
 
 unsafe fn load(parent: HWND, path: Option<PathBuf>, show_flags: c_int) -> HWND {
+    init_formats();
     path.and_then(|p| window::create_viewer(parent, &p, show_flags))
         .unwrap_or_default()
 }
@@ -275,6 +294,7 @@ unsafe fn load_next(
     path: Option<PathBuf>,
     show_flags: c_int,
 ) -> c_int {
+    init_formats();
     match path {
         Some(p) if window::load_next(parent, list_win, &p, show_flags) => LISTPLUGIN_OK,
         _ => LISTPLUGIN_ERROR,

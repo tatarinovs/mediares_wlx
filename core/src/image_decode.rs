@@ -1,10 +1,12 @@
 //! Photo decoding shared by WDX hashing and the WLX viewer: the `image` crate for standard
 //! formats, WIC for HEIC/AVIF/JXL/JXR/DDS (and whatever `image` fails on), Direct2D for SVG, plus
-//! embedded previews for RAW/PSD. All paths go through the same memory limits.
+//! embedded previews for RAW/PSD, and an optional fallback decoder (libmpv in the viewer) for what
+//! WIC lacks the codec for. All paths go through the same memory limits.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::OnceLock;
 
 use image::metadata::Orientation;
 use image::{DynamicImage, ImageFormat, ImageReader, Limits};
@@ -113,6 +115,34 @@ fn linear_to_srgb(v: f32) -> f32 {
     }
 }
 
+/// Decodes a picture WIC couldn't (no Store extension for its format), turned upright by the
+/// container's own rotation as WIC does.
+pub type FallbackDecoder = fn(&Path) -> Option<DynamicImage>;
+
+struct Fallback {
+    extensions: &'static [&'static str],
+    decode: FallbackDecoder,
+}
+
+static FALLBACK: OnceLock<Fallback> = OnceLock::new();
+
+/// Registers the decoder of last resort for files with `extensions` (the viewer plugs libmpv in
+/// here when it is installed). Only the first registration counts.
+pub fn set_fallback_decoder(extensions: &'static [&'static str], decode: FallbackDecoder) {
+    let _ = FALLBACK.set(Fallback { extensions, decode });
+}
+
+fn fallback_for(path: &Path) -> Option<&'static Fallback> {
+    FALLBACK
+        .get()
+        .filter(|f| crate::probe::has_extension(path, f.extensions))
+}
+
+fn decode_fallback(path: &Path) -> Option<DynamicImage> {
+    (fallback_for(path)?.decode)(path)
+        .filter(|img| (img.width() as u64) * (img.height() as u64) <= MAX_PIXELS)
+}
+
 /// A standard image by whichever decoder owns its format; files the `image` crate cannot read
 /// (JPEG-in-TIFF, unusual BMP variants, ...) get a second chance through WIC.
 fn decode_standard(path: &Path) -> Option<DynamicImage> {
@@ -120,7 +150,7 @@ fn decode_standard(path: &Path) -> Option<DynamicImage> {
         return crate::svg::decode(path);
     }
     if crate::wic_decode::handles(path) {
-        return crate::wic_decode::decode(path);
+        return crate::wic_decode::decode(path).or_else(|| decode_fallback(path));
     }
     open(path)
         .and_then(decode)
@@ -150,9 +180,13 @@ pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
 pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
     match kind {
         MediaType::StandardImage if crate::svg::handles(path) => header_dimensions(path).is_some(),
-        MediaType::StandardImage => header_dimensions(path).is_some_and(|(w, h)| {
-            w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
-        }),
+        MediaType::StandardImage => match header_dimensions(path) {
+            Some((w, h)) => {
+                w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
+            }
+            // Without WIC's codec the header can't be read, but the fallback may still decode it.
+            None => fallback_for(path).is_some(),
+        },
         MediaType::RawImage | MediaType::PsdImage => path.is_file(),
         _ => false,
     }

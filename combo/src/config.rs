@@ -47,6 +47,14 @@ pub fn data_file(name: &str) -> PathBuf {
     ini_path().with_file_name(name)
 }
 
+/// A cache folder tied to this machine (GPU, drivers), in `%LOCALAPPDATA%\mediares`.
+pub fn cache_dir(name: &str) -> PathBuf {
+    match std::env::var_os("LOCALAPPDATA") {
+        Some(dir) => PathBuf::from(dir).join("mediares").join(name),
+        None => data_file(name),
+    }
+}
+
 /// Player volume (0..=1) left by the previous session; full volume if none was saved.
 pub fn load_volume() -> f64 {
     let ini = HSTRING::from(ini_path().as_os_str());

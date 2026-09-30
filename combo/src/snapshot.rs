@@ -24,6 +24,7 @@ use windows::Win32::UI::Shell::DROPFILES;
 use crate::audio_view::folder_cover;
 use crate::i18n::tr;
 use crate::image_cache::{self, DecodedImage};
+use crate::playback_mpv;
 use crate::transport_bar::format_time;
 
 const CF_DIB: u32 = 8;
@@ -239,7 +240,10 @@ pub fn save_picture(img: &DecodedImage, path: &Path, format: FrameFormat) -> boo
 fn source_picture(path: &Path) -> Option<DynamicImage> {
     match probe_file(path) {
         kind if kind.is_image_kind() => decode_oriented(path, kind, true).map(|(img, _)| img),
-        MediaType::Video => video_frame_rgba(path, THUMBNAIL_AT).map(DynamicImage::ImageRgba8),
+        // libmpv first when installed, like playback: it decodes more, and faster.
+        MediaType::Video => playback_mpv::video_frame(path, THUMBNAIL_AT)
+            .or_else(|| video_frame_rgba(path, THUMBNAIL_AT))
+            .map(DynamicImage::ImageRgba8),
         MediaType::Audio => {
             let embedded = read_tags(path, true)
                 .and_then(|t| t.cover)
