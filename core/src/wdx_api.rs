@@ -380,7 +380,7 @@ unsafe fn get_value(
         return FT_FILEERROR;
     };
     let Some(&(field, _, _)) = field_at(field_index) else {
-        return FT_FIELDEMPTY;
+        return FT_NOSUCHFIELD;
     };
     if field_value.is_null() {
         return FT_FIELDEMPTY;
@@ -494,8 +494,8 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         (ImageCoarseHash, CachedMedia::Image(img)) => text(img.coarse_hash_hex()),
         (ImageDimensions, CachedMedia::Image(img)) => text(img.dimensions_str()),
         (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio.clone()),
-        (VideoFingerprint, CachedMedia::Video(vid)) => text(vid.fingerprint.clone()),
-        (VideoDHashMid, CachedMedia::Video(vid)) => text(vid.dhash_mid_hex()),
+        (VideoFingerprint, CachedMedia::Video(vid)) => vid.fingerprint.clone().map(Value::Text),
+        (VideoDHashMid, CachedMedia::Video(vid)) => vid.dhash_mid_hex().map(Value::Text),
         (VideoDurationSec, CachedMedia::Video(vid)) => Some(int(vid.duration_sec)),
         (VideoDimensions, CachedMedia::Video(vid)) => text(vid.dimensions_str()),
         (AudioFingerprint, CachedMedia::Audio(a)) => a.fingerprint.clone().map(Value::Text),

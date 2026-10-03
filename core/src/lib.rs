@@ -69,4 +69,87 @@ pub(crate) mod test_util {
         std::fs::write(&path, b).unwrap();
         path
     }
+
+    /// An uncompressed AVI (24-bit RGB, every frame a key frame) in the temp folder;
+    /// `luma(frame, x, y)` is the gray level of each pixel. `width` must be a multiple of 4.
+    pub fn gray_avi(
+        name: &str,
+        (width, height): (u32, u32),
+        fps: u32,
+        frames: u32,
+        luma: impl Fn(u32, u32, u32) -> u8,
+    ) -> PathBuf {
+        let chunk = |id: &[u8; 4], body: &[u8]| {
+            let mut c = id.to_vec();
+            c.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            c.extend_from_slice(body);
+            c
+        };
+        let list = |kind: &[u8; 4], body: &[u8]| chunk(b"LIST", &[&kind[..], body].concat());
+        let u32s = |v: &[u32]| v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<u8>>();
+        let frame_size = width * height * 3;
+
+        // avih: µs per frame, max bytes/s, padding, flags (HASINDEX), frames, initial frames,
+        // streams, suggested buffer, width, height, 4 reserved.
+        let avih = u32s(&[
+            1_000_000 / fps,
+            frame_size * fps,
+            0,
+            0x10,
+            frames,
+            0,
+            1,
+            frame_size,
+            width,
+            height,
+            0,
+            0,
+            0,
+            0,
+        ]);
+        // strh: type, handler, flags, priority+language, initial frames, scale, rate, start,
+        // length, suggested buffer, quality, sample size, frame rectangle.
+        let mut strh = b"vidsDIB ".to_vec();
+        strh.extend(u32s(&[0, 0, 0, 1, fps, 0, frames, frame_size, u32::MAX, 0]));
+        strh.extend([0u16, 0, width as u16, height as u16].iter().flat_map(|v| v.to_le_bytes()));
+        // BITMAPINFOHEADER, bottom-up 24-bit BI_RGB.
+        let mut strf = u32s(&[40, width, height]);
+        strf.extend_from_slice(&1u16.to_le_bytes());
+        strf.extend_from_slice(&24u16.to_le_bytes());
+        strf.extend(u32s(&[0, frame_size, 0, 0, 0, 0]));
+        let hdrl = list(
+            b"hdrl",
+            &[
+                chunk(b"avih", &avih),
+                list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat()),
+            ]
+            .concat(),
+        );
+
+        let mut movi = Vec::new();
+        let mut idx1 = Vec::new();
+        for f in 0..frames {
+            let mut pixels = Vec::with_capacity(frame_size as usize);
+            for y in (0..height).rev() {
+                for x in 0..width {
+                    pixels.extend_from_slice(&[luma(f, x, y); 3]);
+                }
+            }
+            // Offsets are relative to the `movi` FOURCC.
+            idx1.extend_from_slice(b"00db");
+            idx1.extend(u32s(&[0x10, 4 + movi.len() as u32, frame_size]));
+            movi.extend(chunk(b"00db", &pixels));
+        }
+        let body = [
+            &b"AVI "[..],
+            &hdrl,
+            &list(b"movi", &movi),
+            &chunk(b"idx1", &idx1),
+        ]
+        .concat();
+        let path =
+            std::env::temp_dir().join(format!("mediares_{}_{}.avi", name, std::process::id()));
+        std::fs::write(&path, chunk(b"RIFF", &body)).unwrap();
+        path
+    }
 }

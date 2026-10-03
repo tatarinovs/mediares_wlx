@@ -15,13 +15,19 @@ pub const FT_STRING: c_int = 8;
 pub const FT_FULLTEXT: c_int = 9;
 pub const FT_DATETIME: c_int = 10;
 pub const FT_STRINGW: c_int = 11;
-pub const FT_NUMERIC_32_UN: c_int = 12;
-pub const FT_NUMERIC_64_UN: c_int = 13;
+pub const FT_FULLTEXTW: c_int = 12;
 
-// Return values for ContentGetValue / ContentGetValueW
-pub const FT_FILEERROR: c_int = -1;
-pub const FT_FIELDEMPTY: c_int = -2;
-pub const FT_ONEDAYS: c_int = -3;
+// Return values for ContentGetValue / ContentGetValueW (contplug.h)
+/// Invalid field index.
+pub const FT_NOSUCHFIELD: c_int = -1;
+/// File I/O error.
+pub const FT_FILEERROR: c_int = -2;
+/// The field exists but has no value for this file.
+pub const FT_FIELDEMPTY: c_int = -3;
+pub const FT_ONDEMAND: c_int = -4;
+pub const FT_NOTSUPPORTED: c_int = -5;
+pub const FT_SETCANCEL: c_int = -6;
+/// Takes long: TC asks again from its background thread.
 pub const FT_DELAYED: c_int = 0;
 
 // Flags for ContentGetValue / ContentGetValueW
@@ -60,3 +66,26 @@ pub const LCP_FITLARGERONLY: c_int = 32;
 pub const LCP_CENTER: c_int = 64;
 /// TC 11+: TC uses its dark theme (also re-sent via `LC_NEWPARAMS` when it switches).
 pub const LCP_DARKMODE: c_int = 128;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The values TC's SDK (`contplug.h`) defines; TC reads the raw numbers.
+    #[test]
+    fn content_return_codes_match_the_sdk() {
+        assert_eq!(
+            [
+                FT_NOSUCHFIELD,
+                FT_FILEERROR,
+                FT_FIELDEMPTY,
+                FT_ONDEMAND,
+                FT_NOTSUPPORTED,
+                FT_SETCANCEL,
+                FT_DELAYED,
+            ],
+            [-1, -2, -3, -4, -5, -6, 0]
+        );
+        assert_eq!((FT_STRINGW, FT_FULLTEXTW), (11, 12));
+    }
+}

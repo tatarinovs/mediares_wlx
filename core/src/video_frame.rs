@@ -6,7 +6,8 @@ use std::path::Path;
 
 use windows::core::{Interface, GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSourceReader, MF2DBuffer_LockFlags_Read,
+    IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSample, IMFSourceReader,
+    MF2DBuffer_LockFlags_Read,
     MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
     MFSampleExtension_CleanPoint, MFVideoFormat_NV12, MFVideoFormat_RGB32,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
@@ -25,13 +26,15 @@ pub struct VideoAnalysis {
     pub duration_sec: u32,
     pub width: u32,
     pub height: u32,
-    pub dhash_mid: u64,
-    pub fingerprint: String,
+    /// `None` if the middle frame could not be decoded.
+    pub dhash_mid: Option<u64>,
+    /// `None` unless all three frames were decoded: a missing hash must not match other files.
+    pub fingerprint: Option<String>,
 }
 
 impl VideoAnalysis {
-    pub fn dhash_mid_hex(&self) -> String {
-        format!("{:016x}", self.dhash_mid)
+    pub fn dhash_mid_hex(&self) -> Option<String> {
+        self.dhash_mid.map(|h| format!("{:016x}", h))
     }
 
     pub fn dimensions_str(&self) -> String {
@@ -270,22 +273,25 @@ pub fn analyze_video(
         let duration_hns = duration_hns(&reader);
         let duration_sec = (duration_hns / 10_000_000) as u32;
 
-        let mut hashes = [0u64; 3];
+        let mut hashes = [None; 3];
         for (hash, quarter) in hashes.iter_mut().zip([1u64, 2, 3]) {
             check()?;
-            *hash = grab_frame_dhash(&reader, duration_hns * quarter / 4, &geometry).unwrap_or(0);
+            *hash = grab_frame_dhash(&reader, duration_hns * quarter / 4, &geometry);
         }
         let [dhash_25, dhash_mid, dhash_75] = hashes;
+        let fingerprint = match (dhash_25, dhash_mid, dhash_75) {
+            (Some(a), Some(b), Some(c)) => {
+                Some(format!("{}s_{:016x}_{:016x}_{:016x}", duration_sec, a, b, c))
+            }
+            _ => None,
+        };
 
         Ok(VideoAnalysis {
             duration_sec,
             width: geometry.width,
             height: geometry.height,
             dhash_mid,
-            fingerprint: format!(
-                "{}s_{:016x}_{:016x}_{:016x}",
-                duration_sec, dhash_25, dhash_mid, dhash_75
-            ),
+            fingerprint,
         })
     }
 }
@@ -307,19 +313,7 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
         }
         let at = (duration_hns(&reader) as f64 * fraction.clamp(0.0, 1.0)) as i64;
         set_position(&reader, at).ok()?;
-
-        // The first reads after a seek may carry no sample (stream tick, format change).
-        let sample = (0..16).find_map(|_| {
-            let (mut flags, mut sample) = (0u32, None);
-            reader
-                .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
-                .ok()?;
-            if sample.is_none() && flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-                return Some(None);
-            }
-            sample.map(Some)
-        })??;
-        let buffer = sample.ConvertToContiguousBuffer().ok()?;
+        let buffer = next_sample(&reader)?.ConvertToContiguousBuffer().ok()?;
         with_linear_frame(&buffer, &geo, |frame| {
             let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
             for y in 0..height {
@@ -333,6 +327,25 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
             image::RgbaImage::from_raw(width, height, rgba)
         })
     }
+}
+
+/// The next decoded sample of the video stream. The first reads after a seek may carry no
+/// sample (stream tick, format change); `None` at the end of the stream or on an error. The flags
+/// argument is mandatory: a synchronous reader fails with `E_POINTER` without it.
+unsafe fn next_sample(reader: &IMFSourceReader) -> Option<IMFSample> {
+    for _ in 0..16 {
+        let (mut flags, mut sample) = (0u32, None);
+        reader
+            .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+            .ok()?;
+        if sample.is_some() {
+            return sample;
+        }
+        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
+            return None;
+        }
+    }
+    None
 }
 
 unsafe fn set_output_format(reader: &IMFSourceReader, subtype: &GUID) -> windows::core::Result<()> {
@@ -393,12 +406,7 @@ unsafe fn grab_frame_dhash(
     }
 
     set_position(reader, timestamp_hns as i64).ok()?;
-
-    let mut sample = None;
-    reader
-        .ReadSample(STREAM, 0, None, None, None, Some(&mut sample))
-        .ok()?;
-    let buffer = sample?.ConvertToContiguousBuffer().ok()?;
+    let buffer = next_sample(reader)?.ConvertToContiguousBuffer().ok()?;
 
     if let Ok(buf2d) = buffer.cast::<IMF2DBuffer2>() {
         let (mut scanline0, mut pitch) = (std::ptr::null_mut(), 0i32);
@@ -607,6 +615,72 @@ unsafe fn propvariant_u64(var: &PROPVARIANT) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 6 s of 8x8 gray blocks whose layout changes every second; `seed` makes another video.
+    fn blocks_video(name: &str, seed: u32) -> std::path::PathBuf {
+        crate::test_util::gray_avi(name, (64, 48), 10, 60, |frame, x, y| {
+            let second = frame / 10;
+            ((x / 8 * 7 + y / 8 * 13 + second * 29 + seed * 53) * 37 % 256) as u8
+        })
+    }
+
+    /// 6 s of per-pixel noise that changes every second; `seed` makes another video.
+    fn noise_video(name: &str, seed: u32) -> std::path::PathBuf {
+        crate::test_util::gray_avi(name, (64, 48), 10, 60, |frame, x, y| {
+            // murmur3's finalizer over (x, y, second, seed).
+            let mut h = x | y << 8 | (frame / 10) << 16 | seed << 24;
+            h ^= h >> 16;
+            h = h.wrapping_mul(0x85eb_ca6b);
+            h ^= h >> 13;
+            h = h.wrapping_mul(0xc2b2_ae35);
+            (h ^ h >> 16) as u8
+        })
+    }
+
+    /// Regression: the frames were read with a null flags pointer, which a synchronous source
+    /// reader rejects (`E_POINTER`), so every video hashed to zeros and all videos of the same
+    /// length looked like duplicates.
+    #[test]
+    fn videos_get_real_distinct_hashes() {
+        let (a, b) = (noise_video("hash_a", 0), noise_video("hash_b", 1));
+        let analyze = |p: &Path| analyze_video(p, &|| false).expect("analysis");
+        let (first, again, other) = (analyze(&a), analyze(&a), analyze(&b));
+        let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
+
+        assert_eq!(
+            (first.duration_sec, first.width, first.height),
+            (6, 64, 48)
+        );
+        let fingerprint = first.fingerprint.clone().expect("all three frames decoded");
+        let parts: Vec<&str> = fingerprint.split('_').collect();
+        assert_eq!(parts.len(), 4, "{fingerprint}");
+        assert_eq!(parts[0], "6s");
+        // The frames at 25 / 50 / 75 % come from different seconds, so they differ.
+        assert!(
+            parts[1] != parts[2] && parts[2] != parts[3] && parts[1] != parts[3],
+            "{fingerprint}"
+        );
+        assert!(parts[1..].iter().all(|h| *h != "0000000000000000"), "{fingerprint}");
+        assert_eq!(first.dhash_mid_hex().as_deref(), Some(parts[2]));
+
+        assert_eq!(again.fingerprint.as_deref(), Some(fingerprint.as_str()), "stable");
+        let other = other.fingerprint.expect("other video decoded");
+        assert!(other.starts_with("6s_"));
+        assert_ne!(other, fingerprint, "a different video of the same length");
+    }
+
+    #[test]
+    fn thumbnail_frame_is_decoded() {
+        let path = blocks_video("thumb", 2);
+        let frame = video_frame_rgba(&path, 0.5);
+        let _ = std::fs::remove_file(&path);
+        let frame = frame.expect("frame");
+        assert_eq!(frame.dimensions(), (64, 48));
+        // Second 3, block (0, 0): (3 * 29 + 2 * 53) * 37 % 256.
+        let expected = ((3 * 29 + 2 * 53) * 37 % 256) as u8;
+        let px = frame.get_pixel(3, 3).0;
+        assert!(px[..3].iter().all(|&c| c.abs_diff(expected) <= 2), "{px:?} vs {expected}");
+    }
 
     #[test]
     fn codec_names() {

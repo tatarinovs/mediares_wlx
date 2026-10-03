@@ -816,3 +816,64 @@ fn test_readmes_list_every_field() {
         assert!(missing.is_empty(), "{} lacks {:?}", readme, missing);
     }
 }
+
+/// TC tells "no such field", "file error" and "empty" apart by these raw codes (`contplug.h`).
+#[test]
+fn test_return_codes_reach_tc_as_in_the_sdk() {
+    use std::os::windows::ffi::OsStrExt;
+    let path = std::env::temp_dir().join(format!("mediares_codes_{}.wav", std::process::id()));
+    write_wav(&path, 8000, 2, 0, 1.0);
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let get = |field: i32| {
+        let mut buf = [0u16; 256];
+        unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field,
+                0,
+                buf.as_mut_ptr() as *mut c_void,
+                512,
+                0,
+            )
+        }
+    };
+    let empty = get(field("Audio_Artist_Title"));
+    let no_such = get(10_000);
+    let no_file = unsafe { ContentGetValueW(std::ptr::null(), 0, 0, std::ptr::null_mut(), 0, 0) };
+    let _ = std::fs::remove_file(&path);
+    assert_eq!(empty, -3, "ft_fieldempty for an untagged file");
+    assert_eq!(no_such, -1, "ft_nosuchfield");
+    assert_eq!(no_file, -2, "ft_fileerror");
+}
+
+/// `mediares.lng` (Windows-1251, like TC's own Russian files) names every field for TC's
+/// dialogs: a field missing there would show up in English among the translated ones.
+#[test]
+fn test_every_field_has_a_russian_name() {
+    let lng = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../pluginst/mediares.lng"))
+        .expect("pluginst/mediares.lng");
+    assert!(!lng.starts_with(&[0xEF, 0xBB, 0xBF]), "ANSI, no UTF-8 BOM");
+    let mut section = Vec::new();
+    let mut in_rus = false;
+    for line in lng.split(|&b| b == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.starts_with(b"[") {
+            in_rus = line == b"[Rus]";
+        } else if in_rus && !line.starts_with(b";") && !line.is_empty() {
+            let eq = line.iter().position(|&b| b == b'=').expect("key=value");
+            section.push((line[..eq].to_vec(), line[eq + 1..].to_vec()));
+        }
+    }
+    let fields: Vec<String> = (0..).map_while(field_info).map(|(n, _)| n).collect();
+    let mut keys: Vec<&[u8]> = section.iter().map(|(k, _)| k.as_slice()).collect();
+    keys.sort();
+    let mut expected: Vec<&[u8]> = fields.iter().map(|f| f.as_bytes()).collect();
+    expected.sort();
+    assert_eq!(keys, expected, "one translation per field, no strays");
+    let mut names: Vec<&[u8]> = section.iter().map(|(_, v)| v.as_slice()).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), section.len(), "translations are unique");
+    // Characters TC uses in field references ([=plugin.Field.Unit]) stay out of the names.
+    assert!(names.iter().all(|n| !n.is_empty() && !n.iter().any(|b| b"|[]".contains(b))));
+}
