@@ -59,10 +59,7 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
     if same_path(&target, source) {
         show_error(
             owner,
-            tr(
-                "Нельзя сохранить поверх открытого файла.",
-                "Cannot save over the open file.",
-            ),
+            tr("Cannot save over the open file."),
         );
         return;
     }
@@ -72,19 +69,38 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
         SetCursor(Some(previous));
     }
     if !ok {
-        let _ = std::fs::remove_file(&target);
         show_error(
             owner,
             &format!(
                 "{}:\n{}",
-                tr("Не удалось сохранить", "Could not save"),
+                tr("Could not save"),
                 target.display()
             ),
         );
     }
 }
 
+/// Writes into a temporary file next to `target` and only then replaces it: a failure leaves an
+/// existing file the user chose to overwrite as it was.
 fn write(
+    source: &Path,
+    target: &Path,
+    format: Format,
+    quarter_turns: u8,
+    auto_rotate: bool,
+) -> bool {
+    let mut temp = target.as_os_str().to_owned();
+    temp.push(".mediares-tmp");
+    let temp = PathBuf::from(temp);
+    let ok = write_to(source, &temp, format, quarter_turns, auto_rotate)
+        && std::fs::rename(&temp, target).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&temp);
+    }
+    ok
+}
+
+fn write_to(
     source: &Path,
     target: &Path,
     format: Format,
@@ -211,7 +227,7 @@ unsafe fn ask_target(owner: HWND, source: &Path) -> Option<(PathBuf, Format)> {
         .collect();
     file[..name.len()].copy_from_slice(&name);
     let dir = HSTRING::from(source.parent().unwrap_or(Path::new("")).as_os_str());
-    let title = HSTRING::from(tr("Сохранить как", "Save as"));
+    let title = HSTRING::from(tr("Save as"));
     let mut ofn = OPENFILENAMEW {
         lStructSize: size_of::<OPENFILENAMEW>() as u32,
         hwndOwner: owner,
@@ -290,6 +306,30 @@ mod tests {
         let back = mediares_core::image::open(&jpg).unwrap();
         assert_eq!((back.width(), back.height()), (1, 2));
         assert!(!back.color().has_alpha());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Regression: a failed save deleted the file the user had chosen to overwrite.
+    #[test]
+    fn failed_save_keeps_the_existing_target() {
+        let dir = std::env::temp_dir().join(format!("mediares_keep_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (broken, target) = (dir.join("broken.jpg"), dir.join("target.png"));
+        std::fs::write(&broken, [0xFF, 0xD8, 0xFF, 0x00, 0x13, 0x37]).unwrap();
+        std::fs::write(&target, b"precious").unwrap();
+
+        assert!(!write(&broken, &target, Format::Png, 1, true));
+        assert_eq!(std::fs::read(&target).unwrap(), b"precious");
+        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(left.len(), 2, "no temporary file left behind");
+
+        // A successful save replaces it.
+        let png = dir.join("ok.png");
+        RgbaImage::from_pixel(2, 1, mediares_core::image::Rgba([1, 2, 3, 255]))
+            .save(&png)
+            .unwrap();
+        assert!(write(&png, &target, Format::Png, 1, true));
+        assert_eq!(mediares_core::image::open(&target).unwrap().width(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

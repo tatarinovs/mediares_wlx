@@ -189,7 +189,7 @@ impl AudioView {
     pub fn title_info(&self) -> String {
         let mut parts = vec![self.format.clone()];
         if let Some(kbps) = self.tags.bitrate_kbps {
-            parts.push(format!("{} {}", kbps, tr("кбит/с", "kbps")));
+            parts.push(format!("{} {}", kbps, tr("kbps")));
         }
         parts.push(format_time(
             self.transport().duration().max(self.known_duration()),
@@ -453,19 +453,19 @@ fn format_line(t: &AudioTags) -> String {
         } else {
             i18n::decimal(format!("{:.1}", rate as f64 / 1000.0))
         };
-        parts.push(format!("{} {}", khz, tr("кГц", "kHz")));
+        parts.push(format!("{} {}", khz, tr("kHz")));
     }
     if let Some(bits) = t.bit_depth {
-        parts.push(format!("{} {}", bits, tr("бит", "bit")));
+        parts.push(format!("{} {}", bits, tr("bit")));
     }
     if let Some(ch) = t.channels {
         parts.push(match ch {
             1 | 2 => osd_template::channels(ch.into()),
-            n => format!("{} {}", n, tr("кан.", "ch")),
+            n => format!("{} {}", n, tr("ch")),
         });
     }
     if let Some(kbps) = t.bitrate_kbps {
-        parts.push(format!("{} {}", kbps, tr("кбит/с", "kbps")));
+        parts.push(format!("{} {}", kbps, tr("kbps")));
     }
     parts.join(" · ")
 }

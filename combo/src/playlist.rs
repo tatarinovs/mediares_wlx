@@ -35,9 +35,9 @@ impl Repeat {
 
     pub fn label(self) -> &'static str {
         match self {
-            Repeat::Off => tr("Без повтора", "No repeat"),
-            Repeat::All => tr("Повторять список", "Repeat list"),
-            Repeat::One => tr("Повторять файл", "Repeat file"),
+            Repeat::Off => tr("No repeat"),
+            Repeat::All => tr("Repeat list"),
+            Repeat::One => tr("Repeat file"),
         }
     }
 }

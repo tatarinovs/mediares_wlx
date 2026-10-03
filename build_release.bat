@@ -93,6 +93,7 @@ set "STAGE_WDX=%STAGING_DIR%\wdx"
 mkdir "%STAGE_WDX%"
 copy /y "%WDX_DLL%" "%STAGE_WDX%\mediares.wdx64" >nul
 copy /y "pluginst\pluginst-wdx.inf" "%STAGE_WDX%\pluginst.inf" >nul
+copy /y "pluginst\mediares.lng" "%STAGE_WDX%\mediares.lng" >nul
 copy /y "docs\readme_rus.txt" "%STAGE_WDX%\readme_rus.txt" >nul
 copy /y "docs\readme_eng.txt" "%STAGE_WDX%\readme_eng.txt" >nul
 
@@ -107,6 +108,10 @@ set "STAGE_WLX=%STAGING_DIR%\wlx"
 mkdir "%STAGE_WLX%"
 copy /y "%COMBO_DLL%" "%STAGE_WLX%\mediares.wlx64" >nul
 copy /y "pluginst\pluginst-wlx.inf" "%STAGE_WLX%\pluginst.inf" >nul
+:: Russian field names for TC's dialogs; must sit next to the plugin under the same name.
+copy /y "pluginst\mediares.lng" "%STAGE_WLX%\mediares.lng" >nul
+:: Sample of the built-in UI translations; a copy next to the plugin overrides them.
+copy /y "pluginst\mediares_ui.lng" "%STAGE_WLX%\mediares_ui.lng" >nul
 copy /y "docs\readme_rus.txt" "%STAGE_WLX%\readme_rus.txt" >nul
 copy /y "docs\readme_eng.txt" "%STAGE_WLX%\readme_eng.txt" >nul
 

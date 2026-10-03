@@ -277,7 +277,8 @@ Music:
 Open any file in the viewer (F3) and press S or choose "Settings..." in
 the right-click menu. You can set:
 
-  * the language (same as Total Commander, English or Russian);
+  * the language (same as Total Commander, English, Russian or one added
+    in mediares_ui.lng, see below);
   * starting in full screen;
   * auto-rotating photos by the camera data;
   * the loupe zoom, the background color around photos;
@@ -299,3 +300,16 @@ the right-click menu. You can set:
 The settings are stored in mediares.ini next to Total Commander's
 settings. If you put mediares.ini next to the plugin file itself, it is
 used from there (handy for a portable installation).
+
+The interface translations are built into the plugin; a sample comes
+in the archive as mediares_ui.lng (UTF-8). Put this file next to the
+plugin and its strings replace the built-in ones: this is how to fix a
+translation or add a language. A language section is named after the
+Total Commander language file: wcmd_rus.lng -> [Rus], wcmd_deu.lng ->
+[Deu]. The key is the English text, the value is the translation; keep
+{name} placeholders as they are. A new language appears in the
+settings list, and "same as Total Commander" picks it up when TC runs
+in that language. Restart Total Commander after editing the file.
+
+mediares.lng holds Russian field names for Total Commander's dialogs;
+it does not affect other languages.

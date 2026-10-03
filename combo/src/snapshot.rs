@@ -198,8 +198,8 @@ impl FrameFormat {
 
     pub fn label(self) -> &'static str {
         match self {
-            FrameFormat::Png => tr("PNG — без потерь", "PNG — lossless"),
-            FrameFormat::Jpeg => tr("JPEG — компактнее", "JPEG — smaller"),
+            FrameFormat::Png => tr("PNG — lossless"),
+            FrameFormat::Jpeg => tr("JPEG — smaller"),
         }
     }
 }

@@ -1,0 +1,243 @@
+; Mediares interface translations, UTF-8. Key: the English text; value: the translation.
+; Escapes in keys and values: \n line break, \t tab, \0 NUL, \= equals sign, \\ backslash.
+; {name} placeholders must stay as they are (the order may change).
+; One section per language, named like Total Commander's language file: wcmd_rus.lng -> [Rus].
+; @name is shown in the settings; @decimal is the decimal separator.
+; A copy next to the plugin overrides the built-in strings and may add languages.
+
+[Rus]
+@name=Русский
+@decimal=,
+
+; audio_view.rs
+kbps=кбит/с
+kHz=кГц
+bit=бит
+ch=кан.
+
+; config.rs
+Hidden=Не показывать
+On photos=На фото
+On videos=На видео
+On photos and videos=На фото и видео
+
+; exif_dialog.rs
+No EXIF metadata found, or the format is not supported.=EXIF метаданные не найдены или формат не поддерживается.
+File path=Путь к файлу
+EXIF metadata=EXIF метаданные
+Close=Закрыть
+Make=Производитель
+Camera model=Модель камеры
+Lens=Объектив
+Date and time taken=Дата и время съёмки
+Date modified=Дата изменения
+Exposure=Выдержка
+Aperture=Диафрагма
+Sensitivity (ISO)=Светочувствительность (ISO)
+Focal length=Фокусное расстояние
+equiv.=экв.
+mm=мм
+Flash=Вспышка
+Fired=Сработала
+Did not fire=Не сработала
+EXIF orientation=Ориентация EXIF
+code=код
+EXIF dimensions=Разрешение EXIF
+Software=Программа
+Normal (0°)=Обычная (0°)
+Mirrored horizontally=Отражение по горизонтали
+Rotated 180°=Поворот на 180°
+Mirrored vertically=Отражение по вертикали
+Rotated 90° counterclockwise and mirrored=Поворот на 90° против часовой и отражение
+Rotated 90° clockwise=Поворот на 90° по часовой
+Rotated 90° clockwise and mirrored=Поворот на 90° по часовой и отражение
+Rotated 270° clockwise=Поворот на 270° по часовой
+Unknown=Неизвестно
+
+; image_view.rs
+Cannot open the image=Не удалось открыть изображение
+RAW preview=превью RAW
+
+; media_view.rs
+Speed=Скорость
+Stepping back is not available for this file (inexact seeking)=Шаг назад недоступен для этого файла (неточная перемотка)
+Resuming from=Продолжение с
+
+; osd_template.rs
+ISO=ISO
+File name=Имя файла
+Name without extension=Имя без расширения
+Extension=Расширение
+Folder=Папка
+Full path=Полный путь
+Size (812 KB, 45.3 MB)=Размер (812 KB, 45.3 MB)
+Size in KB=Размер в KB
+Position in the list=Номер в списке
+Files in the list=Файлов в списке
+File=Файл
+Image=Изображение
+Width=Ширина
+Height=Высота
+Megapixels=Мегапиксели
+Zoom, %=Масштаб, %
+"RAW preview" for an embedded preview=«превью RAW» для встроенного превью
+EXIF=EXIF
+Camera (make and model)=Камера (производитель и модель)
+Model=Модель
+Date taken=Дата съёмки
+Time taken=Время съёмки
+Exposure (1/250 s)=Выдержка (1/250 с)
+Aperture (f/2.8)=Диафрагма (f/2.8)
+Focal length, 35 mm equiv.=Фокусное, экв. 35 мм
+"flash" if it fired=«вспышка», если сработала
+GPS coordinates=Координаты GPS
+Playback=Воспроизведение
+Current position=Текущая позиция
+Duration=Длительность
+Video and audio=Видео и звук
+Frames per second=Кадров в секунду
+Video codec=Видеокодек
+Bitrate, kbps=Битрейт, кбит/с
+Audio codec=Аудиокодек
+Audio channels=Каналы звука
+Sample rate, Hz=Частота звука, Гц
+Tags=Теги
+Title=Название
+Artist=Исполнитель
+Director=Режиссёр
+Date / year=Дата / год
+Genre=Жанр
+Comment=Комментарий
+s=с
+flash=вспышка
+mono=моно
+stereo=стерео
+
+; osd_template_dialog.rs
+{field} — the field's value. <…> — a block hidden when a field in it is empty.\n{{ }} << >> — the characters themselves. Enter — a new OSD line.={поле} — значение поля. <…> — блок, который скрывается, если в нём есть пустое поле.\n{{ }} << >> — сами символы. Enter — новая строка OSD.
+Add field...=Добавить поле...
+Default=По умолчанию
+OK=ОК
+Cancel=Отмена
+
+; playlist.rs
+No repeat=Без повтора
+Repeat list=Повторять список
+Repeat file=Повторять файл
+
+; save_as.rs
+Cannot save over the open file.=Нельзя сохранить поверх открытого файла.
+Could not save=Не удалось сохранить
+Save as=Сохранить как
+
+; settings_dialog.rs
+Mediares Settings=Настройки Mediares
+Browse...=Обзор...
+the program assigned in Windows=программа, назначенная в Windows
+Start in full screen=Запускать в полноэкранном режиме
+Auto-rotate by EXIF orientation=Автоповорот по ориентации EXIF
+Photos=Просмотр фото
+Loupe zoom (left click):=Масштаб лупы (ЛКМ):
+Background:=Цвет фона:
+Choose color...=Выбрать цвет...
+Don't enlarge small images=Не растягивать маленькие изображения
+Smooth enlarged images=Сглаживание при увеличении
+Confirm moving to Recycle Bin (Del)=Спрашивать перед удалением в корзину (Del)
+Info line (OSD)=Информационная строка (OSD)
+Show OSD:=Показывать OSD:
+Font size:=Размер шрифта:
+Font color:=Цвет шрифта:
+Contents:=Что показывать:
+Photos...=Для фото...
+Videos...=Для видео...
+Full screen=Полноэкранный режим
+⏮ ⏯ ⏭ buttons over photos=Кнопки ⏮ ⏯ ⏭ поверх фото
+Control bar over videos=Панель управления поверх видео
+Hide the bar when idle=Скрывать панель при бездействии
+Slideshow interval (F5):=Интервал слайд-шоу (F5):
+Audio and video=Аудио и видео
+Auto-advance to the next file=Автопереход к следующему файлу
+Repeat:=Повтор:
+Shuffle=Случайный порядок
+Resume videos longer than 5 min where they stopped=Продолжать видео длиннее 5 мин с места остановки
+Frames (Shift+S):=Кадры (Shift+S):
+External editors ("Open in editor")=Внешние редакторы («Открыть в редакторе»)
+Photo:=Фото:
+Video:=Видео:
+Audio:=Аудио:
+Content plugin (WDX)=Контентный плагин (WDX)
+mediares fields for TC columns, duplicate search and multi-rename=Поля mediares для колонок, поиска дубликатов и группового переименования в TC
+Register WDX=Зарегистрировать WDX
+Video OSD=OSD для видео
+Photo OSD=OSD для фото
+WDX registered=WDX зарегистрирован
+wincmd.ini not found. Add the plugin manually: Configuration → Options → Plugins → Content plugins → Add, select mediares.wlx64.=Не найден wincmd.ini. Подключите плагин вручную: Конфигурация → Настройка → Плагины → Контентные плагины → Добавить, выбрать mediares.wlx64.
+WDX registered, restart Total Commander.=WDX зарегистрирован, перезапустите Total Commander.
+Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0=Программы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0
+Choose an editor=Выберите редактор
+
+; snapshot.rs
+PNG — lossless=PNG — без потерь
+JPEG — smaller=JPEG — компактнее
+
+; tc_register.rs
+Could not write to=Не удалось записать в
+Add it manually to the section=Добавьте вручную в секцию
+
+; video_view.rs
+decoding error=ошибка декодирования
+format or codec not supported=формат или кодек не поддерживается
+file is encrypted=файл зашифрован
+playback error=ошибка воспроизведения
+Cannot play=Не удалось воспроизвести
+
+; window.rs
+Play / pause\tSpace=Воспроизведение / пауза\tПробел
+Mute\tM=Без звука\tM
+Full screen\tEnter / F=Полноэкранный режим\tEnter / F
+Copy image\tCtrl+C=Копировать изображение\tCtrl+C
+Save as...\tCtrl+S=Сохранить как...\tCtrl+S
+Save frame next to the video\tShift+S=Сохранить кадр рядом с видео\tShift+S
+Show OSD\tO=Отображать OSD\tO
+Slideshow\tF5=Слайд-шоу\tF5
+Rotate left\tL=Повернуть влево\tL
+Rotate right\tR=Повернуть вправо\tR
+Save rotation to file (JPEG, lossless)\tCtrl+R=Записать поворот в файл (JPEG, без потерь)\tCtrl+R
+Slower\t[=Медленнее\t[
+Faster\t]=Быстрее\t]
+Normal speed\t\\=Обычная скорость\t\\
+Previous frame\t,=Кадр назад\t,
+Next frame\t.=Кадр вперёд\t.
+EXIF info...\tE=Просмотр EXIF...\tE
+Open in editor\tF4=Открыть в редакторе\tF4
+Show in folder\tCtrl+Enter=Показать в папке\tCtrl+Enter
+Set as desktop background=Сделать обоями рабочего стола
+Print...\tCtrl+P=Печать...\tCtrl+P
+Move to Recycle Bin\tDel=Удалить в корзину\tDel
+Settings...\tS=Настройки...\tS
+Next file\tSpace / Right=Следующий файл\tПробел / Right
+Previous file\tBackspace / Left=Предыдущий файл\tBackspace / Left
+Next file\tN / PgDn=Следующий файл\tN / PgDn
+Previous file\tBackspace / PgUp=Предыдущий файл\tBackspace / PgUp
+ [slideshow]= [слайд-шоу]
+Image copied to the clipboard=Изображение скопировано в буфер обмена
+Nothing to copy=Нечего копировать
+Frame saved=Кадр сохранён
+Could not save the frame=Не удалось сохранить кадр
+Could not open the file in an external program.=Не удалось открыть файл во внешней программе.
+Could not start the editor=Не удалось запустить редактор
+The path is set in Settings (S).=Путь задаётся в настройках (S).
+Turn the photo with L / R first.=Сначала поверните фото клавишами L / R.
+Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S).=Поворот без потерь записывается только в JPEG.\nДля других форматов используйте «Сохранить как» (Ctrl+S).
+Could not save the rotation=Не удалось записать поворот
+Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it.=Поворот записан. Автоповорот по EXIF выключен в настройках, поэтому здесь фото показано без него.
+Could not set the desktop background.=Не удалось установить обои.
+
+; file_actions.rs
+Move "{name}" to the Recycle Bin?=Удалить «{name}» в корзину?
+
+; i18n.rs
+Same as Total Commander=Как в Total Commander
+
+; settings_dialog.rs
+Language=Язык

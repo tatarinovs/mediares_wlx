@@ -25,7 +25,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
     let Some(dlg) = dialog::create_frame(
         owner,
         CLASS_NAME,
-        &format!("{} - {}", tr("EXIF метаданные", "EXIF metadata"), filename),
+        &format!("{} - {}", tr("EXIF metadata"), filename),
         540,
         440,
     ) else {
@@ -51,7 +51,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
     let close = dialog::control(
         dlg,
         w!("BUTTON"),
-        tr("Закрыть", "Close"),
+        tr("Close"),
         WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
         (410, 360, 100, 28),
         IDOK.0 as usize,
@@ -66,11 +66,10 @@ fn exif_text(file_path: &Path) -> String {
         .map(|info| display_rows(&info))
         .unwrap_or_default();
     let mut text = if rows.is_empty() {
-        tr(
-            "EXIF метаданные не найдены или формат не поддерживается.\r\n",
-            "No EXIF metadata found, or the format is not supported.\r\n",
+        format!(
+            "{}\r\n",
+            tr("No EXIF metadata found, or the format is not supported.")
         )
-        .to_string()
     } else {
         let width = rows
             .iter()
@@ -81,10 +80,7 @@ fn exif_text(file_path: &Path) -> String {
             .map(|(k, v)| format!("{:<width$} : {}\r\n", k, v))
             .collect()
     };
-    text.push_str(tr(
-        "\r\n--- Путь к файлу ---\r\n",
-        "\r\n--- File path ---\r\n",
-    ));
+    text.push_str(&format!("\r\n--- {} ---\r\n", tr("File path")));
     text.push_str(&file_path.to_string_lossy());
     text.push_str("\r\n");
     text
@@ -98,67 +94,67 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
         }
     };
 
-    push(tr("Производитель", "Make"), info.make.clone());
-    push(tr("Модель камеры", "Camera model"), info.model.clone());
-    push(tr("Объектив", "Lens"), info.lens_model.clone());
+    push(tr("Make"), info.make.clone());
+    push(tr("Camera model"), info.model.clone());
+    push(tr("Lens"), info.lens_model.clone());
     match (&info.date_time_original, &info.date_time) {
         (Some(taken), _) => push(
-            tr("Дата и время съемки", "Date and time taken"),
+            tr("Date and time taken"),
             Some(taken.clone()),
         ),
-        (None, modified) => push(tr("Дата изменения", "Date modified"), modified.clone()),
+        (None, modified) => push(tr("Date modified"), modified.clone()),
     }
     push(
-        tr("Выдержка", "Exposure"),
+        tr("Exposure"),
         info.exposure_time
             .as_ref()
-            .map(|s| format!("{} {}", s, tr("c", "s"))),
+            .map(|s| format!("{} {}", s, tr("s"))),
     );
     push(
-        tr("Диафрагма", "Aperture"),
+        tr("Aperture"),
         info.f_number.map(|f| format!("f/{:.1}", f)),
     );
     push(
-        tr("Светочувствительность (ISO)", "Sensitivity (ISO)"),
+        tr("Sensitivity (ISO)"),
         info.iso.map(|v| v.to_string()),
     );
     push(
-        tr("Фокусное расстояние", "Focal length"),
+        tr("Focal length"),
         info.focal_length.map(|f| match info.focal_length_35mm {
             Some(eq) => format!(
                 "{:.1} {mm} ({} {} {mm})",
                 f,
-                tr("экв.", "equiv."),
+                tr("equiv."),
                 eq,
-                mm = tr("мм", "mm")
+                mm = tr("mm")
             ),
-            None => format!("{:.1} {}", f, tr("мм", "mm")),
+            None => format!("{:.1} {}", f, tr("mm")),
         }),
     );
     push(
-        tr("Вспышка", "Flash"),
+        tr("Flash"),
         info.flash_fired.map(|f| {
             if f {
-                tr("Сработала", "Fired")
+                tr("Fired")
             } else {
-                tr("Не сработала", "Did not fire")
+                tr("Did not fire")
             }
             .to_string()
         }),
     );
     push(
-        tr("Ориентация EXIF", "EXIF orientation"),
+        tr("EXIF orientation"),
         info.orientation
-            .map(|o| format!("{} ({} {})", orientation_name(o), tr("код", "code"), o)),
+            .map(|o| format!("{} ({} {})", orientation_name(o), tr("code"), o)),
     );
     push(
-        tr("Разрешение EXIF", "EXIF dimensions"),
+        tr("EXIF dimensions"),
         info.width
             .zip(info.height)
             .map(|(w, h)| format!("{} x {}", w, h)),
     );
     push(
-        tr("Программное обеспечение", "Software"),
+        tr("Software"),
         info.software.clone(),
     );
     rows
@@ -166,21 +162,15 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
 
 fn orientation_name(code: u16) -> &'static str {
     match code {
-        1 => tr("Обычная (0°)", "Normal (0°)"),
-        2 => tr("Отражение по горизонтали", "Mirrored horizontally"),
-        3 => tr("Поворот на 180°", "Rotated 180°"),
-        4 => tr("Отражение по вертикали", "Mirrored vertically"),
-        5 => tr(
-            "Поворот на 90° против часовой и отражение",
-            "Rotated 90° counterclockwise and mirrored",
-        ),
-        6 => tr("Поворот на 90° по часовой", "Rotated 90° clockwise"),
-        7 => tr(
-            "Поворот на 90° по часовой и отражение",
-            "Rotated 90° clockwise and mirrored",
-        ),
-        8 => tr("Поворот на 270° по часовой", "Rotated 270° clockwise"),
-        _ => tr("Неизвестно", "Unknown"),
+        1 => tr("Normal (0°)"),
+        2 => tr("Mirrored horizontally"),
+        3 => tr("Rotated 180°"),
+        4 => tr("Mirrored vertically"),
+        5 => tr("Rotated 90° counterclockwise and mirrored"),
+        6 => tr("Rotated 90° clockwise"),
+        7 => tr("Rotated 90° clockwise and mirrored"),
+        8 => tr("Rotated 270° clockwise"),
+        _ => tr("Unknown"),
     }
 }
 
@@ -223,17 +213,18 @@ mod tests {
         };
         let rows = display_rows(&info);
         let has = |k: &str, v: &str| rows.iter().any(|(rk, rv)| *rk == k && rv == v);
-        assert!(has(tr("Производитель", "Make"), "Canon"));
-        assert!(has(tr("Модель камеры", "Camera model"), "EOS R5"));
+        assert!(has(tr("Make"), "Canon"));
+        assert!(has(tr("Camera model"), "EOS R5"));
         assert!(has(
-            tr("Ориентация EXIF", "EXIF orientation"),
+            tr("EXIF orientation"),
             "Поворот на 90° по часовой (код 6)"
         ));
-        assert!(has(tr("Диафрагма", "Aperture"), "f/2.8"));
+        assert!(has(tr("Aperture"), "f/2.8"));
         assert!(has(
-            tr("Светочувствительность (ISO)", "Sensitivity (ISO)"),
+            tr("Sensitivity (ISO)"),
             "400"
         ));
-        assert!(has(tr("Выдержка", "Exposure"), "1/250 c"));
+        // Cyrillic "с" (seconds); the old pair had a Latin "c" by mistake.
+        assert!(has(tr("Exposure"), "1/250 \u{0441}"));
     }
 }

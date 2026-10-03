@@ -7,7 +7,7 @@ use mediares_core::exif::{parse_exif_datetime, ExifInfo};
 use mediares_core::video_frame::VideoMeta;
 use mediares_core::video_tags::VideoTags;
 
-use crate::i18n::tr;
+use crate::i18n::{n, tr};
 
 /// Photo OSD as it was before templates.
 pub const DEFAULT_PHOTO: &str = "{name} ( {width} x {height} = {mp} MP , {size_kb} KB )< [ {index} / {count} ]><  {zoom}%><  [{preview}]>";
@@ -15,119 +15,102 @@ pub const DEFAULT_PHOTO: &str = "{name} ( {width} x {height} = {mp} MP , {size_k
 pub const DEFAULT_VIDEO: &str =
     "{name} ( {width} x {height} , {size} )< [ {index} / {count} ]>   {time} / {duration}";
 
-/// A field offered by the editor's "Добавить поле" menu, with its Russian / English label.
+/// A field offered by the editor's "Add field" menu, with its (English) label.
 pub struct Field {
     pub key: &'static str,
-    ru: &'static str,
-    en: &'static str,
+    label: &'static str,
 }
 
 impl Field {
     pub fn label(&self) -> &'static str {
-        tr(self.ru, self.en)
+        tr(self.label)
     }
 }
 
-const fn f(key: &'static str, ru: &'static str, en: &'static str) -> Field {
-    Field { key, ru, en }
+const fn f(key: &'static str, label: &'static str) -> Field {
+    Field { key, label }
 }
 
-/// Menu groups: ((Russian, English submenu title), fields).
-pub type FieldGroups = &'static [((&'static str, &'static str), &'static [Field])];
+/// Menu groups: (submenu title, fields); titles go through [`tr`].
+pub type FieldGroups = &'static [(&'static str, &'static [Field])];
 
 const FILE_FIELDS: &[Field] = &[
-    f("name", "Имя файла", "File name"),
-    f("stem", "Имя без расширения", "Name without extension"),
-    f("ext", "Расширение", "Extension"),
-    f("folder", "Папка", "Folder"),
-    f("path", "Полный путь", "Full path"),
-    f("size", "Размер (812 KB, 45.3 MB)", "Size (812 KB, 45.3 MB)"),
-    f("size_kb", "Размер в KB", "Size in KB"),
-    f("index", "Номер в списке", "Position in the list"),
-    f("count", "Файлов в списке", "Files in the list"),
+    f("name", n("File name")),
+    f("stem", n("Name without extension")),
+    f("ext", n("Extension")),
+    f("folder", n("Folder")),
+    f("path", n("Full path")),
+    f("size", n("Size (812 KB, 45.3 MB)")),
+    f("size_kb", n("Size in KB")),
+    f("index", n("Position in the list")),
+    f("count", n("Files in the list")),
 ];
 
 pub const PHOTO_FIELDS: FieldGroups = &[
-    (("Файл", "File"), FILE_FIELDS),
+    (n("File"), FILE_FIELDS),
     (
-        ("Изображение", "Image"),
+        n("Image"),
         &[
-            f("width", "Ширина", "Width"),
-            f("height", "Высота", "Height"),
-            f("mp", "Мегапиксели", "Megapixels"),
-            f("zoom", "Масштаб, %", "Zoom, %"),
-            f(
-                "preview",
-                "«превью RAW» для встроенного превью",
-                "\"RAW preview\" for an embedded preview",
-            ),
+            f("width", n("Width")),
+            f("height", n("Height")),
+            f("mp", n("Megapixels")),
+            f("zoom", n("Zoom, %")),
+            f("preview", n("\"RAW preview\" for an embedded preview")),
         ],
     ),
     (
-        ("EXIF", "EXIF"),
+        n("EXIF"),
         &[
-            f(
-                "camera",
-                "Камера (производитель и модель)",
-                "Camera (make and model)",
-            ),
-            f("make", "Производитель", "Make"),
-            f("model", "Модель", "Model"),
-            f("lens", "Объектив", "Lens"),
-            f("taken", "Дата и время съёмки", "Date and time taken"),
-            f("date", "Дата съёмки", "Date taken"),
-            f("time", "Время съёмки", "Time taken"),
-            f("exposure", "Выдержка (1/250 с)", "Exposure (1/250 s)"),
-            f("aperture", "Диафрагма (f/2.8)", "Aperture (f/2.8)"),
-            f("iso", "ISO", "ISO"),
-            f("focal", "Фокусное расстояние", "Focal length"),
-            f(
-                "focal35",
-                "Фокусное, экв. 35 мм",
-                "Focal length, 35 mm equiv.",
-            ),
-            f(
-                "flash",
-                "«вспышка», если сработала",
-                "\"flash\" if it fired",
-            ),
-            f("software", "Программа", "Software"),
-            f("gps", "Координаты GPS", "GPS coordinates"),
+            f("camera", n("Camera (make and model)")),
+            f("make", n("Make")),
+            f("model", n("Model")),
+            f("lens", n("Lens")),
+            f("taken", n("Date and time taken")),
+            f("date", n("Date taken")),
+            f("time", n("Time taken")),
+            f("exposure", n("Exposure (1/250 s)")),
+            f("aperture", n("Aperture (f/2.8)")),
+            f("iso", n("ISO")),
+            f("focal", n("Focal length")),
+            f("focal35", n("Focal length, 35 mm equiv.")),
+            f("flash", n("\"flash\" if it fired")),
+            f("software", n("Software")),
+            f("gps", n("GPS coordinates")),
         ],
     ),
 ];
 
 pub const VIDEO_FIELDS: FieldGroups = &[
-    (("Файл", "File"), FILE_FIELDS),
+    (n("File"), FILE_FIELDS),
     (
-        ("Воспроизведение", "Playback"),
+        n("Playback"),
         &[
-            f("time", "Текущая позиция", "Current position"),
-            f("duration", "Длительность", "Duration"),
+            f("time", n("Current position")),
+            f("duration", n("Duration")),
         ],
     ),
     (
-        ("Видео и звук", "Video and audio"),
+        n("Video and audio"),
         &[
-            f("width", "Ширина", "Width"),
-            f("height", "Высота", "Height"),
-            f("fps", "Кадров в секунду", "Frames per second"),
-            f("codec", "Видеокодек", "Video codec"),
-            f("bitrate", "Битрейт, кбит/с", "Bitrate, kbps"),
-            f("audio_codec", "Аудиокодек", "Audio codec"),
-            f("channels", "Каналы звука", "Audio channels"),
-            f("sample_rate", "Частота звука, Гц", "Sample rate, Hz"),
+            f("width", n("Width")),
+            f("height", n("Height")),
+            f("fps", n("Frames per second")),
+            f("codec", n("Video codec")),
+            f("bitrate", n("Bitrate, kbps")),
+            f("audio_codec", n("Audio codec")),
+            f("channels", n("Audio channels")),
+            f("sample_rate", n("Sample rate, Hz")),
         ],
     ),
     (
-        ("Теги", "Tags"),
+        n("Tags"),
         &[
-            f("title", "Название", "Title"),
-            f("artist", "Исполнитель", "Artist"),
-            f("director", "Режиссёр", "Director"),
-            f("year", "Дата / год", "Date / year"),
-            f("genre", "Жанр", "Genre"),
-            f("comment", "Комментарий", "Comment"),
+            f("title", n("Title")),
+            f("artist", n("Artist")),
+            f("director", n("Director")),
+            f("year", n("Date / year")),
+            f("genre", n("Genre")),
+            f("comment", n("Comment")),
         ],
     ),
 ];
@@ -186,7 +169,7 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
             .unwrap_or_default(),
         "exposure" => e
             .exposure_time
-            .map(|t| format!("{} {}", t, tr("с", "s")))
+            .map(|t| format!("{} {}", t, tr("s")))
             .unwrap_or_default(),
         "aperture" => e
             .f_number
@@ -195,15 +178,15 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
         "iso" => e.iso.map(|v| v.to_string()).unwrap_or_default(),
         "focal" => e
             .focal_length
-            .map(|f| format!("{} {}", trim_float(f, 1), tr("мм", "mm")))
+            .map(|f| format!("{} {}", trim_float(f, 1), tr("mm")))
             .unwrap_or_default(),
         "focal35" => e
             .focal_length_35mm
-            .map(|f| format!("{} {}", f, tr("мм", "mm")))
+            .map(|f| format!("{} {}", f, tr("mm")))
             .unwrap_or_default(),
         "flash" => {
             if e.flash_fired == Some(true) {
-                tr("вспышка", "flash").to_string()
+                tr("flash").to_string()
             } else {
                 String::new()
             }
@@ -275,8 +258,8 @@ fn format_date(raw: &str) -> String {
 
 pub fn channels(n: u32) -> String {
     match n {
-        1 => tr("моно", "mono").into(),
-        2 => tr("стерео", "stereo").into(),
+        1 => tr("mono").into(),
+        2 => tr("stereo").into(),
         6 => "5.1".into(),
         8 => "7.1".into(),
         n => n.to_string(),

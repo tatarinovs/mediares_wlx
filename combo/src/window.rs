@@ -31,7 +31,7 @@ use mediares_core::tc_api::{
 };
 
 use crate::config::ViewerConfig;
-use crate::i18n::tr;
+use crate::i18n::{n, tr};
 use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, client_size, point_from_lparam};
 use crate::media_view::EventEffect;
@@ -96,105 +96,93 @@ enum Command {
 }
 
 impl Command {
-    /// Menu items with their Russian / English labels.
-    const MENU: &[Option<(Command, (&'static str, &'static str))>] = &[
+    /// Menu items with their (English) labels; shown through [`tr`].
+    const MENU: &[Option<(Command, &'static str)>] = &[
         Some((
             Command::TogglePlay,
-            ("Воспроизведение / пауза\tПробел", "Play / pause\tSpace"),
+            n("Play / pause\tSpace"),
         )),
-        Some((Command::ToggleMute, ("Без звука\tM", "Mute\tM"))),
+        Some((Command::ToggleMute, n("Mute\tM"))),
         Some((
             Command::ToggleFullscreen,
-            ("Полноэкранный режим\tEnter / F", "Full screen\tEnter / F"),
+            n("Full screen\tEnter / F"),
         )),
         Some((
             Command::Copy,
-            ("Копировать изображение\tCtrl+C", "Copy image\tCtrl+C"),
+            n("Copy image\tCtrl+C"),
         )),
         Some((
             Command::SaveAs,
-            ("Сохранить как...\tCtrl+S", "Save as...\tCtrl+S"),
+            n("Save as...\tCtrl+S"),
         )),
         Some((
             Command::SaveFrame,
-            (
-                "Сохранить кадр рядом с видео\tShift+S",
-                "Save frame next to the video\tShift+S",
-            ),
+            n("Save frame next to the video\tShift+S"),
         )),
-        Some((Command::ToggleOsd, ("Отображать OSD\tO", "Show OSD\tO"))),
-        Some((Command::ToggleSlideshow, ("Слайд-шоу\tF5", "Slideshow\tF5"))),
+        Some((Command::ToggleOsd, n("Show OSD\tO"))),
+        Some((Command::ToggleSlideshow, n("Slideshow\tF5"))),
         Some((
             Command::RotateLeft,
-            ("Повернуть влево\tL", "Rotate left\tL"),
+            n("Rotate left\tL"),
         )),
         Some((
             Command::RotateRight,
-            ("Повернуть вправо\tR", "Rotate right\tR"),
+            n("Rotate right\tR"),
         )),
         Some((
             Command::SaveRotation,
-            (
-                "Записать поворот в файл (JPEG, без потерь)\tCtrl+R",
-                "Save rotation to file (JPEG, lossless)\tCtrl+R",
-            ),
+            n("Save rotation to file (JPEG, lossless)\tCtrl+R"),
         )),
         None,
-        Some((Command::Slower, ("Медленнее\t[", "Slower\t["))),
-        Some((Command::Faster, ("Быстрее\t]", "Faster\t]"))),
+        Some((Command::Slower, n("Slower\t["))),
+        Some((Command::Faster, n("Faster\t]"))),
         Some((
             Command::NormalSpeed,
-            ("Обычная скорость\t\\", "Normal speed\t\\"),
+            n("Normal speed\t\\"),
         )),
-        Some((Command::FrameBack, ("Кадр назад\t,", "Previous frame\t,"))),
-        Some((Command::FrameForward, ("Кадр вперёд\t.", "Next frame\t."))),
+        Some((Command::FrameBack, n("Previous frame\t,"))),
+        Some((Command::FrameForward, n("Next frame\t."))),
         None,
         Some((
             Command::ToggleAutoAdvance,
-            (
-                "Автопереход к следующему файлу",
-                "Auto-advance to the next file",
-            ),
+            n("Auto-advance to the next file"),
         )),
-        Some((Command::RepeatOff, ("Без повтора", "No repeat"))),
-        Some((Command::RepeatAll, ("Повторять список", "Repeat list"))),
-        Some((Command::RepeatOne, ("Повторять файл", "Repeat file"))),
-        Some((Command::ToggleShuffle, ("Случайный порядок", "Shuffle"))),
+        Some((Command::RepeatOff, n("No repeat"))),
+        Some((Command::RepeatAll, n("Repeat list"))),
+        Some((Command::RepeatOne, n("Repeat file"))),
+        Some((Command::ToggleShuffle, n("Shuffle"))),
         None,
         Some((
             Command::ShowExif,
-            ("Просмотр EXIF...\tE", "EXIF info...\tE"),
+            n("EXIF info...\tE"),
         )),
         Some((
             Command::OpenInEditor,
-            ("Открыть в редакторе\tF4", "Open in editor\tF4"),
+            n("Open in editor\tF4"),
         )),
         Some((
             Command::ShowInFolder,
-            ("Показать в папке\tCtrl+Enter", "Show in folder\tCtrl+Enter"),
+            n("Show in folder\tCtrl+Enter"),
         )),
         Some((
             Command::SetWallpaper,
-            ("Сделать обоями рабочего стола", "Set as desktop background"),
+            n("Set as desktop background"),
         )),
-        Some((Command::Print, ("Печать...\tCtrl+P", "Print...\tCtrl+P"))),
+        Some((Command::Print, n("Print...\tCtrl+P"))),
         Some((
             Command::Delete,
-            ("Удалить в корзину\tDel", "Move to Recycle Bin\tDel"),
+            n("Move to Recycle Bin\tDel"),
         )),
         None,
-        Some((Command::ShowSettings, ("Настройки...\tS", "Settings...\tS"))),
+        Some((Command::ShowSettings, n("Settings...\tS"))),
         None,
         Some((
             Command::Next,
-            ("Следующий файл\tПробел / Right", "Next file\tSpace / Right"),
+            n("Next file\tSpace / Right"),
         )),
         Some((
             Command::Previous,
-            (
-                "Предыдущий файл\tBackspace / Left",
-                "Previous file\tBackspace / Left",
-            ),
+            n("Previous file\tBackspace / Left"),
         )),
     ];
 
@@ -213,13 +201,10 @@ impl Command {
     }
 
     /// For audio/video, where Space plays / pauses and Left / Right seek (see [`Self::from_key`]).
-    fn media_label(self, media: bool) -> Option<(&'static str, &'static str)> {
+    fn media_label(self, media: bool) -> Option<&'static str> {
         match self {
-            Command::Next if media => Some(("Следующий файл\tN / PgDn", "Next file\tN / PgDn")),
-            Command::Previous if media => Some((
-                "Предыдущий файл\tBackspace / PgUp",
-                "Previous file\tBackspace / PgUp",
-            )),
+            Command::Next if media => Some(n("Next file\tN / PgDn")),
+            Command::Previous if media => Some(n("Previous file\tBackspace / PgUp")),
             _ => None,
         }
     }
@@ -608,7 +593,7 @@ unsafe fn caption(state: &ViewerState) -> String {
         );
     }
     if state.slideshow {
-        title += tr(" [слайд-шоу]", " [slideshow]");
+        title += tr(" [slideshow]");
     }
     title
 }
@@ -769,12 +754,9 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
             if let Some(media) = state.media.as_mut() {
                 let text = if copied {
-                    tr(
-                        "Изображение скопировано в буфер обмена",
-                        "Image copied to the clipboard",
-                    )
+                    tr("Image copied to the clipboard")
                 } else {
-                    tr("Нечего копировать", "Nothing to copy")
+                    tr("Nothing to copy")
                 };
                 media.show_status(text.to_string());
             }
@@ -791,10 +773,10 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let text = match saved {
                 Some(target) => format!(
                     "{}: {}",
-                    tr("Кадр сохранён", "Frame saved"),
+                    tr("Frame saved"),
                     target.file_name().unwrap_or_default().to_string_lossy()
                 ),
-                None => tr("Не удалось сохранить кадр", "Could not save the frame").to_string(),
+                None => tr("Could not save the frame").to_string(),
             };
             media.show_status(text);
         }
@@ -820,23 +802,14 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let path = state.file_path.clone();
             if !file_actions::open_in_editor(hwnd, &path, &editor) {
                 let text = if editor.is_empty() {
-                    tr(
-                        "Не удалось открыть файл во внешней программе.",
-                        "Could not open the file in an external program.",
-                    )
+                    tr("Could not open the file in an external program.")
                     .to_string()
                 } else {
                     format!(
                         "{}:\n{}\n\n{}",
-                        tr(
-                            "Не удалось запустить редактор",
-                            "Could not start the editor"
-                        ),
+                        tr("Could not start the editor"),
                         editor,
-                        tr(
-                            "Путь задаётся в настройках (S).",
-                            "The path is set in Settings (S)."
-                        ),
+                        tr("The path is set in Settings (S)."),
                     )
                 };
                 file_actions::show_error(dialog::modal_owner(hwnd), &text);
@@ -1000,20 +973,14 @@ unsafe fn save_rotation(hwnd: HWND) {
     if state.quarter_turns == 0 {
         file_actions::show_error(
             owner,
-            tr(
-                "Сначала поверните фото клавишами L / R.",
-                "Turn the photo with L / R first.",
-            ),
+            tr("Turn the photo with L / R first."),
         );
         return;
     }
     if !is_jpeg_file(&path) {
         file_actions::show_error(
             owner,
-            tr(
-                "Поворот без потерь записывается только в JPEG.\nДля других форматов используйте «Сохранить как» (Ctrl+S).",
-                "Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S).",
-            ),
+            tr("Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S)."),
         );
         return;
     }
@@ -1030,7 +997,7 @@ unsafe fn save_rotation(hwnd: HWND) {
             owner,
             &format!(
                 "{}:\n{}\n\n{}",
-                tr("Не удалось записать поворот", "Could not save the rotation"),
+                tr("Could not save the rotation"),
                 path.display(),
                 e
             ),
@@ -1044,10 +1011,7 @@ unsafe fn save_rotation(hwnd: HWND) {
     } else {
         file_actions::show_error(
             owner,
-            tr(
-                "Поворот записан. Автоповорот по EXIF выключен в настройках, поэтому здесь фото показано без него.",
-                "Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it.",
-            ),
+            tr("Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it."),
         );
     }
 }
@@ -1083,10 +1047,7 @@ unsafe fn set_wallpaper(hwnd: HWND) {
     if !source.is_some_and(|s| file_actions::set_wallpaper(&s)) {
         file_actions::show_error(
             dialog::modal_owner(hwnd),
-            tr(
-                "Не удалось установить обои.",
-                "Could not set the desktop background.",
-            ),
+            tr("Could not set the desktop background."),
         );
     }
 }
@@ -1203,7 +1164,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
                     cmd => cmd.repeat_mode().is_some_and(|r| r == queue.repeat),
                 };
                 let label = cmd.media_label(media).unwrap_or(*label);
-                menu.item(*cmd as u32, tr(label.0, label.1), checked);
+                menu.item(*cmd as u32, tr(label), checked);
             }
             None => menu.separator(),
         }

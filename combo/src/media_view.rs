@@ -391,7 +391,7 @@ impl MediaView {
         let rate = v.change_rate(faster);
         self.show_status(format!(
             "{} {}×",
-            tr("Скорость", "Speed"),
+            tr("Speed"),
             i18n::decimal(rate.to_string())
         ));
     }
@@ -400,10 +400,7 @@ impl MediaView {
         if let Content::Video(v) = &mut self.content {
             if !v.frame_step(forward) {
                 self.show_status(
-                    tr(
-                        "Шаг назад недоступен для этого файла (неточная перемотка)",
-                        "Stepping back is not available for this file (inexact seeking)",
-                    )
+                    tr("Stepping back is not available for this file (inexact seeking)")
                     .to_string(),
                 );
             }
@@ -426,7 +423,7 @@ impl MediaView {
                 if let Some(t) = v.take_resumed() {
                     self.show_status(format!(
                         "{} {}",
-                        tr("Продолжение с", "Resuming from"),
+                        tr("Resuming from"),
                         transport_bar::format_time(t)
                     ));
                 }

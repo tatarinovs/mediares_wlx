@@ -116,10 +116,10 @@ impl OsdMode {
 
     pub fn label(self) -> &'static str {
         match self {
-            OsdMode::Off => tr("Не показывать", "Hidden"),
-            OsdMode::Photo => tr("На фото", "On photos"),
-            OsdMode::Video => tr("На видео", "On videos"),
-            OsdMode::Both => tr("На фото и видео", "On photos and videos"),
+            OsdMode::Off => tr("Hidden"),
+            OsdMode::Photo => tr("On photos"),
+            OsdMode::Video => tr("On videos"),
+            OsdMode::Both => tr("On photos and videos"),
         }
     }
 

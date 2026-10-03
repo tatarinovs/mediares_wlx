@@ -65,12 +65,9 @@ impl Registration {
         {
             return Err(format!(
                 "{} {}.\n\n{} [ContentPlugins]:\n{}={}",
-                tr("Не удалось записать в", "Could not write to"),
+                tr("Could not write to"),
                 self.ini.display(),
-                tr(
-                    "Добавьте вручную в секцию",
-                    "Add it manually to the section"
-                ),
+                tr("Add it manually to the section"),
                 index,
                 value
             ));

@@ -56,12 +56,7 @@ pub unsafe fn show(
     let font = crate::gdi::create_font("Segoe UI", -12, false);
     let mono = crate::gdi::create_font("Consolas", -14, false);
     let tab = WS_TABSTOP.0;
-    let hint = tr(
-        "{поле} — значение поля. <…> — блок, который скрывается, если в нём есть пустое поле.\n\
-                {{ }} << >> — сами символы. Enter — новая строка OSD.",
-        "{field} — the field's value. <…> — a block hidden when a field in it is empty.\n\
-                {{ }} << >> — the characters themselves. Enter — a new OSD line.",
-    );
+    let hint = tr("{field} — the field's value. <…> — a block hidden when a field in it is empty.\n{{ }} << >> — the characters themselves. Enter — a new OSD line.");
     dialog::control(
         dlg,
         w!("STATIC"),
@@ -99,22 +94,22 @@ pub unsafe fn show(
         );
     };
     button(
-        tr("Добавить поле...", "Add field..."),
+        tr("Add field..."),
         15,
         140,
         IDC_ADD_FIELD,
         BS_PUSHBUTTON as u32,
     );
     button(
-        tr("По умолчанию", "Default"),
+        tr("Default"),
         165,
         125,
         IDC_DEFAULT,
         BS_PUSHBUTTON as u32,
     );
-    button(tr("ОК", "OK"), 425, 95, IDOK.0, BS_DEFPUSHBUTTON as u32);
+    button(tr("OK"), 425, 95, IDOK.0, BS_DEFPUSHBUTTON as u32);
     button(
-        tr("Отмена", "Cancel"),
+        tr("Cancel"),
         535,
         95,
         IDCANCEL.0,
@@ -156,7 +151,7 @@ unsafe fn add_field(dlg: HWND, ctx: &Context) {
             menu,
             MF_POPUP,
             sub.0 as usize,
-            &HSTRING::from(tr(group.0, group.1)),
+            &HSTRING::from(tr(group)),
         );
     }
 
