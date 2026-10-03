@@ -39,6 +39,11 @@ const MAX_RENDER_SIDE: f32 = 8192.0;
 /// SVG files (after SVGZ unpacking) beyond this are not parsed: the XML tree costs far more
 /// memory than the file.
 const MAX_XML_BYTES: u64 = 64 * 1024 * 1024;
+/// Direct2D's SVG engine crashes (access violation in d2d1.dll, about once in a hundred) when two
+/// threads parse documents at once, even on separate single-threaded factories: TC's thumbnail
+/// thread and the viewer do. One document at a time.
+static D2D_SVG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Size the SVG spec prescribes when neither `width`/`height` nor `viewBox` give one.
 const DEFAULT_SIZE: (f32, f32) = (300.0, 150.0);
 
@@ -168,13 +173,16 @@ fn parsed_size(xml: &[u8]) -> Option<(f32, f32)> {
 /// The drawing's own size, rounded.
 pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     let _com = ComScope::new();
-    let (w, h) = parsed_size(&read_xml(path)?)?;
+    let xml = read_xml(path)?;
+    let _d2d = D2D_SVG.lock().unwrap_or_else(|e| e.into_inner());
+    let (w, h) = parsed_size(&xml)?;
     Some(((w.round() as u32).max(1), (h.round() as u32).max(1)))
 }
 
 pub fn decode(path: &Path) -> Option<DynamicImage> {
     let _com = ComScope::new();
     let xml = read_xml(path)?;
+    let _d2d = D2D_SVG.lock().unwrap_or_else(|e| e.into_inner());
     let size = parsed_size(&xml)?;
     let (w, h, scale) = render_size(size)?;
     let canvas = Canvas::new(w, h)?;

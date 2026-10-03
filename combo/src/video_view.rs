@@ -439,7 +439,9 @@ impl VideoView {
             return true;
         }
         match &mut self.stepping {
-            Some(step) => step.remaining += 1,
+            // Key auto-repeat outruns a slow decoder: queue at most one more frame, so the
+            // picture stops as soon as the key is released.
+            Some(step) => step.remaining = (step.remaining + 1).min(2),
             None => {
                 let muted = self.player.is_muted();
                 self.player.set_muted(true);

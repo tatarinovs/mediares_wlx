@@ -54,11 +54,17 @@ const AUDIO_EXTS: &[&str] = &[
     "mp3", "mp2", "flac", "wav", "ogg", "oga", "opus", "m4a", "m4b", "aac", "wma", "aif", "aiff",
     "aifc", "caf", "mka", "ac3",
 ];
-/// Audio only libmpv plays (FFmpeg decoders); counted as audio once it is found, see
-/// [`enable_mpv_formats`].
+/// Video and audio only libmpv plays (FFmpeg demuxers and decoders); recognized once it is
+/// found, see [`enable_mpv_formats`]. Fixed for a full build (shinchiro / zhongfly): asking the
+/// DLL itself costs about a second at TC's start, and a build missing a decoder just reports
+/// the file as unsupported.
+const MPV_VIDEO_EXTS: &[&str] = &[
+    "m2ts", "m2t", "rm", "rmvb", "ogv", "divx", "f4v", "mxf", "y4m", "dav", "nut", "dv",
+];
 const MPV_AUDIO_EXTS: &[&str] = &[
     "ape", "wv", "dsf", "dff", "tta", "mpc", "tak", "dts", "eac3", "thd", "mlp", "spx", "shn",
-    "w64", "amr", "au", "ra",
+    "w64", "amr", "au", "ra", // tracker music through libopenmpt:
+    "mod", "xm", "it", "s3m", "mptm",
 ];
 const PLAYLIST_EXTS: &[&str] = &["m3u", "m3u8"];
 
@@ -67,6 +73,21 @@ static MPV_FORMATS: AtomicBool = AtomicBool::new(false);
 /// libmpv is installed: the formats only it plays are recognized from now on.
 pub fn enable_mpv_formats() {
     MPV_FORMATS.store(true, Ordering::Relaxed);
+}
+
+/// One of the formats recognized only because libmpv is installed: Media Foundation either
+/// can't open it or (through a third-party source) reports the decoded PCM instead of the codec.
+pub fn is_mpv_only(path: &Path) -> bool {
+    has_extension(path, MPV_VIDEO_EXTS) || has_extension(path, MPV_AUDIO_EXTS)
+}
+
+fn video_exts() -> &'static [&'static str] {
+    static WITH_MPV: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    if MPV_FORMATS.load(Ordering::Relaxed) {
+        WITH_MPV.get_or_init(|| [VIDEO_EXTS, MPV_VIDEO_EXTS].concat())
+    } else {
+        VIDEO_EXTS
+    }
 }
 
 fn audio_exts() -> &'static [&'static str] {
@@ -93,7 +114,7 @@ impl MediaType {
             MediaType::StandardImage => standard_image_exts(),
             MediaType::RawImage => RAW_EXTS,
             MediaType::PsdImage => PSD_EXTS,
-            MediaType::Video => VIDEO_EXTS,
+            MediaType::Video => video_exts(),
             MediaType::Audio => audio_exts(),
             MediaType::Playlist => PLAYLIST_EXTS,
             MediaType::Unsupported => &[],

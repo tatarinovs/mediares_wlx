@@ -64,6 +64,20 @@ pub struct MediaView {
     last_seek_step: Option<Instant>,
 }
 
+/// RealMedia, Ogg and the like are often sound only: those play in the audio view (tags, cover,
+/// no black picture).
+fn playable_kind(path: &Path, kind: MediaType) -> MediaType {
+    if kind != MediaType::Video || !mediares_core::probe::is_mpv_only(path) {
+        return kind;
+    }
+    match mediares_core::cache::get_video_meta(path) {
+        Some(meta) if meta.codec.is_none() && meta.width == 0 && meta.audio_codec.is_some() => {
+            MediaType::Audio
+        }
+        _ => kind,
+    }
+}
+
 impl MediaView {
     /// Opens `path` (`kind` must be playable), reusing `previous` when it shows the same kind of
     /// content. `None` if the file can't be played.
@@ -74,6 +88,7 @@ impl MediaView {
         kind: MediaType,
         resume: bool,
     ) -> Option<MediaView> {
+        let kind = playable_kind(path, kind);
         if let Some(mut view) = previous {
             let reused = match &mut view.content {
                 Content::Video(v) if kind == MediaType::Video => v.open(path, resume),

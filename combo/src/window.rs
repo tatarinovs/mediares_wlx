@@ -16,24 +16,26 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetClassNameW, GetClientRect, GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW,
-    SetCursor, SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, TrackPopupMenu, CS_DBLCLKS,
-    GWLP_USERDATA, GWL_STYLE, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MENU_ITEM_FLAGS, MF_CHECKED,
-    MF_SEPARATOR, MF_STRING, MF_UNCHECKED, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND, WM_DESTROY, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
-    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, SetCursor, SetTimer,
+    SetWindowLongPtrW, SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
+    IDC_HAND, IDC_SIZEALL, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND, WM_DESTROY, WM_DRAWITEM,
+    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM,
+    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW,
+    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
-use mediares_core::tc_api::{LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS};
+use mediares_core::tc_api::{
+    LCP_DARKMODE, LCP_FITLARGERONLY, LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS,
+};
 
 use crate::config::ViewerConfig;
 use crate::i18n::tr;
 use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, client_size, point_from_lparam};
 use crate::media_view::EventEffect;
+use crate::menu_theme::{self, ThemedMenu};
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
 use crate::playback_video::WM_MEDIA_EVENT;
 use crate::playlist::Repeat;
@@ -454,7 +456,8 @@ pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) 
 }
 
 /// `ListSendCommand`. A toggled `LCP_FITTOWINDOW` means the user pressed TC's `F` hotkey,
-/// which we map to fullscreen (the viewer always fits the window anyway).
+/// which we map to fullscreen (the viewer always fits the window anyway); a toggled
+/// `LCP_FITLARGERONLY` is TC's `L` ("fit larger only"), our rotate left.
 pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
     let Some(state) = get_state(hwnd) else {
         return false;
@@ -466,9 +469,12 @@ pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
         execute(hwnd, Command::Copy);
         return true;
     }
-    let fit_toggled = (state.show_flags ^ parameter) & LCP_FITTOWINDOW != 0;
+    let toggled = state.show_flags ^ parameter;
     state.show_flags = parameter;
-    if fit_toggled {
+    // `L` alone, whatever TC does to the fit flag along with it.
+    if toggled & LCP_FITLARGERONLY != 0 {
+        execute(hwnd, Command::RotateLeft);
+    } else if toggled & LCP_FITTOWINDOW != 0 {
         execute(hwnd, Command::ToggleFullscreen);
     }
     true
@@ -1158,7 +1164,6 @@ unsafe fn zoom_at(state: &mut ViewerState, view: (f32, f32), zoom_in: bool, anch
 
 unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     let Some(state) = get_state(hwnd) else { return };
-    let checked = |on: bool| if on { MF_CHECKED } else { MF_UNCHECKED };
     let (fullscreen, media, queue) = (
         state.fullscreen.is_some(),
         state.media.is_some(),
@@ -1171,7 +1176,9 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
         state.config.osd.photo()
     };
 
-    let Ok(menu) = CreatePopupMenu() else { return };
+    let Some(mut menu) = ThemedMenu::new(hwnd, state.show_flags & LCP_DARKMODE != 0) else {
+        return;
+    };
     // Fullscreen hides the idle cursor: the menu needs it.
     if let Some(fs) = state.overlay.as_mut() {
         fs.reveal_cursor(hwnd);
@@ -1188,40 +1195,28 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
         previous_was_separator = item.is_none();
         match item {
             Some((cmd, label)) => {
-                let flags = match cmd {
-                    Command::ToggleFullscreen => checked(fullscreen),
-                    Command::ToggleOsd => checked(osd),
-                    Command::ToggleAutoAdvance => checked(queue.auto_advance),
-                    Command::ToggleShuffle => checked(queue.shuffle),
-                    cmd => cmd
-                        .repeat_mode()
-                        .map_or(MENU_ITEM_FLAGS(0), |r| checked(r == queue.repeat)),
+                let checked = match cmd {
+                    Command::ToggleFullscreen => fullscreen,
+                    Command::ToggleOsd => osd,
+                    Command::ToggleAutoAdvance => queue.auto_advance,
+                    Command::ToggleShuffle => queue.shuffle,
+                    cmd => cmd.repeat_mode().is_some_and(|r| r == queue.repeat),
                 };
                 let label = cmd.media_label(media).unwrap_or(*label);
-                let _ = AppendMenuW(
-                    menu,
-                    MF_STRING | flags,
-                    *cmd as usize,
-                    &HSTRING::from(tr(label.0, label.1)),
-                );
+                menu.item(*cmd as u32, tr(label.0, label.1), checked);
             }
-            None => {
-                let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
-            }
+            None => menu.separator(),
         }
     }
-    let id = TrackPopupMenu(
-        menu,
-        TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
+    let id = menu.track(
+        hwnd,
         screen.x,
         screen.y,
-        Some(0),
-        hwnd,
-        None,
+        TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD,
     );
-    let _ = DestroyMenu(menu);
+    drop(menu);
 
-    if let Some(cmd) = usize::try_from(id.0).ok().and_then(Command::from_raw) {
+    if let Some(cmd) = Command::from_raw(id as usize) {
         execute(hwnd, cmd);
     }
 }
@@ -1369,6 +1364,8 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let _ = InvalidateRect(Some(hwnd), None, false);
             update_title(state);
         }
+        WM_MEASUREITEM if menu_theme::measure_item(lparam) => return LRESULT(1),
+        WM_DRAWITEM if menu_theme::draw_item(lparam) => return LRESULT(1),
         WM_RBUTTONUP => {
             let mut pt = point_from_lparam(lparam.0);
             let _ = ClientToScreen(hwnd, &mut pt);

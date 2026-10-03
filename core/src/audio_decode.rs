@@ -174,7 +174,12 @@ impl AudioDecoder {
 /// Probes the container of `path` (tags and pictures included). MP3 wrapped in a WAV header
 /// (format tag 0x55) is handed over as a plain MPEG stream — symphonia's WAV reader only takes
 /// PCM — keeping any tags in front of and behind the RIFF structure.
+/// Formats only libmpv plays are refused: APE and WavPack keep the source WAV header inside, and
+/// symphonia's probe finds it and reads the compressed data as PCM.
 pub(crate) fn open_format(path: &Path) -> Option<Box<dyn FormatReader>> {
+    if crate::probe::is_mpv_only(path) {
+        return None;
+    }
     let mut file = File::open(path).ok()?;
     let mut hint = Hint::new();
     let source: Box<dyn MediaSource> = match riff_mp3_ranges(&mut file) {

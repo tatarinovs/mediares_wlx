@@ -14,6 +14,7 @@ mod i18n;
 mod image_cache;
 mod image_view;
 mod media_view;
+mod menu_theme;
 mod osd_template;
 mod osd_template_dialog;
 mod overlay;
@@ -80,7 +81,7 @@ pub unsafe extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *m
 // Total Commander WDX (Content Plugin) API
 // ==========================================
 
-mediares_core::export_content_plugin!();
+mediares_core::export_content_plugin!(init = init_formats);
 
 // ==========================================
 // Total Commander WLX (Lister Plugin) API
@@ -97,6 +98,10 @@ fn init_formats() {
                 playback_mpv::PICTURE_EXTS,
                 playback_mpv::picture,
             );
+            mediares_core::cache::set_meta_fallback(mediares_core::cache::MetaFallback {
+                video: playback_mpv::video_meta,
+                audio: playback_mpv::audio_meta,
+            });
         }
     });
 }

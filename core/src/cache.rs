@@ -225,9 +225,40 @@ fn video_meta_cache() -> &'static MetaCache<VideoMeta> {
     VIDEO.get_or_init(MetaCache::new)
 }
 
+/// Stream properties of files Media Foundation can't open (the viewer plugs libmpv in here when
+/// it is installed). Asked first for the formats only libmpv plays, see `probe::is_mpv_only`.
+pub struct MetaFallback {
+    pub video: fn(&Path) -> Option<VideoMeta>,
+    pub audio: fn(&Path) -> Option<crate::mf_audio::AudioStreamMeta>,
+}
+
+static META_FALLBACK: OnceLock<MetaFallback> = OnceLock::new();
+
+/// Only the first registration counts.
+pub fn set_meta_fallback(fallback: MetaFallback) {
+    let _ = META_FALLBACK.set(fallback);
+}
+
+type MetaReader<T> = fn(&Path) -> Option<T>;
+
+fn with_fallback<T>(
+    path: &Path,
+    mf: MetaReader<T>,
+    pick: fn(&MetaFallback) -> MetaReader<T>,
+) -> Option<T> {
+    let Some(fallback) = META_FALLBACK.get().map(pick) else {
+        return mf(path);
+    };
+    if crate::probe::is_mpv_only(path) {
+        fallback(path).or_else(|| mf(path))
+    } else {
+        mf(path).or_else(|| fallback(path))
+    }
+}
+
 /// Stream properties via Media Foundation: no decoding, but opening the source still takes a while.
 pub fn get_video_meta(path: &Path) -> Option<Arc<VideoMeta>> {
-    video_meta_cache().get_or_read(path, probe_video_meta)
+    video_meta_cache().get_or_read(path, |p| with_fallback(p, probe_video_meta, |f| f.video))
 }
 
 pub fn is_video_meta_cached(path: &Path) -> bool {
@@ -241,7 +272,9 @@ fn audio_meta_cache() -> &'static MetaCache<crate::mf_audio::AudioStreamMeta> {
 
 /// Audio stream properties via Media Foundation, for files symphonia can't parse (WMA, AC3...).
 pub fn get_audio_meta(path: &Path) -> Option<Arc<crate::mf_audio::AudioStreamMeta>> {
-    audio_meta_cache().get_or_read(path, crate::mf_audio::probe_audio_meta)
+    audio_meta_cache().get_or_read(path, |p| {
+        with_fallback(p, crate::mf_audio::probe_audio_meta, |f| f.audio)
+    })
 }
 
 pub fn is_audio_meta_cached(path: &Path) -> bool {

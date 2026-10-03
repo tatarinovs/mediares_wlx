@@ -810,6 +810,10 @@ impl Output {
 #[macro_export]
 macro_rules! export_content_plugin {
     () => {
+        $crate::export_content_plugin!(init = || {});
+    };
+    // `init` runs before files are looked at (the combo plugin enables libmpv's formats there).
+    (init = $init:expr) => {
         #[no_mangle]
         pub unsafe extern "system" fn ContentGetSupportedField(
             field_index: ::std::os::raw::c_int,
@@ -837,6 +841,7 @@ macro_rules! export_content_plugin {
             flags: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
+                ($init)();
                 $crate::wdx_api::content_get_value_w(
                     file_name,
                     field_index,
@@ -857,6 +862,7 @@ macro_rules! export_content_plugin {
             flags: ::std::os::raw::c_int,
         ) -> ::std::os::raw::c_int {
             $crate::ffi::guard($crate::tc_api::FT_FILEERROR, || unsafe {
+                ($init)();
                 $crate::wdx_api::content_get_value_a(
                     file_name,
                     field_index,
@@ -885,6 +891,7 @@ macro_rules! export_content_plugin {
             max_len: ::std::os::raw::c_int,
         ) {
             $crate::ffi::guard((), || unsafe {
+                ($init)();
                 $crate::wdx_api::content_get_detect_string(detect_string, max_len)
             })
         }

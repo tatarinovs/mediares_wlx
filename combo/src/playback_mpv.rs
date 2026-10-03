@@ -33,6 +33,8 @@ use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use mediares_core::audio_tags::AudioTags;
 use mediares_core::image::{DynamicImage, RgbaImage};
+use mediares_core::mf_audio::AudioStreamMeta;
+use mediares_core::video_frame::VideoMeta;
 
 use crate::playback_video::{Osd, WM_MEDIA_EVENT};
 use crate::transport_bar::Transport;
@@ -312,6 +314,231 @@ unsafe fn first_frame(
     }
 }
 
+unsafe fn get_raw<T: Default>(api: &Api, handle: Handle, name: &str, format: c_int) -> Option<T> {
+    let mut value = T::default();
+    let r = (api.get_property)(
+        handle,
+        cstr(name).as_ptr(),
+        format,
+        &mut value as *mut T as *mut c_void,
+    );
+    (r >= 0).then_some(value)
+}
+
+unsafe fn get_f64(api: &Api, handle: Handle, name: &str) -> Option<f64> {
+    get_raw::<f64>(api, handle, name, FORMAT_DOUBLE).filter(|v| v.is_finite())
+}
+
+unsafe fn get_i64(api: &Api, handle: Handle, name: &str) -> Option<i64> {
+    get_raw(api, handle, name, FORMAT_INT64)
+}
+
+unsafe fn get_flag(api: &Api, handle: Handle, name: &str) -> bool {
+    get_raw::<c_int>(api, handle, name, FORMAT_FLAG).is_some_and(|v| v != 0)
+}
+
+unsafe fn get_string(api: &Api, handle: Handle, name: &str) -> Option<String> {
+    let value: *mut c_char = get_raw::<usize>(api, handle, name, FORMAT_STRING)? as *mut c_char;
+    if value.is_null() {
+        return None;
+    }
+    let text = CStr::from_ptr(value).to_string_lossy().trim().to_string();
+    (api.free)(value as *mut c_void);
+    Some(text).filter(|t| !t.is_empty())
+}
+
+/// How long reading a file's streams may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A file opened by mpv's demuxer, nothing decoded: its streams, for files Media Foundation can't
+/// open.
+struct Probe {
+    api: &'static Api,
+    handle: Handle,
+}
+
+impl Probe {
+    fn open(path: &Path) -> Option<Self> {
+        let api = api()?;
+        unsafe {
+            let handle = create_handle(
+                api,
+                &[
+                    ("vo", "null"),
+                    ("ao", "null"),
+                    ("pause", "yes"),
+                    ("idle", "yes"),
+                ],
+            )?;
+            let probe = Self { api, handle };
+            if !command(api, handle, &["loadfile", &path.to_string_lossy()]) {
+                return None;
+            }
+            let deadline = Instant::now() + PROBE_TIMEOUT;
+            loop {
+                let left = deadline.checked_duration_since(Instant::now())?;
+                match (*(api.wait_event)(handle, left.as_secs_f64())).event_id {
+                    EVENT_NONE | EVENT_END_FILE | EVENT_SHUTDOWN => return None,
+                    EVENT_FILE_LOADED => return Some(probe),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    fn f64(&self, name: &str) -> Option<f64> {
+        unsafe { get_f64(self.api, self.handle, name) }
+    }
+
+    fn u32(&self, name: &str) -> Option<u32> {
+        unsafe { get_i64(self.api, self.handle, name) }
+            .and_then(|v| u32::try_from(v).ok())
+            .filter(|&v| v > 0)
+    }
+
+    fn string(&self, name: &str) -> Option<String> {
+        unsafe { get_string(self.api, self.handle, name) }
+    }
+
+    /// `track-list/N/` of the first track of `kind` ("video" / "audio"); cover art isn't video.
+    fn track(&self, kind: &str) -> Option<String> {
+        let count = unsafe { get_i64(self.api, self.handle, "track-list/count") }?;
+        (0..count).map(|i| format!("track-list/{i}/")).find(|t| {
+            self.string(&format!("{t}type")).as_deref() == Some(kind)
+                && !unsafe { get_flag(self.api, self.handle, &format!("{t}albumart")) }
+        })
+    }
+
+    fn duration(&self) -> f64 {
+        self.f64("duration").unwrap_or(0.0).max(0.0)
+    }
+
+    /// Whole file (size / duration), kbit/s.
+    fn bitrate_kbps(&self) -> Option<u32> {
+        let duration = self.duration();
+        let size = unsafe { get_i64(self.api, self.handle, "file-size") }?;
+        (duration >= 1.0 && size > 0)
+            .then(|| (size as f64 * 8.0 / 1000.0 / duration).round() as u32)
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        unsafe { (self.api.terminate_destroy)(self.handle) };
+    }
+}
+
+/// FFmpeg codec names as Media Foundation's are shown ("h264" → "H.264").
+fn codec_name(codec: &str) -> String {
+    let name = match codec {
+        "h264" => "H.264",
+        "hevc" => "HEVC",
+        "av1" => "AV1",
+        "vp8" => "VP8",
+        "vp9" => "VP9",
+        "mpeg1video" => "MPEG-1",
+        "mpeg2video" => "MPEG-2",
+        "mpeg4" => "MPEG-4",
+        "msmpeg4v3" => "DivX 3",
+        "rv10" | "rv20" | "rv30" | "rv40" => "RealVideo",
+        "theora" => "Theora",
+        "dvvideo" => "DV",
+        "mjpeg" => "MJPEG",
+        "prores" => "ProRes",
+        "aac" => "AAC",
+        "mp1" => "MP1",
+        "mp2" => "MP2",
+        "mp3" => "MP3",
+        "ac3" => "AC-3",
+        "eac3" => "E-AC-3",
+        "dts" | "dca" => "DTS",
+        "truehd" => "TrueHD",
+        "mlp" => "MLP",
+        "flac" => "FLAC",
+        "alac" => "ALAC",
+        "opus" => "Opus",
+        "vorbis" => "Vorbis",
+        "ape" => "APE",
+        "wavpack" => "WavPack",
+        "tta" => "TTA",
+        "tak" => "TAK",
+        "mpc7" | "mpc8" => "Musepack",
+        "cook" | "ralf" | "sipr" | "atrac3" => "RealAudio",
+        "speex" => "Speex",
+        "shorten" => "Shorten",
+        "amr_nb" | "amrnb" => "AMR",
+        "amr_wb" | "amrwb" => "AMR-WB",
+        c if c.starts_with("dsd_") => "DSD",
+        c if c.starts_with("pcm_") => "PCM",
+        c => return c.to_ascii_uppercase(),
+    };
+    name.to_string()
+}
+
+fn is_lossless(codec: &str) -> bool {
+    matches!(
+        codec,
+        "flac" | "alac" | "ape" | "wavpack" | "tta" | "tak" | "truehd" | "mlp" | "shorten" | "ralf"
+    ) || codec.starts_with("pcm_")
+        || codec.starts_with("dsd_")
+}
+
+/// Stream properties of a video Media Foundation can't open.
+pub fn video_meta(path: &Path) -> Option<VideoMeta> {
+    let probe = Probe::open(path)?;
+    // RealMedia and the like are often audio only: still worth the duration and codec.
+    let video = probe.track("video");
+    let audio = probe.track("audio");
+    if video.is_none() && audio.is_none() {
+        return None;
+    }
+    let video_prop = |name: &str| video.as_ref().map(|v| format!("{v}{name}"));
+    let audio_prop = |name: &str| {
+        audio
+            .as_ref()
+            .and_then(|a| probe.u32(&format!("{a}{name}")))
+    };
+    Some(VideoMeta {
+        width: video_prop("demux-w")
+            .and_then(|p| probe.u32(&p))
+            .unwrap_or(0),
+        height: video_prop("demux-h")
+            .and_then(|p| probe.u32(&p))
+            .unwrap_or(0),
+        duration_sec: probe.duration(),
+        frame_rate: video_prop("demux-fps")
+            .and_then(|p| probe.f64(&p))
+            .unwrap_or(0.0)
+            .max(0.0),
+        codec: video_prop("codec")
+            .and_then(|p| probe.string(&p))
+            .map(|c| codec_name(&c)),
+        bitrate_kbps: probe.bitrate_kbps(),
+        audio_codec: audio
+            .as_ref()
+            .and_then(|a| probe.string(&format!("{a}codec")))
+            .map(|c| codec_name(&c)),
+        audio_channels: audio_prop("demux-channel-count"),
+        audio_sample_rate: audio_prop("demux-samplerate"),
+    })
+}
+
+/// Stream properties of audio neither symphonia nor Media Foundation can open.
+pub fn audio_meta(path: &Path) -> Option<AudioStreamMeta> {
+    let probe = Probe::open(path)?;
+    let audio = probe.track("audio")?;
+    let codec = probe.string(&format!("{audio}codec"));
+    Some(AudioStreamMeta {
+        lossless: codec.as_deref().map(is_lossless),
+        codec: codec.as_deref().map(codec_name),
+        duration_sec: probe.duration(),
+        bitrate_kbps: probe.bitrate_kbps(),
+        sample_rate: probe.u32(&format!("{audio}demux-samplerate")),
+        channels: probe.u32(&format!("{audio}demux-channel-count")),
+        bit_depth: None,
+    })
+}
+
 /// Observed properties, told apart by their reply id.
 const OBSERVED: &[(u64, &str, c_int)] = &[
     (1, "time-pos", FORMAT_NONE),
@@ -321,6 +548,9 @@ const OBSERVED: &[(u64, &str, c_int)] = &[
     (5, "mute", FORMAT_NONE),
     (6, "eof-reached", FORMAT_FLAG),
 ];
+
+/// A frame step that shows nothing (the end of the file) stops holding back the next one.
+const STEP_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Position updates are posted at most this often (mpv reports every frame).
 const TIME_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
@@ -332,6 +562,8 @@ struct Shared {
     seeking: AtomicBool,
     /// Error code (`MF_MEDIA_ENGINE_ERR`) of the last failed file, 0 if none.
     error: AtomicU16,
+    /// A frame step was sent and its frame isn't on screen yet.
+    stepping: AtomicBool,
 }
 
 /// `Handle` is thread-safe by libmpv's contract.
@@ -348,6 +580,8 @@ pub struct MpvPlayer {
     size: std::cell::Cell<(i32, i32)>,
     /// OSD text on screen, as sent to mpv.
     osd: std::cell::RefCell<Option<String>>,
+    /// When the pending frame step was sent.
+    step_sent: std::cell::Cell<Option<Instant>>,
 }
 
 /// Both kinds of players.
@@ -400,6 +634,7 @@ impl MpvPlayer {
             stop: AtomicBool::new(false),
             seeking: AtomicBool::new(false),
             error: AtomicU16::new(0),
+            stepping: AtomicBool::new(false),
         });
         let events = {
             let shared = shared.clone();
@@ -423,6 +658,7 @@ impl MpvPlayer {
             events: Some(events),
             size: std::cell::Cell::new((1, 1)),
             osd: std::cell::RefCell::new(None),
+            step_sent: std::cell::Cell::new(None),
         })
     }
 
@@ -610,7 +846,8 @@ impl MpvPlayer {
             }
         };
         fill(&mut tags.title, &["title"]);
-        fill(&mut tags.artist, &["artist"]);
+        // RealMedia calls the artist "author".
+        fill(&mut tags.artist, &["artist", "author"]);
         fill(&mut tags.album, &["album"]);
         fill(&mut tags.album_artist, &["album_artist", "album artist"]);
         fill(&mut tags.genre, &["genre"]);
@@ -649,8 +886,19 @@ impl MpvPlayer {
         self.shared.seeking.load(Ordering::SeqCst) || self.get_flag("seeking")
     }
 
-    /// One frame forward / back, ending paused.
+    /// One frame forward / back, ending paused. mpv adds up steps sent before the last one is
+    /// shown, and key auto-repeat outruns a slow decoder: those are dropped, so the picture
+    /// stops as soon as the key is released (at the end of the file no frame comes, hence the
+    /// time limit).
     pub fn frame_step(&self, forward: bool) {
+        let now = Instant::now();
+        if self.shared.stepping.load(Ordering::SeqCst)
+            && self.step_sent.get().is_some_and(|t| now - t < STEP_TIMEOUT)
+        {
+            return;
+        }
+        self.shared.stepping.store(true, Ordering::SeqCst);
+        self.step_sent.set(Some(now));
         self.command(&[if forward {
             "frame-step"
         } else {
@@ -727,6 +975,7 @@ fn event_loop(api: &'static Api, handle: Handle, shared: &Shared, target: isize)
             EVENT_VIDEO_RECONFIG => post(MF_MEDIA_ENGINE_EVENT_FORMATCHANGE),
             EVENT_PLAYBACK_RESTART => {
                 shared.seeking.store(false, Ordering::SeqCst);
+                shared.stepping.store(false, Ordering::SeqCst);
                 post(MF_MEDIA_ENGINE_EVENT_SEEKED);
             }
             EVENT_END_FILE => {
@@ -744,6 +993,7 @@ fn event_loop(api: &'static Api, handle: Handle, shared: &Shared, target: isize)
             }
             EVENT_PROPERTY_CHANGE => match event.reply_userdata {
                 1 => {
+                    shared.stepping.store(false, Ordering::SeqCst);
                     if last_time_update.is_none_or(|t| t.elapsed() >= TIME_UPDATE_INTERVAL) {
                         last_time_update = Some(Instant::now());
                         post(MF_MEDIA_ENGINE_EVENT_TIMEUPDATE);

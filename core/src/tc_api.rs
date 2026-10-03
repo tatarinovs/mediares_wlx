@@ -58,3 +58,5 @@ pub const LCP_ASCII: c_int = 8;
 pub const LCP_FORCESHOW: c_int = 16;
 pub const LCP_FITLARGERONLY: c_int = 32;
 pub const LCP_CENTER: c_int = 64;
+/// TC 11+: TC uses its dark theme (also re-sent via `LC_NEWPARAMS` when it switches).
+pub const LCP_DARKMODE: c_int = 128;
