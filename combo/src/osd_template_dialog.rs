@@ -100,21 +100,9 @@ pub unsafe fn show(
         IDC_ADD_FIELD,
         BS_PUSHBUTTON as u32,
     );
-    button(
-        tr("Default"),
-        165,
-        125,
-        IDC_DEFAULT,
-        BS_PUSHBUTTON as u32,
-    );
+    button(tr("Default"), 165, 125, IDC_DEFAULT, BS_PUSHBUTTON as u32);
     button(tr("OK"), 425, 95, IDOK.0, BS_DEFPUSHBUTTON as u32);
-    button(
-        tr("Cancel"),
-        535,
-        95,
-        IDCANCEL.0,
-        BS_PUSHBUTTON as u32,
-    );
+    button(tr("Cancel"), 535, 95, IDCANCEL.0, BS_PUSHBUTTON as u32);
 
     dialog::run_modal(dlg, edit);
     // run_modal returns only after the window is destroyed, so nothing references `ctx` anymore.
@@ -147,12 +135,7 @@ unsafe fn add_field(dlg: HWND, ctx: &Context) {
             );
         }
         // The submenu is destroyed with its parent.
-        let _ = AppendMenuW(
-            menu,
-            MF_POPUP,
-            sub.0 as usize,
-            &HSTRING::from(tr(group)),
-        );
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &HSTRING::from(tr(group)));
     }
 
     let mut rc = RECT::default();

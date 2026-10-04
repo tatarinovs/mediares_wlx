@@ -144,6 +144,7 @@ impl OsdMode {
 
 pub const LOUPE_SCALE_RANGE: (f32, f32) = (1.0, 5.0);
 pub const FONT_SIZE_RANGE: (i32, i32) = (8, 72);
+pub const SEEK_STEP_RANGE: (i32, i32) = (1, 600);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerConfig {
@@ -174,6 +175,8 @@ pub struct ViewerConfig {
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
     pub resume_video: bool,
+    /// Left / Right arrow step, seconds.
+    pub seek_step_sec: u32,
     pub frame_format: FrameFormat,
     /// Programs for "Открыть в редакторе"; empty = the file type's Edit verb or default program.
     pub photo_editor: String,
@@ -205,6 +208,7 @@ impl Default for ViewerConfig {
             smooth_zoom: true,
             confirm_delete: true,
             resume_video: true,
+            seek_step_sec: 5,
             frame_format: FrameFormat::Png,
             photo_editor: String::new(),
             video_editor: String::new(),
@@ -300,6 +304,8 @@ impl ViewerConfig {
             smooth_zoom: int(w!("SmoothZoom"), d.smooth_zoom as i32) != 0,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
+            seek_step_sec: int(w!("SeekStep"), d.seek_step_sec as i32)
+                .clamp(SEEK_STEP_RANGE.0, SEEK_STEP_RANGE.1) as u32,
             frame_format: FrameFormat::from_ini(&string(w!("FrameFormat"), "")),
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
@@ -344,6 +350,7 @@ impl ViewerConfig {
             write(w!("SmoothZoom"), flag(self.smooth_zoom)),
             write(w!("ConfirmDelete"), flag(self.confirm_delete)),
             write(w!("ResumeVideo"), flag(self.resume_video)),
+            write(w!("SeekStep"), self.seek_step_sec.to_string()),
             write(w!("FrameFormat"), self.frame_format.extension().to_string()),
             write(w!("PhotoEditor"), self.photo_editor.clone()),
             write(w!("VideoEditor"), self.video_editor.clone()),

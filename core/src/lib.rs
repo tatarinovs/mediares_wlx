@@ -111,7 +111,11 @@ pub(crate) mod test_util {
         // length, suggested buffer, quality, sample size, frame rectangle.
         let mut strh = b"vidsDIB ".to_vec();
         strh.extend(u32s(&[0, 0, 0, 1, fps, 0, frames, frame_size, u32::MAX, 0]));
-        strh.extend([0u16, 0, width as u16, height as u16].iter().flat_map(|v| v.to_le_bytes()));
+        strh.extend(
+            [0u16, 0, width as u16, height as u16]
+                .iter()
+                .flat_map(|v| v.to_le_bytes()),
+        );
         // BITMAPINFOHEADER, bottom-up 24-bit BI_RGB.
         let mut strf = u32s(&[40, width, height]);
         strf.extend_from_slice(&1u16.to_le_bytes());
@@ -121,7 +125,10 @@ pub(crate) mod test_util {
             b"hdrl",
             &[
                 chunk(b"avih", &avih),
-                list(b"strl", &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat()),
+                list(
+                    b"strl",
+                    &[chunk(b"strh", &strh), chunk(b"strf", &strf)].concat(),
+                ),
             ]
             .concat(),
         );

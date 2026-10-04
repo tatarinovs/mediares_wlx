@@ -850,8 +850,11 @@ fn test_return_codes_reach_tc_as_in_the_sdk() {
 /// dialogs: a field missing there would show up in English among the translated ones.
 #[test]
 fn test_every_field_has_a_russian_name() {
-    let lng = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../pluginst/mediares.lng"))
-        .expect("pluginst/mediares.lng");
+    let lng = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../pluginst/mediares.lng"
+    ))
+    .expect("pluginst/mediares.lng");
     assert!(!lng.starts_with(&[0xEF, 0xBB, 0xBF]), "ANSI, no UTF-8 BOM");
     let mut section = Vec::new();
     let mut in_rus = false;
@@ -875,5 +878,7 @@ fn test_every_field_has_a_russian_name() {
     names.dedup();
     assert_eq!(names.len(), section.len(), "translations are unique");
     // Characters TC uses in field references ([=plugin.Field.Unit]) stay out of the names.
-    assert!(names.iter().all(|n| !n.is_empty() && !n.iter().any(|b| b"|[]".contains(b))));
+    assert!(names
+        .iter()
+        .all(|n| !n.is_empty() && !n.iter().any(|b| b"|[]".contains(b))));
 }

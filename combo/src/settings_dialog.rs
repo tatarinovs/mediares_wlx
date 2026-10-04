@@ -63,6 +63,7 @@ const IDC_NO_UPSCALE: i32 = 128;
 const IDC_LANGUAGE: i32 = 129;
 const IDC_FRAME_FORMAT: i32 = 130;
 const IDC_SMOOTH_ZOOM: i32 = 131;
+const IDC_SEEK_STEP: i32 = 132;
 
 const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
@@ -77,6 +78,7 @@ const SS_SUNKEN: u32 = 0x1000;
 const LOUPE_SCALES: &[f32] = &[1.0, 1.5, 2.0, 2.5, 3.0];
 const FONT_SIZES: &[i32] = &[10, 12, 14, 16, 18, 20, 24, 28, 32];
 const SLIDESHOW_SECONDS: &[u32] = &[2, 3, 4, 5, 7, 10, 15, 30, 60];
+const SEEK_STEPS: &[u32] = &[2, 3, 5, 10, 15, 20, 30, 60];
 
 /// Custom colors of the color picker, kept for the session; `None` until first used.
 static CUSTOM_COLORS: Mutex<Option<[COLORREF; 16]>> = Mutex::new(None);
@@ -98,6 +100,7 @@ struct Context {
     loupe_scales: Vec<f32>,
     font_sizes: Vec<i32>,
     slideshow_seconds: Vec<u32>,
+    seek_steps: Vec<u32>,
     /// Fills both previews: the background swatch and the OSD "Aa" (shown on that background).
     background_brush: Brush,
     /// Read from `wincmd.ini` on every opening: TC or the user may have changed the plugin list.
@@ -108,13 +111,7 @@ struct Context {
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(
-        owner,
-        CLASS_NAME,
-        tr("Mediares Settings"),
-        850,
-        625,
-    )?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 850, 625)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         config: current.clone(),
@@ -127,6 +124,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         slideshow_seconds: with_current(SLIDESHOW_SECONDS, current.slideshow_seconds, |a, b| {
             a == b
         }),
+        seek_steps: with_current(SEEK_STEPS, current.seek_step_sec, |a, b| a == b),
         background_brush: gdi::solid_brush(current.photo_background),
         registration: Registration::find(),
         result: None,
@@ -425,7 +423,7 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("Audio and video"),
         BS_GROUPBOX as u32,
-        (425, 15, 395, 165),
+        (425, 15, 395, 195),
         0,
     );
     checkbox(
@@ -434,13 +432,7 @@ unsafe fn build_controls(
         IDC_AUTO_ADVANCE,
         cfg.queue.auto_advance,
     );
-    control(
-        w!("STATIC"),
-        tr("Repeat:"),
-        SS_LEFT,
-        (438, 72, 140, 20),
-        0,
-    );
+    control(w!("STATIC"), tr("Repeat:"), SS_LEFT, (438, 72, 140, 20), 0);
     let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
     combo(
         (585, 69, 190, 120),
@@ -481,30 +473,48 @@ unsafe fn build_controls(
         frame_labels,
         frame_sel,
     );
+    control(
+        w!("STATIC"),
+        tr("Seek step (← →):"),
+        SS_LEFT,
+        (438, 183, 140, 20),
+        0,
+    );
+    let step_labels = ctx
+        .seek_steps
+        .iter()
+        .map(|s| format!("{} {}", s, tr("s")))
+        .collect();
+    let step_sel = ctx
+        .seek_steps
+        .iter()
+        .position(|&s| s == cfg.seek_step_sec)
+        .unwrap_or(0);
+    combo((585, 180, 90, 200), IDC_SEEK_STEP, step_labels, step_sel);
 
     control(
         w!("BUTTON"),
         tr("External editors (\"Open in editor\")"),
         BS_GROUPBOX as u32,
-        (425, 190, 395, 125),
+        (425, 220, 395, 125),
         0,
     );
     program_row(
-        218,
+        248,
         tr("Photo:"),
         &cfg.photo_editor,
         IDC_PHOTO_EDITOR,
         IDC_BROWSE_PHOTO_EDITOR,
     );
     program_row(
-        250,
+        280,
         tr("Video:"),
         &cfg.video_editor,
         IDC_VIDEO_EDITOR,
         IDC_BROWSE_VIDEO_EDITOR,
     );
     program_row(
-        282,
+        312,
         tr("Audio:"),
         &cfg.audio_editor,
         IDC_AUDIO_EDITOR,
@@ -515,11 +525,11 @@ unsafe fn build_controls(
         w!("BUTTON"),
         tr("Content plugin (WDX)"),
         BS_GROUPBOX as u32,
-        (425, 325, 395, 102),
+        (425, 355, 395, 102),
         0,
     );
     let hint = tr("mediares fields for TC columns, duplicate search and multi-rename");
-    control(w!("STATIC"), hint, SS_LEFT, (438, 348, 370, 36), 0);
+    control(w!("STATIC"), hint, SS_LEFT, (438, 378, 370, 36), 0);
     let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
     let label = if registered {
         registered_label()
@@ -530,7 +540,7 @@ unsafe fn build_controls(
         w!("BUTTON"),
         label,
         tab | BS_PUSHBUTTON as u32,
-        (438, 388, 200, 26),
+        (438, 418, 200, 26),
         IDC_REGISTER_WDX,
     );
     let _ = EnableWindow(button, !registered);
@@ -539,7 +549,7 @@ unsafe fn build_controls(
         w!("STATIC"),
         &language_caption(),
         SS_LEFT,
-        (438, 450, 140, 20),
+        (438, 480, 140, 20),
         0,
     );
     let languages = LangSetting::all();
@@ -548,7 +558,7 @@ unsafe fn build_controls(
         .iter()
         .position(|&l| l == cfg.language)
         .unwrap_or(0);
-    combo((585, 447, 225, 120), IDC_LANGUAGE, lang_labels, lang_sel);
+    combo((585, 477, 225, 120), IDC_LANGUAGE, lang_labels, lang_sel);
 
     let ok = control(
         w!("BUTTON"),
@@ -664,6 +674,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.smooth_zoom = is_checked(dlg, IDC_SMOOTH_ZOOM);
     cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
+    cfg.seek_step_sec = selected(dlg, IDC_SEEK_STEP, &ctx.seek_steps).unwrap_or(cfg.seek_step_sec);
     cfg.frame_format =
         selected(dlg, IDC_FRAME_FORMAT, &FrameFormat::ALL).unwrap_or(cfg.frame_format);
     cfg.photo_editor = edit_text(dlg, IDC_PHOTO_EDITOR);

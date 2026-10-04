@@ -121,6 +121,10 @@ pub unsafe fn text(
     color: u32,
     flags: DRAW_TEXT_FORMAT,
 ) {
+    // An empty Vec's pointer is dangling, and DrawTextW reads the first char even at length 0.
+    if s.is_empty() {
+        return;
+    }
     let mut wide: Vec<u16> = s.encode_utf16().collect();
     let mut rc = r;
     let old = font.map(|f| SelectObject(dc, f.into()));

@@ -21,9 +21,10 @@ const FILL: u32 = 0x00E0A040; // COLORREF is BGR: a light blue
 const ICON: u32 = 0x00E8E8E8;
 const TEXT: u32 = 0x00D0D0D0;
 const ERROR_TEXT: u32 = 0x006060FF;
-const SEEK_STEP_SEC: f64 = 5.0;
-const SEEK_END_MARGIN_SEC: f64 = 1.0;
-/// Key auto-repeat of the ±5 s step is cut down to one step per this interval.
+/// Up / Down step for audio, which has no key frames.
+pub const FINE_STEP_SEC: f64 = 1.0;
+pub const SEEK_END_MARGIN_SEC: f64 = 1.0;
+/// Key auto-repeat of the arrow-key step is cut down to one step per this interval.
 pub const SEEK_REPEAT_INTERVAL: Duration = Duration::from_millis(80);
 const VOLUME_STEP: f64 = 0.05;
 
@@ -115,14 +116,14 @@ pub fn toggle_mute(t: &dyn Transport) {
     remember_audio_level(t);
 }
 
-/// `base` ± 5 s, kept within the stream (`duration` 0 = unknown). Stepping forward stops
+/// `base` ± `step` s, kept within the stream (`duration` 0 = unknown). Stepping forward stops
 /// [`SEEK_END_MARGIN_SEC`] short of the end: reaching it would end the file and let the play queue
 /// move on to the next one while the key is still held.
-pub fn step_target(base: f64, duration: f64, forward: bool) -> f64 {
+pub fn step_target(base: f64, duration: f64, forward: bool, step: f64) -> f64 {
     if !forward {
-        return (base - SEEK_STEP_SEC).max(0.0);
+        return (base - step).max(0.0);
     }
-    let target = base + SEEK_STEP_SEC;
+    let target = base + step;
     if duration > 0.0 {
         // Never backwards when already inside the margin.
         target.min((duration - SEEK_END_MARGIN_SEC).max(base))
@@ -131,10 +132,10 @@ pub fn step_target(base: f64, duration: f64, forward: bool) -> f64 {
     }
 }
 
-/// ±5 s. For a player whose position follows a seek at once (audio; video has its own).
-pub fn seek_by(t: &dyn Transport, forward: bool) {
+/// ±`step` s. For a player whose position follows a seek at once (audio; video has its own).
+pub fn seek_by(t: &dyn Transport, forward: bool, step: f64) {
     let base = t.position();
-    let target = step_target(base, t.duration(), forward);
+    let target = step_target(base, t.duration(), forward, step);
     // Already at the start / end: seeking there again would only restart the seek.
     if target != base {
         t.seek(target, false);
@@ -628,12 +629,12 @@ mod tests {
 
     #[test]
     fn step_target_bounds() {
-        assert_eq!(step_target(10.0, 100.0, true), 15.0);
-        assert_eq!(step_target(10.0, 100.0, false), 5.0);
-        assert_eq!(step_target(2.0, 100.0, false), 0.0);
-        assert_eq!(step_target(97.0, 100.0, true), 99.0);
-        assert_eq!(step_target(99.5, 100.0, true), 99.5);
-        assert_eq!(step_target(99.5, 100.0, false), 94.5);
-        assert_eq!(step_target(10.0, 0.0, true), 15.0);
+        assert_eq!(step_target(10.0, 100.0, true, 5.0), 15.0);
+        assert_eq!(step_target(10.0, 100.0, false, 5.0), 5.0);
+        assert_eq!(step_target(2.0, 100.0, false, 5.0), 0.0);
+        assert_eq!(step_target(97.0, 100.0, true, 5.0), 99.0);
+        assert_eq!(step_target(99.5, 100.0, true, 5.0), 99.5);
+        assert_eq!(step_target(99.5, 100.0, false, 5.0), 94.5);
+        assert_eq!(step_target(10.0, 0.0, true, 5.0), 15.0);
     }
 }

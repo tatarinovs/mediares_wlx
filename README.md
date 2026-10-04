@@ -163,7 +163,7 @@ MPEG-2 PS), декодирование через системные кодек�
 | Действие | Клавиши / мышь |
 |---|---|
 | Пауза / воспроизведение | Пробел, K, клик по видео / обложке, мультимедийная клавиша |
-| Перемотка ±5 с | ← / →, клик или перетаскивание по таймлайну |
+| Перемотка ±5 с (шаг — в настройках) | ← / →, клик или перетаскивание по таймлайну |
 | Следующий / предыдущий ключевой кадр (аудио: ±1 с) | ↑ / ↓ |
 | Скорость видео 0,25×–2× / обычная | [ / ] / \ |
 | Кадр назад / вперёд (с паузой; удержание — несколько кадров). В MPG/MPEG/VOB — только вперёд: их источник Media Foundation не перематывает точно | , / . |
@@ -424,7 +424,7 @@ Contents=[=mediares.Video_Title]\n[=mediares.Video_Width]\n[=mediares.Video_Heig
 
 Ключи секции `[Settings]` с неочевидным форматом: `Language` (`auto`, `en`, `ru`), `PhotoBackground` и
 `OSDFontColor` (COLORREF `0x00BBGGRR` десятичным числом), `OSDMode` (0 — не показывать, 1 — на фото,
-2 — на видео, 3 — везде), `Repeat` (0 — нет, 1 — список, 2 — файл), `FrameFormat` (`png` / `jpg`),
+2 — на видео, 3 — везде), `Repeat` (0 — нет, 1 — список, 2 — файл), `SeekStep` (шаг ← / → в секундах, 1–600), `FrameFormat` (`png` / `jpg`),
 `PhotoEditor` / `VideoEditor` / `AudioEditor` (путь к программе, можно с аргументами и `%1`),
 `PhotoOSDTemplate` / `VideoOSDTemplate` (см. OSD). Флаги — 0/1: `StartFullscreen`, `AutoRotateExif`,
 `NoUpscale`, `SmoothZoom`, `ConfirmDelete`, `ResumeVideo`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`, `OverlayVideo`,

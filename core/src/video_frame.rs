@@ -7,9 +7,8 @@ use std::path::Path;
 use windows::core::{Interface, GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSample, IMFSourceReader,
-    MF2DBuffer_LockFlags_Read,
-    MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFVideoFormat_NV12, MFVideoFormat_RGB32,
+    MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFVideoFormat_NV12, MFVideoFormat_RGB32,
     MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
     MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
     MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
@@ -280,9 +279,10 @@ pub fn analyze_video(
         }
         let [dhash_25, dhash_mid, dhash_75] = hashes;
         let fingerprint = match (dhash_25, dhash_mid, dhash_75) {
-            (Some(a), Some(b), Some(c)) => {
-                Some(format!("{}s_{:016x}_{:016x}_{:016x}", duration_sec, a, b, c))
-            }
+            (Some(a), Some(b), Some(c)) => Some(format!(
+                "{}s_{:016x}_{:016x}_{:016x}",
+                duration_sec, a, b, c
+            )),
             _ => None,
         };
 
@@ -647,10 +647,7 @@ mod tests {
         let (first, again, other) = (analyze(&a), analyze(&a), analyze(&b));
         let _ = (std::fs::remove_file(&a), std::fs::remove_file(&b));
 
-        assert_eq!(
-            (first.duration_sec, first.width, first.height),
-            (6, 64, 48)
-        );
+        assert_eq!((first.duration_sec, first.width, first.height), (6, 64, 48));
         let fingerprint = first.fingerprint.clone().expect("all three frames decoded");
         let parts: Vec<&str> = fingerprint.split('_').collect();
         assert_eq!(parts.len(), 4, "{fingerprint}");
@@ -660,10 +657,17 @@ mod tests {
             parts[1] != parts[2] && parts[2] != parts[3] && parts[1] != parts[3],
             "{fingerprint}"
         );
-        assert!(parts[1..].iter().all(|h| *h != "0000000000000000"), "{fingerprint}");
+        assert!(
+            parts[1..].iter().all(|h| *h != "0000000000000000"),
+            "{fingerprint}"
+        );
         assert_eq!(first.dhash_mid_hex().as_deref(), Some(parts[2]));
 
-        assert_eq!(again.fingerprint.as_deref(), Some(fingerprint.as_str()), "stable");
+        assert_eq!(
+            again.fingerprint.as_deref(),
+            Some(fingerprint.as_str()),
+            "stable"
+        );
         let other = other.fingerprint.expect("other video decoded");
         assert!(other.starts_with("6s_"));
         assert_ne!(other, fingerprint, "a different video of the same length");
@@ -679,7 +683,10 @@ mod tests {
         // Second 3, block (0, 0): (3 * 29 + 2 * 53) * 37 % 256.
         let expected = ((3 * 29 + 2 * 53) * 37 % 256) as u8;
         let px = frame.get_pixel(3, 3).0;
-        assert!(px[..3].iter().all(|&c| c.abs_diff(expected) <= 2), "{px:?} vs {expected}");
+        assert!(
+            px[..3].iter().all(|&c| c.abs_diff(expected) <= 2),
+            "{px:?} vs {expected}"
+        );
     }
 
     #[test]

@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use windows::core::{w, HSTRING};
-use windows::Win32::Globalization::{GetLocaleInfoW, GetUserDefaultUILanguage, LOCALE_SABBREVLANGNAME};
+use windows::Win32::Globalization::{
+    GetLocaleInfoW, GetUserDefaultUILanguage, LOCALE_SABBREVLANGNAME,
+};
 use windows::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
 
 const FILE_NAME: &str = "mediares_ui.lng";
@@ -178,10 +180,9 @@ pub fn tr(text: &'static str) -> &'static str {
 
 /// [`tr`] with `{name}` placeholders filled in (translations may reorder them).
 pub fn tr_fmt(text: &'static str, args: &[(&str, &str)]) -> String {
-    args.iter()
-        .fold(tr(text).to_string(), |s, (name, value)| {
-            s.replace(&format!("{{{name}}}"), value)
-        })
+    args.iter().fold(tr(text).to_string(), |s, (name, value)| {
+        s.replace(&format!("{{{name}}}"), value)
+    })
 }
 
 /// Marks a string in a table for translation; it is passed through [`tr`] where shown.
@@ -314,7 +315,10 @@ mod tests {
     #[test]
     fn tc_language_files_name_the_sections() {
         assert_eq!(language_code("wcmd_rus.lng"), "rus");
-        assert_eq!(language_code(r"%COMMANDER_PATH%\Language\WCMD_DEU.LNG"), "deu");
+        assert_eq!(
+            language_code(r"%COMMANDER_PATH%\Language\WCMD_DEU.LNG"),
+            "deu"
+        );
         assert_eq!(language_code(""), "eng");
     }
 
@@ -418,7 +422,12 @@ mod tests {
                     .unwrap_or_else(|| panic!("[{}] lacks {key:?} ({file})", lang.code));
                 // Only `tr_fmt` fills placeholders; elsewhere braces are plain text.
                 if *formatted {
-                    assert_eq!(placeholders(key), placeholders(value), "[{}] {key:?}", lang.code);
+                    assert_eq!(
+                        placeholders(key),
+                        placeholders(value),
+                        "[{}] {key:?}",
+                        lang.code
+                    );
                 }
                 assert_eq!(
                     key.contains('\t'),

@@ -161,6 +161,7 @@ Repeat:=Повтор:
 Shuffle=Случайный порядок
 Resume videos longer than 5 min where they stopped=Продолжать видео длиннее 5 мин с места остановки
 Frames (Shift+S):=Кадры (Shift+S):
+Seek step (← →):=Шаг перемотки (← →):
 External editors ("Open in editor")=Внешние редакторы («Открыть в редакторе»)
 Photo:=Фото:
 Video:=Видео:

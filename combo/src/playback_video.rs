@@ -8,8 +8,9 @@
 //! threads and are forwarded to the viewer as [`WM_MEDIA_EVENT`] (`wparam` = event, `lparam` =
 //! param 1).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use mediares_core::mf_init::{mf_scope, ComScope};
 use windows::core::{implement, Interface, BSTR};
@@ -161,12 +162,39 @@ unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
 }
 
 /// Frame length when the stream doesn't state its rate (25 fps).
-pub const FALLBACK_FRAME_SEC: f64 = 0.04;
+const FALLBACK_FRAME_SEC: f64 = 0.04;
+
+/// Length of one frame at `frame_rate` fps (25 if unknown).
+pub fn frame_sec(frame_rate: f64) -> f64 {
+    if frame_rate > 0.0 {
+        1.0 / frame_rate
+    } else {
+        FALLBACK_FRAME_SEC
+    }
+}
+
+/// An exact seek waits this long at most for its frame (sources without accurate seeking may
+/// never deliver it).
+const HOLD_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// Frames aren't presented until the seek is done and one at least as late as `earliest`
+/// arrives.
+#[derive(Clone, Copy)]
+struct Hold {
+    /// 100 ns units, as `OnVideoStreamTick` reports.
+    earliest: i64,
+    since: Instant,
+}
 
 /// Field order matters: the engine is released before the output and COM.
 pub struct VideoPlayer {
     engine: IMFMediaEngine,
     engine_ex: Option<IMFMediaEngineEx>,
+    /// After an exact seek: it decodes from the key frame before the target, and the engine
+    /// hands out those frames on the way; showing them flashes an older picture first.
+    hold: Cell<Option<Hold>>,
+    /// Frame length of the current file (see [`Self::set_frame_rate`]).
+    frame: Cell<f64>,
     output: RefCell<Output>,
     _manager: IMFDXGIDeviceManager,
     _com: ComScope,
@@ -207,6 +235,8 @@ impl VideoPlayer {
             engine,
             engine_ex,
             output: RefCell::new(output),
+            hold: Cell::new(None),
+            frame: Cell::new(FALLBACK_FRAME_SEC),
             _manager: manager,
             _com: com,
         })
@@ -215,6 +245,7 @@ impl VideoPlayer {
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
     pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
         self.output.borrow_mut().last_pts = None;
+        self.hold.set(None);
         self.engine
             .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
         self.engine.Play()
@@ -229,6 +260,13 @@ impl VideoPlayer {
         let Ok(pts) = self.engine.OnVideoStreamTick() else {
             return;
         };
+        if let Some(hold) = self.hold.get() {
+            let arrived = !self.engine.IsSeeking().as_bool() && pts >= hold.earliest;
+            if !arrived && hold.since.elapsed() < HOLD_TIMEOUT {
+                return;
+            }
+            self.hold.set(None);
+        }
         let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
         if out.last_pts == Some(pts) && !out.dirty && !osd_changed {
             return;
@@ -388,18 +426,9 @@ impl VideoPlayer {
         self.output.try_borrow().ok()?.last_pts
     }
 
-    /// Pauses and seeks exactly one frame (`frame_rate` fps; 25 if unknown) back. Returns the
-    /// target (sources without accurate seeking land elsewhere).
-    pub unsafe fn step_back(&self, frame_rate: f64) -> f64 {
-        let _ = self.engine.Pause();
-        let frame = if frame_rate > 0.0 {
-            1.0 / frame_rate
-        } else {
-            FALLBACK_FRAME_SEC
-        };
-        let target = (self.position() - frame).max(0.0);
-        self.seek(target, false);
-        target
+    /// Frame rate of the file being opened (0 if unknown).
+    pub fn set_frame_rate(&self, frame_rate: f64) {
+        self.frame.set(frame_sec(frame_rate));
     }
 
     /// Engine error code (`MF_MEDIA_ENGINE_ERR`), if playback failed.
@@ -436,6 +465,12 @@ impl Transport for VideoPlayer {
 
     fn seek(&self, seconds: f64, approximate: bool) {
         let t = seconds.clamp(0.0, self.duration().max(0.0));
+        // The frame showing at `t` starts up to a frame earlier; the one before it, and the
+        // frames decoded on the way from the key frame, start earlier still.
+        self.hold.set((!approximate).then(|| Hold {
+            earliest: ((t - self.frame.get() + 0.001) * 1e7) as i64,
+            since: Instant::now(),
+        }));
         unsafe {
             match &self.engine_ex {
                 Some(ex) => {

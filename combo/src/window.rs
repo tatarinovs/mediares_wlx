@@ -98,37 +98,19 @@ enum Command {
 impl Command {
     /// Menu items with their (English) labels; shown through [`tr`].
     const MENU: &[Option<(Command, &'static str)>] = &[
-        Some((
-            Command::TogglePlay,
-            n("Play / pause\tSpace"),
-        )),
+        Some((Command::TogglePlay, n("Play / pause\tSpace"))),
         Some((Command::ToggleMute, n("Mute\tM"))),
-        Some((
-            Command::ToggleFullscreen,
-            n("Full screen\tEnter / F"),
-        )),
-        Some((
-            Command::Copy,
-            n("Copy image\tCtrl+C"),
-        )),
-        Some((
-            Command::SaveAs,
-            n("Save as...\tCtrl+S"),
-        )),
+        Some((Command::ToggleFullscreen, n("Full screen\tEnter / F"))),
+        Some((Command::Copy, n("Copy image\tCtrl+C"))),
+        Some((Command::SaveAs, n("Save as...\tCtrl+S"))),
         Some((
             Command::SaveFrame,
             n("Save frame next to the video\tShift+S"),
         )),
         Some((Command::ToggleOsd, n("Show OSD\tO"))),
         Some((Command::ToggleSlideshow, n("Slideshow\tF5"))),
-        Some((
-            Command::RotateLeft,
-            n("Rotate left\tL"),
-        )),
-        Some((
-            Command::RotateRight,
-            n("Rotate right\tR"),
-        )),
+        Some((Command::RotateLeft, n("Rotate left\tL"))),
+        Some((Command::RotateRight, n("Rotate right\tR"))),
         Some((
             Command::SaveRotation,
             n("Save rotation to file (JPEG, lossless)\tCtrl+R"),
@@ -136,10 +118,7 @@ impl Command {
         None,
         Some((Command::Slower, n("Slower\t["))),
         Some((Command::Faster, n("Faster\t]"))),
-        Some((
-            Command::NormalSpeed,
-            n("Normal speed\t\\"),
-        )),
+        Some((Command::NormalSpeed, n("Normal speed\t\\"))),
         Some((Command::FrameBack, n("Previous frame\t,"))),
         Some((Command::FrameForward, n("Next frame\t."))),
         None,
@@ -152,38 +131,17 @@ impl Command {
         Some((Command::RepeatOne, n("Repeat file"))),
         Some((Command::ToggleShuffle, n("Shuffle"))),
         None,
-        Some((
-            Command::ShowExif,
-            n("EXIF info...\tE"),
-        )),
-        Some((
-            Command::OpenInEditor,
-            n("Open in editor\tF4"),
-        )),
-        Some((
-            Command::ShowInFolder,
-            n("Show in folder\tCtrl+Enter"),
-        )),
-        Some((
-            Command::SetWallpaper,
-            n("Set as desktop background"),
-        )),
+        Some((Command::ShowExif, n("EXIF info...\tE"))),
+        Some((Command::OpenInEditor, n("Open in editor\tF4"))),
+        Some((Command::ShowInFolder, n("Show in folder\tCtrl+Enter"))),
+        Some((Command::SetWallpaper, n("Set as desktop background"))),
         Some((Command::Print, n("Print...\tCtrl+P"))),
-        Some((
-            Command::Delete,
-            n("Move to Recycle Bin\tDel"),
-        )),
+        Some((Command::Delete, n("Move to Recycle Bin\tDel"))),
         None,
         Some((Command::ShowSettings, n("Settings...\tS"))),
         None,
-        Some((
-            Command::Next,
-            n("Next file\tSpace / Right"),
-        )),
-        Some((
-            Command::Previous,
-            n("Previous file\tBackspace / Left"),
-        )),
+        Some((Command::Next, n("Next file\tSpace / Right"))),
+        Some((Command::Previous, n("Previous file\tBackspace / Left"))),
     ];
 
     /// Whether the item applies to the current content (photo, or audio/video).
@@ -314,8 +272,8 @@ impl Command {
         if media && !ctrl {
             let player = match vk {
                 0x20 | 0x4B => Some(TogglePlay), // Space, K
-                0x25 => Some(SeekBack),          // Left: -5 s
-                0x27 => Some(SeekForward),       // Right: +5 s
+                0x25 => Some(SeekBack),          // Left: -step (5 s by default)
+                0x27 => Some(SeekForward),       // Right: +step
                 0x26 => Some(KeyframeForward),   // Up: next key frame (audio: +1 s)
                 0x28 => Some(KeyframeBack),      // Down: previous key frame (audio: -1 s)
                 0xBB | 0x6B => Some(VolumeUp),   // '+' / numpad +
@@ -802,8 +760,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let path = state.file_path.clone();
             if !file_actions::open_in_editor(hwnd, &path, &editor) {
                 let text = if editor.is_empty() {
-                    tr("Could not open the file in an external program.")
-                    .to_string()
+                    tr("Could not open the file in an external program.").to_string()
                 } else {
                     format!(
                         "{}:\n{}\n\n{}",
@@ -902,7 +859,8 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 Command::TogglePlay => media.toggle_play(),
                 Command::ToggleMute => media.toggle_mute(),
                 Command::SeekBack | Command::SeekForward => {
-                    media.seek_by(command == Command::SeekForward)
+                    let step = state.config.seek_step_sec as f64;
+                    media.seek_by(command == Command::SeekForward, step)
                 }
                 Command::KeyframeBack | Command::KeyframeForward => {
                     media.seek_keyframe(command == Command::KeyframeForward)
@@ -971,10 +929,7 @@ unsafe fn save_rotation(hwnd: HWND) {
     let owner = dialog::modal_owner(hwnd);
     let path = state.file_path.clone();
     if state.quarter_turns == 0 {
-        file_actions::show_error(
-            owner,
-            tr("Turn the photo with L / R first."),
-        );
+        file_actions::show_error(owner, tr("Turn the photo with L / R first."));
         return;
     }
     if !is_jpeg_file(&path) {

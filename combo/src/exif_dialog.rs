@@ -98,10 +98,7 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
     push(tr("Camera model"), info.model.clone());
     push(tr("Lens"), info.lens_model.clone());
     match (&info.date_time_original, &info.date_time) {
-        (Some(taken), _) => push(
-            tr("Date and time taken"),
-            Some(taken.clone()),
-        ),
+        (Some(taken), _) => push(tr("Date and time taken"), Some(taken.clone())),
         (None, modified) => push(tr("Date modified"), modified.clone()),
     }
     push(
@@ -110,14 +107,8 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
             .as_ref()
             .map(|s| format!("{} {}", s, tr("s"))),
     );
-    push(
-        tr("Aperture"),
-        info.f_number.map(|f| format!("f/{:.1}", f)),
-    );
-    push(
-        tr("Sensitivity (ISO)"),
-        info.iso.map(|v| v.to_string()),
-    );
+    push(tr("Aperture"), info.f_number.map(|f| format!("f/{:.1}", f)));
+    push(tr("Sensitivity (ISO)"), info.iso.map(|v| v.to_string()));
     push(
         tr("Focal length"),
         info.focal_length.map(|f| match info.focal_length_35mm {
@@ -133,14 +124,8 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
     );
     push(
         tr("Flash"),
-        info.flash_fired.map(|f| {
-            if f {
-                tr("Fired")
-            } else {
-                tr("Did not fire")
-            }
-            .to_string()
-        }),
+        info.flash_fired
+            .map(|f| if f { tr("Fired") } else { tr("Did not fire") }.to_string()),
     );
     push(
         tr("EXIF orientation"),
@@ -153,10 +138,7 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
             .zip(info.height)
             .map(|(w, h)| format!("{} x {}", w, h)),
     );
-    push(
-        tr("Software"),
-        info.software.clone(),
-    );
+    push(tr("Software"), info.software.clone());
     rows
 }
 
@@ -220,10 +202,7 @@ mod tests {
             "Поворот на 90° по часовой (код 6)"
         ));
         assert!(has(tr("Aperture"), "f/2.8"));
-        assert!(has(
-            tr("Sensitivity (ISO)"),
-            "400"
-        ));
+        assert!(has(tr("Sensitivity (ISO)"), "400"));
         // Cyrillic "с" (seconds); the old pair had a Latin "c" by mistake.
         assert!(has(tr("Exposure"), "1/250 \u{0441}"));
     }

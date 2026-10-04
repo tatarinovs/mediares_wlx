@@ -163,7 +163,7 @@ repeat-list or repeat-one and shuffle — in the right-click menu and in setting
 | Action | Keys / mouse |
 |---|---|
 | Pause / play | Space, K, click on the video / cover art, media key |
-| Seek ±5 s | ← / →, click or drag on the timeline |
+| Seek ±5 s (step in settings) | ← / →, click or drag on the timeline |
 | Next / previous key frame (audio: ±1 s) | ↑ / ↓ |
 | Video speed 0.25×–2× / normal | [ / ] / \ |
 | Frame back / forward (pauses; hold for several frames). In MPG/MPEG/VOB — forward only: their Media Foundation source can't seek precisely | , / . |
@@ -425,7 +425,7 @@ holds `mediares_resume.txt` (video positions, up to 200 entries) and `mediares_w
 
 `[Settings]` keys with a non-obvious format: `Language` (`auto`, `en`, `ru`), `PhotoBackground` and
 `OSDFontColor` (a COLORREF `0x00BBGGRR` as a decimal number), `OSDMode` (0 — off, 1 — on photos, 2 — on video,
-3 — both), `Repeat` (0 — none, 1 — list, 2 — file), `FrameFormat` (`png` / `jpg`), `PhotoEditor` /
+3 — both), `Repeat` (0 — none, 1 — list, 2 — file), `SeekStep` (the ← / → step in seconds, 1–600), `FrameFormat` (`png` / `jpg`), `PhotoEditor` /
 `VideoEditor` / `AudioEditor` (a program path, optionally with arguments and `%1`), `PhotoOSDTemplate` /
 `VideoOSDTemplate` (see OSD). Flags — 0/1: `StartFullscreen`, `AutoRotateExif`, `NoUpscale`, `SmoothZoom`,
 `ConfirmDelete`, `ResumeVideo`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`, `OverlayVideo`, `OverlayAutoHide`.

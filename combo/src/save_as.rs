@@ -57,10 +57,7 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
     };
     LAST_PNG.store(format == Format::Png, Ordering::Relaxed);
     if same_path(&target, source) {
-        show_error(
-            owner,
-            tr("Cannot save over the open file."),
-        );
+        show_error(owner, tr("Cannot save over the open file."));
         return;
     }
     let previous = LoadCursorW(None, IDC_WAIT).map(|c| SetCursor(Some(c)));
@@ -71,11 +68,7 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
     if !ok {
         show_error(
             owner,
-            &format!(
-                "{}:\n{}",
-                tr("Could not save"),
-                target.display()
-            ),
+            &format!("{}:\n{}", tr("Could not save"), target.display()),
         );
     }
 }

@@ -39,3 +39,8 @@ windows = { version = "0.62.2", features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[lints.rust]
+# MSVC prints "Creating library ...lib" for every DLL; rustc filters it only in English, so a
+# localized Visual Studio turns it into a warning. Real linker errors still fail the build.
+linker_messages = "allow"

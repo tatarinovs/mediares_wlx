@@ -60,7 +60,7 @@ pub struct MediaView {
     status: Option<String>,
     /// Fullscreen: the bar lives in this overlay window and the content takes the whole viewer.
     bar_host: Option<HWND>,
-    /// Last ±5 s step (key auto-repeat is thinned out).
+    /// Last arrow-key step (key auto-repeat is thinned out).
     last_seek_step: Option<Instant>,
 }
 
@@ -354,7 +354,8 @@ impl MediaView {
         t.play();
     }
 
-    pub unsafe fn seek_by(&mut self, forward: bool) {
+    /// ±`step` s (Left / Right).
+    pub unsafe fn seek_by(&mut self, forward: bool, step: f64) {
         let now = Instant::now();
         if self
             .last_seek_step
@@ -364,8 +365,8 @@ impl MediaView {
         }
         self.last_seek_step = Some(now);
         match &mut self.content {
-            Content::Video(v) => v.seek_by(forward),
-            Content::Audio(a) => transport_bar::seek_by(a.transport(), forward),
+            Content::Video(v) => v.seek_by(forward, step),
+            Content::Audio(a) => transport_bar::seek_by(a.transport(), forward, step),
         }
     }
 
@@ -374,11 +375,7 @@ impl MediaView {
             Content::Video(v) => v.seek_keyframe(forward),
             // Audio has no key frames: a finer step instead.
             Content::Audio(a) => {
-                let t = a.transport();
-                t.seek(
-                    (t.position() + if forward { 1.0 } else { -1.0 }).max(0.0),
-                    false,
-                );
+                transport_bar::seek_by(a.transport(), forward, transport_bar::FINE_STEP_SEC)
             }
         }
     }
@@ -401,7 +398,7 @@ impl MediaView {
             if !v.frame_step(forward) {
                 self.show_status(
                     tr("Stepping back is not available for this file (inexact seeking)")
-                    .to_string(),
+                        .to_string(),
                 );
             }
         }
