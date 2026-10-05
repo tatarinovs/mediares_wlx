@@ -8,12 +8,12 @@
 use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
-use windows::core::{HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapDecoder,
-    IWICBitmapFrameDecode, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeCustom,
-    WICDecodeMetadataCacheOnDemand,
+    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, WICBitmapDitherTypeNone,
+    WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICDecodeMetadataCacheOnDemand,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 
@@ -73,19 +73,39 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
 
 /// Decodes the first frame to RGBA under the shared size limits.
 pub fn decode(path: &Path) -> Option<DynamicImage> {
+    decode_fitted(path, None).map(|(img, _)| img)
+}
+
+/// Decodes the first frame to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
+/// along with the frame's full size. Decoders that can (HEIF, JPEG) produce the smaller picture
+/// directly, which is several times faster than decoding it whole. The size limits apply to the
+/// full frame, so a picture is either shown at every size or not at all.
+pub fn decode_fitted(path: &Path, fit: Option<(u32, u32)>) -> Option<(DynamicImage, (u32, u32))> {
     let _com = ComScope::new();
     let Frame { frame, factory, .. } = &first_frame(path)?;
     let (w, h) = frame_size(frame)?;
     if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
     }
-    let stride = w * 4;
-    let mut rgba = vec![0u8; stride as usize * h as usize];
+    let (tw, th) = fit.map_or((w, h), |(fw, fh)| {
+        crate::image_decode::fitted_size((w, h), (fw, fh))
+    });
+    let stride = tw * 4;
+    let mut rgba = vec![0u8; stride as usize * th as usize];
     unsafe {
+        let source: IWICBitmapSource = if (tw, th) == (w, h) {
+            frame.cast().ok()?
+        } else {
+            let scaler = factory.CreateBitmapScaler().ok()?;
+            scaler
+                .Initialize(frame, tw, th, WICBitmapInterpolationModeFant)
+                .ok()?;
+            scaler.cast().ok()?
+        };
         let converter = factory.CreateFormatConverter().ok()?;
         converter
             .Initialize(
-                frame,
+                &source,
                 &GUID_WICPixelFormat32bppRGBA,
                 WICBitmapDitherTypeNone,
                 None,
@@ -97,7 +117,8 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
             .CopyPixels(std::ptr::null(), stride, &mut rgba)
             .ok()?;
     }
-    RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)
+    let img = RgbaImage::from_raw(tw, th, rgba).map(DynamicImage::ImageRgba8)?;
+    Some((img, (w, h)))
 }
 
 #[cfg(test)]

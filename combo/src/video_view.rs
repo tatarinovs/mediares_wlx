@@ -838,6 +838,7 @@ impl VideoView {
         Some(crate::image_cache::DecodedImage {
             width,
             height,
+            full: (width, height),
             bgra,
             is_preview: false,
             exif: None,

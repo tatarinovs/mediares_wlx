@@ -877,8 +877,9 @@ fn test_every_field_has_a_russian_name() {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), section.len(), "translations are unique");
-    // Characters TC uses in field references ([=plugin.Field.Unit]) stay out of the names.
+    // TC rejects names with `.`, `|` or `:` ("Invalid character in Plugin field"), and
+    // `[]` would clash with field references ([=plugin.Field.Unit]).
     assert!(names
         .iter()
-        .all(|n| !n.is_empty() && !n.iter().any(|b| b"|[]".contains(b))));
+        .all(|n| !n.is_empty() && !n.iter().any(|b| b".|:[]".contains(b))));
 }

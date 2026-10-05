@@ -175,6 +175,53 @@ pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
     }
 }
 
+/// `size` scaled down to fit into `fit` (aspect kept); never enlarged.
+pub fn fitted_size((w, h): (u32, u32), (fit_w, fit_h): (u32, u32)) -> (u32, u32) {
+    let ratio = (fit_w as f64 / w.max(1) as f64).min(fit_h as f64 / h.max(1) as f64);
+    if ratio >= 1.0 {
+        return (w, h);
+    }
+    (
+        ((w as f64 * ratio).round() as u32).max(1),
+        ((h as f64 * ratio).round() as u32).max(1),
+    )
+}
+
+/// Like [`decode_file`], but fitted into `fit` (never enlarged), along with the size of the whole
+/// picture. JPEG and the WIC formats are reduced while decoding (HEIC about three times faster at
+/// a quarter of the size); the rest are decoded whole and then shrunk.
+pub fn decode_file_fitted(
+    path: &Path,
+    kind: MediaType,
+    fit: (u32, u32),
+) -> Option<(DynamicImage, (u32, u32))> {
+    let by_wic = kind == MediaType::StandardImage
+        && !crate::svg::handles(path)
+        && (crate::wic_decode::handles(path) || is_jpeg(path));
+    if let Some(fitted) = by_wic
+        .then(|| crate::wic_decode::decode_fitted(path, Some(fit)))
+        .flatten()
+    {
+        return Some(fitted);
+    }
+    let img = decode_file(path, kind)?;
+    let full = (img.width(), img.height());
+    let (w, h) = fitted_size(full, fit);
+    let img = if (w, h) == full {
+        img
+    } else {
+        thumbnail(&img, w, h)
+    };
+    Some((img, full))
+}
+
+fn is_jpeg(path: &Path) -> bool {
+    let mut magic = [0u8; 3];
+    File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok_and(|_| magic == [0xFF, 0xD8, 0xFF])
+}
+
 /// Cheap pre-check reading only the header: whether a standard image is likely decodable within
 /// the limits. Formats whose header only a codec reads (SVG is parsed whole, under a lock the
 /// decoder holds while rendering), RAW and PSD are accepted as is: the decode itself tells.
@@ -251,7 +298,24 @@ pub fn decode_oriented(
     kind: MediaType,
     auto_rotate: bool,
 ) -> Option<(DynamicImage, Option<crate::exif::ExifInfo>)> {
-    let mut img = decode_file(path, kind)?;
+    decode_oriented_fitted(path, kind, auto_rotate, None).map(|(img, _, exif)| (img, exif))
+}
+
+/// [`decode_oriented`] fitted into `fit` when given (see [`decode_file_fitted`]); also returns
+/// the size of the whole upright picture.
+pub fn decode_oriented_fitted(
+    path: &Path,
+    kind: MediaType,
+    auto_rotate: bool,
+    fit: Option<(u32, u32)>,
+) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
+    let (mut img, (mut w, mut h)) = match fit {
+        Some(fit) => decode_file_fitted(path, kind, fit)?,
+        None => decode_file(path, kind).map(|img| {
+            let size = (img.width(), img.height());
+            (img, size)
+        })?,
+    };
     let exif = crate::exif::read_exif(path);
     if let Some(orientation) = exif
         .as_ref()
@@ -259,6 +323,9 @@ pub fn decode_oriented(
         .filter(|_| auto_rotate)
     {
         apply_exif_orientation(&mut img, orientation);
+        if (5..=8).contains(&orientation) {
+            (w, h) = (h, w);
+        }
     }
-    Some((img, exif))
+    Some((img, (w, h), exif))
 }

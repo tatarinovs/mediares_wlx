@@ -435,6 +435,7 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
         DecodeOptions {
             auto_rotate: false,
             background: BACKGROUND,
+            fit: 0,
         },
     )
 }

@@ -8,7 +8,7 @@ use mediares_core::audio_tags::read_tags;
 use mediares_core::image::codecs::jpeg::JpegEncoder;
 use mediares_core::image::codecs::png::PngEncoder;
 use mediares_core::image::{DynamicImage, ExtendedColorType, ImageEncoder};
-use mediares_core::image_decode::{decode_bytes, decode_oriented};
+use mediares_core::image_decode::{decode_bytes, decode_oriented_fitted};
 use mediares_core::probe::{probe_file, MediaType};
 use mediares_core::video_frame::video_frame_rgba;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
@@ -238,10 +238,13 @@ pub fn save_picture(img: &DecodedImage, path: &Path, format: PictureFormat) -> b
     ok
 }
 
-/// Picture representing the file: the photo, a video frame, or the album art.
-fn source_picture(path: &Path) -> Option<DynamicImage> {
+/// Picture representing the file: the photo (decoded no larger than needed for a square of
+/// `side`), a video frame, or the album art.
+fn source_picture(path: &Path, side: u32) -> Option<DynamicImage> {
     match probe_file(path) {
-        kind if kind.is_image_kind() => decode_oriented(path, kind, true).map(|(img, _)| img),
+        kind if kind.is_image_kind() => {
+            decode_oriented_fitted(path, kind, true, Some((side, side))).map(|(img, ..)| img)
+        }
         // libmpv first when installed, like playback: it decodes more, and faster.
         MediaType::Video => playback_mpv::video_frame(path, THUMBNAIL_AT)
             .or_else(|| video_frame_rgba(path, THUMBNAIL_AT))
@@ -264,7 +267,7 @@ fn source_picture(path: &Path) -> Option<DynamicImage> {
 
 /// Fitted into `max_w` x `max_h` (never enlarged), transparency flattened onto white.
 pub fn thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<DecodedImage> {
-    let img = source_picture(path)?;
+    let img = source_picture(path, max_w.max(max_h).max(1))?;
     let img = if img.width() > max_w || img.height() > max_h {
         mediares_core::image_decode::thumbnail(&img, max_w.max(1), max_h.max(1))
     } else {

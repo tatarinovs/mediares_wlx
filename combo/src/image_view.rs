@@ -32,8 +32,15 @@ pub unsafe fn client_size(hwnd: HWND) -> Option<(f32, f32)> {
     (w > 0.0 && h > 0.0).then_some((w, h))
 }
 
+/// Size of the whole picture: the geometry below works in its pixels (100% = one of them per
+/// screen pixel), whichever copy is drawn.
+fn size(img: &DecodedImage) -> (f32, f32) {
+    (img.full.0 as f32, img.full.1 as f32)
+}
+
 fn fit_scale(state: &ViewerState, img: &DecodedImage, (w, h): (f32, f32)) -> f32 {
-    let s = (w / img.width as f32).min(h / img.height as f32);
+    let (iw, ih) = size(img);
+    let s = (w / iw).min(h / ih);
     if state.config.no_upscale {
         s.min(1.0)
     } else {
@@ -54,9 +61,10 @@ fn origin(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> (f32, f3
     match state.zoom {
         ZoomMode::Fit => {
             let s = fit_scale(state, img, view);
+            let (iw, ih) = size(img);
             (
-                ((view.0 - img.width as f32 * s) / 2.0).round(),
-                ((view.1 - img.height as f32 * s) / 2.0).round(),
+                ((view.0 - iw * s) / 2.0).round(),
+                ((view.1 - ih * s) / 2.0).round(),
             )
         }
         ZoomMode::Custom(_) => state.offset,
@@ -74,9 +82,10 @@ fn clamp_axis(offset: f32, image_len: f32, window_len: f32) -> f32 {
 
 pub fn clamp_offset(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32)) {
     if let ZoomMode::Custom(s) = state.zoom {
+        let (iw, ih) = size(img);
         state.offset = (
-            clamp_axis(state.offset.0, img.width as f32 * s, view.0),
-            clamp_axis(state.offset.1, img.height as f32 * s, view.1),
+            clamp_axis(state.offset.0, iw * s, view.0),
+            clamp_axis(state.offset.1, ih * s, view.1),
         );
     }
 }
@@ -126,9 +135,10 @@ pub fn zoom_to(
     state.loupe = None;
     let current = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
+    let (iw, ih) = size(img);
     let point = (
-        (anchor.0 - ox) / current / img.width as f32,
-        (anchor.1 - oy) / current / img.height as f32,
+        (anchor.0 - ox) / current / iw,
+        (anchor.1 - oy) / current / ih,
     );
     show_at(state, img, view, new_scale, point, anchor);
 }
@@ -144,9 +154,10 @@ fn show_at(
     at: (f32, f32),
 ) {
     state.zoom = ZoomMode::Custom(new_scale);
+    let (iw, ih) = size(img);
     state.offset = (
-        at.0 - point.0 * img.width as f32 * new_scale,
-        at.1 - point.1 * img.height as f32 * new_scale,
+        at.0 - point.0 * iw * new_scale,
+        at.1 - point.1 * ih * new_scale,
     );
     clamp_offset(state, img, view);
 }
@@ -298,17 +309,37 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT, smooth: bool)
     );
 }
 
+/// The copy to draw at `scale` (of the whole picture): the one fitted to the screen while its
+/// pixels suffice, the whole picture beyond that once it has arrived.
+fn copy_for_scale<'a>(
+    state: &'a ViewerState,
+    img: &'a DecodedImage,
+    scale: f32,
+) -> &'a DecodedImage {
+    let needed = scale * img.full.0 as f32;
+    match &state.whole {
+        Some(whole) if needed > img.width as f32 + 0.5 => whole,
+        _ => img,
+    }
+}
+
 unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
     let s = scale(state, img, view);
     let (ox, oy) = origin(state, img, view);
+    let src = copy_for_scale(state, img, s);
+    // Screen pixels per pixel of the copy drawn.
+    let (sx, sy) = (
+        s * img.full.0 as f32 / src.width as f32,
+        s * img.full.1 as f32 / src.height as f32,
+    );
     if let (Some(x), Some(y)) = (
-        visible_span(ox, s, img.width, view.0),
-        visible_span(oy, s, img.height, view.1),
+        visible_span(ox, sx, src.width, view.0),
+        visible_span(oy, sy, src.height, view.1),
     ) {
         let smooth =
             state.config.smooth_zoom && (state.zoom == ZoomMode::Fit || s <= MAX_SMOOTH_ZOOM);
         let window = gdi::rect(view.0 as i32, view.1 as i32);
-        stretch(dc, img, x, y, filter(s, smooth), window);
+        stretch(dc, src, x, y, filter(sx, smooth), window);
     }
 }
 
@@ -410,9 +441,9 @@ fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
             .or_else(|| osd_template::exif_field(img.exif.as_ref(), key))
             .or_else(|| {
                 Some(match key {
-                    "width" => img.width.to_string(),
-                    "height" => img.height.to_string(),
-                    "mp" => format!("{:.2}", img.width as f64 * img.height as f64 / 1_000_000.0),
+                    "width" => img.full.0.to_string(),
+                    "height" => img.full.1.to_string(),
+                    "mp" => format!("{:.2}", img.full.0 as f64 * img.full.1 as f64 / 1_000_000.0),
                     "zoom" => zoom.map(|z| z.to_string()).unwrap_or_default(),
                     "preview" => {
                         if img.is_preview {
@@ -526,6 +557,7 @@ mod tests {
         let img = DecodedImage {
             width: 4,
             height: 4,
+            full: (4, 4),
             bgra: (0..16)
                 .flat_map(|i| if i % 4 < 2 { [0, 0, 0, 255] } else { [255; 4] })
                 .collect(),

@@ -39,7 +39,7 @@ use crate::menu_theme::{self, ThemedMenu};
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
 use crate::playback_video::WM_MEDIA_EVENT;
 use crate::playlist::Repeat;
-use crate::state::{Drag, ViewerState, ZoomMode};
+use crate::state::{Arrived, Drag, ViewerState, ZoomMode};
 use crate::transport_bar::Click;
 use crate::{
     config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template, save_as,
@@ -504,8 +504,9 @@ unsafe fn caption(state: &ViewerState) -> String {
         .unwrap_or_default();
     let mut title = name.into_owned();
     if let Some(img) = &state.image {
-        let mp = img.width as f64 * img.height as f64 / 1_000_000.0;
-        title += &format!(" - [{}x{}, {:.1} MP]", img.width, img.height, mp);
+        let (w, h) = img.full;
+        let mp = w as f64 * h as f64 / 1_000_000.0;
+        title += &format!(" - [{}x{}, {:.1} MP]", w, h, mp);
         if let Some(zoom) = image_view::zoom_percent(state) {
             title += &format!(" [{}%]", zoom);
         }
@@ -690,7 +691,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                     });
                     (picture, file)
                 }
-                None => (state.image.clone(), Some(state.file_path.clone())),
+                None => (state.whole_image(), Some(state.file_path.clone())),
             };
             let copied =
                 picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
@@ -972,16 +973,17 @@ fn is_jpeg_file(path: &Path) -> bool {
 /// (RAW, PSD, turned with R / L, EXIF-rotated) the picture on screen saved as PNG.
 unsafe fn set_wallpaper(hwnd: HWND) {
     let Some(state) = get_state(hwnd) else { return };
-    let Some(img) = state.image.clone() else {
-        return;
-    };
     let path = state.file_path.clone();
-    let as_is = state.quarter_turns == 0
+    let as_is = state.image.is_some()
+        && state.quarter_turns == 0
         && mediares_core::probe::has_extension(&path, &["jpg", "jpeg", "png", "bmp"])
         && read_orientation(&path).is_none_or(|o| o == 1);
     let source = if as_is {
         Some(path)
     } else {
+        let Some(img) = state.whole_image() else {
+            return;
+        };
         let target = config::data_file("mediares_wallpaper.png");
         snapshot::save_png(&img, &target).then_some(target)
     };
@@ -1000,7 +1002,7 @@ pub unsafe fn print(hwnd: HWND, margins: Option<RECT>) -> bool {
     };
     let picture = match &state.media {
         Some(media) => media.current_picture(),
-        None => state.image.clone(),
+        None => state.whole_image(),
     };
     let Some(picture) = picture else { return false };
     let name = state
@@ -1196,14 +1198,17 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 execute(hwnd, cmd);
             }
         }
-        WM_IMAGE_READY => {
-            if state.image_ready() {
+        WM_IMAGE_READY => match state.image_ready() {
+            Arrived::Photo => {
                 if state.slideshow {
                     set_slideshow(state, true);
                 }
                 refresh(state);
             }
-        }
+            // Sharper when zoomed in; nothing else changes.
+            Arrived::Whole => redraw(hwnd),
+            Arrived::Nothing => {}
+        },
         // A photo still decoding gets its full slideshow interval once it is shown.
         WM_TIMER if wparam.0 == SLIDESHOW_TIMER_ID && state.pending.is_some() => {}
         WM_TIMER if wparam.0 == SLIDESHOW_TIMER_ID => {

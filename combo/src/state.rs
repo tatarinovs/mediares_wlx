@@ -6,6 +6,9 @@ use std::sync::Arc;
 use mediares_core::image_decode::header_looks_decodable;
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 
 use crate::config::ViewerConfig;
 use crate::gdi::Font;
@@ -41,9 +44,15 @@ pub struct ViewerState {
     pub lister: HWND,
     pub file_path: PathBuf,
     pub file_size: u64,
+    /// The photo on screen, usually fitted to the screen (see [`DecodedImage::full`]).
     pub image: Option<Arc<DecodedImage>>,
     /// The photo being decoded in the background (then `image` is `None`).
     pub pending: Option<Ticket>,
+    /// The whole picture of `image` when that is a fitted copy, turned like it; drawn when
+    /// zoomed in beyond the copy's own pixels.
+    pub whole: Option<Arc<DecodedImage>>,
+    /// The whole picture being decoded in the background.
+    whole_pending: Option<Ticket>,
     /// The last photo shown, drawn while `pending` so switching doesn't flash an empty window.
     pub previous: Option<Arc<DecodedImage>>,
     /// The current photo could not be decoded.
@@ -90,6 +99,8 @@ impl ViewerState {
             file_size: 0,
             image: None,
             pending: None,
+            whole: None,
+            whole_pending: None,
             previous: None,
             load_failed: false,
             quarter_turns: 0,
@@ -164,18 +175,65 @@ impl ViewerState {
         self.image.as_ref()?.exif.as_ref()?.gps()
     }
 
-    /// Takes the background decode result if it has arrived. Returns whether the view changed.
-    pub fn image_ready(&mut self) -> bool {
-        let Some(result) = self.pending.as_ref().and_then(Ticket::result) else {
-            return false;
-        };
-        self.pending = None;
-        self.previous = None;
-        match result {
-            Some(img) => self.image = Some(img),
-            None => self.load_failed = true,
+    /// Takes the background decode results that have arrived.
+    pub fn image_ready(&mut self) -> Arrived {
+        let mut arrived = Arrived::Nothing;
+        if let Some(result) = self.whole_pending.as_ref().and_then(Ticket::result) {
+            self.whole_pending = None;
+            if let Some(img) = result {
+                self.whole = Some(turned(img, self.quarter_turns));
+                arrived = Arrived::Whole;
+            }
         }
-        true
+        if let Some(result) = self.pending.as_ref().and_then(Ticket::result) {
+            self.pending = None;
+            self.previous = None;
+            match result {
+                Some(img) => self.set_image(img),
+                None => self.load_failed = true,
+            }
+            arrived = Arrived::Photo;
+        }
+        arrived
+    }
+
+    /// Shows `img` (just decoded, so not turned yet) and, when it is a fitted copy, has the
+    /// whole picture decoded in the background.
+    fn set_image(&mut self, img: Arc<DecodedImage>) {
+        self.image = Some(img);
+        self.request_whole();
+    }
+
+    /// Queues the whole picture of a fitted photo on screen. Called after the neighbours are
+    /// queued: it runs once they are done.
+    fn request_whole(&mut self) {
+        let fitted = self.image.as_ref().is_some_and(|img| !img.is_whole());
+        if fitted && self.whole.is_none() && self.whole_pending.is_none() {
+            let kind = probe_file(&self.file_path);
+            self.whole_pending =
+                image_cache::request_whole(&self.file_path, kind, self.decode_options(), self.hwnd);
+        }
+    }
+
+    /// The whole picture of the photo on screen, as turned on screen; decoded right here when
+    /// the background decode is not done yet (printing, copying).
+    pub fn whole_image(&mut self) -> Option<Arc<DecodedImage>> {
+        let img = self.image.clone()?;
+        if img.is_whole() {
+            return Some(img);
+        }
+        if self.whole.is_none() {
+            let whole = match self.whole_pending.take() {
+                Some(ticket) => ticket.finish()?,
+                None => {
+                    let kind = probe_file(&self.file_path);
+                    let options = self.decode_options();
+                    Arc::new(image_cache::decode_whole(&self.file_path, kind, options)?)
+                }
+            };
+            self.whole = Some(turned(whole, self.quarter_turns));
+        }
+        self.whole.clone()
     }
 
     /// Shows the file at `idx` of the list; false if it can't be displayed.
@@ -259,6 +317,7 @@ impl ViewerState {
         DecodeOptions {
             auto_rotate: self.config.auto_rotate_exif,
             background: self.config.photo_background,
+            fit: screen_side(self.hwnd),
         }
     }
 
@@ -266,6 +325,9 @@ impl ViewerState {
     pub fn rotate(&mut self, clockwise: bool) -> bool {
         let Some(img) = &self.image else { return false };
         self.image = Some(Arc::new(image_cache::rotated(img, clockwise)));
+        if let Some(whole) = &self.whole {
+            self.whole = Some(Arc::new(image_cache::rotated(whole, clockwise)));
+        }
         self.quarter_turns = (self.quarter_turns + if clockwise { 1 } else { 3 }) % 4;
         self.zoom = ZoomMode::Fit;
         self.loupe = None;
@@ -281,6 +343,7 @@ impl ViewerState {
             self.dir_files.remove(self.current_idx);
         }
         self.image = None;
+        self.whole = None;
         self.previous = None;
         if self.dir_files.is_empty() {
             self.pending = None;
@@ -306,6 +369,8 @@ impl ViewerState {
 
         let shown = self.image.take();
         self.pending = None;
+        self.whole = None;
+        self.whole_pending = None;
         self.load_failed = false;
         if kind.is_playable() {
             self.previous = None;
@@ -345,6 +410,7 @@ impl ViewerState {
         }
 
         image_cache::prefetch(self.prefetch_candidates(), options);
+        self.request_whole();
     }
 
     /// Neighbouring photos to warm up, most likely next first: two ahead in the direction of the
@@ -368,6 +434,42 @@ impl ViewerState {
             .map(|i| self.dir_files[i].clone())
             .filter(|p| probe_file(p).is_image_kind())
             .collect()
+    }
+}
+
+/// What [`ViewerState::image_ready`] took.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Arrived {
+    Nothing,
+    /// The photo to show (or its failure).
+    Photo,
+    /// The whole picture of the photo already shown.
+    Whole,
+}
+
+/// `img` turned by `quarter_turns` clockwise.
+fn turned(img: Arc<DecodedImage>, quarter_turns: u8) -> Arc<DecodedImage> {
+    match quarter_turns % 4 {
+        0 => img,
+        3 => Arc::new(image_cache::rotated(&img, false)),
+        n => (0..n).fold(img, |img, _| Arc::new(image_cache::rotated(&img, true))),
+    }
+}
+
+/// The longer side of the monitor showing `hwnd`: photos are decoded to fit a square of it, so
+/// they stay sharp in fullscreen and when turned. 0 (the whole picture) if it is unknown.
+fn screen_side(hwnd: HWND) -> u32 {
+    unsafe {
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return 0;
+        }
+        let rc = info.rcMonitor;
+        (rc.right - rc.left).max(rc.bottom - rc.top).max(0) as u32
     }
 }
 
