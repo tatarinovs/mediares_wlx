@@ -109,7 +109,7 @@ decode later, the window shows a message.
 | Action | Keys / mouse |
 |---|---|
 | Next / previous photo | Space, →, ↓, PgDn, N, wheel / ←, ↑, PgUp, Backspace, P; mouse side buttons |
-| Zoom | + / −, Ctrl+wheel (towards the cursor); 1 — 100%; 0, *, / — fit to window |
+| Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
 | Pan / loupe | drag while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
 | Write the rotation into the JPEG losslessly | Ctrl+R (or the menu) |
@@ -117,6 +117,7 @@ decode later, the window shows a message.
 | OSD on/off / slideshow | O or I / F5 |
 | Delete to recycle bin and show the next one | Del (confirmation can be turned off in settings) |
 | EXIF / settings | E / S |
+| Where the photo was taken, on OpenStreetMap (photos with GPS) | G (or the menu; a button in the EXIF window) |
 | Copy the picture | Ctrl+C |
 | Save as JPEG / PNG | Ctrl+S (or the menu) |
 | Print | Ctrl+P (or the menu) |
@@ -312,7 +313,7 @@ noticeable amount of time, so these fields are delayed.
 
 | Field | Type | Value |
 |---|---|---|
-| `Video_Duration_Sec` | number | Duration in whole seconds (from analysis, as in the fingerprint) |
+| `Video_Duration_Sec` | number | Duration rounded to whole seconds, as in `Video_Length` (from analysis; `Video_Fingerprint` drops the fraction) |
 | `Video_Length` | time | Duration, h:mm:ss |
 | `Video_Width`, `Video_Height` | number | Frame size |
 | `Video_Dimensions` | string | `WxH` from analysis |

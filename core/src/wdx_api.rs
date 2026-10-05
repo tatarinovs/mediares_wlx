@@ -558,7 +558,7 @@ fn exif_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         PhotoSoftware => text(&exif.software),
         PhotoGpsLatitude => exif.gps_latitude.map(Value::Float),
         PhotoGpsLongitude => exif.gps_longitude.map(Value::Float),
-        PhotoHasGps => Some(Value::Bool(exif.gps_latitude.is_some())),
+        PhotoHasGps => Some(Value::Bool(exif.gps().is_some())),
         _ => None,
     }
 }

@@ -92,6 +92,8 @@ const PRESET_COLORS: [u32; 6] = [
 ];
 
 struct Context {
+    /// The settings as the dialog opened, to save only what changed.
+    initial: ViewerConfig,
     config: ViewerConfig,
     color: u32,
     background: u32,
@@ -112,6 +114,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
     let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 850, 625)?;
 
     let ctx = Box::into_raw(Box::new(Context {
+        initial: current.clone(),
         config: current.clone(),
         color: current.osd_font_color,
         background: current.photo_background,
@@ -678,7 +681,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.photo_editor = edit_text(dlg, IDC_PHOTO_EDITOR);
     cfg.video_editor = edit_text(dlg, IDC_VIDEO_EDITOR);
     cfg.audio_editor = edit_text(dlg, IDC_AUDIO_EDITOR);
-    cfg.save();
+    cfg.save(&ctx.initial);
     ctx.result = Some(cfg.clone());
 }
 

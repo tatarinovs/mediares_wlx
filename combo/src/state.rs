@@ -156,6 +156,11 @@ impl ViewerState {
         self.image.is_some() || self.pending.is_some()
     }
 
+    /// Where the photo shown was taken, if its EXIF says.
+    pub fn photo_gps(&self) -> Option<(f64, f64)> {
+        self.image.as_ref()?.exif.as_ref()?.gps()
+    }
+
     /// Takes the background decode result if it has arrived. Returns whether the view changed.
     pub fn image_ready(&mut self) -> bool {
         let Some(result) = self.pending.as_ref().and_then(Ticket::result) else {

@@ -107,6 +107,9 @@ commands! {
     FrameForward,
     SaveAs,
     SaveRotation,
+    OpenMap,
+    Zoom200,
+    Zoom300,
 }
 
 impl Command {
@@ -146,6 +149,7 @@ impl Command {
         Some((Command::ToggleShuffle, n("Shuffle"))),
         None,
         Some((Command::ShowExif, n("EXIF info...\tE"))),
+        Some((Command::OpenMap, n("Open on map\tG"))),
         Some((Command::OpenInEditor, n("Open in editor\tF4"))),
         Some((Command::ShowInFolder, n("Show in folder\tCtrl+Enter"))),
         Some((Command::SetWallpaper, n("Set as desktop background"))),
@@ -166,7 +170,7 @@ impl Command {
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
             | ToggleShuffle => media,
             ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SaveRotation | SetWallpaper
-            | SaveAs => !media,
+            | SaveAs | OpenMap => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
         }
@@ -261,19 +265,25 @@ impl Command {
         let zoom = match vk {
             0xBB | 0x6B => Some(ZoomIn),  // '+' / numpad +
             0xBD | 0x6D => Some(ZoomOut), // '-' / numpad -
-            0x30 | 0x60 => Some(ZoomFit), // '0' / numpad 0
             _ => None,
         };
         if ctrl {
-            return zoom;
+            // Only with Ctrl: bare digits switch the Lister's view mode.
+            return zoom.or(match vk {
+                0x30 | 0x60 => Some(ZoomFit),        // Ctrl+0
+                0x31 | 0x61 => Some(ZoomActualSize), // Ctrl+1
+                0x32 | 0x62 => Some(Zoom200),        // Ctrl+2
+                0x33 | 0x63 => Some(Zoom300),        // Ctrl+3
+                _ => None,
+            });
         }
         zoom.or(match vk {
             0x0D | 0x46 | 0x7A => Some(ToggleFullscreen), // Enter, F, F11
             0x4F | 0x49 => Some(ToggleOsd),               // O, I
             0x74 => Some(ToggleSlideshow),                // F5
             0x45 => Some(ShowExif),                       // E
+            0x47 => Some(OpenMap),                        // G
             0x53 => Some(ShowSettings),                   // S
-            0x31 | 0x61 => Some(ZoomActualSize),          // '1' / numpad 1
             0x4C => Some(RotateLeft),                     // L
             0x52 => Some(RotateRight),                    // R
             0x2E => Some(Delete),                         // Del
@@ -632,19 +642,25 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         }
         Command::ToggleOsd => {
             // Switches the OSD for the kind of content shown (audio has none).
-            let osd = state.config.osd;
+            let before = state.config.clone();
+            let osd = before.osd;
             let video = state.media.as_ref().is_some_and(|m| m.is_video());
             state.config.osd = match (video, state.shows_photo()) {
                 (true, _) => osd.with(osd.photo(), !osd.video()),
                 (false, true) => osd.with(!osd.photo(), osd.video()),
                 (false, false) => return,
             };
-            state.config.save();
+            state.config.save(&before);
             refresh(state);
         }
         Command::ShowExif => {
             let path = state.file_path.clone();
             exif_dialog::show(dialog::modal_owner(hwnd), &path);
+        }
+        Command::OpenMap => {
+            if let Some(place) = state.photo_gps() {
+                file_actions::open_map(hwnd, place);
+            }
         }
         Command::ShowSettings => {
             let current = state.config.clone();
@@ -782,13 +798,14 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         | Command::RepeatAll
         | Command::RepeatOne
         | Command::ToggleShuffle => {
+            let before = state.config.clone();
             let queue = &mut state.config.queue;
             match command {
                 Command::ToggleAutoAdvance => queue.auto_advance = !queue.auto_advance,
                 Command::ToggleShuffle => queue.shuffle = !queue.shuffle,
                 _ => queue.repeat = command.repeat_mode().unwrap_or_default(),
             }
-            state.config.save();
+            state.config.save(&before);
         }
         Command::ZoomIn | Command::ZoomOut => {
             if let Some(view) = client_size(hwnd) {
@@ -800,9 +817,14 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 );
             }
         }
-        Command::ZoomActualSize => {
+        Command::ZoomActualSize | Command::Zoom200 | Command::Zoom300 => {
             if let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) {
-                image_view::zoom_actual_size(state, &img, view);
+                let scale = match command {
+                    Command::Zoom200 => 2.0,
+                    Command::Zoom300 => 3.0,
+                    _ => 1.0,
+                };
+                image_view::zoom_to(state, &img, view, scale, (view.0 / 2.0, view.1 / 2.0));
                 refresh(state);
             }
         }
@@ -1055,6 +1077,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     } else {
         state.config.osd.photo()
     };
+    let gps = state.photo_gps().is_some();
 
     let Some(mut menu) = ThemedMenu::new(hwnd, state.show_flags & LCP_DARKMODE != 0) else {
         return;
@@ -1063,9 +1086,9 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     if let Some(fs) = state.overlay.as_mut() {
         fs.reveal_cursor(hwnd);
     }
-    let items = Command::MENU
-        .iter()
-        .filter(|item| item.is_none_or(|(cmd, _)| cmd.available(media, video)));
+    let items = Command::MENU.iter().filter(|item| {
+        item.is_none_or(|(cmd, _)| cmd.available(media, video) && (cmd != Command::OpenMap || gps))
+    });
     let mut previous_was_separator = true;
     for item in items {
         // Skip separators that would end up leading or doubled after filtering.
@@ -1454,6 +1477,15 @@ mod tests {
             Command::from_key(0xBB, true, false, false),
             Some(Command::ZoomIn)
         );
+        for (vk, zoom) in [
+            (0x30, Command::ZoomFit),
+            (0x31, Command::ZoomActualSize),
+            (0x62, Command::Zoom200),
+            (0x33, Command::Zoom300),
+        ] {
+            assert_eq!(Command::from_key(vk, true, false, false), Some(zoom));
+        }
+        assert_eq!(Command::from_key(0x31, false, false, false), None); // 1: Lister's text mode
         for media in [false, true] {
             assert_eq!(
                 Command::from_key(0x73, false, false, media),
@@ -1558,9 +1590,9 @@ mod tests {
     #[test]
     fn raw_values_outside_the_commands() {
         assert_eq!(Command::from_raw(0), None);
-        assert_eq!(Command::from_raw(Command::SaveRotation as usize + 1), None);
+        assert_eq!(Command::from_raw(Command::ALL.len() + 1), None);
         assert_eq!(Command::from_raw(1), Some(Command::ToggleFullscreen));
-        for value in 1..=Command::SaveRotation as usize {
+        for value in 1..=Command::ALL.len() {
             assert_eq!(Command::from_raw(value).map(|c| c as usize), Some(value));
         }
     }

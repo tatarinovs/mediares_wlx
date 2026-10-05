@@ -146,6 +146,13 @@ pub unsafe fn show_in_folder(owner: HWND, path: &Path) -> bool {
     )
 }
 
+/// The place on OpenStreetMap in the default browser.
+pub unsafe fn open_map(owner: HWND, (latitude, longitude): (f64, f64)) -> bool {
+    let (lat, lon) = (format!("{latitude:.6}"), format!("{longitude:.6}"));
+    let url = format!("https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=16/{lat}/{lon}");
+    shell_execute(owner, w!("open"), &HSTRING::from(url), None)
+}
+
 /// `image` must be a format Windows accepts as wallpaper (JPEG, PNG, BMP).
 pub unsafe fn set_wallpaper(image: &Path) -> bool {
     let mut wide: Vec<u16> = image.as_os_str().encode_wide().chain([0]).collect();

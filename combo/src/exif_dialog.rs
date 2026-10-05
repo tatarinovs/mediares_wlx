@@ -6,8 +6,9 @@ use mediares_core::exif::{read_exif, ExifInfo};
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, BS_DEFPUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, IDCANCEL, IDOK,
-    WM_CLOSE, WM_COMMAND, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    DefWindowProcW, GetWindowLongPtrW, SetWindowLongPtrW, BS_DEFPUSHBUTTON, ES_AUTOVSCROLL,
+    ES_MULTILINE, ES_READONLY, GWLP_USERDATA, IDCANCEL, IDOK, WM_CLOSE, WM_COMMAND, WS_BORDER,
+    WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::dialog;
@@ -15,6 +16,7 @@ use crate::i18n::tr;
 
 const CLASS_NAME: PCWSTR = w!("MediaresExifDialogClass");
 const IDC_EXIF_TEXT: usize = 201;
+const IDC_OPEN_MAP: i32 = 202;
 
 pub unsafe fn show(owner: HWND, file_path: &Path) {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
@@ -32,6 +34,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
         return;
     };
 
+    let info = read_exif(file_path);
     // Monospace so the label column lines up.
     let font = dialog::font(dlg, "Consolas", -13);
     let ui_font = dialog::font(dlg, "Segoe UI", -12);
@@ -42,7 +45,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
     dialog::control(
         dlg,
         w!("EDIT"),
-        &exif_text(file_path),
+        &exif_text(file_path, info.as_ref()),
         edit_style,
         (15, 15, 495, 335),
         IDC_EXIF_TEXT,
@@ -58,13 +61,31 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
         ui_font.0,
     );
 
+    // The coordinates for the map button live in the window until it is gone.
+    let place = info.as_ref().and_then(ExifInfo::gps).map(|place| {
+        dialog::control(
+            dlg,
+            w!("BUTTON"),
+            tr("Open on map"),
+            WS_TABSTOP.0,
+            (15, 360, 150, 28),
+            IDC_OPEN_MAP as usize,
+            ui_font.0,
+        );
+        let place = Box::into_raw(Box::new(place));
+        SetWindowLongPtrW(dlg, GWLP_USERDATA, place as isize);
+        place
+    });
+
     dialog::run_modal(dlg, close);
+    // run_modal returns only after the window is destroyed, so nothing references `place` anymore.
+    if let Some(place) = place {
+        drop(Box::from_raw(place));
+    }
 }
 
-fn exif_text(file_path: &Path) -> String {
-    let rows = read_exif(file_path)
-        .map(|info| display_rows(&info))
-        .unwrap_or_default();
+fn exif_text(file_path: &Path, info: Option<&ExifInfo>) -> String {
+    let rows = info.map(display_rows).unwrap_or_default();
     let mut text = if rows.is_empty() {
         format!(
             "{}\r\n",
@@ -139,6 +160,11 @@ fn display_rows(info: &ExifInfo) -> Vec<(&'static str, String)> {
             .map(|(w, h)| format!("{} x {}", w, h)),
     );
     push(tr("Software"), info.software.clone());
+    push(
+        tr("GPS coordinates"),
+        info.gps()
+            .map(|(lat, lon)| format!("{:.6}, {:.6}", lat, lon)),
+    );
     rows
 }
 
@@ -169,6 +195,13 @@ unsafe extern "system" fn wnd_proc(
                 dialog::close(hwnd);
                 LRESULT(0)
             }
+            WM_COMMAND if id == IDC_OPEN_MAP => {
+                let place = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const (f64, f64);
+                if let Some(&place) = place.as_ref() {
+                    crate::file_actions::open_map(hwnd, place);
+                }
+                LRESULT(0)
+            }
             WM_CLOSE => {
                 dialog::close(hwnd);
                 LRESULT(0)
@@ -191,6 +224,8 @@ mod tests {
             f_number: Some(2.8),
             iso: Some(400),
             exposure_time: Some("1/250".into()),
+            gps_latitude: Some(55.751244),
+            gps_longitude: Some(-37.618423),
             ..Default::default()
         };
         let rows = display_rows(&info);
@@ -203,6 +238,7 @@ mod tests {
         ));
         assert!(has(tr("Aperture"), "f/2.8"));
         assert!(has(tr("Sensitivity (ISO)"), "400"));
+        assert!(has(tr("GPS coordinates"), "55.751244, -37.618423"));
         // Cyrillic "с" (seconds); the old pair had a Latin "c" by mistake.
         assert!(has(tr("Exposure"), "1/250 \u{0441}"));
     }

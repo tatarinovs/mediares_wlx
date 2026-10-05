@@ -49,6 +49,9 @@ const DARK: Palette = Palette {
 const CHECK_WIDTH: f32 = 28.0;
 const MARGIN_RIGHT: f32 = 20.0;
 const SHORTCUT_GAP: f32 = 32.0;
+/// Space above and below an item's text, together (at 96 DPI): about 22 px items, like the
+/// classic menus TC itself shows.
+const ITEM_PADDING: f32 = 6.0;
 
 /// Shared by all items: every item's `itemData` points here.
 struct Style {
@@ -172,7 +175,7 @@ pub unsafe fn measure_item(lparam: LPARAM) -> bool {
     SelectObject(dc, old);
     ReleaseDC(None, dc);
     mis.itemWidth = width as u32;
-    mis.itemHeight = (size.cy + style.px(12.0)) as u32;
+    mis.itemHeight = (size.cy + style.px(ITEM_PADDING)) as u32;
     true
 }
 

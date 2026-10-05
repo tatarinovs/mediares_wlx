@@ -321,51 +321,61 @@ impl ViewerConfig {
         }
     }
 
-    /// Writes all settings; returns false if any write failed (e.g. read-only location).
-    pub fn save(&self) -> bool {
-        let ini = HSTRING::from(ini_path().as_os_str());
-        let write = |key: PCWSTR, value: String| unsafe {
-            WritePrivateProfileStringW(SECTION, key, &HSTRING::from(value), &ini).is_ok()
-        };
+    /// The settings as INI key / value pairs.
+    fn entries(&self) -> [(PCWSTR, String); 27] {
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
-
         [
-            write(w!("Language"), self.language.to_ini().to_string()),
-            write(w!("StartFullscreen"), flag(self.start_fullscreen)),
-            write(w!("OSDMode"), self.osd.index().to_string()),
-            write(w!("OSDFontSize"), self.osd_font_size.to_string()),
-            write(w!("OSDFontColor"), self.osd_font_color.to_string()),
-            write(w!("OSDFontName"), self.osd_font_name.clone()),
-            write(w!("AutoRotateExif"), flag(self.auto_rotate_exif)),
-            write(w!("LoupeScale"), format!("{:.1}", self.loupe_scale)),
-            write(w!("AutoAdvance"), flag(self.queue.auto_advance)),
-            write(w!("Repeat"), self.queue.repeat.index().to_string()),
-            write(w!("Shuffle"), flag(self.queue.shuffle)),
-            write(w!("OverlayPhoto"), flag(self.overlay_photo)),
-            write(w!("OverlayVideo"), flag(self.overlay_video)),
-            write(w!("OverlayAutoHide"), flag(self.overlay_autohide)),
-            write(w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
-            write(w!("PhotoBackground"), self.photo_background.to_string()),
-            write(w!("NoUpscale"), flag(self.no_upscale)),
-            write(w!("SmoothZoom"), flag(self.smooth_zoom)),
-            write(w!("ConfirmDelete"), flag(self.confirm_delete)),
-            write(w!("ResumeVideo"), flag(self.resume_video)),
-            write(w!("SeekStep"), self.seek_step_sec.to_string()),
-            write(w!("FrameFormat"), self.frame_format.extension().to_string()),
-            write(w!("PhotoEditor"), self.photo_editor.clone()),
-            write(w!("VideoEditor"), self.video_editor.clone()),
-            write(w!("AudioEditor"), self.audio_editor.clone()),
+            (w!("Language"), self.language.to_ini().to_string()),
+            (w!("StartFullscreen"), flag(self.start_fullscreen)),
+            (w!("OSDMode"), self.osd.index().to_string()),
+            (w!("OSDFontSize"), self.osd_font_size.to_string()),
+            (w!("OSDFontColor"), self.osd_font_color.to_string()),
+            (w!("OSDFontName"), self.osd_font_name.clone()),
+            (w!("AutoRotateExif"), flag(self.auto_rotate_exif)),
+            (w!("LoupeScale"), format!("{:.1}", self.loupe_scale)),
+            (w!("AutoAdvance"), flag(self.queue.auto_advance)),
+            (w!("Repeat"), self.queue.repeat.index().to_string()),
+            (w!("Shuffle"), flag(self.queue.shuffle)),
+            (w!("OverlayPhoto"), flag(self.overlay_photo)),
+            (w!("OverlayVideo"), flag(self.overlay_video)),
+            (w!("OverlayAutoHide"), flag(self.overlay_autohide)),
+            (w!("SlideshowSeconds"), self.slideshow_seconds.to_string()),
+            (w!("PhotoBackground"), self.photo_background.to_string()),
+            (w!("NoUpscale"), flag(self.no_upscale)),
+            (w!("SmoothZoom"), flag(self.smooth_zoom)),
+            (w!("ConfirmDelete"), flag(self.confirm_delete)),
+            (w!("ResumeVideo"), flag(self.resume_video)),
+            (w!("SeekStep"), self.seek_step_sec.to_string()),
+            (w!("FrameFormat"), self.frame_format.extension().to_string()),
+            (w!("PhotoEditor"), self.photo_editor.clone()),
+            (w!("VideoEditor"), self.video_editor.clone()),
+            (w!("AudioEditor"), self.audio_editor.clone()),
             // The default is stored as empty, so a changed default reaches users who never edited it.
-            write(
+            (
                 w!("PhotoOSDTemplate"),
                 template_to_ini(&self.photo_osd, osd_template::DEFAULT_PHOTO),
             ),
-            write(
+            (
                 w!("VideoOSDTemplate"),
                 template_to_ini(&self.video_osd, osd_template::DEFAULT_VIDEO),
             ),
         ]
-        .iter()
-        .all(|&ok| ok)
+    }
+
+    /// Writes the settings that differ from `before` (what was loaded or last saved), so keys
+    /// another viewer window or the user changed in the meantime are kept. Returns false if any
+    /// write failed (e.g. read-only location).
+    pub fn save(&self, before: &ViewerConfig) -> bool {
+        let ini = HSTRING::from(ini_path().as_os_str());
+        self.entries()
+            .into_iter()
+            .zip(before.entries())
+            .filter(|((_, value), (_, old))| value != old)
+            // Every write is attempted, so one failure doesn't drop the rest.
+            .filter(|((key, value), _)| unsafe {
+                WritePrivateProfileStringW(SECTION, *key, &HSTRING::from(value), &ini).is_err()
+            })
+            .count()
+            == 0
     }
 }

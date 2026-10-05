@@ -201,8 +201,7 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
         }
         "software" => text(&e.software),
         "gps" => e
-            .gps_latitude
-            .zip(e.gps_longitude)
+            .gps()
             .map(|(la, lo)| format!("{:.5}, {:.5}", la, lo))
             .unwrap_or_default(),
         _ => return None,

@@ -270,7 +270,6 @@ pub fn analyze_video(
             .ok_or_else(|| VideoError::Failed("no output media type".into()))?;
 
         let duration_hns = duration_hns(&reader);
-        let duration_sec = (duration_hns / 10_000_000) as u32;
 
         let mut hashes = [None; 3];
         for (hash, quarter) in hashes.iter_mut().zip([1u64, 2, 3]) {
@@ -279,15 +278,20 @@ pub fn analyze_video(
         }
         let [dhash_25, dhash_mid, dhash_75] = hashes;
         let fingerprint = match (dhash_25, dhash_mid, dhash_75) {
+            // Whole seconds cut down, as the fingerprints already in use were made.
             (Some(a), Some(b), Some(c)) => Some(format!(
                 "{}s_{:016x}_{:016x}_{:016x}",
-                duration_sec, a, b, c
+                duration_hns / 10_000_000,
+                a,
+                b,
+                c
             )),
             _ => None,
         };
 
         Ok(VideoAnalysis {
-            duration_sec,
+            // Rounded like `Video_Duration` shows it.
+            duration_sec: ((duration_hns + 5_000_000) / 10_000_000) as u32,
             width: geometry.width,
             height: geometry.height,
             dhash_mid,

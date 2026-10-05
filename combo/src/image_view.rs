@@ -81,6 +81,22 @@ pub fn clamp_offset(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32
     }
 }
 
+/// One zoom step from `current`. A step that would jump over 100% stops there, so + and -
+/// reach it whatever scale fitting started from.
+fn step_scale(current: f32, zoom_in: bool) -> f32 {
+    let next = if zoom_in {
+        current * ZOOM_STEP
+    } else {
+        current / ZOOM_STEP
+    };
+    let crosses = if zoom_in {
+        current < 1.0 - 1e-3 && next > 1.0
+    } else {
+        current > 1.0 + 1e-3 && next < 1.0
+    };
+    if crosses { 1.0 } else { next }.clamp(MIN_ZOOM, MAX_ZOOM)
+}
+
 /// Zooms by one step keeping the image point under `anchor` fixed.
 pub fn zoom_step(
     state: &mut ViewerState,
@@ -89,31 +105,49 @@ pub fn zoom_step(
     zoom_in: bool,
     anchor: (f32, f32),
 ) {
-    state.loupe = None;
-    let current = scale(state, img, view);
-    let (ox, oy) = origin(state, img, view);
+    let new_scale = step_scale(scale(state, img, view), zoom_in);
     let fit = fit_scale(state, img, view);
-    let new_scale = if zoom_in {
-        current * ZOOM_STEP
-    } else {
-        current / ZOOM_STEP
-    }
-    .clamp(MIN_ZOOM, MAX_ZOOM);
-
     if !zoom_in && ((new_scale - fit).abs() / fit < FIT_SNAP) {
+        state.loupe = None;
         state.zoom = ZoomMode::Fit;
         return;
     }
-    let img_x = (anchor.0 - ox) / current;
-    let img_y = (anchor.1 - oy) / current;
-    state.zoom = ZoomMode::Custom(new_scale);
-    state.offset = (anchor.0 - img_x * new_scale, anchor.1 - img_y * new_scale);
-    clamp_offset(state, img, view);
+    zoom_to(state, img, view, new_scale, anchor);
 }
 
-pub fn zoom_actual_size(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32)) {
+/// Sets the scale keeping the image point under `anchor` fixed.
+pub fn zoom_to(
+    state: &mut ViewerState,
+    img: &DecodedImage,
+    view: (f32, f32),
+    new_scale: f32,
+    anchor: (f32, f32),
+) {
     state.loupe = None;
-    state.zoom = ZoomMode::Custom(1.0);
+    let current = scale(state, img, view);
+    let (ox, oy) = origin(state, img, view);
+    let point = (
+        (anchor.0 - ox) / current / img.width as f32,
+        (anchor.1 - oy) / current / img.height as f32,
+    );
+    show_at(state, img, view, new_scale, point, anchor);
+}
+
+/// Zooms to `new_scale` with the image point `point` (fractions of the width and height) at
+/// window position `at`, as far as the image can still cover the window.
+fn show_at(
+    state: &mut ViewerState,
+    img: &DecodedImage,
+    view: (f32, f32),
+    new_scale: f32,
+    point: (f32, f32),
+    at: (f32, f32),
+) {
+    state.zoom = ZoomMode::Custom(new_scale);
+    state.offset = (
+        at.0 - point.0 * img.width as f32 * new_scale,
+        at.1 - point.1 * img.height as f32 * new_scale,
+    );
     clamp_offset(state, img, view);
 }
 
@@ -128,25 +162,23 @@ pub fn loupe_begin(
         saved_zoom: state.zoom,
         saved_offset: state.offset,
     });
-    state.zoom = ZoomMode::Custom(state.config.loupe_scale);
     loupe_follow(state, img, view, cursor);
 }
 
+/// The cursor's place in the window picks the same place in the image, so moving across the
+/// window scans the whole picture.
 pub fn loupe_follow(
     state: &mut ViewerState,
     img: &DecodedImage,
     view: (f32, f32),
     cursor: (i32, i32),
 ) {
-    let s = state.config.loupe_scale;
-    let axis = |pos: i32, image_len: f32, window_len: f32| {
-        let t = (pos as f32 / window_len).clamp(0.0, 1.0);
-        clamp_axis(-(image_len - window_len) * t, image_len, window_len)
-    };
-    state.offset = (
-        axis(cursor.0, img.width as f32 * s, view.0),
-        axis(cursor.1, img.height as f32 * s, view.1),
+    let t = (
+        (cursor.0 as f32 / view.0).clamp(0.0, 1.0),
+        (cursor.1 as f32 / view.1).clamp(0.0, 1.0),
     );
+    let at = (t.0 * view.0, t.1 * view.1);
+    show_at(state, img, view, state.config.loupe_scale, t, at);
 }
 
 pub fn loupe_end(state: &mut ViewerState) -> bool {
@@ -469,6 +501,78 @@ mod tests {
         );
         // Off-screen.
         assert_eq!(visible_span(900.0, 1.0, 100, 800.0), None);
+    }
+
+    #[test]
+    fn zoom_steps_stop_at_actual_size() {
+        // From a fit scale of 37%: 46, 58, 72, 90, then 100 instead of 113.
+        let mut s = 0.37;
+        for _ in 0..5 {
+            s = step_scale(s, true);
+        }
+        assert_eq!(s, 1.0);
+        assert_eq!(step_scale(1.0, true), 1.25);
+        assert_eq!(step_scale(1.1, false), 1.0);
+        assert_eq!(step_scale(1.0, false), 0.8);
+        assert_eq!(step_scale(MAX_ZOOM, true), MAX_ZOOM);
+    }
+
+    /// Paints a picture whose left half is black and right half white at `scale` the way the
+    /// window does, and returns the blue channel of the middle row.
+    fn paint_row(scale: f32, origin_x: f32, width: i32) -> Vec<u8> {
+        use windows::Win32::Graphics::Gdi::{
+            CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
+        };
+        let img = DecodedImage {
+            width: 4,
+            height: 4,
+            bgra: (0..16)
+                .flat_map(|i| if i % 4 < 2 { [0, 0, 0, 255] } else { [255; 4] })
+                .collect(),
+            is_preview: false,
+            exif: None,
+        };
+        let height = (4.0 * scale) as i32;
+        unsafe {
+            let dc = CreateCompatibleDC(None);
+            let mut bits = std::ptr::null_mut();
+            let bmi = gdi::bitmap_info(width as u32, -height);
+            let bmp = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0).unwrap();
+            let old = SelectObject(dc, bmp.into());
+            let window = gdi::rect(width, height);
+            let x = visible_span(origin_x, scale, 4, width as f32).unwrap();
+            let y = visible_span(0.0, scale, 4, height as f32).unwrap();
+            stretch(dc, &img, x, y, filter(scale, true), window);
+            let row = std::slice::from_raw_parts(
+                (bits as *const u8).add((height / 2 * width * 4) as usize),
+                width as usize * 4,
+            );
+            let blue = row.iter().step_by(4).copied().collect();
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+            blue
+        }
+    }
+
+    #[test]
+    fn enlarged_photos_are_smoothed() {
+        for scale in [2.0, 3.0] {
+            let w = (4.0 * scale) as i32;
+            let row = paint_row(scale, 0.0, w);
+            // Square pixels would jump from 0 to 255 at the edge; bicubic leaves a ramp.
+            let ramp = row.iter().filter(|&&b| b > 20 && b < 235).count();
+            assert!(ramp >= 2, "{scale}x: {row:?}");
+            assert!(
+                row[0] < 20 && row[w as usize - 1] > 235,
+                "{scale}x: {row:?}"
+            );
+        }
+        // Zoomed in and panned, only part of the picture is in the window.
+        let row = paint_row(3.0, -3.0, 6);
+        assert!(row.iter().any(|&b| b > 20 && b < 235), "{row:?}");
+        // 100% is drawn as is.
+        assert_eq!(paint_row(1.0, 0.0, 4), [0, 0, 255, 255]);
     }
 
     #[test]

@@ -52,6 +52,11 @@ impl ExifInfo {
             .as_deref()
             .or(self.date_time.as_deref())
     }
+
+    /// Latitude and longitude in degrees (south and west negative).
+    pub fn gps(&self) -> Option<(f64, f64)> {
+        self.gps_latitude.zip(self.gps_longitude)
+    }
 }
 
 /// Camera clock time from an EXIF `YYYY:MM:DD HH:MM:SS` string (no time zone).
