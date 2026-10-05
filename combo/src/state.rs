@@ -75,6 +75,8 @@ pub struct ViewerState {
     pub show_flags: i32,
     /// Lazily created OSD font; dropped whenever the config changes.
     pub osd_font: Option<Font>,
+    /// Keeps the image cache while this window lives.
+    _cache_hold: image_cache::ViewerHold,
 }
 
 impl ViewerState {
@@ -106,6 +108,7 @@ impl ViewerState {
             config,
             show_flags: 0,
             osd_font: None,
+            _cache_hold: image_cache::ViewerHold::new(),
         };
         state.set_file(path).then_some(state)
     }

@@ -6,6 +6,7 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 
 use mediares_core::cache::FileKey;
@@ -100,6 +101,43 @@ pub fn load(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Arc<
     Some(img)
 }
 
+/// Viewer windows alive; the cache lives only while there is one.
+static VIEWERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Held by every viewer window. When the last one goes, the decoded images are freed along with
+/// pending work: the Lister is mostly opened for one file, and TC keeps the plugin loaded.
+pub struct ViewerHold(());
+
+impl ViewerHold {
+    pub fn new() -> Self {
+        VIEWERS.fetch_add(1, Ordering::SeqCst);
+        ViewerHold(())
+    }
+}
+
+impl Drop for ViewerHold {
+    fn drop(&mut self) {
+        if VIEWERS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            release_all();
+        }
+    }
+}
+
+/// Drops the cached images and queued decodes; decodes already running are not cached.
+fn release_all() {
+    // No pool yet means nothing was decoded in the background (e.g. only audio was shown).
+    let mut q = POOL.get().map(Pool::lock);
+    if VIEWERS.load(Ordering::SeqCst) > 0 {
+        return; // a new viewer opened meanwhile
+    }
+    if let Some(q) = q.as_mut() {
+        q.generation += 1;
+        q.foreground.clear();
+        q.prefetch.clear();
+    }
+    cache().entries = Vec::new();
+}
+
 pub enum Request {
     Ready(Arc<DecodedImage>),
     /// Decoding in the background; `notify` receives [`WM_IMAGE_READY`] when it is done.
@@ -141,7 +179,7 @@ pub fn request(
         .find(|job| job.key == key)
         .cloned();
     let job = existing.unwrap_or_else(|| {
-        let job = Job::new(key, path.to_path_buf(), kind);
+        let job = Job::new(key, path.to_path_buf(), kind, q.generation);
         q.foreground.push_back(job.clone());
         pool.wake.notify_one();
         job
@@ -185,17 +223,20 @@ struct Job {
     key: Key,
     path: PathBuf,
     kind: MediaType,
+    /// [`Queue::generation`] when the job was made; a result from an older one is not cached.
+    generation: u64,
     /// Windows to post [`WM_IMAGE_READY`] to (raw handles: HWND is not `Send`).
     notify: Mutex<Vec<isize>>,
     result: OnceLock<Option<Arc<DecodedImage>>>,
 }
 
 impl Job {
-    fn new(key: Key, path: PathBuf, kind: MediaType) -> Arc<Job> {
+    fn new(key: Key, path: PathBuf, kind: MediaType, generation: u64) -> Arc<Job> {
         Arc::new(Job {
             key,
             path,
             kind,
+            generation,
             notify: Mutex::new(Vec::new()),
             result: OnceLock::new(),
         })
@@ -203,6 +244,11 @@ impl Job {
 
     fn lock_notify(&self) -> MutexGuard<'_, Vec<isize>> {
         self.notify.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether a window waits for the result (a prefetch becomes wanted once requested).
+    fn is_wanted(&self) -> bool {
+        !self.lock_notify().is_empty()
     }
 }
 
@@ -213,13 +259,21 @@ struct Queue {
     in_flight: Vec<Arc<Job>>,
     /// Decoder threads; with more than one, prefetching leaves one free for the photo asked for.
     workers: usize,
+    /// Bumped when the last viewer closes and the cache is emptied.
+    generation: u64,
 }
 
 impl Queue {
     /// The next job to run: requested images first, then prefetches not already done or running.
+    /// Neighbours wait until no decode that a window waits for is running: the viewer is often
+    /// opened for a single file, and codecs like the HEIF one gain nothing from parallel decodes
+    /// (three at once take as long as three in a row), so a prefetch would only delay the photo.
     fn next_job(&mut self) -> Option<Arc<Job>> {
         if let Some(job) = self.foreground.pop_front() {
             return Some(job);
+        }
+        if self.in_flight.iter().any(|job| job.is_wanted()) {
+            return None;
         }
         if self.workers > 1 && self.in_flight.len() + 1 >= self.workers {
             return None;
@@ -233,7 +287,7 @@ impl Queue {
                 continue;
             }
             let kind = probe_file(&path);
-            return Some(Job::new(key, path, kind));
+            return Some(Job::new(key, path, kind, self.generation));
         }
         None
     }
@@ -250,8 +304,9 @@ impl Pool {
     }
 }
 
+static POOL: OnceLock<Pool> = OnceLock::new();
+
 fn pool() -> &'static Pool {
-    static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
         let workers = (0..cores.saturating_sub(1).clamp(1, MAX_WORKERS))
@@ -291,7 +346,12 @@ fn worker_loop() {
         let result = cached.or_else(|| {
             let decoded = std::panic::catch_unwind(|| decode(&job.path, job.kind, job.key.options));
             let img = decoded.ok().flatten().map(Arc::new)?;
-            cache().insert(job.key.clone(), img.clone());
+            // Under the queue lock, so the cache cannot be emptied between check and insert.
+            let q = pool.lock();
+            if q.generation == job.generation {
+                cache().insert(job.key.clone(), img.clone());
+            }
+            drop(q);
             Some(img)
         });
         let _ = job.result.set(result);
@@ -299,7 +359,12 @@ fn worker_loop() {
         let notify = {
             let mut q = pool.lock();
             q.in_flight.retain(|j| !Arc::ptr_eq(j, &job));
-            std::mem::take(&mut *job.lock_notify())
+            let notify = std::mem::take(&mut *job.lock_notify());
+            if !notify.is_empty() {
+                // Prefetching held back for this job may start now, on every idle worker.
+                pool.wake.notify_all();
+            }
+            notify
         };
         for hwnd in notify {
             unsafe {
@@ -474,5 +539,61 @@ mod tests {
         cache.insert(c.clone(), big(third));
         assert!(cache.contains(&a) && cache.contains(&c));
         assert!(!cache.contains(&b));
+    }
+
+    #[test]
+    fn prefetch_waits_for_the_requested_photo() {
+        let options = DecodeOptions {
+            auto_rotate: true,
+            background: BACKGROUND,
+        };
+        let file = |name: &str| Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+        let job = |name: &str| {
+            let key = Key {
+                file: FileKey::for_path(&file(name)).expect("file exists"),
+                options,
+            };
+            Job::new(key, file(name), MediaType::StandardImage, 0)
+        };
+        let shown = job("Cargo.toml");
+        shown.lock_notify().push(1);
+        let mut q = Queue {
+            in_flight: vec![shown.clone()],
+            prefetch: [(file("src/lib.rs"), options)].into(),
+            workers: 3,
+            ..Queue::default()
+        };
+        assert!(q.next_job().is_none());
+        // Done (or no longer wanted): the neighbour may go.
+        shown.lock_notify().clear();
+        assert_eq!(
+            q.next_job().map(|j| j.path.clone()),
+            Some(file("src/lib.rs"))
+        );
+    }
+
+    #[test]
+    fn last_viewer_frees_the_cache() {
+        let key = Key {
+            file: FileKey::for_path(&Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml"))
+                .expect("exists"),
+            options: DecodeOptions {
+                auto_rotate: false,
+                background: 0,
+            },
+        };
+        let img = Arc::new(DecodedImage {
+            width: 1,
+            height: 1,
+            bgra: vec![0; 4],
+            is_preview: false,
+            exif: None,
+        });
+        let (first, second) = (ViewerHold::new(), ViewerHold::new());
+        cache().insert(key.clone(), img);
+        drop(first);
+        assert!(cache().contains(&key), "another viewer is still open");
+        drop(second);
+        assert!(!cache().contains(&key));
     }
 }
