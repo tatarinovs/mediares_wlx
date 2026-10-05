@@ -42,17 +42,18 @@ fn ini_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(INI_NAME))
 }
 
-/// A data file kept next to `mediares.ini`.
-pub fn data_file(name: &str) -> PathBuf {
-    ini_path().with_file_name(name)
-}
-
-/// A cache folder tied to this machine (GPU, drivers), in `%LOCALAPPDATA%\mediares`.
-pub fn cache_dir(name: &str) -> PathBuf {
-    match std::env::var_os("LOCALAPPDATA") {
+/// A file or folder that only makes sense on this machine (shader cache, video positions,
+/// wallpaper), in `%LOCALAPPDATA%\mediares` — a portable TC carries just `mediares.ini`.
+/// The parent folder is created on demand.
+pub fn local_path(name: &str) -> PathBuf {
+    let path = match std::env::var_os("LOCALAPPDATA") {
         Some(dir) => PathBuf::from(dir).join("mediares").join(name),
-        None => data_file(name),
+        None => ini_path().with_file_name(name),
+    };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
     }
+    path
 }
 
 /// Player volume (0..=1) left by the previous session; full volume if none was saved.

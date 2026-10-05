@@ -984,7 +984,7 @@ unsafe fn set_wallpaper(hwnd: HWND) {
         let Some(img) = state.whole_image() else {
             return;
         };
-        let target = config::data_file("mediares_wallpaper.png");
+        let target = config::local_path("mediares_wallpaper.png");
         snapshot::save_png(&img, &target).then_some(target)
     };
     if !source.is_some_and(|s| file_actions::set_wallpaper(&s)) {

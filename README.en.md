@@ -421,8 +421,9 @@ Contents=[=mediares.Video_Title]\n[=mediares.Video_Width]\n[=mediares.Video_Heig
 
 Everything is configured in the settings window (S); there's no need to edit the ini by hand. `mediares.ini`
 is looked for next to the DLL (a portable install); if it's not there, TC's plugin settings folder is used
-(the path from `ListSetDefaultParams`), since the plugin's own folder is often read-only. The same folder
-holds `mediares_resume.txt` (video positions, up to 200 entries) and `mediares_wallpaper.png`.
+(the path from `ListSetDefaultParams`), since the plugin's own folder is often read-only. Data tied to this
+particular computer doesn't travel with a portable TC and lives in `%LOCALAPPDATA%\mediares`:
+`mediares_resume.txt` (video positions, up to 200 entries), `mediares_wallpaper.png` and `mpv_shader_cache`.
 
 `[Settings]` keys with a non-obvious format: `Language` (`auto`, `en`, `ru`), `PhotoBackground` and
 `OSDFontColor` (a COLORREF `0x00BBGGRR` as a decimal number), `OSDMode` (0 — off, 1 — on photos, 2 — on video,

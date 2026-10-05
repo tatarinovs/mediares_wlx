@@ -600,7 +600,7 @@ impl MpvPlayer {
     pub unsafe fn new(surface: HWND, events_to: HWND) -> Option<Self> {
         let api = api()?;
         let wid = (surface.0 as isize).to_string();
-        let cache = crate::config::cache_dir("mpv_shader_cache");
+        let cache = crate::config::local_path("mpv_shader_cache");
         let _ = std::fs::create_dir_all(&cache);
         let cache = cache.to_string_lossy();
         let video = [

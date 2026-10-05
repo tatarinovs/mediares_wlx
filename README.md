@@ -420,8 +420,9 @@ Contents=[=mediares.Video_Title]\n[=mediares.Video_Width]\n[=mediares.Video_Heig
 
 Всё настраивается в окне настроек (S), править ini вручную не нужно. `mediares.ini` ищется рядом с DLL
 (портативная установка); если его там нет — используется папка плагинных настроек TC (путь из
-`ListSetDefaultParams`), т.к. папка плагина часто защищена от записи. Там же лежат `mediares_resume.txt`
-(позиции видео, до 200 записей) и `mediares_wallpaper.png`.
+`ListSetDefaultParams`), т.к. папка плагина часто защищена от записи. Данные, привязанные к конкретному
+компьютеру, с портативным TC не переезжают и лежат в `%LOCALAPPDATA%\mediares`: `mediares_resume.txt`
+(позиции видео, до 200 записей), `mediares_wallpaper.png` и `mpv_shader_cache`.
 
 Ключи секции `[Settings]` с неочевидным форматом: `Language` (`auto`, `en`, `ru`), `PhotoBackground` и
 `OSDFontColor` (COLORREF `0x00BBGGRR` десятичным числом), `OSDMode` (0 — не показывать, 1 — на фото,

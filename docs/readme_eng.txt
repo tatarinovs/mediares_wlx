@@ -299,7 +299,9 @@ the right-click menu. You can set:
 
 The settings are stored in mediares.ini next to Total Commander's
 settings. If you put mediares.ini next to the plugin file itself, it is
-used from there (handy for a portable installation).
+used from there (handy for a portable installation). Video resume
+positions, the wallpaper image and the libmpv shader cache belong to
+the particular computer and are kept in %LOCALAPPDATA%\mediares.
 
 The interface translations are built into the plugin; a sample comes
 in the archive as mediares_ui.lng (UTF-8). Put this file next to the

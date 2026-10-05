@@ -1,4 +1,4 @@
-//! Where long videos were left off: `mediares_resume.txt` next to `mediares.ini`, one
+//! Where long videos were left off: `mediares_resume.txt` in `%LOCALAPPDATA%\mediares`, one
 //! "<seconds>\t<path>" line per video, most recent first.
 
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ type Entry = (f64, PathBuf);
 
 /// The position to continue `video` from, if one was remembered.
 pub fn load(video: &Path) -> Option<f64> {
-    let text = std::fs::read_to_string(config::data_file(FILE_NAME)).ok()?;
+    let text = std::fs::read_to_string(config::local_path(FILE_NAME)).ok()?;
     parse(&text)
         .into_iter()
         .find(|(_, p)| same(p, video))
@@ -29,7 +29,7 @@ pub fn store(video: &Path, position: f64, duration: f64) {
     if duration < MIN_DURATION_SEC {
         return;
     }
-    let file = config::data_file(FILE_NAME);
+    let file = config::local_path(FILE_NAME);
     let entries = std::fs::read_to_string(&file)
         .map(|t| parse(&t))
         .unwrap_or_default();
