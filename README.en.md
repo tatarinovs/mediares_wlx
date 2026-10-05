@@ -59,7 +59,7 @@ mediares_wlx/
 │   ├── print.rs                # Printing a picture (ListPrint): printer dialog, fitting to margins
 │   ├── snapshot.rs             # Clipboard, saving a frame (PNG/JPEG), TC thumbnails
 │   ├── save_as.rs              # "Save as" for photos: copy, RAW preview with EXIF, or re-encode
-│   ├── fullscreen.rs           # Fullscreen mode: a separate topmost window on the Lister's monitor
+│   ├── fullscreen.rs           # Fullscreen mode: a separate window on the Lister's monitor
 │   ├── overlay.rs              # Floating panels in fullscreen mode, cursor hiding
 │   ├── media_view.rs           # Shared audio/video layer: control panel, mouse, events, timers
 │   ├── playback_video.rs       # IMFMediaEngine (frame-server) + D3D11 swap chain
@@ -85,14 +85,14 @@ mediares_wlx/
 
 ### Photos
 
-JPEG (JPG, JPEG, JPE; THM — Canon thumbnails), PNG, GIF, WEBP, BMP, TIFF, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
+JPEG (JPG, JPEG, JPE; THM — Canon thumbnails), PNG, GIF, WEBP, BMP, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
 CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — via the embedded JPEG preview; PSD/PSB — via the composite.
 
 Through Windows codecs (WIC), adding nothing to the plugin size: **HEIC/HEIF/HIF** and **AVIF** — need the
 Microsoft Store extensions "HEIF Image Extensions" plus "HEVC Video Extensions" (for HEIC) or "AV1 Video Extension"
-(for AVIF); **JXL** — "JPEG XL Image Extension"; **JXR/WDP/HDP** (JPEG XR) and **DDS** (BC1–BC3, uncompressed) —
-built into Windows. The HEIF container's rotation (`irot`/`imir`) is applied and its EXIF (date, camera, GPS) is
-read. A file the standard decoder fails on (e.g. TIFF with old-style JPEG compression) gets a second try via WIC.
+(for AVIF); **JXL** — "JPEG XL Image Extension"; **JXR/WDP/HDP** (JPEG XR) and **DDS** (BC1–BC3, uncompressed) and
+**TIFF/TIF** (any compression, old-style JPEG included) — built into Windows. The HEIF container's rotation (`irot`/`imir`) is applied and its EXIF (date, camera, GPS) is
+read. A file the standard decoder fails on (e.g. an unusual BMP variant) gets a second try via WIC.
 
 **SVG/SVGZ** is drawn by the Direct2D engine (Windows 10 1703+): shapes, paths, gradients, clipping, `use`, styles —
 including `<style>` sheets with simple selectors (`.class`, `#id`, `tag`). `<text>`, filters and masks are not drawn.
@@ -439,7 +439,7 @@ translated.
 
 ```bash
 cargo test                 # tests for the whole workspace
-cargo build --release      # binaries in target/release/
+cargo build --release      # binaries in target/release/ (for a release use build_release.bat, see below)
 build_release.bat          # tests, build and TC archives in dist/ (--no-test to skip tests)
 ```
 
@@ -447,7 +447,11 @@ Each archive ships with instructions for the user: `docs/readme_rus.txt` and `do
 with a BOM, so Lister shows Cyrillic correctly right away). A new WDX field needs to be described in both:
 the `test_readmes_list_every_field` test checks that every field is mentioned there.
 
-After `cargo build --release`, in `target/release/`:
+`build_release.bat` builds each DLL on its own as a plain `cdylib` (`cargo rustc --release -p … --lib
+--crate-type cdylib`): with the `rlib` type alongside (tests and examples need it) LTO keeps more code, and the
+DLLs come out about 230 KB larger.
+
+After the build, in `target/release/`:
 - `mediares_wdx.dll` → rename to `mediares.wdx64`
 - `mediares_combo.dll` → rename to `mediares.wlx64` (also connected as the content plugin)
 

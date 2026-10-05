@@ -41,13 +41,16 @@ if "!RUN_TESTS!"=="1" (
     echo [1/4] Skipping tests: --no-test flag specified.
 )
 
-:: Build release binaries
+:: Build release binaries. The crates are "cdylib" + "rlib" (the rlib serves tests and examples),
+:: and with both types LTO keeps more code: built as a cdylib alone each DLL is ~230 KB smaller.
 echo:
-echo [2/4] Building release binaries via cargo build --release...
-cargo build --release --workspace
-if errorlevel 1 (
-    echo [ERROR] Cargo build failed!
-    exit /b 1
+echo [2/4] Building release binaries as cdylib-only...
+for %%P in (mediares_combo mediares_wdx) do (
+    cargo rustc --release -p %%P --lib --crate-type cdylib
+    if errorlevel 1 (
+        echo [ERROR] Cargo build of %%P failed!
+        exit /b 1
+    )
 )
 
 set "COMBO_DLL=target\release\mediares_combo.dll"

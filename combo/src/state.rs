@@ -266,7 +266,8 @@ impl ViewerState {
     }
 
     /// The current file was deleted: drops it from the list and shows the one that took its
-    /// place (or the new last one). False if nothing is left.
+    /// place (or the new last one). False if nothing is left; a next file that can't be shown
+    /// still keeps the viewer open, so the user can move on from it.
     pub fn remove_current(&mut self) -> bool {
         if self.current_idx < self.dir_files.len() {
             self.dir_files.remove(self.current_idx);
@@ -278,7 +279,8 @@ impl ViewerState {
             self.media = None;
             return false;
         }
-        self.go_to(self.current_idx.min(self.dir_files.len() - 1))
+        self.go_to(self.current_idx.min(self.dir_files.len() - 1));
+        true
     }
 
     /// Shows the current file again (e.g. after its player was closed to free the file).
@@ -311,18 +313,20 @@ impl ViewerState {
         } else {
             self.media = None;
             if kind.is_image_kind() {
-                match image_cache::request(&self.file_path, kind, options, self.hwnd) {
+                // Checked before queueing: a file that fails it would be decoded for nothing.
+                let request = header_looks_decodable(&self.file_path, kind)
+                    .then(|| image_cache::request(&self.file_path, kind, options, self.hwnd))
+                    .flatten();
+                match request {
                     Some(Request::Ready(img)) => {
                         self.image = Some(img);
                         self.previous = None;
                     }
-                    Some(Request::Pending(ticket))
-                        if header_looks_decodable(&self.file_path, kind) =>
-                    {
+                    Some(Request::Pending(ticket)) => {
                         self.pending = Some(ticket);
                         self.previous = shown.or(self.previous.take());
                     }
-                    _ => {
+                    None => {
                         self.load_failed = true;
                         self.previous = None;
                     }

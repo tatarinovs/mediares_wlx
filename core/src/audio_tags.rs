@@ -89,10 +89,7 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
     }
     revisions.extend(log.current().cloned());
     revisions.reverse();
-    let is_wav = path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case("wav"));
-    if is_wav {
+    if crate::probe::has_extension(path, &["wav"]) {
         revisions.extend(wav_trailing_info(path));
     }
     revisions.sort_by_key(|rev| match rev.info.short_name {

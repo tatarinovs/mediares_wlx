@@ -3,11 +3,14 @@
 //! The metadata block is read into memory once and parsed from a slice, so every access is
 //! bounds-checked and malformed offsets simply yield missing fields.
 
+use std::cell::Cell;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// TIFF-based files keep IFD0 and the Exif IFD near the start; this is how much we scan.
+/// TIFF-based files keep IFD0 and the Exif IFD near the start: this much is read first...
+const TIFF_HEAD_BYTES: u64 = 64 * 1024;
+/// ...and this much if their values lie further on.
 const TIFF_SCAN_BYTES: u64 = 1024 * 1024;
 const MAX_STRING_LEN: usize = 4096;
 
@@ -106,10 +109,20 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
     let block = if magic.starts_with(&[0xFF, 0xD8]) {
         read_jpeg_app1(&mut file)?
     } else if magic == b"II*\0" || magic == b"MM\0*" {
-        let mut data = Vec::new();
-        file.seek(SeekFrom::Start(0)).ok()?;
-        file.take(TIFF_SCAN_BYTES).read_to_end(&mut data).ok()?;
-        data
+        // The head usually holds all the metadata (a Sony ARW's ends at about 43 KB); only if an
+        // offset points past it is the longer scan read.
+        let read_head = |file: &mut File, len: u64| {
+            let mut data = Vec::new();
+            file.seek(SeekFrom::Start(0)).ok()?;
+            file.take(len).read_to_end(&mut data).ok()?;
+            Some(data)
+        };
+        let head = read_head(&mut file, TIFF_HEAD_BYTES)?;
+        let (info, cut_short) = parse_tiff_checked(&head);
+        if !cut_short || head.len() < TIFF_HEAD_BYTES as usize {
+            return info;
+        }
+        read_head(&mut file, TIFF_SCAN_BYTES)?
     } else {
         return None;
     };
@@ -144,11 +157,12 @@ fn read_jpeg_app1(file: &mut File) -> Option<Vec<u8>> {
         file.read_exact(&mut len_buf).ok()?;
         let payload_len = (u16::from_be_bytes(len_buf) as usize).checked_sub(2)?;
 
-        if marker == 0xE1 && payload_len > 6 {
+        let header = crate::jpeg::EXIF_HEADER;
+        if marker == 0xE1 && payload_len > header.len() {
             let mut payload = vec![0u8; payload_len];
             file.read_exact(&mut payload).ok()?;
-            if payload.starts_with(b"Exif\0\0") {
-                payload.drain(..6);
+            if payload.starts_with(header) {
+                payload.drain(..header.len());
                 return Some(payload);
             }
         } else {
@@ -159,27 +173,24 @@ fn read_jpeg_app1(file: &mut File) -> Option<Vec<u8>> {
 
 /// Parses a TIFF structure (`II*\0` / `MM\0*` header) from memory.
 fn parse_tiff(data: &[u8]) -> Option<ExifInfo> {
-    let le = match data.get(..4)? {
-        b"II*\0" => true,
-        b"MM\0*" => false,
-        _ => return None,
+    parse_tiff_checked(data).0
+}
+
+/// [`parse_tiff`], and whether something it looked for lay past the end of `data` (a file's
+/// head, which may then be read further).
+fn parse_tiff_checked(data: &[u8]) -> (Option<ExifInfo>, bool) {
+    let le = match data.get(..4) {
+        Some(b"II*\0") => true,
+        Some(b"MM\0*") => false,
+        _ => return (None, false),
     };
     let tiff = Tiff {
         data,
         rd: Endian(le),
+        cut_short: Cell::new(false),
     };
-    let ifd0 = tiff.u32(4)? as usize;
-
-    let mut info = ExifInfo::default();
-    let mut subs = SubIfds::default();
-    tiff.parse_ifd(ifd0, &mut info, &mut subs);
-    if let Some(offset) = subs.exif {
-        tiff.parse_ifd(offset, &mut info, &mut SubIfds::default());
-    }
-    if let Some(offset) = subs.gps {
-        tiff.parse_gps_ifd(offset, &mut info);
-    }
-    Some(info)
+    let info = tiff.parse();
+    (info, tiff.cut_short.get())
 }
 
 /// Offsets of the Exif and GPS IFDs referenced from IFD0.
@@ -216,6 +227,8 @@ impl Endian {
 struct Tiff<'a> {
     data: &'a [u8],
     rd: Endian,
+    /// A read went past the end of `data`.
+    cut_short: Cell<bool>,
 }
 
 struct Entry<'a> {
@@ -226,8 +239,27 @@ struct Entry<'a> {
 }
 
 impl<'a> Tiff<'a> {
+    /// IFD0, then the Exif and GPS IFDs it points to.
+    fn parse(&self) -> Option<ExifInfo> {
+        let ifd0 = self.u32(4)? as usize;
+        let mut info = ExifInfo::default();
+        let mut subs = SubIfds::default();
+        self.parse_ifd(ifd0, &mut info, &mut subs);
+        if let Some(offset) = subs.exif {
+            self.parse_ifd(offset, &mut info, &mut SubIfds::default());
+        }
+        if let Some(offset) = subs.gps {
+            self.parse_gps_ifd(offset, &mut info);
+        }
+        Some(info)
+    }
+
     fn bytes(&self, offset: usize, len: usize) -> Option<&'a [u8]> {
-        self.data.get(offset..offset.checked_add(len)?)
+        let end = offset.checked_add(len)?;
+        if end > self.data.len() {
+            self.cut_short.set(true);
+        }
+        self.data.get(offset..end)
     }
 
     fn u32(&self, offset: usize) -> Option<u32> {
@@ -627,6 +659,30 @@ mod tests {
         assert_eq!(info.iso, Some(400));
         assert_eq!(info.exposure_time, None);
         assert_eq!(info.f_number, Some(2.8));
+    }
+
+    /// The Exif IFD past the first read: the file is read further and the ISO still found.
+    #[test]
+    fn exif_ifd_beyond_the_head_is_found() {
+        let far = 100_000usize;
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        t.extend_from_slice(&1u16.to_le_bytes());
+        t.extend_from_slice(&[0x69, 0x87, 4, 0, 1, 0, 0, 0]);
+        t.extend_from_slice(&(far as u32).to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.resize(far, 0);
+        t.extend_from_slice(&1u16.to_le_bytes());
+        t.extend_from_slice(&[0x27, 0x88, 3, 0, 1, 0, 0, 0, 0x90, 0x01, 0, 0]);
+        t.extend_from_slice(&0u32.to_le_bytes());
+        assert!(parse_tiff_checked(&t[..TIFF_HEAD_BYTES as usize]).1);
+        assert!(!parse_tiff_checked(&t).1);
+
+        let path = std::env::temp_dir().join(format!("mediares_{}_far.tif", std::process::id()));
+        std::fs::write(&path, &t).unwrap();
+        let iso = read_exif(&path).and_then(|e| e.iso);
+        std::fs::remove_file(&path).ok();
+        assert_eq!(iso, Some(400));
     }
 
     #[test]

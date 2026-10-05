@@ -13,20 +13,20 @@ use windows::Win32::UI::Controls::Dialogs::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetDlgItemTextW, GetWindowLongPtrW, MessageBoxW,
-    SendDlgItemMessageW, SetDlgItemTextW, SetWindowLongPtrW, BM_GETCHECK, BM_SETCHECK,
-    BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING,
-    CB_GETCURSEL, CB_SETCURSEL, GWLP_USERDATA, IDCANCEL, IDOK, MB_ICONINFORMATION, MB_OK, WM_CLOSE,
-    WM_COMMAND, WM_CTLCOLORSTATIC, WM_NCDESTROY, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, MessageBoxW, SendDlgItemMessageW,
+    SetDlgItemTextW, SetWindowLongPtrW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
+    BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
+    CB_SETCURSEL, GWLP_USERDATA, IDCANCEL, IDOK, MB_ICONINFORMATION, MB_OK, WM_CLOSE, WM_COMMAND,
+    WM_CTLCOLORSTATIC, WM_NCDESTROY, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::config::{OsdMode, ViewerConfig};
-use crate::dialog;
+use crate::dialog::{self, ES_AUTOHSCROLL, SS_LEFT};
 use crate::file_actions::show_error;
 use crate::gdi::{self, Brush};
 use crate::i18n::{tr, LangSetting};
 use crate::playlist::Repeat;
-use crate::snapshot::FrameFormat;
+use crate::snapshot::PictureFormat;
 use crate::tc_register::Registration;
 use crate::{osd_template, osd_template_dialog};
 
@@ -65,12 +65,10 @@ const IDC_FRAME_FORMAT: i32 = 130;
 const IDC_SMOOTH_ZOOM: i32 = 131;
 const IDC_SEEK_STEP: i32 = 132;
 
-const ES_AUTOHSCROLL: i32 = 0x0080;
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
 const EM_SETCUEBANNER: u32 = 0x1501;
 
 const BST_CHECKED: usize = 1;
-const SS_LEFT: u32 = 0x0000;
 const SS_CENTER: u32 = 0x0001;
 const SS_CENTERIMAGE: u32 = 0x0200;
 const SS_SUNKEN: u32 = 0x1000;
@@ -131,7 +129,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
-    let font = gdi::create_font("Segoe UI", -12, false);
+    let font = dialog::font(dlg, "Segoe UI", -12);
     let ok = build_controls(dlg, &*ctx, font.0);
     dialog::run_modal(dlg, ok);
 
@@ -195,7 +193,7 @@ unsafe fn build_controls(
         control(
             w!("EDIT"),
             path,
-            tab | WS_BORDER.0 | ES_AUTOHSCROLL as u32,
+            tab | WS_BORDER.0 | ES_AUTOHSCROLL,
             (495, y - 3, 235, 24),
             edit_id,
         );
@@ -247,7 +245,7 @@ unsafe fn build_controls(
     let loupe_labels = ctx
         .loupe_scales
         .iter()
-        .map(|s| format!("{}:1", s).replace('.', ","))
+        .map(|s| crate::i18n::decimal(format!("{}:1", s)))
         .collect();
     let loupe_sel = ctx
         .loupe_scales
@@ -459,11 +457,11 @@ unsafe fn build_controls(
         (438, 153, 140, 20),
         0,
     );
-    let frame_labels = FrameFormat::ALL
+    let frame_labels = PictureFormat::ALL
         .iter()
         .map(|f| f.label().to_string())
         .collect();
-    let frame_sel = FrameFormat::ALL
+    let frame_sel = PictureFormat::ALL
         .iter()
         .position(|&f| f == cfg.frame_format)
         .unwrap_or(0);
@@ -676,7 +674,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
     cfg.seek_step_sec = selected(dlg, IDC_SEEK_STEP, &ctx.seek_steps).unwrap_or(cfg.seek_step_sec);
     cfg.frame_format =
-        selected(dlg, IDC_FRAME_FORMAT, &FrameFormat::ALL).unwrap_or(cfg.frame_format);
+        selected(dlg, IDC_FRAME_FORMAT, &PictureFormat::ALL).unwrap_or(cfg.frame_format);
     cfg.photo_editor = edit_text(dlg, IDC_PHOTO_EDITOR);
     cfg.video_editor = edit_text(dlg, IDC_VIDEO_EDITOR);
     cfg.audio_editor = edit_text(dlg, IDC_AUDIO_EDITOR);
@@ -718,9 +716,7 @@ unsafe fn repaint_previews(dlg: HWND) {
 }
 
 unsafe fn edit_text(dlg: HWND, id: i32) -> String {
-    let mut buf = [0u16; 1024];
-    let len = GetDlgItemTextW(dlg, id, &mut buf) as usize;
-    String::from_utf16_lossy(&buf[..len]).trim().to_string()
+    dialog::item_text(dlg, id).trim().to_string()
 }
 
 /// "Обзор...": picks a program and puts its path into the edit box `edit_id`.

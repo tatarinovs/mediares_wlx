@@ -145,14 +145,21 @@ pub fn file_field(
 
 /// EXIF fields of a photo; `""` when the file lacks the value. `None`: not an EXIF field.
 pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
-    let taken = exif.and_then(|e| e.taken()).and_then(parse_exif_datetime);
-    let e = exif.cloned().unwrap_or_default();
-    let text = |v: Option<String>| v.map(|s| s.trim().to_string()).unwrap_or_default();
+    let none;
+    let e = match exif {
+        Some(e) => e,
+        None => {
+            none = ExifInfo::default();
+            &none
+        }
+    };
+    let taken = e.taken().and_then(parse_exif_datetime);
+    let text = |v: &Option<String>| v.as_deref().map(str::trim).unwrap_or_default().to_string();
     Some(match key {
         "camera" => camera(e.make.as_deref(), e.model.as_deref()),
-        "make" => text(e.make),
-        "model" => text(e.model),
-        "lens" => text(e.lens_model),
+        "make" => text(&e.make),
+        "model" => text(&e.model),
+        "lens" => text(&e.lens_model),
         "taken" => taken
             .map(|t| {
                 format!(
@@ -169,6 +176,7 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
             .unwrap_or_default(),
         "exposure" => e
             .exposure_time
+            .as_ref()
             .map(|t| format!("{} {}", t, tr("s")))
             .unwrap_or_default(),
         "aperture" => e
@@ -191,7 +199,7 @@ pub fn exif_field(exif: Option<&ExifInfo>, key: &str) -> Option<String> {
                 String::new()
             }
         }
-        "software" => text(e.software),
+        "software" => text(&e.software),
         "gps" => e
             .gps_latitude
             .zip(e.gps_longitude)
@@ -389,12 +397,25 @@ fn render_nodes(nodes: &[Node], lookup: &dyn Fn(&str) -> Option<String>, out: &m
     complete
 }
 
-/// Fills `template`. `lookup(key)`: the value (`""` if the file has none), `None` for an unknown key.
+/// A template parsed once and rendered many times (the video OSD, on every frame).
+pub struct Template(Vec<Node>);
+
+impl Template {
+    pub fn parse(template: &str) -> Self {
+        Template(parse(&mut template.chars().peekable(), false))
+    }
+
+    /// `lookup(key)`: the value (`""` if the file has none), `None` for an unknown key.
+    pub fn render(&self, lookup: impl Fn(&str) -> Option<String>) -> String {
+        let mut out = String::new();
+        render_nodes(&self.0, &lookup, &mut out);
+        out.trim_end().to_string()
+    }
+}
+
+/// Fills `template` (see [`Template::render`]).
 pub fn render(template: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
-    let nodes = parse(&mut template.chars().peekable(), false);
-    let mut out = String::new();
-    render_nodes(&nodes, &lookup, &mut out);
-    out.trim_end().to_string()
+    Template::parse(template).render(lookup)
 }
 
 /// Whether `template` uses any of `keys`.

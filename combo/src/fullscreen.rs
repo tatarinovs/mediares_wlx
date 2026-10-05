@@ -1,14 +1,16 @@
-//! Fullscreen toggle: the viewer is detached from the Lister into a topmost popup covering the
-//! Lister's monitor, and re-attached on exit. TC's own window is never restyled, so closing
-//! the Lister or switching plugins while fullscreen leaves nothing to restore.
+//! Fullscreen toggle: the viewer is detached from the Lister into a popup covering the Lister's
+//! monitor, and re-attached on exit. The popup is not topmost: Alt+Tab, Task Manager and other
+//! programs can still come above it (Windows itself hides the taskbar while a monitor-sized
+//! window is active). TC's own window is never restyled, so closing the Lister or switching
+//! plugins while fullscreen leaves nothing to restore.
 //!
 //! TC keeps resizing the plugin window to the Lister's client area (`MoveWindow` in client
 //! coordinates); while fullscreen, [`pin`] overrides every such move with the monitor rectangle.
 //!
-//! DWM draws a window's show / maximize / close animation above all other windows, topmost ones
-//! included. When the viewer starts fullscreen, TC shows its (white) Lister window only after
-//! `ListLoad`, and that animation would play over the picture; so the Lister's DWM transitions are
-//! off while fullscreen.
+//! DWM draws a window's show / maximize / close animation above all other windows. When the
+//! viewer starts fullscreen, TC shows its (white) Lister window only after `ListLoad`, and that
+//! animation would play over the picture; so the Lister's DWM transitions are off while
+//! fullscreen.
 
 use windows::core::BOOL;
 use windows::Win32::Foundation::{HWND, RECT};
@@ -19,9 +21,9 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
     GetAncestor, GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent,
-    SetWindowLongPtrW, SetWindowPos, GA_ROOT, GWLP_HWNDPARENT, GWL_STYLE, HWND_NOTOPMOST,
-    HWND_TOPMOST, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    WINDOWPOS, WS_CHILD, WS_POPUP,
+    SetWindowLongPtrW, SetWindowPos, GA_ROOT, GWLP_HWNDPARENT, GWL_STYLE, HWND_TOP,
+    SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD,
+    WS_POPUP,
 };
 
 use crate::overlay::{Fullscreen, PanelKind};
@@ -56,7 +58,7 @@ unsafe fn enter(state: &mut ViewerState) {
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, state.lister.0 as isize);
     let _ = SetWindowPos(
         hwnd,
-        Some(HWND_TOPMOST),
+        Some(HWND_TOP),
         rc.left,
         rc.top,
         rc.right - rc.left,
@@ -103,15 +105,6 @@ unsafe fn exit(state: &mut ViewerState) {
     sync_overlay(state);
     // Unpin first so the moves below are not overridden.
     state.fullscreen = None;
-    let _ = SetWindowPos(
-        hwnd,
-        Some(HWND_NOTOPMOST),
-        0,
-        0,
-        0,
-        0,
-        SWP_NOMOVE | SWP_NOSIZE,
-    );
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
     // Switch WS_POPUP -> WS_CHILD before re-parenting.
     set_style(hwnd, WS_CHILD.0, WS_POPUP.0);

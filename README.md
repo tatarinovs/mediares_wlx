@@ -59,7 +59,7 @@ mediares_wlx/
 │   ├── print.rs                # Печать картинки (ListPrint): диалог принтера, вписывание в поля
 │   ├── snapshot.rs             # Буфер обмена, сохранение кадра (PNG/JPEG), миниатюры TC
 │   ├── save_as.rs              # «Сохранить как» для фото: копия, RAW-превью с EXIF или перекодирование
-│   ├── fullscreen.rs           # Полноэкранный режим: отдельное topmost-окно на мониторе Lister
+│   ├── fullscreen.rs           # Полноэкранный режим: отдельное окно на мониторе Lister
 │   ├── overlay.rs              # Плавающие панели полноэкранного режима, скрытие курсора
 │   ├── media_view.rs           # Общий слой аудио/видео: панель управления, мышь, события, таймеры
 │   ├── playback_video.rs       # IMFMediaEngine (frame-server) + D3D11 swap chain
@@ -85,14 +85,14 @@ mediares_wlx/
 
 ### Фото
 
-JPEG (JPG, JPEG, JPE; THM — миниатюры Canon), PNG, GIF, WEBP, BMP, TIFF, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
+JPEG (JPG, JPEG, JPE; THM — миниатюры Canon), PNG, GIF, WEBP, BMP, ICO, TGA, HDR (Radiance); RAW (CR2, CR3,
 CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — по встроенному JPEG-превью; PSD/PSB — по композиту.
 
 Через кодеки Windows (WIC), ничего не добавляя к размеру плагина: **HEIC/HEIF/HIF** и **AVIF** — нужны
 расширения из Microsoft Store «HEIF Image Extensions» и «HEVC Video Extensions» (для HEIC) или «AV1 Video
 Extension» (для AVIF); **JXL** — «JPEG XL Image Extension»; **JXR/WDP/HDP** (JPEG XR) и **DDS** (BC1–BC3, без
-сжатия) — встроены в Windows. Поворот из контейнера HEIF (`irot`/`imir`) применяется, EXIF (дата, камера, GPS)
-читается. Если у формата в стандартном декодере что-то не получилось (например, TIFF со старым JPEG-сжатием),
+сжатия) и **TIFF/TIF** (любое сжатие, включая старое JPEG) — встроены в Windows. Поворот из контейнера HEIF (`irot`/`imir`) применяется, EXIF (дата, камера, GPS)
+читается. Если у формата в стандартном декодере что-то не получилось (например, редкий вариант BMP),
 файл пробуется ещё раз через WIC.
 
 **SVG/SVGZ** рисуется движком Direct2D (Windows 10 1703+): фигуры, контуры, градиенты, обтравка, `use`,
@@ -438,7 +438,7 @@ Contents=[=mediares.Video_Title]\n[=mediares.Video_Width]\n[=mediares.Video_Heig
 
 ```bash
 cargo test                 # тесты всего воркспейса
-cargo build --release      # бинарники в target/release/
+cargo build --release      # бинарники в target/release/ (для релиза — build_release.bat, см. ниже)
 build_release.bat          # тесты, сборка и архивы для TC в dist/ (--no-test — без тестов)
 ```
 
@@ -446,7 +446,11 @@ build_release.bat          # тесты, сборка и архивы для TC 
 чтобы Lister сразу показал кириллицу). Новое поле WDX нужно описать в обеих: тест `test_readmes_list_every_field`
 проверяет, что там упомянуты все поля.
 
-После `cargo build --release` в `target/release/`:
+`build_release.bat` собирает каждую DLL отдельно как чистый `cdylib` (`cargo rustc --release -p … --lib
+--crate-type cdylib`): с типом `rlib` в придачу (он нужен тестам и примерам) LTO оставляет больше кода, и DLL
+выходят примерно на 230 КБ больше.
+
+После сборки в `target/release/`:
 - `mediares_wdx.dll` → переименовать в `mediares.wdx64`
 - `mediares_combo.dll` → переименовать в `mediares.wlx64` (он же подключается как контент-плагин)
 

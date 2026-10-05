@@ -28,23 +28,8 @@ use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_WAIT};
 
 use crate::file_actions::show_error;
 use crate::i18n::tr;
-use crate::snapshot::JPEG_QUALITY;
+use crate::snapshot::{unique_path, PictureFormat as Format, JPEG_QUALITY};
 use crate::state::same_path;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Format {
-    Jpeg,
-    Png,
-}
-
-impl Format {
-    fn extension(self) -> &'static str {
-        match self {
-            Format::Jpeg => "jpg",
-            Format::Png => "png",
-        }
-    }
-}
 
 /// The format chosen last time; the dialog offers it again.
 static LAST_PNG: AtomicBool = AtomicBool::new(false);
@@ -184,21 +169,8 @@ fn on_white(img: DynamicImage) -> RgbImage {
 
 /// "<name>.jpg" next to the source, " (2)", " (3)"... if taken.
 fn free_name(source: &Path, format: Format) -> PathBuf {
-    let stem = source
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let dir = source.parent().unwrap_or(Path::new(""));
-    (1..)
-        .map(|n| {
-            dir.join(if n == 1 {
-                format!("{}.{}", stem, format.extension())
-            } else {
-                format!("{} ({}).{}", stem, n, format.extension())
-            })
-        })
-        .find(|p| !p.exists())
-        .expect("an unused name exists")
+    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+    unique_path(source, &stem, format)
 }
 
 /// The save dialog. The format follows the typed extension, else the selected file type (whose

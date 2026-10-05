@@ -151,16 +151,31 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     let res_len = read_u32(&mut reader)?;
     reader.seek(SeekFrom::Current(res_len as i64)).ok()?;
 
-    // Section 4: Layer and Mask Information.
-    let layer_len = if is_psb {
-        let mut b = [0u8; 8];
-        reader.read_exact(&mut b).ok()?;
-        u64::from_be_bytes(b)
-    } else {
-        read_u32(&mut reader)? as u64
+    // Section 4: Layer and Mask Information. Only the sign of the layer count is needed: negative
+    // means the first extra channel of the merged image is its transparency. Otherwise extra
+    // channels are the user's saved selections and must not make the picture see-through.
+    let read_len = |reader: &mut BufReader<File>| -> Option<u64> {
+        if is_psb {
+            let mut b = [0u8; 8];
+            reader.read_exact(&mut b).ok()?;
+            Some(u64::from_be_bytes(b))
+        } else {
+            read_u32(reader).map(u64::from)
+        }
     };
+    let layer_len = read_len(&mut reader)?;
+    let layers_start = reader.stream_position().ok()?;
+    let mut transparent = false;
+    if layer_len > 0 {
+        let info_len = read_len(&mut reader)?;
+        if info_len >= 2 {
+            let mut count = [0u8; 2];
+            reader.read_exact(&mut count).ok()?;
+            transparent = i16::from_be_bytes(count) < 0;
+        }
+    }
     reader
-        .seek(SeekFrom::Current(i64::try_from(layer_len).ok()?))
+        .seek(SeekFrom::Start(layers_start.checked_add(layer_len)?))
         .ok()?;
 
     // Section 5: Image Data.
@@ -170,8 +185,13 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     let row_bytes = w * bytes_per_sample;
     let remaining = file_len.saturating_sub(reader.stream_position().ok()?);
 
-    // We need at most 5 channels (CMYK + alpha); the rest are skipped.
-    let active = channels.min(5);
+    // The color channels, plus the transparency if the document has one; the rest are skipped.
+    let color_channels = match color_mode {
+        MODE_RGB => 3,
+        MODE_CMYK => 4,
+        _ => 1,
+    };
+    let active = channels.min(color_channels + usize::from(transparent));
     let mut planes: Vec<Vec<u8>> = vec![Vec::with_capacity(num_pixels); active];
 
     match compression {
@@ -335,13 +355,34 @@ mod tests {
         assert_eq!(rgba.get_pixel(0, 1).0, [0, 255, 0, 255]);
     }
 
+    /// `TEST_PSD_RGBA` with a layer section whose layer count is negative (-1): the 4th channel
+    /// is the merged transparency.
+    fn transparent_rgba() -> Vec<u8> {
+        let mut psd = TEST_PSD_RGBA.to_vec();
+        // Layer section length (offset 34), then: layer info length 2, layer count -1, no global
+        // layer mask.
+        psd[34..38].copy_from_slice(&10u32.to_be_bytes());
+        psd.splice(38..38, [0, 0, 0, 2, 0xFF, 0xFF, 0, 0, 0, 0]);
+        psd
+    }
+
     #[test]
     fn decodes_rgba_composite() {
-        let rgba = load("mediares_test_rgba.psd", TEST_PSD_RGBA)
+        let rgba = load("mediares_test_rgba.psd", &transparent_rgba())
             .expect("rgba psd")
             .to_rgba8();
         assert_eq!(rgba.get_pixel(1, 0).0, [255, 0, 0, 0]);
         assert_eq!(rgba.get_pixel(0, 1).0, [0, 255, 0, 128]);
+    }
+
+    /// Without layers saying so, an extra channel is a saved selection: the picture stays opaque.
+    #[test]
+    fn saved_selection_is_not_transparency() {
+        let rgba = load("mediares_test_selection.psd", TEST_PSD_RGBA)
+            .expect("rgba psd")
+            .to_rgba8();
+        assert_eq!(rgba.get_pixel(1, 0).0, [255, 0, 0, 255]);
+        assert_eq!(rgba.get_pixel(0, 1).0, [0, 255, 0, 255]);
     }
 
     #[test]

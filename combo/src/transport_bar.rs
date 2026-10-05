@@ -116,6 +116,16 @@ pub fn toggle_mute(t: &dyn Transport) {
     remember_audio_level(t);
 }
 
+/// A seek target within the stream; `duration` 0 (unknown, e.g. a file without an index) leaves
+/// it unbounded rather than sending every seek to the start.
+pub fn clamp_to_duration(seconds: f64, duration: f64) -> f64 {
+    if duration > 0.0 {
+        seconds.clamp(0.0, duration)
+    } else {
+        seconds.max(0.0)
+    }
+}
+
 /// `base` ± `step` s, kept within the stream (`duration` 0 = unknown). Stepping forward stops
 /// [`SEEK_END_MARGIN_SEC`] short of the end: reaching it would end the file and let the play queue
 /// move on to the next one while the key is still held.
@@ -636,5 +646,8 @@ mod tests {
         assert_eq!(step_target(99.5, 100.0, true, 5.0), 99.5);
         assert_eq!(step_target(99.5, 100.0, false, 5.0), 94.5);
         assert_eq!(step_target(10.0, 0.0, true, 5.0), 15.0);
+        assert_eq!(clamp_to_duration(120.0, 100.0), 100.0);
+        assert_eq!(clamp_to_duration(120.0, 0.0), 120.0);
+        assert_eq!(clamp_to_duration(-1.0, 0.0), 0.0);
     }
 }

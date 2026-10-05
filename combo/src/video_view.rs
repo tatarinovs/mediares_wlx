@@ -119,13 +119,6 @@ impl Player {
         VideoPlayer::new(surface, viewer).ok().map(Self::Mf)
     }
 
-    fn transport(&self) -> &dyn Transport {
-        match self {
-            Self::Mf(p) => p,
-            Self::Mpv(p) => p,
-        }
-    }
-
     unsafe fn open(&self, path: &Path) -> bool {
         match self {
             Self::Mf(p) => p.open(path).is_ok(),
@@ -217,36 +210,17 @@ impl Player {
             Self::Mpv(p) => p.error_code(),
         }
     }
+}
 
-    fn is_playing(&self) -> bool {
-        self.transport().is_playing()
-    }
-    fn play(&self) {
-        self.transport().play()
-    }
-    fn pause(&self) {
-        self.transport().pause()
-    }
-    fn position(&self) -> f64 {
-        self.transport().position()
-    }
-    fn duration(&self) -> f64 {
-        self.transport().duration()
-    }
-    fn seek(&self, seconds: f64, approximate: bool) {
-        self.transport().seek(seconds, approximate)
-    }
-    fn volume(&self) -> f64 {
-        self.transport().volume()
-    }
-    fn set_volume(&self, volume: f64) {
-        self.transport().set_volume(volume)
-    }
-    fn is_muted(&self) -> bool {
-        self.transport().is_muted()
-    }
-    fn set_muted(&self, muted: bool) {
-        self.transport().set_muted(muted)
+/// Play, pause, seek, volume... go straight to the backend's [`Transport`].
+impl std::ops::Deref for Player {
+    type Target = dyn Transport;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Mf(p) => p,
+            Self::Mpv(p) => p,
+        }
     }
 }
 
@@ -330,11 +304,7 @@ const STEP_RATE: f64 = 0.25;
 
 /// Containers whose Media Foundation source can't seek to an exact frame.
 fn seeks_precisely(path: &Path) -> bool {
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
-    !matches!(ext.as_str(), "mpg" | "mpeg" | "vob")
+    !mediares_core::probe::has_extension(path, &["mpg", "mpeg", "vob"])
 }
 
 /// Font and colour of the OSD (the viewer config's OSD settings).
@@ -348,7 +318,9 @@ pub struct OsdStyle {
 struct VideoOsd {
     style: OsdStyle,
     font: crate::gdi::Font,
-    text: OsdText,
+    /// Parsed once per change, rendered on every frame.
+    template: crate::osd_template::Template,
+    fields: HashMap<&'static str, String>,
 }
 
 /// What the OSD shows: a template and the values of its fields, except the playback position
@@ -366,7 +338,7 @@ impl VideoView {
         let surface = Surface::new(viewer, true)?;
         let player = Player::new(surface.0, viewer)?;
         player.set_frame_rate(info.frame_rate);
-        transport_bar::restore_audio_level(player.transport());
+        transport_bar::restore_audio_level(&*player);
         if !player.open(path) {
             return None;
         }
@@ -538,10 +510,10 @@ impl VideoView {
             Some(osd) => {
                 let position = format_time(self.position());
                 let duration = format_time(self.player.duration().max(self.info.duration_sec));
-                let text = crate::osd_template::render(&osd.text.template, |key| match key {
+                let text = osd.template.render(|key| match key {
                     "time" => Some(position.clone()),
                     "duration" => Some(duration.clone()),
-                    _ => osd.text.fields.get(key).cloned(),
+                    _ => osd.fields.get(key).cloned(),
                 });
                 self.player.render(Some(Osd {
                     text: &text,
@@ -562,17 +534,29 @@ impl VideoView {
 
     /// Shows (`Some`) or hides the OSD.
     pub unsafe fn set_osd(&mut self, style: Option<OsdStyle>, text: OsdText) {
-        self.osd = match style {
-            None => None,
-            Some(style) => match self.osd.take() {
-                Some(osd) if osd.style == style => Some(VideoOsd { text, ..osd }),
-                _ => {
-                    let dpi = (crate::gdi::dpi_scale(self.viewer) * 96.0).round() as i32;
-                    let font = crate::image_view::create_osd_font(&style.face, style.size_pt, dpi);
-                    Some(VideoOsd { style, font, text })
-                }
-            },
+        let Some(style) = style else {
+            self.osd = None;
+            return;
         };
+        let template = crate::osd_template::Template::parse(&text.template);
+        let fields = text.fields;
+        self.osd = Some(match self.osd.take() {
+            Some(osd) if osd.style == style => VideoOsd {
+                template,
+                fields,
+                ..osd
+            },
+            _ => {
+                let dpi = (crate::gdi::dpi_scale(self.viewer) * 96.0).round() as i32;
+                let font = crate::image_view::create_osd_font(&style.face, style.size_pt, dpi);
+                VideoOsd {
+                    style,
+                    font,
+                    template,
+                    fields,
+                }
+            }
+        });
     }
 
     /// Stretches the surface over `area` (viewer client coordinates). The engine letterboxes the

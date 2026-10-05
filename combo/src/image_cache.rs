@@ -211,6 +211,8 @@ struct Queue {
     foreground: VecDeque<Arc<Job>>,
     prefetch: VecDeque<(PathBuf, DecodeOptions)>,
     in_flight: Vec<Arc<Job>>,
+    /// Decoder threads; with more than one, prefetching leaves one free for the photo asked for.
+    workers: usize,
 }
 
 impl Queue {
@@ -218,6 +220,9 @@ impl Queue {
     fn next_job(&mut self) -> Option<Arc<Job>> {
         if let Some(job) = self.foreground.pop_front() {
             return Some(job);
+        }
+        if self.workers > 1 && self.in_flight.len() + 1 >= self.workers {
+            return None;
         }
         while let Some((path, options)) = self.prefetch.pop_front() {
             let Some(file) = FileKey::for_path(&path) else {
@@ -249,13 +254,19 @@ fn pool() -> &'static Pool {
     static POOL: OnceLock<Pool> = OnceLock::new();
     POOL.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
-        for i in 0..cores.saturating_sub(1).clamp(1, MAX_WORKERS) {
-            let _ = std::thread::Builder::new()
-                .name(format!("mediares-decode-{i}"))
-                .spawn(worker_loop);
-        }
+        let workers = (0..cores.saturating_sub(1).clamp(1, MAX_WORKERS))
+            .filter(|i| {
+                std::thread::Builder::new()
+                    .name(format!("mediares-decode-{i}"))
+                    .spawn(worker_loop)
+                    .is_ok()
+            })
+            .count();
         Pool {
-            queue: Mutex::new(Queue::default()),
+            queue: Mutex::new(Queue {
+                workers,
+                ..Queue::default()
+            }),
             wake: Condvar::new(),
         }
     })

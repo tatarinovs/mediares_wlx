@@ -33,8 +33,8 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
     };
 
     // Monospace so the label column lines up.
-    let font = crate::gdi::create_font("Consolas", -13, false);
-    let ui_font = crate::gdi::create_font("Segoe UI", -12, false);
+    let font = dialog::font(dlg, "Consolas", -13);
+    let ui_font = dialog::font(dlg, "Segoe UI", -12);
     let edit_style = WS_TABSTOP.0
         | WS_VSCROLL.0
         | WS_BORDER.0

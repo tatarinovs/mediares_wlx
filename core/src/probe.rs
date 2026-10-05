@@ -17,11 +17,13 @@ pub enum MediaType {
 
 /// Decoded by the `image` crate.
 const STANDARD_IMAGE_EXTS: &[&str] = &[
-    "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "tiff", "tif", "ico", "tga", "hdr",
+    "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "ico", "tga", "hdr",
 ];
-/// Decoded by Windows Imaging Component (HEIF/AV1/JPEG XL extensions, built-in JPEG XR and DDS).
+/// Decoded by Windows Imaging Component (HEIF/AV1/JPEG XL extensions, built-in TIFF, JPEG XR and
+/// DDS). TIFF goes there too: WIC reads every compression TIFF uses (old-style JPEG included), and
+/// the `image` crate's decoder would cost about 300 KB of binary.
 pub const WIC_IMAGE_EXTS: &[&str] = &[
-    "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp", "hdp", "dds",
+    "tiff", "tif", "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp", "hdp", "dds",
 ];
 /// Rendered by Direct2D.
 pub const SVG_EXTS: &[&str] = &["svg", "svgz"];

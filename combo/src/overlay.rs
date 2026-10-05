@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow, GUITHREADINFO,
     GUI_INMENUMODE, GUI_POPUPMENUMODE, GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE,
     SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::gdi;
@@ -158,7 +158,7 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
         }
     };
     let hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         CLASS_NAME,
         None,
         WS_POPUP,

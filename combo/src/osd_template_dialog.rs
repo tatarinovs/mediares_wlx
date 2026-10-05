@@ -4,14 +4,14 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetDlgItem, GetDlgItemTextW,
-    GetWindowLongPtrW, GetWindowRect, SendDlgItemMessageW, SetDlgItemTextW, SetWindowLongPtrW,
-    TrackPopupMenu, BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA,
-    IDCANCEL, IDOK, MF_POPUP, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WM_CLOSE,
-    WM_COMMAND, WM_NCDESTROY, WS_BORDER, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
+    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetDlgItem, GetWindowLongPtrW,
+    GetWindowRect, SendDlgItemMessageW, SetDlgItemTextW, SetWindowLongPtrW, TrackPopupMenu,
+    BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA, IDCANCEL, IDOK,
+    MF_POPUP, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND,
+    WM_NCDESTROY, WS_BORDER, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
 };
 
-use crate::dialog;
+use crate::dialog::{self, ES_AUTOHSCROLL, SS_LEFT};
 use crate::i18n::tr;
 use crate::osd_template::FieldGroups;
 
@@ -21,10 +21,8 @@ const IDC_TEMPLATE: i32 = 301;
 const IDC_ADD_FIELD: i32 = 302;
 const IDC_DEFAULT: i32 = 303;
 
-const ES_AUTOHSCROLL: u32 = 0x0080;
 const ES_WANTRETURN: u32 = 0x1000;
 const EM_REPLACESEL: u32 = 0x00C2;
-const SS_LEFT: u32 = 0x0000;
 
 /// Menu command of field `i` in group `g`.
 const FIELD_CMD_BASE: usize = 1000;
@@ -53,8 +51,8 @@ pub unsafe fn show(
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
-    let font = crate::gdi::create_font("Segoe UI", -12, false);
-    let mono = crate::gdi::create_font("Consolas", -14, false);
+    let font = dialog::font(dlg, "Segoe UI", -12);
+    let mono = dialog::font(dlg, "Consolas", -14);
     let tab = WS_TABSTOP.0;
     let hint = tr("{field} — the field's value. <…> — a block hidden when a field in it is empty.\n{{ }} << >> — the characters themselves. Enter — a new OSD line.");
     dialog::control(
@@ -115,9 +113,7 @@ fn to_edit(template: &str) -> String {
 }
 
 unsafe fn edit_text(dlg: HWND) -> String {
-    let mut buf = vec![0u16; 16384];
-    let len = GetDlgItemTextW(dlg, IDC_TEMPLATE, &mut buf) as usize;
-    String::from_utf16_lossy(&buf[..len]).replace("\r\n", "\n")
+    dialog::item_text(dlg, IDC_TEMPLATE).replace("\r\n", "\n")
 }
 
 /// "Добавить поле...": a menu of the fields by group; the chosen `{key}` goes in at the caret.

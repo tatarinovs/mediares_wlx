@@ -6,7 +6,7 @@
 //! Vector art has no pixel size of its own, so small drawings (icons) are rendered larger to stay
 //! sharp when shown fitted to the window.
 
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
@@ -53,10 +53,10 @@ pub fn handles(path: &Path) -> bool {
 
 /// The XML text; SVGZ (and gzipped `.svg`) is unpacked.
 fn read_xml(path: &Path) -> Option<Vec<u8>> {
-    let file = std::fs::File::open(path).ok()?;
+    let mut file = std::fs::File::open(path).ok()?;
     let mut head = [0u8; 2];
-    (&file).read_exact(&mut head).ok()?;
-    let file = std::fs::File::open(path).ok()?;
+    file.read_exact(&mut head).ok()?;
+    file.seek(std::io::SeekFrom::Start(0)).ok()?;
     let mut xml = Vec::new();
     let limit = MAX_XML_BYTES + 1;
     if head == [0x1F, 0x8B] {

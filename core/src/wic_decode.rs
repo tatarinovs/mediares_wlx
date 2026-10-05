@@ -1,5 +1,5 @@
 //! Formats decoded by Windows Imaging Component: HEIC/HEIF and AVIF (the Store's HEIF and AV1
-//! extensions), JPEG XL (its extension), JPEG XR and DDS (built into Windows). Nothing of the
+//! extensions), JPEG XL (its extension), TIFF, JPEG XR and DDS (built into Windows). Nothing of the
 //! codecs lands in our binary; a missing extension simply makes decoding fail.
 //!
 //! WIC applies the container's own transforms (HEIF `irot` / `imir`), so the pixels come out
@@ -98,4 +98,75 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
             .ok()?;
     }
     RgbaImage::from_raw(w, h, rgba).map(DynamicImage::ImageRgba8)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::image_decode::{decode_file, header_dimensions, header_needs_codec};
+    use crate::probe::{probe_file, MediaType};
+
+    /// Uncompressed little-endian RGB TIFF, 2x1: red, green.
+    fn rgb_tiff() -> Vec<u8> {
+        let short = |tag: u16, v: u16| {
+            [
+                &tag.to_le_bytes()[..],
+                &[3, 0, 1, 0, 0, 0],
+                &v.to_le_bytes(),
+                &[0, 0],
+            ]
+            .concat()
+        };
+        let long = |tag: u16, v: u32| {
+            [
+                &tag.to_le_bytes()[..],
+                &[4, 0, 1, 0, 0, 0],
+                &v.to_le_bytes(),
+            ]
+            .concat()
+        };
+        // Header, IFD (9 entries) at 8, BitsPerSample values at 122, pixels at 128.
+        let mut t = b"II*\0".to_vec();
+        t.extend_from_slice(&8u32.to_le_bytes());
+        t.extend_from_slice(&9u16.to_le_bytes());
+        t.extend(short(256, 2));
+        t.extend(short(257, 1));
+        t.extend(
+            [
+                &258u16.to_le_bytes()[..],
+                &[3, 0, 3, 0, 0, 0],
+                &122u32.to_le_bytes(),
+            ]
+            .concat(),
+        );
+        t.extend(short(259, 1));
+        t.extend(short(262, 2));
+        t.extend(long(273, 128));
+        t.extend(short(277, 3));
+        t.extend(short(278, 1));
+        t.extend(long(279, 6));
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.extend([8u16, 8, 8].iter().flat_map(|v| v.to_le_bytes()));
+        t.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
+        t
+    }
+
+    #[test]
+    fn tiff_goes_through_wic() {
+        let path = std::env::temp_dir().join(format!("mediares_{}_rgb.tif", std::process::id()));
+        std::fs::write(&path, rgb_tiff()).unwrap();
+        let (kind, codec, size) = (
+            probe_file(&path),
+            header_needs_codec(&path),
+            header_dimensions(&path),
+        );
+        let img = decode_file(&path, MediaType::StandardImage).map(|i| i.into_rgba8());
+        std::fs::remove_file(&path).ok();
+        assert_eq!(
+            (kind, codec, size),
+            (MediaType::StandardImage, true, Some((2, 1)))
+        );
+        let img = img.expect("decoded");
+        assert_eq!(img.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 0).0, [0, 255, 0, 255]);
+    }
 }

@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::config;
+use crate::state::same_path as same;
 
 const FILE_NAME: &str = "mediares_resume.txt";
 const MAX_ENTRIES: usize = 200;
@@ -59,11 +60,6 @@ fn update(mut entries: Vec<Entry>, video: &Path, position: Option<f64>) -> Vec<E
     }
     entries.truncate(MAX_ENTRIES);
     entries
-}
-
-/// NTFS names are case-insensitive, Cyrillic included.
-fn same(a: &Path, b: &Path) -> bool {
-    crate::state::same_path(a, b)
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use windows::core::{s, HSTRING};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Graphics::Gdi::LOGFONTW;
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT, MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, MF_MEDIA_ENGINE_EVENT_ENDED,
     MF_MEDIA_ENGINE_EVENT_ERROR, MF_MEDIA_ENGINE_EVENT_FORMATCHANGE,
@@ -580,6 +581,8 @@ pub struct MpvPlayer {
     size: std::cell::Cell<(i32, i32)>,
     /// OSD text on screen, as sent to mpv.
     osd: std::cell::RefCell<Option<String>>,
+    /// The OSD font and its cell height, measured once per font (not on every render tick).
+    osd_font: std::cell::RefCell<Option<(LOGFONTW, i32)>>,
     /// When the pending frame step was sent.
     step_sent: std::cell::Cell<Option<Instant>>,
 }
@@ -658,6 +661,7 @@ impl MpvPlayer {
             events: Some(events),
             size: std::cell::Cell::new((1, 1)),
             osd: std::cell::RefCell::new(None),
+            osd_font: std::cell::RefCell::new(None),
             step_sent: std::cell::Cell::new(None),
         })
     }
@@ -667,21 +671,7 @@ impl MpvPlayer {
     }
 
     fn get_string(&self, name: &str) -> Option<String> {
-        let mut value: *mut c_char = std::ptr::null_mut();
-        unsafe {
-            let r = (self.api.get_property)(
-                self.handle,
-                cstr(name).as_ptr(),
-                FORMAT_STRING,
-                &mut value as *mut *mut c_char as *mut c_void,
-            );
-            if r < 0 || value.is_null() {
-                return None;
-            }
-            let text = CStr::from_ptr(value).to_string_lossy().trim().to_string();
-            (self.api.free)(value as *mut c_void);
-            Some(text).filter(|t| !t.is_empty())
-        }
+        unsafe { get_string(self.api, self.handle, name) }
     }
 
     fn set(&self, name: &str, value: &str) {
@@ -691,42 +681,15 @@ impl MpvPlayer {
     }
 
     fn get_f64(&self, name: &str) -> Option<f64> {
-        let mut v = 0f64;
-        let r = unsafe {
-            (self.api.get_property)(
-                self.handle,
-                cstr(name).as_ptr(),
-                FORMAT_DOUBLE,
-                &mut v as *mut f64 as *mut c_void,
-            )
-        };
-        (r >= 0 && v.is_finite()).then_some(v)
+        unsafe { get_f64(self.api, self.handle, name) }
     }
 
     fn get_i64(&self, name: &str) -> Option<i64> {
-        let mut v = 0i64;
-        let r = unsafe {
-            (self.api.get_property)(
-                self.handle,
-                cstr(name).as_ptr(),
-                FORMAT_INT64,
-                &mut v as *mut i64 as *mut c_void,
-            )
-        };
-        (r >= 0).then_some(v)
+        unsafe { get_i64(self.api, self.handle, name) }
     }
 
     fn get_flag(&self, name: &str) -> bool {
-        let mut v: c_int = 0;
-        let r = unsafe {
-            (self.api.get_property)(
-                self.handle,
-                cstr(name).as_ptr(),
-                FORMAT_FLAG,
-                &mut v as *mut c_int as *mut c_void,
-            )
-        };
-        r >= 0 && v != 0
+        unsafe { get_flag(self.api, self.handle, name) }
     }
 
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
@@ -760,33 +723,42 @@ impl MpvPlayer {
     /// The OSD line as an ASS event, looking like the GDI one: top left, 1 px black shadow.
     fn ass_text(&self, osd: &Osd<'_>) -> String {
         use windows::Win32::Graphics::Gdi::{
-            GetDC, GetObjectW, GetTextMetricsW, ReleaseDC, SelectObject, FW_BOLD, LOGFONTW,
-            TEXTMETRICW,
+            GetDC, GetObjectW, GetTextMetricsW, ReleaseDC, SelectObject, FW_BOLD, TEXTMETRICW,
         };
         let mut lf = LOGFONTW::default();
-        let mut tm = TEXTMETRICW::default();
         unsafe {
             GetObjectW(
                 osd.font.into(),
                 std::mem::size_of::<LOGFONTW>() as i32,
                 Some(&mut lf as *mut _ as *mut c_void),
             );
-            let dc = GetDC(None);
-            let old = SelectObject(dc, osd.font.into());
-            let _ = GetTextMetricsW(dc, &mut tm);
-            SelectObject(dc, old);
-            ReleaseDC(None, dc);
         }
+        let mut cached = self.osd_font.borrow_mut();
+        let size = match *cached {
+            Some((font, size)) if font == lf => size,
+            _ => {
+                let mut tm = TEXTMETRICW::default();
+                unsafe {
+                    let dc = GetDC(None);
+                    let old = SelectObject(dc, osd.font.into());
+                    let _ = GetTextMetricsW(dc, &mut tm);
+                    SelectObject(dc, old);
+                    ReleaseDC(None, dc);
+                }
+                // libass `\fs` is the line height (win ascent + descent), not the em size GDI
+                // fonts are created with: that is the GDI cell height.
+                let size = if tm.tmHeight > 0 {
+                    tm.tmHeight
+                } else {
+                    lf.lfHeight.abs()
+                }
+                .max(1);
+                *cached = Some((lf, size));
+                size
+            }
+        };
         let face_len = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0);
         let face = String::from_utf16_lossy(&lf.lfFaceName[..face_len]);
-        // libass `\fs` is the line height (win ascent + descent), not the em size GDI fonts are
-        // created with: that is the GDI cell height.
-        let size = if tm.tmHeight > 0 {
-            tm.tmHeight
-        } else {
-            lf.lfHeight.abs()
-        }
-        .max(1);
         let bold = (lf.lfWeight >= FW_BOLD.0 as i32) as u8;
         let mut escaped = String::with_capacity(osd.text.len());
         for c in osd.text.chars() {
@@ -1057,7 +1029,7 @@ impl Transport for MpvPlayer {
     }
 
     fn seek(&self, seconds: f64, approximate: bool) {
-        let t = seconds.clamp(0.0, self.duration().max(0.0));
+        let t = crate::transport_bar::clamp_to_duration(seconds, self.duration());
         let flags = if approximate {
             "absolute+keyframes"
         } else {

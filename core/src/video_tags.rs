@@ -42,11 +42,13 @@ enum Container {
 }
 
 fn container(path: &Path) -> Option<Container> {
-    let ext = path.extension()?.to_string_lossy().to_ascii_lowercase();
-    match ext.as_str() {
-        "mkv" | "webm" | "mka" | "mk3d" => Some(Container::Matroska),
-        "mp4" | "m4v" | "mov" | "qt" | "3gp" | "3g2" => Some(Container::Mp4),
-        _ => None,
+    use crate::probe::has_extension;
+    if has_extension(path, &["mkv", "webm", "mka", "mk3d"]) {
+        Some(Container::Matroska)
+    } else if has_extension(path, &["mp4", "m4v", "mov", "qt", "3gp", "3g2"]) {
+        Some(Container::Mp4)
+    } else {
+        None
     }
 }
 

@@ -557,15 +557,7 @@ impl KeyframeIndex {
 
     /// Next sample; `None` at the end of the stream. Returns (time in seconds, is key frame).
     unsafe fn read(&self) -> Option<(f64, bool)> {
-        let mut flags = 0u32;
-        let mut sample = None;
-        self.reader
-            .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
-            .ok()?;
-        if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-            return None;
-        }
-        let sample = sample?;
+        let sample = next_sample(&self.reader)?;
         let time = sample.GetSampleTime().ok()? as f64 / HNS_PER_SEC;
         let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
         Some((time, key))

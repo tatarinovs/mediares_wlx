@@ -13,7 +13,7 @@ use windows::core::{w, HSTRING, PCWSTR};
 use crate::i18n::{tr, LangSetting};
 use crate::osd_template;
 use crate::playlist::{QueueOptions, Repeat};
-use crate::snapshot::FrameFormat;
+use crate::snapshot::PictureFormat;
 use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::WindowsProgramming::{
     GetPrivateProfileIntW, GetPrivateProfileStringW, WritePrivateProfileStringW,
@@ -177,7 +177,7 @@ pub struct ViewerConfig {
     pub resume_video: bool,
     /// Left / Right arrow step, seconds.
     pub seek_step_sec: u32,
-    pub frame_format: FrameFormat,
+    pub frame_format: PictureFormat,
     /// Programs for "Открыть в редакторе"; empty = the file type's Edit verb or default program.
     pub photo_editor: String,
     pub video_editor: String,
@@ -209,7 +209,7 @@ impl Default for ViewerConfig {
             confirm_delete: true,
             resume_video: true,
             seek_step_sec: 5,
-            frame_format: FrameFormat::Png,
+            frame_format: PictureFormat::Png,
             photo_editor: String::new(),
             video_editor: String::new(),
             audio_editor: String::new(),
@@ -306,7 +306,7 @@ impl ViewerConfig {
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
             seek_step_sec: int(w!("SeekStep"), d.seek_step_sec as i32)
                 .clamp(SEEK_STEP_RANGE.0, SEEK_STEP_RANGE.1) as u32,
-            frame_format: FrameFormat::from_ini(&string(w!("FrameFormat"), "")),
+            frame_format: PictureFormat::from_ini(&string(w!("FrameFormat"), "")),
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
             audio_editor: string(w!("AudioEditor"), "").trim().to_string(),

@@ -37,7 +37,7 @@ impl ImageAnalysis {
 pub fn analyze(img: &DynamicImage) -> ImageAnalysis {
     let (width, height) = (img.width(), img.height());
     let gray = if width.max(height) > WORKING_SIZE {
-        img.thumbnail(WORKING_SIZE, WORKING_SIZE).to_luma8()
+        crate::image_decode::thumbnail(img, WORKING_SIZE, WORKING_SIZE).to_luma8()
     } else {
         img.to_luma8()
     };

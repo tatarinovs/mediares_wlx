@@ -1,5 +1,5 @@
 //! Photo decoding shared by WDX hashing and the WLX viewer: the `image` crate for standard
-//! formats, WIC for HEIC/AVIF/JXL/JXR/DDS (and whatever `image` fails on), Direct2D for SVG, plus
+//! formats, WIC for TIFF/HEIC/AVIF/JXL/JXR/DDS (and whatever `image` fails on), Direct2D for SVG, plus
 //! embedded previews for RAW/PSD, and an optional fallback decoder (libmpv in the viewer) for what
 //! WIC lacks the codec for. All paths go through the same memory limits.
 
@@ -144,7 +144,7 @@ fn decode_fallback(path: &Path) -> Option<DynamicImage> {
 }
 
 /// A standard image by whichever decoder owns its format; files the `image` crate cannot read
-/// (JPEG-in-TIFF, unusual BMP variants, ...) get a second chance through WIC.
+/// (unusual BMP variants, ...) get a second chance through WIC.
 fn decode_standard(path: &Path) -> Option<DynamicImage> {
     if crate::svg::handles(path) {
         return crate::svg::decode(path);
@@ -176,17 +176,14 @@ pub fn decode_file(path: &Path, kind: MediaType) -> Option<DynamicImage> {
 }
 
 /// Cheap pre-check reading only the header: whether a standard image is likely decodable within
-/// the limits. RAW/PSD are accepted as is (their previews are found only by a full parse).
+/// the limits. Formats whose header only a codec reads (SVG is parsed whole, under a lock the
+/// decoder holds while rendering), RAW and PSD are accepted as is: the decode itself tells.
 pub fn header_looks_decodable(path: &Path, kind: MediaType) -> bool {
     match kind {
-        MediaType::StandardImage if crate::svg::handles(path) => header_dimensions(path).is_some(),
-        MediaType::StandardImage => match header_dimensions(path) {
-            Some((w, h)) => {
-                w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
-            }
-            // Without WIC's codec the header can't be read, but the fallback may still decode it.
-            None => fallback_for(path).is_some(),
-        },
+        MediaType::StandardImage if header_needs_codec(path) => path.is_file(),
+        MediaType::StandardImage => header_dimensions(path).is_some_and(|(w, h)| {
+            w <= MAX_DIMENSION && h <= MAX_DIMENSION && (w as u64) * (h as u64) <= MAX_PIXELS
+        }),
         MediaType::RawImage | MediaType::PsdImage => path.is_file(),
         _ => false,
     }
@@ -216,6 +213,25 @@ pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
         .into_dimensions()
         .ok()
         .or_else(|| crate::wic_decode::dimensions(path))
+}
+
+/// `img` fitted into `max_w` x `max_h` (aspect kept) by averaging, like
+/// [`DynamicImage::thumbnail`], but only for the buffer types the decoders produce: that method
+/// compiles its filter for every pixel type (about 45 KB). Rarer types go through RGBA8.
+pub fn thumbnail(img: &DynamicImage, max_w: u32, max_h: u32) -> DynamicImage {
+    use image::imageops;
+    let (w, h) = (img.width().max(1) as f64, img.height().max(1) as f64);
+    let ratio = (max_w as f64 / w).min(max_h as f64 / h);
+    let (tw, th) = (
+        ((w * ratio).round() as u32).max(1),
+        ((h * ratio).round() as u32).max(1),
+    );
+    match img {
+        DynamicImage::ImageRgb8(b) => imageops::thumbnail(b, tw, th).into(),
+        DynamicImage::ImageRgba8(b) => imageops::thumbnail(b, tw, th).into(),
+        DynamicImage::ImageLuma8(b) => imageops::thumbnail(b, tw, th).into(),
+        other => imageops::thumbnail(&other.to_rgba8(), tw, th).into(),
+    }
 }
 
 /// Applies an EXIF orientation code (1..=8); other values leave the image untouched.

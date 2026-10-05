@@ -198,11 +198,7 @@ impl Transport for AudioPlayer {
 
     fn seek(&self, seconds: f64, _approximate: bool) {
         let Some(track) = &self.track else { return };
-        let seconds = if track.duration > 0.0 {
-            seconds.clamp(0.0, track.duration)
-        } else {
-            seconds.max(0.0)
-        };
+        let seconds = crate::transport_bar::clamp_to_duration(seconds, track.duration);
         let epoch = track.state.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         track.state.set_position(seconds);
         track.state.ended.store(false, Ordering::Relaxed);

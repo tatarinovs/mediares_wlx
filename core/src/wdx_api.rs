@@ -166,9 +166,8 @@ impl Field {
     }
 }
 
-/// Field order is the public WDX index TC stores in user configurations — append only.
-/// The order TC lists them in. TC refers to fields by name (columns, search templates), so the
-/// order can change freely.
+/// The order TC lists the fields in. TC refers to fields by name (columns, search templates), so
+/// the order can change freely.
 const FIELDS: &[(Field, &str, c_int)] = &[
     // Hashes for duplicate search first, then the fields of each content type.
     (Field::ImageDHash, "Image_dHash", FT_STRINGW),
@@ -375,7 +374,12 @@ unsafe fn get_value(
     flags: c_int,
     unicode: bool,
 ) -> c_int {
-    reset_stop_flag();
+    // A stop is meant for TC's background thread, which asks without `CONTENT_DELAYIFSLOW`. The
+    // main thread's quick calls for the next folder must not clear it while that thread still
+    // works on a file the user has left.
+    if flags & CONTENT_DELAYIFSLOW == 0 {
+        reset_stop_flag();
+    }
     let Some(path) = path else {
         return FT_FILEERROR;
     };
@@ -467,7 +471,7 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
             };
             return text(name.into());
         }
-        Source::Tags => return tag_value(path, field),
+        Source::Tags => return tag_value(path, field, kind),
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
@@ -670,8 +674,8 @@ fn tags_cached(_path: &Path) -> bool {
     true
 }
 
-fn tag_value(path: &Path, field: Field) -> Option<Value> {
-    if probe_file(path) != MediaType::Audio {
+fn tag_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
+    if kind != MediaType::Audio {
         return None;
     }
     if needs_audio_meta(path, field, MediaType::Audio) {

@@ -43,7 +43,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
-use crate::transport_bar::Transport;
+use crate::transport_bar::{clamp_to_duration, Transport};
 
 pub const WM_MEDIA_EVENT: u32 = WM_APP + 0x10;
 
@@ -464,7 +464,7 @@ impl Transport for VideoPlayer {
     }
 
     fn seek(&self, seconds: f64, approximate: bool) {
-        let t = seconds.clamp(0.0, self.duration().max(0.0));
+        let t = clamp_to_duration(seconds, self.duration());
         // The frame showing at `t` starts up to a frame earlier; the one before it, and the
         // frames decoded on the way from the key frame, start earlier still.
         self.hold.set((!approximate).then(|| Hold {

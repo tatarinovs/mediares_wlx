@@ -49,9 +49,23 @@ use mediares_core::exif::read_orientation;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Command {
-    ToggleFullscreen = 1,
+/// The commands, numbered from 1 in this order (menu ids, posted messages); `ALL` lists them.
+macro_rules! commands {
+    ($first:ident, $($rest:ident),* $(,)?) => {
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Command {
+            $first = 1,
+            $($rest),*
+        }
+
+        impl Command {
+            const ALL: &[Command] = &[Command::$first, $(Command::$rest),*];
+        }
+    };
+}
+
+commands! {
+    ToggleFullscreen,
     ToggleOsd,
     ShowExif,
     ShowSettings,
@@ -178,53 +192,7 @@ impl Command {
 
     /// Any command by its numeric value (posted messages, menu ids).
     fn from_raw(value: usize) -> Option<Command> {
-        use Command::*;
-        const ALL: [Command; 42] = [
-            ToggleFullscreen,
-            ToggleOsd,
-            ShowExif,
-            ShowSettings,
-            Next,
-            Previous,
-            ZoomIn,
-            ZoomOut,
-            ZoomActualSize,
-            ZoomFit,
-            TogglePlay,
-            ToggleMute,
-            SeekBack,
-            SeekForward,
-            KeyframeBack,
-            KeyframeForward,
-            VolumeUp,
-            VolumeDown,
-            PreviousTrack,
-            NextTrack,
-            ToggleAutoAdvance,
-            RepeatOff,
-            RepeatAll,
-            RepeatOne,
-            ToggleShuffle,
-            Copy,
-            SaveFrame,
-            ToggleSlideshow,
-            RotateLeft,
-            RotateRight,
-            Delete,
-            OpenInEditor,
-            ShowInFolder,
-            SetWallpaper,
-            Print,
-            Slower,
-            Faster,
-            NormalSpeed,
-            FrameBack,
-            FrameForward,
-            SaveAs,
-            SaveRotation,
-        ];
-        // Values start at 1 and follow the declaration order.
-        ALL.get(value.checked_sub(1)?).copied()
+        Self::ALL.get(value.checked_sub(1)?).copied()
     }
 
     /// Previous / next file in the play queue.
@@ -872,7 +840,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
     }
 }
 
-/// Another program is about to open: fullscreen (topmost) would keep it hidden.
+/// Another program is about to open: the user goes to it from the normal Lister.
 unsafe fn leave_fullscreen(hwnd: HWND) {
     if get_state(hwnd).is_some_and(|s| s.fullscreen.is_some()) {
         execute(hwnd, Command::ToggleFullscreen);
@@ -986,12 +954,8 @@ unsafe fn set_wallpaper(hwnd: HWND) {
         return;
     };
     let path = state.file_path.clone();
-    let ext = path
-        .extension()
-        .map(|e| e.to_string_lossy().to_ascii_lowercase())
-        .unwrap_or_default();
     let as_is = state.quarter_turns == 0
-        && matches!(ext.as_str(), "jpg" | "jpeg" | "png" | "bmp")
+        && mediares_core::probe::has_extension(&path, &["jpg", "jpeg", "png", "bmp"])
         && read_orientation(&path).is_none_or(|o| o == 1);
     let source = if as_is {
         Some(path)

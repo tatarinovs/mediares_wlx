@@ -1,18 +1,43 @@
 //! Shared plumbing for the plugin's modal dialogs (EXIF viewer, settings).
+//!
+//! Layouts and font sizes are written for 96 DPI; [`create_frame`], [`control`] and [`font`] scale
+//! them to the DPI of the window they go into.
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH, HFONT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetMessageW, GetWindow,
-    GetWindowRect, IsDialogMessageW, IsWindow, PostQuitMessage, SendMessageW, SetForegroundWindow,
-    ShowWindow, TranslateMessage, CS_HREDRAW, CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME,
-    WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetDlgItem, GetDlgItemTextW,
+    GetMessageW, GetWindow, GetWindowRect, GetWindowTextLengthW, IsDialogMessageW, IsWindow,
+    PostQuitMessage, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW,
+    CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT,
+    WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
 };
 
+use crate::gdi::{self, Font};
 use crate::module;
+
+pub const SS_LEFT: u32 = 0x0000;
+pub const ES_AUTOHSCROLL: u32 = 0x0080;
+
+/// `v` (at 96 DPI) in pixels of `hwnd`'s monitor.
+pub fn px(hwnd: HWND, v: i32) -> i32 {
+    (v as f32 * gdi::dpi_scale(hwnd)).round() as i32
+}
+
+/// A font for the controls of `dlg`; `height` at 96 DPI, as `CreateFontW` takes it.
+pub unsafe fn font(dlg: HWND, face: &str, height: i32) -> Font {
+    gdi::create_font(face, px(dlg, height), false)
+}
+
+/// The text of the control `id`.
+pub unsafe fn item_text(dlg: HWND, id: i32) -> String {
+    let len = GetDlgItem(Some(dlg), id).map_or(0, |item| GetWindowTextLengthW(item));
+    let mut buf = vec![0u16; usize::try_from(len).unwrap_or(0) + 1];
+    let len = GetDlgItemTextW(dlg, id, &mut buf) as usize;
+    String::from_utf16_lossy(&buf[..len])
+}
 
 /// Registers a dialog window class on this DLL. Repeated calls fail harmlessly.
 pub unsafe fn register_class(name: PCWSTR, proc: WNDPROC) {
@@ -34,6 +59,7 @@ pub unsafe fn create_frame(
     width: i32,
     height: i32,
 ) -> Option<HWND> {
+    let (width, height) = (px(owner, width), px(owner, height));
     let mut rc = RECT::default();
     let (x, y) = if GetWindowRect(owner, &mut rc).is_ok() {
         (
@@ -71,6 +97,7 @@ pub unsafe fn control(
     id: usize,
     font: HFONT,
 ) -> HWND {
+    let [x, y, w, h] = [x, y, w, h].map(|v| px(parent, v));
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,

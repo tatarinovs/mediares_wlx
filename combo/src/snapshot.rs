@@ -104,7 +104,7 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -
     }
     std::fs::create_dir_all(&dir).ok()?;
     let name = match position {
-        Some(t) => frame_file_name(source, t, FrameFormat::Png)
+        Some(t) => frame_file_name(source, t, PictureFormat::Png)
             .file_name()?
             .to_os_string(),
         None => format!("{}_cover.png", source.file_stem()?.to_string_lossy()).into(),
@@ -151,55 +151,57 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
 }
 
 /// "clip_0-01-23.456.png" next to the video; " (2)", " (3)"... if taken.
-pub fn frame_file_name(video: &Path, position: f64, format: FrameFormat) -> PathBuf {
+pub fn frame_file_name(video: &Path, position: f64, format: PictureFormat) -> PathBuf {
     let stem = video
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
     let millis = ((position.max(0.0) * 1000.0).round() as u64) % 1000;
     let time = format!("{}.{:03}", format_time(position), millis).replace(':', "-");
-    let dir = video.parent().unwrap_or(Path::new(""));
-    let base = format!("{}_{}", stem, time);
+    unique_path(video, &format!("{}_{}", stem, time), format)
+}
+
+/// "<stem>.<ext>" next to `neighbour`; " (2)", " (3)"... if taken.
+pub fn unique_path(neighbour: &Path, stem: &str, format: PictureFormat) -> PathBuf {
+    let dir = neighbour.parent().unwrap_or(Path::new(""));
+    let ext = format.extension();
     (1..)
-        .map(|n| {
-            dir.join(if n == 1 {
-                format!("{}.{}", base, format.extension())
-            } else {
-                format!("{} ({}).{}", base, n, format.extension())
-            })
+        .map(|n| match n {
+            1 => dir.join(format!("{stem}.{ext}")),
+            n => dir.join(format!("{stem} ({n}).{ext}")),
         })
         .find(|p| !p.exists())
         .expect("an unused name exists")
 }
 
-/// How video frames are saved (Shift+S).
+/// How pictures are saved: video frames (Shift+S) and "Save as".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FrameFormat {
+pub enum PictureFormat {
     Png,
     Jpeg,
 }
 
-impl FrameFormat {
-    pub const ALL: [FrameFormat; 2] = [FrameFormat::Png, FrameFormat::Jpeg];
+impl PictureFormat {
+    pub const ALL: [PictureFormat; 2] = [PictureFormat::Png, PictureFormat::Jpeg];
 
     pub fn from_ini(value: &str) -> Self {
         match value.trim().to_ascii_lowercase().as_str() {
-            "jpg" | "jpeg" => FrameFormat::Jpeg,
-            _ => FrameFormat::Png,
+            "jpg" | "jpeg" => PictureFormat::Jpeg,
+            _ => PictureFormat::Png,
         }
     }
 
     pub fn extension(self) -> &'static str {
         match self {
-            FrameFormat::Png => "png",
-            FrameFormat::Jpeg => "jpg",
+            PictureFormat::Png => "png",
+            PictureFormat::Jpeg => "jpg",
         }
     }
 
     pub fn label(self) -> &'static str {
         match self {
-            FrameFormat::Png => tr("PNG — lossless"),
-            FrameFormat::Jpeg => tr("JPEG — smaller"),
+            PictureFormat::Png => tr("PNG — lossless"),
+            PictureFormat::Jpeg => tr("JPEG — smaller"),
         }
     }
 }
@@ -209,10 +211,10 @@ pub const JPEG_QUALITY: u8 = 92;
 
 /// PNG without alpha: pictures on screen are always opaque.
 pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
-    save_picture(img, path, FrameFormat::Png)
+    save_picture(img, path, PictureFormat::Png)
 }
 
-pub fn save_picture(img: &DecodedImage, path: &Path, format: FrameFormat) -> bool {
+pub fn save_picture(img: &DecodedImage, path: &Path, format: PictureFormat) -> bool {
     let rgb: Vec<u8> = img
         .bgra
         .chunks_exact(4)
@@ -224,8 +226,8 @@ pub fn save_picture(img: &DecodedImage, path: &Path, format: FrameFormat) -> boo
     let out = std::io::BufWriter::new(file);
     let (w, h, color) = (img.width, img.height, ExtendedColorType::Rgb8);
     let ok = match format {
-        FrameFormat::Png => PngEncoder::new(out).write_image(&rgb, w, h, color),
-        FrameFormat::Jpeg => {
+        PictureFormat::Png => PngEncoder::new(out).write_image(&rgb, w, h, color),
+        PictureFormat::Jpeg => {
             JpegEncoder::new_with_quality(out, JPEG_QUALITY).write_image(&rgb, w, h, color)
         }
     }
@@ -264,7 +266,7 @@ fn source_picture(path: &Path) -> Option<DynamicImage> {
 pub fn thumbnail(path: &Path, max_w: u32, max_h: u32) -> Option<DecodedImage> {
     let img = source_picture(path)?;
     let img = if img.width() > max_w || img.height() > max_h {
-        img.thumbnail(max_w.max(1), max_h.max(1))
+        mediares_core::image_decode::thumbnail(&img, max_w.max(1), max_h.max(1))
     } else {
         img
     };
@@ -292,17 +294,17 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("mediares_snap_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mp4");
-        let first = frame_file_name(&video, 83.4567, FrameFormat::Png);
+        let first = frame_file_name(&video, 83.4567, PictureFormat::Png);
         assert_eq!(first.file_name().unwrap(), "clip_1-23.457.png");
         std::fs::write(&first, b"x").unwrap();
         assert_eq!(
-            frame_file_name(&video, 83.4567, FrameFormat::Png)
+            frame_file_name(&video, 83.4567, PictureFormat::Png)
                 .file_name()
                 .unwrap(),
             "clip_1-23.457 (2).png"
         );
         assert_eq!(
-            frame_file_name(&video, 83.4567, FrameFormat::Jpeg)
+            frame_file_name(&video, 83.4567, PictureFormat::Jpeg)
                 .file_name()
                 .unwrap(),
             "clip_1-23.457.jpg"

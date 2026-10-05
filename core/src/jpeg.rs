@@ -2,6 +2,9 @@
 
 use std::io::{BufRead, Seek, SeekFrom};
 
+/// What an `Exif` APP1 segment starts with, before its TIFF block.
+pub const EXIF_HEADER: &[u8] = b"Exif\0\0";
+
 /// Width and height from the SOF segment of a baseline/extended/progressive JPEG, reading only the
 /// header segments: the `image` decoder loads the whole file just to report them.
 pub fn read_dimensions(r: &mut (impl BufRead + Seek)) -> Option<(u32, u32)> {
@@ -120,7 +123,6 @@ pub fn find_largest(data: &[u8], min_len: usize) -> Option<&[u8]> {
 /// as the EXIF standard wants. The image data is copied untouched. `None` if the stream is not a
 /// JPEG or `tiff` does not fit into one segment.
 pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
-    const EXIF_HEADER: &[u8] = b"Exif\0\0";
     if !jpeg.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
@@ -157,7 +159,6 @@ pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
 
 /// Where the TIFF payload of the first `Exif` APP1 segment lies in `jpeg` (header segments only).
 pub fn exif_range(jpeg: &[u8]) -> Option<std::ops::Range<usize>> {
-    const EXIF_HEADER: &[u8] = b"Exif\0\0";
     if !jpeg.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
