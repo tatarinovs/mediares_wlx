@@ -14,6 +14,7 @@ pub mod hashing;
 pub mod heif;
 pub mod image_decode;
 pub mod jpeg;
+pub mod keyframes;
 pub mod mf_audio;
 pub mod mf_init;
 pub mod orientation;

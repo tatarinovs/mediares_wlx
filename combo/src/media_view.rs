@@ -160,6 +160,10 @@ impl MediaView {
         if self.bar_host != host {
             self.bar_host = host;
             self.bar.cancel();
+            // A drag cut short has no final seek.
+            if let Content::Video(v) = &self.content {
+                v.settle_preview();
+            }
             self.layout();
         }
     }

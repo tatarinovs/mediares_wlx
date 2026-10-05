@@ -4,14 +4,15 @@
 //! The surface is transparent to mouse input (`HTTRANSPARENT`), so the viewer window receives
 //! every click and decides between the video area and the bar.
 
-use std::cell::Cell;
+use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use mediares_core::cache::{get_video_meta, get_video_tags};
-use mediares_core::video_frame::{KeyframeIndex, VideoMeta};
+use mediares_core::keyframes::{KeyFrame, KeyframeIndex};
+use mediares_core::video_frame::VideoMeta;
 use mediares_core::video_tags::VideoTags;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -110,6 +111,14 @@ enum Player {
 }
 
 impl Player {
+    /// The media engine, if that is the player.
+    fn mf(&self) -> Option<&VideoPlayer> {
+        match self {
+            Self::Mf(p) => Some(p),
+            Self::Mpv(_) => None,
+        }
+    }
+
     unsafe fn new(surface: HWND, viewer: HWND) -> Option<Self> {
         if playback_mpv::available() {
             if let Some(p) = MpvPlayer::new(surface, viewer) {
@@ -230,9 +239,9 @@ pub struct VideoView {
     surface: Surface,
     viewer: HWND,
     path: PathBuf,
-    /// Opened on first key-frame step (`Some(None)`: the file has none to offer); reset when the
-    /// file changes.
-    keyframes: Option<Option<KeyframeIndex>>,
+    /// Opened on first use (holding `None`: the file has none to offer); reset when the file
+    /// changes.
+    keyframes: OnceCell<Option<KeyframeIndex>>,
     /// Stream properties; the size is updated once the engine knows it.
     pub info: VideoMeta,
     error: Option<String>,
@@ -251,13 +260,42 @@ pub struct VideoView {
     /// Paused by a frame step: to reach the next frame the player runs for a moment (the media
     /// engine slowly, mpv by unpausing itself), but that counts as paused until play / pause.
     step_paused: Cell<bool>,
-    /// Seeks land on the requested frame. MPEG program streams (and files found out at run time)
-    /// snap to the next group of pictures, so stepping back is not offered for them.
-    precise_seek: bool,
+    /// How seeking behaves on this file.
+    seek_profile: SeekProfile,
     /// A step back was requested to here; checked when the seek completes.
     back_target: Option<f64>,
     /// Seeking with the arrow keys.
     key_seek: Option<KeySeek>,
+    /// The time of the key frame on screen while the engine is still elsewhere
+    /// ([`SeekProfile::Previewed`]).
+    preview: Cell<Option<f64>>,
+}
+
+/// How seeking behaves on the current file.
+#[derive(Clone, Copy, PartialEq)]
+enum SeekProfile {
+    /// Seeks land on the requested frame: indexed containers on the media engine, and mpv.
+    Precise,
+    /// The media engine snaps seeks to the next group of pictures (MPEG program streams, and
+    /// files found out at run time), so stepping back is not offered.
+    Snapping,
+    /// Transport streams on the media engine. Their source seeks by a bitrate estimate: exact
+    /// seeks take up to seconds, approximate ones land up to a minute off. So, as mpv does by
+    /// default, arrow keys and the timeline go to key frames, shown decoded from the index while
+    /// the engine stays put; it follows once they rest, always exactly.
+    Previewed,
+}
+
+impl SeekProfile {
+    fn of(player: &Player, path: &Path) -> Self {
+        use mediares_core::probe::{has_extension, is_transport_stream};
+        match player {
+            Player::Mpv(_) => Self::Precise,
+            Player::Mf(_) if is_transport_stream(path) => Self::Previewed,
+            Player::Mf(_) if has_extension(path, &["mpg", "mpeg", "vob"]) => Self::Snapping,
+            Player::Mf(_) => Self::Precise,
+        }
+    }
 }
 
 /// Arrow-key seeking, from the first press until the key is released. Playback pauses while the
@@ -266,8 +304,8 @@ pub struct VideoView {
 /// seeks until its decoders are fed). The bar shows the target meanwhile.
 struct KeySeek {
     target: f64,
-    /// `target` is a key frame (or the first press): seek exactly, it costs one decoded frame.
-    exact: bool,
+    /// How `target` is reached.
+    landing: Landing,
     /// When the target last stepped.
     at: Instant,
     /// Last target handed to the engine (NaN: none yet).
@@ -278,9 +316,18 @@ struct KeySeek {
     seek_done: Option<Instant>,
     /// Playback resumes once the key is released (play / pause while seeking change it).
     was_playing: Cell<bool>,
-    /// Frame steps back (`,` on the media engine): each target sent is checked for accurate
-    /// seeking.
-    frame_back: bool,
+}
+
+/// How a [`KeySeek`] target is reached.
+enum Landing {
+    /// An exact seek: it decodes from the preceding key frame up to the target.
+    Exact,
+    /// A frame step back (`,` on the media engine): exact, and checked for accurate seeking.
+    FrameBack,
+    /// Wherever an approximate seek lands (held keys without a key frame index).
+    Approximate,
+    /// The key frame's picture, the engine left where it is ([`SeekProfile::Previewed`]).
+    Preview(KeyFrame),
 }
 
 /// No step for this long: the key was released.
@@ -301,11 +348,6 @@ struct Step {
 const RATES: &[f64] = &[0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 /// Speed while stepping: frames arrive slower than the render tick, so it stops on the next one.
 const STEP_RATE: f64 = 0.25;
-
-/// Containers whose Media Foundation source can't seek to an exact frame.
-fn seeks_precisely(path: &Path) -> bool {
-    !mediares_core::probe::has_extension(path, &["mpg", "mpeg", "vob"])
-}
 
 /// Font and colour of the OSD (the viewer config's OSD settings).
 #[derive(Clone, PartialEq)]
@@ -345,12 +387,13 @@ impl VideoView {
 
         SetTimer(Some(viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
         let resume_at = resume_point(path, &info, resume);
+        let seek_profile = SeekProfile::of(&player, path);
         Some(Self {
             player,
             surface,
             viewer,
             path: path.to_path_buf(),
-            keyframes: None,
+            keyframes: OnceCell::new(),
             info,
             error: None,
             osd: None,
@@ -361,9 +404,10 @@ impl VideoView {
             loaded: false,
             stepping: None,
             step_paused: Cell::new(false),
-            precise_seek: seeks_precisely(path),
+            seek_profile,
             back_target: None,
             key_seek: None,
+            preview: Cell::new(None),
         })
     }
 
@@ -378,7 +422,8 @@ impl VideoView {
         if !self.player.open(path) {
             return false;
         }
-        self.precise_seek = seeks_precisely(path);
+        self.seek_profile = SeekProfile::of(&self.player, path);
+        self.preview.set(None);
         self.back_target = None;
         self.key_seek = None;
         self.resume = resume;
@@ -387,7 +432,7 @@ impl VideoView {
         self.loaded = false;
         self.info = info;
         self.path = path.to_path_buf();
-        self.keyframes = None;
+        self.keyframes = OnceCell::new();
         self.step_paused.set(false);
         self.error = None;
         true
@@ -424,7 +469,7 @@ impl VideoView {
     /// One frame forward / back, ending paused. False if this file can't step back.
     pub unsafe fn frame_step(&mut self, forward: bool) -> bool {
         let mf = matches!(self.player, Player::Mf(_));
-        if mf && !forward && !self.precise_seek {
+        if mf && !forward && self.seek_profile == SeekProfile::Snapping {
             return false;
         }
         self.step_paused.set(true);
@@ -433,6 +478,7 @@ impl VideoView {
             return true;
         }
         // Steps end paused, so a held seek isn't resumed.
+        self.settle_preview();
         self.key_seek = None;
         if let Player::Mpv(p) = &self.player {
             p.frame_step(forward);
@@ -464,7 +510,7 @@ impl VideoView {
     unsafe fn step_back(&mut self) {
         self.finish_step();
         let target = (self.key_seek_base() - frame_sec(self.info.frame_rate)).max(0.0);
-        self.key_seek_to(target, true, true, false);
+        self.key_seek_to(target, Landing::FrameBack, false);
     }
 
     /// Render tick of a forward step: pause once enough new frames were shown.
@@ -581,10 +627,9 @@ impl VideoView {
     }
 
     /// The key frame index, opened on first use (once: a file without one isn't retried).
-    fn keyframe_index(&mut self) -> Option<&KeyframeIndex> {
-        let path = &self.path;
+    fn keyframe_index(&self) -> Option<&KeyframeIndex> {
         self.keyframes
-            .get_or_insert_with(|| KeyframeIndex::open(path))
+            .get_or_init(|| KeyframeIndex::open(&self.path))
             .as_ref()
     }
 
@@ -596,13 +641,13 @@ impl VideoView {
         let Some(index) = self.keyframe_index() else {
             return;
         };
-        let target = if forward {
+        let key = if forward {
             index.next_after(now + 0.01)
         } else {
             index.previous_before(now - KEYFRAME_BACK_SLACK_SEC)
         };
-        if let Some(t) = target {
-            self.player.seek(t, false);
+        if let Some(key) = key {
+            self.engine_seek(key.time, false);
         }
     }
 
@@ -613,15 +658,19 @@ impl VideoView {
         self.end_frame_step();
         let duration = self.player.duration();
         let target = transport_bar::step_target(self.key_seek_base(), duration, forward, step);
-        // The first press seeks exactly; held-down steps go to key frames.
-        let (target, exact) = match &self.key_seek {
-            None => (target, true),
-            Some(_) => match self.keyframe_toward(target, forward, duration) {
-                Some(key) => (key, true),
-                None => (target, false),
-            },
+        // The first press seeks exactly; held-down steps go to key frames. Previewed, every step
+        // does (see `SeekProfile::Previewed`).
+        let previewed = self.seek_profile == SeekProfile::Previewed;
+        let (target, landing) = if self.key_seek.is_none() && !previewed {
+            (target, Landing::Exact)
+        } else {
+            match self.keyframe_toward(target, forward, duration) {
+                Some(key) if previewed => (key.time, Landing::Preview(key)),
+                Some(key) => (key.time, Landing::Exact),
+                None => (target, Landing::Approximate),
+            }
         };
-        self.key_seek_to(target, exact, false, was_playing);
+        self.key_seek_to(target, landing, was_playing);
     }
 
     /// Where the next step starts: the previous target while a key is held (the position lags
@@ -634,23 +683,18 @@ impl VideoView {
     }
 
     /// Moves the held-down target, or starts [`KeySeek`] at it, and sends it if the engine is
-    /// ready. Held down (and for frame steps, which end paused) the player pauses, or it would
-    /// try to play between the seeks.
-    unsafe fn key_seek_to(
-        &mut self,
-        target: f64,
-        exact: bool,
-        frame_back: bool,
-        was_playing: bool,
-    ) {
-        if (frame_back || self.key_seek.is_some()) && self.player.is_playing() {
+    /// ready. Held down (and for frame steps and previews, which stand still) the player pauses,
+    /// or it would play between the seeks.
+    unsafe fn key_seek_to(&mut self, target: f64, landing: Landing, was_playing: bool) {
+        let frame_back = matches!(landing, Landing::FrameBack);
+        let stands_still = frame_back || matches!(landing, Landing::Preview(_));
+        if (stands_still || self.key_seek.is_some()) && self.player.is_playing() {
             self.player.pause();
         }
         match &mut self.key_seek {
             Some(s) => {
                 s.target = target;
-                s.exact = exact;
-                s.frame_back = frame_back;
+                s.landing = landing;
                 s.at = Instant::now();
                 if frame_back {
                     s.was_playing.set(false);
@@ -659,13 +703,12 @@ impl VideoView {
             None => {
                 self.key_seek = Some(KeySeek {
                     target,
-                    exact,
+                    landing,
                     at: Instant::now(),
                     sent: f64::NAN,
                     pts_at_send: None,
                     seek_done: None,
                     was_playing: Cell::new(was_playing),
-                    frame_back,
                 })
             }
         }
@@ -676,16 +719,14 @@ impl VideoView {
     /// the media engine. Its approximate seek lands on the key frame *before* the target, so
     /// with groups of pictures longer than the step the picture alternately stands and jumps;
     /// these targets advance evenly and decode one frame each. mpv picks well itself (`None`).
-    unsafe fn keyframe_toward(&mut self, target: f64, forward: bool, duration: f64) -> Option<f64> {
-        if !matches!(self.player, Player::Mf(_)) {
-            return None;
-        }
+    fn keyframe_toward(&self, target: f64, forward: bool, duration: f64) -> Option<KeyFrame> {
+        self.player.mf()?;
         let index = self.keyframe_index()?;
         if forward {
             // Not into the end margin (see `step_target`): that would end the file.
             index
                 .next_after(target - 1e-3)
-                .filter(|&t| duration <= 0.0 || t <= duration - SEEK_END_MARGIN_SEC)
+                .filter(|key| duration <= 0.0 || key.time <= duration - SEEK_END_MARGIN_SEC)
         } else {
             index.previous_before(target + 1e-3)
         }
@@ -694,6 +735,7 @@ impl VideoView {
     /// Ends arrow-key seeking (released, or another kind of seek takes over); playback resumes
     /// if it was on.
     pub fn cancel_key_seek(&mut self) {
+        self.settle_preview();
         if let Some(s) = self.key_seek.take() {
             if s.was_playing.get() && !self.player.is_playing() {
                 self.player.play();
@@ -704,13 +746,21 @@ impl VideoView {
     /// Hands the arrow-key target to the engine unless it is still busy with the previous seek,
     /// or done but its frame hasn't reached the screen yet: Media Foundation reports a seek done
     /// before the frame arrives, and a new seek would flush it, leaving the picture stuck while
-    /// the key is held. Held-down steps go to key frames (see [`Self::keyframe_toward`]), or seek
-    /// approximately when there is no index.
+    /// the key is held. A previewed key frame needs no engine and shows at once.
     unsafe fn send_key_seek(&mut self) {
-        let Some(s) = &mut self.key_seek else { return };
+        let Some(s) = &self.key_seek else { return };
         if s.sent == s.target {
             return;
         }
+        if let Landing::Preview(key) = &s.landing {
+            if self.show_key_frame(key) {
+                if let Some(s) = &mut self.key_seek {
+                    s.sent = s.target;
+                }
+                return;
+            }
+        }
+        let Some(s) = &mut self.key_seek else { return };
         if self.player.is_seeking() {
             s.seek_done = None;
             return;
@@ -723,21 +773,62 @@ impl VideoView {
         }
         s.pts_at_send = self.player.presented_pts();
         s.seek_done = None;
-        self.player.seek(s.target, !s.exact);
         s.sent = s.target;
-        if s.frame_back {
-            self.back_target = Some(s.target);
+        let (target, landing) = (s.target, &s.landing);
+        let approximate = matches!(landing, Landing::Approximate);
+        let checked = matches!(landing, Landing::FrameBack);
+        self.engine_seek(target, approximate);
+        if checked {
+            self.back_target = Some(target);
         }
     }
 
     /// Render tick / seek completed: sends a target that waited for the engine, and ends arrow-key
-    /// seeking once the key is released and the last seek is done.
+    /// seeking once the key is released and the last seek is done (a previewed one is the
+    /// engine's turn first).
     unsafe fn advance_key_seek(&mut self) {
         let Some(s) = &self.key_seek else { return };
         if s.sent != s.target {
             self.send_key_seek();
         } else if s.at.elapsed() >= KEY_SEEK_QUIET && !self.player.is_seeking() {
-            self.cancel_key_seek();
+            if self.preview.get().is_some() {
+                self.settle_preview();
+            } else {
+                self.cancel_key_seek();
+            }
+        }
+    }
+
+    /// Every engine seek goes through here: it supersedes a preview, and is exact where
+    /// approximate ones land far off.
+    fn engine_seek(&self, seconds: f64, approximate: bool) {
+        if self.preview.take().is_some() {
+            if let Some(player) = self.player.mf() {
+                player.end_preview();
+            }
+        }
+        let approximate = approximate && self.seek_profile != SeekProfile::Previewed;
+        self.player.seek(seconds, approximate);
+    }
+
+    /// Shows `key` decoded, the engine left where it is; false if it can't be decoded.
+    fn show_key_frame(&self, key: &KeyFrame) -> bool {
+        let (Some(player), Some(index)) = (self.player.mf(), self.keyframe_index()) else {
+            return false;
+        };
+        let Some(picture) = index.picture(key) else {
+            return false;
+        };
+        player.show_picture(picture);
+        self.preview.set(Some(key.time));
+        true
+    }
+
+    /// Brings the engine to the key frame a preview left on screen: the arrow key was released,
+    /// a timeline drag was cut short, or something else takes over.
+    pub fn settle_preview(&self) {
+        if let Some(time) = self.preview.get() {
+            self.engine_seek(time, false);
         }
     }
 
@@ -771,7 +862,7 @@ impl VideoView {
                 if let Some(target) = self.back_target.take() {
                     let off = (self.player.position() - target).abs();
                     if off > 1.5 * frame_sec(self.info.frame_rate) {
-                        self.precise_seek = false;
+                        self.seek_profile = SeekProfile::Snapping;
                     }
                 }
             }
@@ -789,7 +880,7 @@ impl VideoView {
                 if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 {
                     self.loaded = true;
                     if let Some(t) = self.resume_at.take() {
-                        self.player.seek(t, false);
+                        self.engine_seek(t, false);
                         self.resumed_to = Some(t);
                     }
                 }
@@ -862,7 +953,7 @@ impl Transport for VideoView {
     fn position(&self) -> f64 {
         match &self.key_seek {
             Some(s) => s.target,
-            None => self.player.position(),
+            None => self.preview.get().unwrap_or_else(|| self.player.position()),
         }
     }
 
@@ -870,8 +961,19 @@ impl Transport for VideoView {
         self.player.duration()
     }
 
+    /// Approximate seeks come from the timeline being clicked or dragged. Previewed, they show the
+    /// key frame at or before `seconds` (mpv's key frame scrubbing); the exact seek on release
+    /// brings the engine there.
     fn seek(&self, seconds: f64, approximate: bool) {
-        self.player.seek(seconds, approximate)
+        if approximate && self.seek_profile == SeekProfile::Previewed && self.key_seek.is_none() {
+            let key = self
+                .keyframe_index()
+                .and_then(|index| index.previous_before(seconds + 1e-3));
+            if key.is_some_and(|key| self.show_key_frame(&key)) {
+                return;
+            }
+        }
+        self.engine_seek(seconds, approximate)
     }
 
     fn volume(&self) -> f64 {

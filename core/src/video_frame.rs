@@ -8,17 +8,17 @@ use windows::core::{Interface, GUID, PCWSTR};
 use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSample, IMFSourceReader,
     MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
-    MFMediaType_Video, MFSampleExtension_CleanPoint, MFVideoFormat_NV12, MFVideoFormat_RGB32,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
+    MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_AUDIO_NUM_CHANNELS,
+    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
 
-use crate::mf_init::{mf_scope, ComScope};
+use crate::mf_init::mf_scope;
 
 #[derive(Debug, Clone)]
 pub struct VideoAnalysis {
@@ -72,10 +72,10 @@ impl From<windows::core::Error> for VideoError {
     }
 }
 
-const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
+pub(crate) const STREAM: u32 = MF_SOURCE_READER_FIRST_VIDEO_STREAM.0 as u32;
 
 /// Opens a source reader restricted to the first video stream.
-unsafe fn open_reader(
+pub(crate) unsafe fn open_reader(
     path: &Path,
     video_processing: bool,
 ) -> windows::core::Result<IMFSourceReader> {
@@ -176,20 +176,25 @@ fn fourcc_base(guid: &GUID) -> Option<u32> {
 /// Subtypes outside the FOURCC family (MPEG-1/2 video and Dolby audio from DirectShow).
 const MPEG1_VIDEO: GUID = GUID::from_u128(0xe436eb81_524f_11ce_9f53_0020af0ba770);
 const MPEG2_VIDEO: GUID = GUID::from_u128(0xe06d8026_db46_11cf_b4d1_00805f6cbbea);
+/// `MFVideoFormat_H264_ES`: H.264 from the MPEG transport stream source.
+const H264_ES: GUID = GUID::from_u128(0x3f40f4f0_5622_4ff8_b6d8_a17a584bee5e);
 const DOLBY_AC3: GUID = GUID::from_u128(0xe06d802c_db46_11cf_b4d1_00805f6cbbea);
 const DOLBY_DDPLUS: GUID = GUID::from_u128(0xa7fb87af_2d02_42fb_a4d4_05cd93843bdd);
 
-fn video_codec_name(guid: &GUID) -> Option<String> {
+pub(crate) fn video_codec_name(guid: &GUID) -> Option<String> {
     if *guid == MPEG2_VIDEO {
         return Some("MPEG-2".into());
     }
     if *guid == MPEG1_VIDEO {
         return Some("MPEG-1".into());
     }
+    if *guid == H264_ES {
+        return Some("H.264".into());
+    }
     let fourcc = fourcc_base(guid)?.to_le_bytes();
     let name = match &fourcc.map(|b| b.to_ascii_uppercase()) {
         b"H264" | b"AVC1" | b"X264" => "H.264",
-        b"HEVC" | b"H265" | b"HVC1" | b"HEV1" => "HEVC",
+        b"HEVC" | b"HEVS" | b"H265" | b"HVC1" | b"HEV1" => "HEVC",
         b"AV01" => "AV1",
         b"VP90" => "VP9",
         b"VP80" => "VP8",
@@ -336,7 +341,7 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
 /// The next decoded sample of the video stream. The first reads after a seek may carry no
 /// sample (stream tick, format change); `None` at the end of the stream or on an error. The flags
 /// argument is mandatory: a synchronous reader fails with `E_POINTER` without it.
-unsafe fn next_sample(reader: &IMFSourceReader) -> Option<IMFSample> {
+pub(crate) unsafe fn next_sample(reader: &IMFSourceReader) -> Option<IMFSample> {
     for _ in 0..16 {
         let (mut flags, mut sample) = (0u32, None);
         reader
@@ -530,7 +535,7 @@ impl FrameView<'_> {
     }
 }
 
-unsafe fn set_position(reader: &IMFSourceReader, hns: i64) -> windows::core::Result<()> {
+pub(crate) unsafe fn set_position(reader: &IMFSourceReader, hns: i64) -> windows::core::Result<()> {
     let mut position = PROPVARIANT::default();
     {
         let inner = &mut *position.Anonymous.Anonymous;
@@ -540,69 +545,7 @@ unsafe fn set_position(reader: &IMFSourceReader, hns: i64) -> windows::core::Res
     reader.SetCurrentPosition(&GUID::zeroed(), &position)
 }
 
-const HNS_PER_SEC: f64 = 10_000_000.0;
-/// Upper bound of compressed samples scanned for one step (a very long GOP at high fps).
-const MAX_SCAN_SAMPLES: usize = 3000;
-
-/// Locates key frames (clean points) of the first video stream by reading compressed samples —
-/// nothing is decoded, so a step costs a few milliseconds.
-pub struct KeyframeIndex {
-    reader: IMFSourceReader,
-    _com: ComScope,
-}
-
-impl KeyframeIndex {
-    pub fn open(path: &Path) -> Option<Self> {
-        let com = mf_scope()?;
-        // No output type is set, so samples stay compressed.
-        let reader = unsafe { open_reader(path, false) }.ok()?;
-        Some(Self { reader, _com: com })
-    }
-
-    /// Next sample; `None` at the end of the stream. Returns (time in seconds, is key frame).
-    unsafe fn read(&self) -> Option<(f64, bool)> {
-        let sample = next_sample(&self.reader)?;
-        let time = sample.GetSampleTime().ok()? as f64 / HNS_PER_SEC;
-        let key = sample.GetUINT32(&MFSampleExtension_CleanPoint).unwrap_or(0) != 0;
-        Some((time, key))
-    }
-
-    /// Seeks the reader to `seconds` and returns the first key frame later than `after`, scanning
-    /// from where it landed (sources position on the key frame preceding the requested time).
-    unsafe fn key_frame_from(&self, seconds: f64, after: f64) -> Option<f64> {
-        set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
-        (0..MAX_SCAN_SAMPLES)
-            .map_while(|_| self.read())
-            .find(|&(t, key)| key && t > after)
-            .map(|(t, _)| t)
-    }
-
-    /// First key frame strictly after `seconds`.
-    pub fn next_after(&self, seconds: f64) -> Option<f64> {
-        unsafe { self.key_frame_from(seconds, seconds) }
-    }
-
-    /// Last key frame strictly before `seconds` (0 if there is none).
-    pub fn previous_before(&self, seconds: f64) -> Option<f64> {
-        let mut probe = seconds;
-        // Probing just before the key frame we landed on normally yields the preceding one; the
-        // step only grows if the source keeps returning the same frame.
-        let mut back = 0.001;
-        for _ in 0..16 {
-            if probe <= 0.0 {
-                return Some(0.0);
-            }
-            let found = unsafe { self.key_frame_from(probe, f64::NEG_INFINITY) }?;
-            if found < seconds {
-                return Some(found);
-            }
-            probe = probe.min(found) - back;
-            back = (back * 4.0).max(0.25);
-        }
-        None
-    }
-}
-
+pub(crate) const HNS_PER_SEC: f64 = 10_000_000.0;
 unsafe fn propvariant_u64(var: &PROPVARIANT) -> Option<u64> {
     let inner = &var.Anonymous.Anonymous;
     (inner.vt == VT_UI8 || inner.vt == VT_I8).then(|| inner.Anonymous.uhVal)

@@ -12,6 +12,7 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use mediares_core::keyframes::KeyPicture;
 use mediares_core::mf_init::{mf_scope, ComScope};
 use windows::core::{implement, Interface, BSTR};
 use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
@@ -32,6 +33,10 @@ use windows::Win32::Graphics::Dxgi::{
     DXGI_MWA_NO_WINDOW_CHANGES, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
     DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE, DXGI_SWAP_EFFECT, DXGI_SWAP_EFFECT_DISCARD,
     DXGI_SWAP_EFFECT_FLIP_DISCARD, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+};
+use windows::Win32::Graphics::Gdi::{
+    FillRect, GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, BLACK_BRUSH,
+    DIB_RGB_COLORS, HALFTONE, HBRUSH, SRCCOPY,
 };
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MFMediaEngineClassFactory, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEngine,
@@ -80,6 +85,7 @@ struct Output {
 }
 
 /// Info line drawn into the video frame (GDI on the swap chain's back buffer).
+#[derive(Clone, Copy)]
 pub struct Osd<'a> {
     pub text: &'a str,
     pub font: windows::Win32::Graphics::Gdi::HFONT,
@@ -135,6 +141,52 @@ unsafe fn draw_osd(swap_chain: &IDXGISwapChain1, osd: &Osd<'_>) {
     let _ = surface.ReleaseDC(None);
 }
 
+/// Draws `picture` letterboxed (as the engine does its frames), with the OSD.
+unsafe fn present_picture(out: &mut Output, picture: &KeyPicture, osd: Option<Osd<'_>>) {
+    let Ok(surface) = out.swap_chain.GetBuffer::<IDXGISurface1>(0) else {
+        return;
+    };
+    // `true`: everything is drawn anew.
+    let Ok(dc) = surface.GetDC(true) else { return };
+    let (cw, ch) = (out.size.0 as i32, out.size.1 as i32);
+    let all = RECT {
+        left: 0,
+        top: 0,
+        right: cw,
+        bottom: ch,
+    };
+    FillRect(dc, &all, HBRUSH(GetStockObject(BLACK_BRUSH).0));
+    let (pw, ph) = (picture.width as f64, picture.height as f64);
+    let scale = (cw as f64 / pw).min(ch as f64 / ph);
+    let (dw, dh) = ((pw * scale).round() as i32, (ph * scale).round() as i32);
+    let bmi = crate::gdi::bitmap_info(picture.width, -(picture.height as i32));
+    SetStretchBltMode(dc, HALFTONE);
+    let _ = SetBrushOrgEx(dc, 0, 0, None);
+    StretchDIBits(
+        dc,
+        (cw - dw) / 2,
+        (ch - dh) / 2,
+        dw,
+        dh,
+        0,
+        0,
+        picture.width as i32,
+        picture.height as i32,
+        Some(picture.bgra.as_ptr() as *const _),
+        &bmi,
+        DIB_RGB_COLORS,
+        SRCCOPY,
+    );
+    if let Some(osd) = &osd {
+        crate::image_view::draw_osd_text(dc, osd.text, osd.font, osd.color);
+    }
+    let _ = surface.ReleaseDC(None);
+    drop(surface);
+    let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
+    out.dirty = false;
+    out.last_osd = osd.map(|o| o.text.to_string());
+}
+
 unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
     let flags = D3D11_CREATE_DEVICE_VIDEO_SUPPORT | D3D11_CREATE_DEVICE_BGRA_SUPPORT;
     let try_driver = |driver: D3D_DRIVER_TYPE| {
@@ -173,9 +225,12 @@ pub fn frame_sec(frame_rate: f64) -> f64 {
     }
 }
 
-/// An exact seek waits this long at most for its frame (sources without accurate seeking may
-/// never deliver it).
+/// Once a seek is done, an exact one waits this long at most for its frame (sources without
+/// accurate seeking may never deliver it).
 const HOLD_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// `OnVideoStreamTick` time while there is no frame (seeking).
+const NO_FRAME: i64 = i64::MIN;
 
 /// Frames aren't presented until the seek is done and one at least as late as `earliest`
 /// arrives.
@@ -184,6 +239,14 @@ struct Hold {
     /// 100 ns units, as `OnVideoStreamTick` reports.
     earliest: i64,
     since: Instant,
+}
+
+/// See [`VideoPlayer::show_picture`].
+struct Preview {
+    picture: KeyPicture,
+    /// [`VideoPlayer::end_preview`] was called: the picture only stands in until the engine has a
+    /// frame to show.
+    ending: bool,
 }
 
 /// Field order matters: the engine is released before the output and COM.
@@ -195,6 +258,9 @@ pub struct VideoPlayer {
     hold: Cell<Option<Hold>>,
     /// Frame length of the current file (see [`Self::set_frame_rate`]).
     frame: Cell<f64>,
+    /// A picture decoded outside the engine, shown instead of its frames (see
+    /// [`Self::show_picture`]).
+    preview: RefCell<Option<Preview>>,
     output: RefCell<Output>,
     _manager: IMFDXGIDeviceManager,
     _com: ComScope,
@@ -237,6 +303,7 @@ impl VideoPlayer {
             output: RefCell::new(output),
             hold: Cell::new(None),
             frame: Cell::new(FALLBACK_FRAME_SEC),
+            preview: RefCell::new(None),
             _manager: manager,
             _com: com,
         })
@@ -246,33 +313,96 @@ impl VideoPlayer {
     pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
         self.output.borrow_mut().last_pts = None;
         self.hold.set(None);
+        self.preview.borrow_mut().take();
         self.engine
             .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
         self.engine.Play()
     }
 
-    /// Render tick: presents a frame if the engine has a new one (or a redraw is pending, or the
-    /// OSD text changed).
+    /// Shows `picture` instead of the engine's frames until [`Self::end_preview`]: the viewer
+    /// shows key frames it decoded itself where the engine's seeks take seconds.
+    pub fn show_picture(&self, picture: KeyPicture) {
+        *self.preview.borrow_mut() = Some(Preview {
+            picture,
+            ending: false,
+        });
+        if let Ok(mut out) = self.output.try_borrow_mut() {
+            out.dirty = true;
+        }
+    }
+
+    /// Back to the engine's frames. The picture stays on screen until the engine has one (it may
+    /// not even have been drawn yet: a click on the timeline ends its preview at once).
+    pub fn end_preview(&self) {
+        if let Some(preview) = self.preview.borrow_mut().as_mut() {
+            preview.ending = true;
+        }
+    }
+
+    /// Render tick: presents the engine's frame if there is a new one (or a redraw is pending, or
+    /// the OSD text changed). A preview stands in while there is none to show.
     pub unsafe fn render(&self, osd: Option<Osd<'_>>) {
         let Ok(mut out) = self.output.try_borrow_mut() else {
             return;
         };
-        let Ok(pts) = self.engine.OnVideoStreamTick() else {
-            return;
+        let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
+        let (previewing, ending) = match self.preview.borrow().as_ref() {
+            Some(p) => (!p.ending, p.ending),
+            None => (false, false),
         };
+        // The engine's frames are pulled under a preview too: that is what carries its seeks
+        // through (one may be under way to where an earlier preview settled).
+        let frame = self
+            .presentable_frame(out.dirty && !previewing && !ending)
+            .filter(|_| !previewing);
+        match frame {
+            Some(pts) => {
+                if (out.last_pts != Some(pts) || out.dirty || osd_changed)
+                    && self.present_frame(&mut out, pts, osd)
+                {
+                    self.preview.borrow_mut().take();
+                }
+            }
+            None => {
+                if let Some(preview) = self.preview.borrow().as_ref() {
+                    if out.dirty || osd_changed {
+                        present_picture(&mut out, &preview.picture, osd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The time of the engine's current frame if it may be shown. While seeking there is none:
+    /// presenting would flash a blank picture, and callers would take it for the seek's frame;
+    /// only a `redraw` (resize) shows the one the engine still holds after an approximate seek.
+    /// After an exact seek, nothing before the target's frame (see [`Hold`]).
+    unsafe fn presentable_frame(&self, redraw: bool) -> Option<i64> {
+        let pts = self.engine.OnVideoStreamTick().ok()?;
+        if self.engine.IsSeeking().as_bool() {
+            if let Some(hold) = self.hold.get() {
+                // The timeout runs from the end of the seek: slow sources take seconds.
+                self.hold.set(Some(Hold {
+                    since: Instant::now(),
+                    ..hold
+                }));
+                return None;
+            }
+            return (redraw && pts != NO_FRAME).then_some(pts);
+        }
         if let Some(hold) = self.hold.get() {
-            let arrived = !self.engine.IsSeeking().as_bool() && pts >= hold.earliest;
-            if !arrived && hold.since.elapsed() < HOLD_TIMEOUT {
-                return;
+            if pts < hold.earliest && hold.since.elapsed() < HOLD_TIMEOUT {
+                return None;
             }
             self.hold.set(None);
         }
-        let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
-        if out.last_pts == Some(pts) && !out.dirty && !osd_changed {
-            return;
-        }
+        Some(pts)
+    }
+
+    /// Transfers the engine's frame to the screen; false if it failed.
+    unsafe fn present_frame(&self, out: &mut Output, pts: i64, osd: Option<Osd<'_>>) -> bool {
         let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else {
-            return;
+            return false;
         };
         let dst = RECT {
             left: 0,
@@ -289,17 +419,19 @@ impl VideoPlayer {
         if self
             .engine
             .TransferVideoFrame(&back_buffer, None, &dst, Some(&black))
-            .is_ok()
+            .is_err()
         {
-            drop(back_buffer);
-            if let Some(osd) = &osd {
-                draw_osd(&out.swap_chain, osd);
-            }
-            let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
-            out.last_pts = Some(pts);
-            out.dirty = false;
-            out.last_osd = osd.map(|o| o.text.to_string());
+            return false;
         }
+        drop(back_buffer);
+        if let Some(osd) = &osd {
+            draw_osd(&out.swap_chain, osd);
+        }
+        let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
+        out.last_pts = Some(pts);
+        out.dirty = false;
+        out.last_osd = osd.map(|o| o.text.to_string());
+        true
     }
 
     /// Resizes the swap chain to the surface's new client size.

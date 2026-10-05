@@ -38,6 +38,14 @@ fn standard_image_exts() -> &'static [&'static str] {
     ALL.get_or_init(|| [STANDARD_IMAGE_EXTS, WIC_IMAGE_EXTS, SVG_EXTS, EXR_EXTS].concat())
 }
 
+/// MPEG transport streams. Media Foundation's source for them flags every frame as a key frame
+/// and seeks by a coarse estimate, landing up to a minute before the requested time.
+const TRANSPORT_STREAM_EXTS: &[&str] = &["ts", "m2ts", "mts", "m2t", "tts", "trp"];
+
+pub fn is_transport_stream(path: &Path) -> bool {
+    has_extension(path, TRANSPORT_STREAM_EXTS)
+}
+
 /// Whether the extension of `path` is one of `exts` (ASCII case-insensitive).
 pub fn has_extension(path: &Path, exts: &[&str]) -> bool {
     path.extension()
