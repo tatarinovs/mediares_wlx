@@ -656,7 +656,14 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         }
         Command::ShowExif => {
             let path = state.file_path.clone();
-            exif_dialog::show(dialog::modal_owner(hwnd), &path);
+            let cleared = exif_dialog::show(dialog::modal_owner(hwnd), &path);
+            // The OSD shows camera fields read before; the state may be gone with the window.
+            if let (true, Some(state)) = (cleared, get_live_state(hwnd)) {
+                if state.media.is_none() && state.file_path == path {
+                    state.reload();
+                    refresh(state);
+                }
+            }
         }
         Command::OpenMap => {
             if let Some(place) = state.photo_gps() {
@@ -962,7 +969,7 @@ unsafe fn save_rotation(hwnd: HWND) {
     }
 }
 
-fn is_jpeg_file(path: &Path) -> bool {
+pub fn is_jpeg_file(path: &Path) -> bool {
     let mut magic = [0u8; 3];
     std::fs::File::open(path)
         .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))

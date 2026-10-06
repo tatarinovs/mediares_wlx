@@ -1,5 +1,5 @@
-//! Lossless rotation of JPEG files: only the EXIF Orientation tag changes, the compressed image
-//! data is left byte for byte as it was.
+//! Lossless edits of JPEG files: rotation (only the EXIF Orientation tag changes) and metadata
+//! removal. The compressed image data is left byte for byte as it was.
 
 use std::fs::OpenOptions;
 use std::io::{self, Seek, SeekFrom, Write};
@@ -146,20 +146,46 @@ pub fn set_jpeg_orientation(path: &Path, orientation: u16) -> io::Result<()> {
             file.write_all(&payload)?;
             file.sync_all()
         }
-        Rewrite::Whole(bytes) => {
-            let mut backup = path.as_os_str().to_owned();
-            backup.push(".mediares-backup");
-            std::fs::write(&backup, &jpeg)?;
-            let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            // The photo is already safely written; a backup briefly held open by an antivirus
-            // or the indexer is left behind rather than reported as a failed rotation.
-            let _ = std::fs::remove_file(&backup);
-            Ok(())
-        }
+        Rewrite::Whole(bytes) => overwrite(path, &jpeg, &bytes),
     }
+}
+
+/// Removes the metadata of the JPEG at `path` except its orientation and pixel size: the EXIF
+/// block is replaced by one with just these, XMP, IPTC and comments go. The image data, the color
+/// profile and anything after the picture (MPF images, motion photo video) stay as they are.
+pub fn clear_jpeg_metadata(path: &Path) -> io::Result<()> {
+    let jpeg = std::fs::read(path)?;
+    if !jpeg.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Err(invalid("not a JPEG file"));
+    }
+    let size = crate::jpeg::read_dimensions(&mut io::Cursor::new(&jpeg));
+    let old = crate::exif::read_exif(path).unwrap_or_default();
+    let kept = ExifInfo {
+        width: size.map(|s| s.0).or(old.width),
+        height: size.map(|s| s.1).or(old.height),
+        ..Default::default()
+    };
+    let tiff = build_exif(&kept, old.orientation.unwrap_or(1));
+    let bytes = crate::jpeg::with_only_exif(&jpeg, &tiff)
+        .ok_or_else(|| invalid("unexpected JPEG structure"))?;
+    overwrite(path, &jpeg, &bytes)
+}
+
+/// Writes `bytes` over the file at `path` (whose content is `old`) in place, so its creation
+/// time, attributes and permissions stay; a full copy of `old` is kept next to it until the write
+/// has succeeded.
+fn overwrite(path: &Path, old: &[u8], bytes: &[u8]) -> io::Result<()> {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(".mediares-backup");
+    std::fs::write(&backup, old)?;
+    let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    // The photo is already safely written; a backup briefly held open by an antivirus
+    // or the indexer is left behind rather than reported as a failed write.
+    let _ = std::fs::remove_file(&backup);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -238,6 +264,41 @@ mod tests {
         let make = crate::exif::read_exif(&path).and_then(|e| e.make);
         std::fs::remove_file(&path).ok();
         assert_eq!(make.as_deref(), Some("Cam"));
+    }
+
+    #[test]
+    fn clearing_keeps_orientation_and_size_only() {
+        let info = ExifInfo {
+            make: Some("Cam".into()),
+            model: Some("X".into()),
+            date_time_original: Some("2024:01:02 03:04:05".into()),
+            gps_latitude: Some(55.0),
+            gps_longitude: Some(37.0),
+            ..Default::default()
+        };
+        let mut jpeg = jpeg_with(Some(&build_exif(&info, 6)));
+        // A 640 x 480 SOF0 before the scan.
+        let sos = jpeg.len() - 8;
+        jpeg.splice(
+            sos..sos,
+            [
+                0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x01, 0xE0, 0x02, 0x80, 0x01, 0x01, 0x11, 0x00,
+            ],
+        );
+        let path = std::env::temp_dir().join(format!("mediares_{}_clear.jpg", std::process::id()));
+        std::fs::write(&path, &jpeg).unwrap();
+        clear_jpeg_metadata(&path).unwrap();
+        let out = std::fs::read(&path).unwrap();
+        let exif = crate::exif::read_exif(&path);
+        std::fs::remove_file(&path).ok();
+        let expected = ExifInfo {
+            orientation: Some(6),
+            width: Some(640),
+            height: Some(480),
+            ..Default::default()
+        };
+        assert_eq!(exif, Some(expected));
+        assert!(out.ends_with(&jpeg[sos..]));
     }
 
     #[test]

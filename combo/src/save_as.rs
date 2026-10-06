@@ -106,7 +106,7 @@ fn lossless(source: &Path, kind: MediaType, format: Format) -> Option<Vec<u8>> {
     match (kind, format) {
         (MediaType::RawImage, Format::Jpeg) => {
             let preview = extract_raw_preview(source)?;
-            let exif = read_exif(source).unwrap_or_default();
+            let exif = without_size(read_exif(source).unwrap_or_default());
             with_exif(&preview, &build_exif(&exif, exif.orientation.unwrap_or(1)))
         }
         (MediaType::StandardImage, _) => {
@@ -121,13 +121,22 @@ fn lossless(source: &Path, kind: MediaType, format: Format) -> Option<Vec<u8>> {
     }
 }
 
+/// The source's size does not describe the saved picture (a smaller preview, a turned one).
+fn without_size(exif: ExifInfo) -> ExifInfo {
+    ExifInfo {
+        width: None,
+        height: None,
+        ..exif
+    }
+}
+
 /// Pixels are already upright, so the orientation written is 1.
 fn encode(img: DynamicImage, exif: Option<&ExifInfo>, target: &Path, format: Format) -> bool {
     let Ok(file) = File::create(target) else {
         return false;
     };
     let out = BufWriter::new(file);
-    let exif = exif.map(|e| build_exif(e, 1));
+    let exif = exif.map(|e| build_exif(&without_size(e.clone()), 1));
     match format {
         Format::Png => {
             let mut encoder = PngEncoder::new(out);

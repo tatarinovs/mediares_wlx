@@ -123,6 +123,23 @@ pub fn find_largest(data: &[u8], min_len: usize) -> Option<&[u8]> {
 /// as the EXIF standard wants. The image data is copied untouched. `None` if the stream is not a
 /// JPEG or `tiff` does not fit into one segment.
 pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
+    replace_metadata(jpeg, tiff, |marker, payload| {
+        marker == 0xE1 && payload.starts_with(EXIF_HEADER)
+    })
+}
+
+/// [`with_exif`] that also drops the other descriptive metadata: XMP and any other APP1, IPTC /
+/// Photoshop (APP13), Ducky (APP12) and comments. What decoding needs stays: JFIF, the ICC
+/// profile, the Adobe color transform, MPF and the like.
+pub fn with_only_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
+    replace_metadata(jpeg, tiff, |marker, _| {
+        matches!(marker, 0xE1 | 0xEC | 0xED | 0xFE)
+    })
+}
+
+/// The JPEG with a new `Exif` segment holding `tiff` and without the header segments `drop`
+/// (marker, payload) picks.
+fn replace_metadata(jpeg: &[u8], tiff: &[u8], drop: impl Fn(u8, &[u8]) -> bool) -> Option<Vec<u8>> {
     if !jpeg.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
@@ -145,8 +162,7 @@ pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
             }
             _ => {
                 let end = skip_segment(jpeg, next)?;
-                let is_exif = marker == 0xE1 && jpeg[next + 2..end].starts_with(EXIF_HEADER);
-                if !is_exif {
+                if !drop(marker, &jpeg[next + 2..end]) {
                     out.extend_from_slice(&jpeg[i..end]);
                 }
                 i = end;
@@ -272,5 +288,23 @@ mod tests {
         expected.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
         assert_eq!(out, expected);
         assert_eq!(with_exif(b"not a jpeg", b""), None);
+    }
+
+    #[test]
+    fn only_exif_drops_xmp_iptc_and_comments() {
+        let mut j = vec![0xFF, 0xD8];
+        j.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0xAA, 0xBB]); // APP0 kept
+        j.extend_from_slice(&[0xFF, 0xE1, 0x00, 0x06, b'h', b't', b't', b'p']); // XMP
+        j.extend_from_slice(&[0xFF, 0xE2, 0x00, 0x04, 0xCC, 0xDD]); // ICC kept
+        j.extend_from_slice(&[0xFF, 0xED, 0x00, 0x03, 0x01]); // IPTC
+        j.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x03, b'c']); // comment
+        j.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
+        let out = with_only_exif(&j, b"II*\0TIFF").unwrap();
+        let mut expected = vec![0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x10];
+        expected.extend_from_slice(b"Exif\0\0II*\0TIFF");
+        expected.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0xAA, 0xBB]);
+        expected.extend_from_slice(&[0xFF, 0xE2, 0x00, 0x04, 0xCC, 0xDD]);
+        expected.extend_from_slice(&[0xFF, 0xDA, 0x00, 0x02, 0x12, 0x34, 0xFF, 0xD9]);
+        assert_eq!(out, expected);
     }
 }

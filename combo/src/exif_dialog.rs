@@ -1,14 +1,17 @@
 //! Modal dialog showing EXIF metadata.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mediares_core::exif::{read_exif, ExifInfo};
+use windows::core::HSTRING;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetWindowLongPtrW, SetWindowLongPtrW, BS_DEFPUSHBUTTON, ES_AUTOVSCROLL,
-    ES_MULTILINE, ES_READONLY, GWLP_USERDATA, IDCANCEL, IDOK, WM_CLOSE, WM_COMMAND, WS_BORDER,
-    WS_TABSTOP, WS_VSCROLL,
+    DefWindowProcW, GetDlgItem, GetWindowLongPtrW, MessageBoxW, SetDlgItemTextW, SetWindowLongPtrW,
+    ShowWindow, BS_DEFPUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA,
+    IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, SW_HIDE, WM_CLOSE, WM_COMMAND,
+    WS_BORDER, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::dialog;
@@ -17,8 +20,17 @@ use crate::i18n::tr;
 const CLASS_NAME: PCWSTR = w!("MediaresExifDialogClass");
 const IDC_EXIF_TEXT: usize = 201;
 const IDC_OPEN_MAP: i32 = 202;
+const IDC_CLEAR: i32 = 203;
 
-pub unsafe fn show(owner: HWND, file_path: &Path) {
+/// What the dialog's buttons work on; lives in the window until it is gone.
+struct Data {
+    path: PathBuf,
+    place: Option<(f64, f64)>,
+    cleared: bool,
+}
+
+/// Shows the dialog; true if the file's metadata was cleared from it.
+pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
     let filename = file_path
         .file_name()
@@ -31,7 +43,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
         540,
         440,
     ) else {
-        return;
+        return false;
     };
 
     let info = read_exif(file_path);
@@ -61,8 +73,8 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
         ui_font.0,
     );
 
-    // The coordinates for the map button live in the window until it is gone.
-    let place = info.as_ref().and_then(ExifInfo::gps).map(|place| {
+    let place = info.as_ref().and_then(ExifInfo::gps);
+    if place.is_some() {
         dialog::control(
             dlg,
             w!("BUTTON"),
@@ -72,15 +84,73 @@ pub unsafe fn show(owner: HWND, file_path: &Path) {
             IDC_OPEN_MAP as usize,
             ui_font.0,
         );
-        let place = Box::into_raw(Box::new(place));
-        SetWindowLongPtrW(dlg, GWLP_USERDATA, place as isize);
-        place
-    });
+    }
+    // Only JPEG can lose its metadata without re-encoding the picture.
+    if crate::window::is_jpeg_file(file_path) {
+        dialog::control(
+            dlg,
+            w!("BUTTON"),
+            tr("Clear EXIF"),
+            WS_TABSTOP.0,
+            (260, 360, 140, 28),
+            IDC_CLEAR as usize,
+            ui_font.0,
+        );
+    }
+    let data = Box::into_raw(Box::new(Data {
+        path: file_path.to_path_buf(),
+        place,
+        cleared: false,
+    }));
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, data as isize);
 
     dialog::run_modal(dlg, close);
-    // run_modal returns only after the window is destroyed, so nothing references `place` anymore.
-    if let Some(place) = place {
-        drop(Box::from_raw(place));
+    // run_modal returns only after the window is destroyed, so nothing references `data` anymore.
+    Box::from_raw(data).cleared
+}
+
+/// Asks, then strips the file's metadata down to orientation and size and shows what is left.
+unsafe fn clear(dlg: HWND, data: &mut Data) {
+    let answer = MessageBoxW(
+        Some(dlg),
+        &HSTRING::from(tr(
+            "Remove all metadata from the file (camera, dates, GPS, XMP, comments) except the orientation and size?\nThe picture itself does not change.",
+        )),
+        w!("Mediares"),
+        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+    );
+    if answer != IDYES {
+        return;
+    }
+    if let Err(e) = mediares_core::orientation::clear_jpeg_metadata(&data.path) {
+        crate::file_actions::show_error(
+            dlg,
+            &format!(
+                "{}:\n{}\n\n{}",
+                tr("Could not clear the metadata"),
+                data.path.display(),
+                e
+            ),
+        );
+        return;
+    }
+    data.cleared = true;
+    data.place = None;
+    let info = read_exif(&data.path);
+    let _ = SetDlgItemTextW(
+        dlg,
+        IDC_EXIF_TEXT as i32,
+        &HSTRING::from(exif_text(&data.path, info.as_ref())),
+    );
+    if let Ok(map) = GetDlgItem(Some(dlg), IDC_OPEN_MAP) {
+        let _ = ShowWindow(map, SW_HIDE);
+    }
+    if let Ok(button) = GetDlgItem(Some(dlg), IDC_CLEAR) {
+        // Focus leaves the button before it is disabled, or keyboard navigation gets stuck.
+        if let Ok(close) = GetDlgItem(Some(dlg), IDOK.0) {
+            let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetFocus(Some(close));
+        }
+        let _ = EnableWindow(button, false);
     }
 }
 
@@ -195,10 +265,16 @@ unsafe extern "system" fn wnd_proc(
                 dialog::close(hwnd);
                 LRESULT(0)
             }
-            WM_COMMAND if id == IDC_OPEN_MAP => {
-                let place = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const (f64, f64);
-                if let Some(&place) = place.as_ref() {
-                    crate::file_actions::open_map(hwnd, place);
+            WM_COMMAND if id == IDC_OPEN_MAP || id == IDC_CLEAR => {
+                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Data;
+                match data.as_mut() {
+                    Some(data) if id == IDC_CLEAR => clear(hwnd, data),
+                    Some(Data {
+                        place: Some(place), ..
+                    }) => {
+                        crate::file_actions::open_map(hwnd, *place);
+                    }
+                    _ => {}
                 }
                 LRESULT(0)
             }

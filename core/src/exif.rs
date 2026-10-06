@@ -437,7 +437,8 @@ fn format_exposure((num, den): (u32, u32)) -> Option<String> {
 
 /// A little-endian TIFF block (the payload of a JPEG `Exif` APP1 segment) with the fields of
 /// `info` a photo library cares about. `orientation` replaces the source's value: pixels that were
-/// already turned upright must be saved with 1.
+/// already turned upright must be saved with 1. `width` / `height` must be the size of the image the
+/// block goes with.
 pub fn build_exif(info: &ExifInfo, orientation: u16) -> Vec<u8> {
     let mut ifd0 = Vec::new();
     let mut exif = Vec::new();
@@ -471,6 +472,10 @@ pub fn build_exif(info: &ExifInfo, orientation: u16) -> Vec<u8> {
         exif.push(short_entry(0xA405, f));
     }
     ascii_entry(&mut exif, 0xA434, &info.lens_model);
+    if let Some((w, h)) = info.width.zip(info.height) {
+        exif.push(long_entry(0xA002, w));
+        exif.push(long_entry(0xA003, h));
+    }
 
     if let Some((lat, lon)) = info.gps_latitude.zip(info.gps_longitude) {
         let reference =

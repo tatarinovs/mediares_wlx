@@ -118,6 +118,7 @@ decode later, the window shows a message.
 | Delete to recycle bin and show the next one | Del (confirmation can be turned off in settings) |
 | EXIF / settings | E / S |
 | Where the photo was taken, on OpenStreetMap (photos with GPS) | G (or the menu; a button in the EXIF window) |
+| Strip metadata (camera, dates, GPS, XMP) from a JPEG, keeping orientation and size; no re-encoding | "Clear EXIF" button in the EXIF window |
 | Copy the picture | Ctrl+C |
 | Save as JPEG / PNG | Ctrl+S (or the menu) |
 | Print | Ctrl+P (or the menu) |
