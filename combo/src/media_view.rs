@@ -56,8 +56,10 @@ pub struct MediaView {
     skip: bool,
     /// Bar font and the DPI it was made for.
     font: Option<(u32, Font)>,
-    /// Short-lived message in place of the timeline ("frame saved...").
+    /// Short-lived message in the timeline instead of the name ("frame saved...").
     status: Option<String>,
+    /// File name, written in the timeline when the audio has no tags to name it.
+    file_name: String,
     /// Fullscreen: the bar lives in this overlay window and the content takes the whole viewer.
     bar_host: Option<HWND>,
     /// Last arrow-key step (key auto-repeat is thinned out).
@@ -76,6 +78,12 @@ fn playable_kind(path: &Path, kind: MediaType) -> MediaType {
         }
         _ => kind,
     }
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 impl MediaView {
@@ -97,6 +105,7 @@ impl MediaView {
             };
             if reused {
                 view.bar.cancel();
+                view.file_name = file_name(path);
                 view.layout();
                 return Some(view);
             }
@@ -115,6 +124,7 @@ impl MediaView {
             skip: false,
             font: None,
             status: None,
+            file_name: file_name(path),
             bar_host: None,
             last_seek_step: None,
         };
@@ -239,10 +249,11 @@ impl MediaView {
         }
         let font = self.font.as_ref().map(|(_, f)| f.0).unwrap_or_default();
         let layout = transport_bar::layout(width, height, scale, self.skip);
+        let name = self.display_title();
         let message = match (&error, &status) {
-            (Some(e), _) => Some(Message::Error(e)),
-            (None, Some(s)) => Some(Message::Info(s)),
-            (None, None) => None,
+            (Some(e), _) => Message::Error(e),
+            (None, Some(s)) => Message::Info(s),
+            (None, None) => Message::Info(name.as_deref().unwrap_or(&self.file_name)),
         };
         transport_bar::paint(dc, &layout, &bar, font, message, scale);
     }

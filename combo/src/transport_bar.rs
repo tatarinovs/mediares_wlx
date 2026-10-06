@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use windows::Win32::Foundation::{POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    SelectObject, DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-    HDC, HFONT,
+    IntersectClipRect, RestoreDC, SaveDC, SelectObject, DRAW_TEXT_FORMAT, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, HDC, HFONT,
 };
 
 use crate::gdi::{self, contains, fill, polygon};
@@ -17,10 +17,15 @@ use crate::gdi::{self, contains, fill, polygon};
 const BAR_HEIGHT: f32 = 40.0;
 pub const BG: u32 = 0x00202020;
 const TRACK: u32 = 0x00505050;
-const FILL: u32 = 0x00E0A040; // COLORREF is BGR: a light blue
+const FILL: u32 = 0x00FFCC80; // COLORREF is BGR: a light blue
 const ICON: u32 = 0x00E8E8E8;
 const TEXT: u32 = 0x00D0D0D0;
 const ERROR_TEXT: u32 = 0x006060FF;
+/// Slider label over the filled part (the light [`FILL`]).
+const TEXT_ON_FILL: u32 = 0x00202020;
+const ERROR_ON_FILL: u32 = 0x000000A0;
+/// Height of the slider strips, which hold their label inside.
+const STRIP_HEIGHT: f32 = 18.0;
 /// Up / Down step for audio, which has no key frames.
 pub const FINE_STEP_SEC: f64 = 1.0;
 pub const SEEK_END_MARGIN_SEC: f64 = 1.0;
@@ -395,38 +400,6 @@ pub fn format_time(seconds: f64) -> String {
     }
 }
 
-/// Thin horizontal track through the middle of `r`, filled up to `value` (0..=1).
-unsafe fn slider(dc: HDC, r: RECT, value: f64, thickness: i32) {
-    let mid = (r.top + r.bottom) / 2;
-    let track = RECT {
-        left: r.left,
-        top: mid - thickness / 2,
-        right: r.right,
-        bottom: mid - thickness / 2 + thickness,
-    };
-    fill(dc, track, TRACK);
-    let filled = r.left + ((r.right - r.left) as f64 * value.clamp(0.0, 1.0)).round() as i32;
-    fill(
-        dc,
-        RECT {
-            right: filled,
-            ..track
-        },
-        FILL,
-    );
-    let knob = thickness * 2;
-    fill(
-        dc,
-        RECT {
-            left: filled - knob / 2,
-            top: mid - knob / 2,
-            right: filled + knob / 2,
-            bottom: mid + knob / 2,
-        },
-        ICON,
-    );
-}
-
 unsafe fn text(dc: HDC, r: RECT, s: &str, color: u32, flags: DRAW_TEXT_FORMAT) {
     gdi::text(dc, r, s, None, color, flags | DT_SINGLELINE | DT_VCENTER);
 }
@@ -487,19 +460,75 @@ pub unsafe fn skip_icon(dc: HDC, r: RECT, forward: bool, dpi_scale: f32) {
     fill(dc, bar, ICON);
 }
 
-/// A text shown instead of the timeline.
+/// A text shown inside the timeline.
 pub enum Message<'a> {
     Error(&'a str),
     Info(&'a str),
 }
 
-/// Paints the bar. `message` (a playback error, "frame saved") replaces the timeline when present.
+/// Slider strip through the middle of `r` (the timeline, the volume), filled up to `value`
+/// (0..=1), with `label` inside: light over the track and dark over the filled part, so it reads
+/// on both.
+unsafe fn strip(
+    dc: HDC,
+    r: RECT,
+    value: f64,
+    label: Message<'_>,
+    align: DRAW_TEXT_FORMAT,
+    dpi_scale: f32,
+) {
+    let s = |v: f32| (v * dpi_scale).round() as i32;
+    let mid = (r.top + r.bottom) / 2;
+    let h = s(STRIP_HEIGHT);
+    let strip = RECT {
+        top: mid - h / 2,
+        bottom: mid - h / 2 + h,
+        ..r
+    };
+    let played = RECT {
+        right: r.left + ((r.right - r.left) as f64 * value.clamp(0.0, 1.0)).round() as i32,
+        ..strip
+    };
+    fill(dc, strip, TRACK);
+    fill(dc, played, FILL);
+    let (msg, color, on_fill) = match label {
+        Message::Error(m) => (m, ERROR_TEXT, ERROR_ON_FILL),
+        Message::Info(m) => (m, TEXT, TEXT_ON_FILL),
+    };
+    let pad = s(6.0);
+    let area = RECT {
+        left: strip.left + pad,
+        right: strip.right - pad,
+        ..strip
+    };
+    let flags = align | DT_END_ELLIPSIS | DT_NOPREFIX;
+    for (clip, color) in [
+        (
+            RECT {
+                left: played.right,
+                ..strip
+            },
+            color,
+        ),
+        (played, on_fill),
+    ] {
+        if clip.right > clip.left {
+            let saved = SaveDC(dc);
+            IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
+            text(dc, area, msg, color, flags);
+            let _ = RestoreDC(dc, saved);
+        }
+    }
+}
+
+/// Paints the bar. `message` (a playback error, "frame saved", the file name) is written inside
+/// the timeline.
 pub unsafe fn paint(
     dc: HDC,
     l: &Layout,
     state: &BarState,
     font: HFONT,
-    message: Option<Message<'_>>,
+    message: Message<'_>,
     dpi_scale: f32,
 ) {
     let s = |v: f32| (v * dpi_scale).round() as i32;
@@ -520,20 +549,12 @@ pub unsafe fn paint(
     );
     text(dc, l.time, &time, TEXT, DT_LEFT);
 
-    match message {
-        Some(Message::Error(msg)) => {
-            text(dc, l.timeline, msg, ERROR_TEXT, DT_LEFT | DT_END_ELLIPSIS)
-        }
-        Some(Message::Info(msg)) => text(dc, l.timeline, msg, TEXT, DT_LEFT | DT_END_ELLIPSIS),
-        None => {
-            let progress = if state.duration > 0.0 {
-                state.position / state.duration
-            } else {
-                0.0
-            };
-            slider(dc, l.timeline, progress, s(4.0));
-        }
-    }
+    let progress = if state.duration > 0.0 {
+        state.position / state.duration
+    } else {
+        0.0
+    };
+    strip(dc, l.timeline, progress, message, DT_LEFT, dpi_scale);
 
     // Speaker: box + cone; a red bar when muted.
     let (sx, sy) = (
@@ -584,12 +605,14 @@ pub unsafe fn paint(
         );
     }
     if l.volume.right > l.volume.left {
-        slider(
-            dc,
-            l.volume,
-            if state.muted { 0.0 } else { state.volume },
-            s(3.0),
-        );
+        // Muted: empty, with the volume unmuting returns to in red.
+        let percent = format!("{}%", (state.volume * 100.0).round() as i32);
+        let (value, label) = if state.muted {
+            (0.0, Message::Error(&percent))
+        } else {
+            (state.volume, Message::Info(&percent))
+        };
+        strip(dc, l.volume, value, label, DT_CENTER, dpi_scale);
     }
 
     SelectObject(dc, old_font);
