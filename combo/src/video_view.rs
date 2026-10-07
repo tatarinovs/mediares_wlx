@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
-use mediares_core::cache::{get_video_meta, get_video_tags};
+use mediares_core::cache::{get_video_meta, get_video_tags, is_video_meta_cached};
 use mediares_core::keyframes::{KeyFrame, KeyframeIndex};
 use mediares_core::video_frame::VideoMeta;
 use mediares_core::video_tags::VideoTags;
@@ -219,6 +219,29 @@ impl Player {
             Self::Mpv(p) => p.error_code(),
         }
     }
+
+    /// Stream properties of the loaded file, from players that know them (mpv).
+    fn stream_meta(&self) -> Option<VideoMeta> {
+        match self {
+            Self::Mf(_) => None,
+            Self::Mpv(p) => p.stream_meta(),
+        }
+    }
+
+    /// Chapters of the loaded file, from players that read them (mpv, any container).
+    fn chapters(&self) -> Vec<(f64, String)> {
+        match self {
+            Self::Mf(_) => Vec::new(),
+            Self::Mpv(p) => p.chapters(),
+        }
+    }
+
+    unsafe fn cycle_audio_track(&self) -> Option<(usize, usize, Option<String>)> {
+        match self {
+            Self::Mf(p) => p.cycle_audio_track(),
+            Self::Mpv(p) => p.cycle_audio_track(),
+        }
+    }
 }
 
 /// Play, pause, seek, volume... go straight to the backend's [`Transport`].
@@ -244,13 +267,15 @@ pub struct VideoView {
     keyframes: OnceCell<Option<KeyframeIndex>>,
     /// Stream properties; the size is updated once the engine knows it.
     pub info: VideoMeta,
+    /// Chapter starts (seconds) and titles.
+    chapters: Vec<(f64, String)>,
     error: Option<String>,
     osd: Option<VideoOsd>,
     rate: f64,
     /// Remember where long videos are left and continue from there.
     resume: bool,
-    /// Position to jump to once the file is loaded.
-    resume_at: Option<f64>,
+    /// Once the file is loaded, look up where it was left (its duration decides).
+    resume_pending: bool,
     /// Just continued from here (the bar says so).
     resumed_to: Option<f64>,
     /// Metadata arrived: the position is meaningful and may be remembered.
@@ -376,17 +401,18 @@ impl VideoView {
     /// Creates the surface inside `viewer` and starts playing `path`. `None` if Media Foundation
     /// cannot open the file (so TC can fall back to another plugin).
     pub unsafe fn new(viewer: HWND, path: &Path, resume: bool) -> Option<Self> {
-        let info = video_meta(path)?;
+        // The check that Media Foundation can open the file runs while the player starts up.
+        let probe = (!playback_mpv::available()).then(|| Probe::start(path));
         let surface = Surface::new(viewer, true)?;
         let player = Player::new(surface.0, viewer)?;
-        player.set_frame_rate(info.frame_rate);
         transport_bar::restore_audio_level(&*player);
         if !player.open(path) {
             return None;
         }
+        let info = Probe::finish(probe, &player, path)?;
+        player.set_frame_rate(info.frame_rate);
 
         SetTimer(Some(viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
-        let resume_at = resume_point(path, &info, resume);
         let seek_profile = SeekProfile::of(&player, path);
         Some(Self {
             player,
@@ -394,12 +420,13 @@ impl VideoView {
             viewer,
             path: path.to_path_buf(),
             keyframes: OnceCell::new(),
+            chapters: file_chapters(path),
             info,
             error: None,
             osd: None,
             rate: 1.0,
             resume,
-            resume_at,
+            resume_pending: resume,
             resumed_to: None,
             loaded: false,
             stepping: None,
@@ -413,7 +440,8 @@ impl VideoView {
 
     /// Switches to another file, reusing the engine (and its speed).
     pub unsafe fn open(&mut self, path: &Path, resume: bool) -> bool {
-        let Some(info) = video_meta(path) else {
+        let probe = matches!(self.player, Player::Mf(_)).then(|| Probe::start(path));
+        let Some(info) = Probe::finish(probe, &self.player, path) else {
             return false;
         };
         self.remember_position();
@@ -427,12 +455,13 @@ impl VideoView {
         self.back_target = None;
         self.key_seek = None;
         self.resume = resume;
-        self.resume_at = resume_point(path, &info, resume);
+        self.resume_pending = resume;
         self.resumed_to = None;
         self.loaded = false;
         self.info = info;
         self.path = path.to_path_buf();
         self.keyframes = OnceCell::new();
+        self.chapters = file_chapters(path);
         self.step_paused.set(false);
         self.error = None;
         true
@@ -544,6 +573,33 @@ impl VideoView {
 
     pub fn transport(&self) -> &dyn Transport {
         self
+    }
+
+    /// The file playing.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Chapter starts (seconds) and titles, in order.
+    pub fn chapters(&self) -> &[(f64, String)] {
+        &self.chapters
+    }
+
+    /// The title of the chapter `seconds` falls in, if it has one.
+    pub fn chapter_at(&self, seconds: f64) -> Option<&str> {
+        self.chapters
+            .iter()
+            .rev()
+            .find(|(start, _)| *start <= seconds)
+            .map(|(_, title)| title.as_str())
+            .filter(|t| !t.is_empty())
+    }
+
+    /// Next audio track; the status text to show, or `None` if there is only one.
+    pub unsafe fn cycle_audio_track(&self) -> Option<String> {
+        let (number, count, language) = self.player.cycle_audio_track()?;
+        let language = language.map(|l| format!(" ({l})")).unwrap_or_default();
+        Some(format!("{} {number}/{count}{language}", tr("Audio track")))
     }
 
     pub fn error(&self) -> Option<&str> {
@@ -874,15 +930,26 @@ impl VideoView {
             e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0
                 || e == MF_MEDIA_ENGINE_EVENT_FORMATCHANGE.0 =>
             {
+                let loaded = e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0;
+                if let Some(meta) = self.player.stream_meta().filter(|_| loaded) {
+                    self.player.set_frame_rate(meta.frame_rate);
+                    self.info = meta;
+                }
                 if let Some((w, h)) = self.player.native_size() {
                     self.info.width = w;
                     self.info.height = h;
                 }
-                if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 {
+                if loaded {
                     self.loaded = true;
-                    if let Some(t) = self.resume_at.take() {
-                        self.engine_seek(t, false);
-                        self.resumed_to = Some(t);
+                    if self.chapters.is_empty() {
+                        self.chapters = self.player.chapters();
+                    }
+                    if std::mem::take(&mut self.resume_pending) {
+                        let duration = self.player.duration().max(self.info.duration_sec);
+                        if let Some(t) = resume_point(&self.path, duration) {
+                            self.engine_seek(t, false);
+                            self.resumed_to = Some(t);
+                        }
                     }
                 }
                 EventEffect::Relayout
@@ -900,18 +967,47 @@ impl VideoView {
     }
 }
 
-/// Stream properties from Media Foundation. mpv plays containers Media Foundation can't read;
-/// their size and duration come from the player once the file is open.
-fn video_meta(path: &Path) -> Option<VideoMeta> {
-    match get_video_meta(path) {
-        Some(info) => Some((*info).clone()),
-        None if playback_mpv::available() => Some(VideoMeta::default()),
-        None => None,
+/// Stream properties of the file being opened. With the media engine they come from Media
+/// Foundation, read on another thread while the player starts up; failing to read them means
+/// the engine can't play the file either (and TC tries another plugin). mpv plays what Media
+/// Foundation can't read and reports the streams itself once the file is loaded: opening the
+/// file once more just to read them would only delay the start.
+struct Probe(Option<std::thread::JoinHandle<Option<VideoMeta>>>);
+
+impl Probe {
+    fn start(path: &Path) -> Self {
+        let path = path.to_path_buf();
+        Self(
+            std::thread::Builder::new()
+                .name("mediares-video-probe".into())
+                .spawn(move || get_video_meta(&path).map(|m| (*m).clone()))
+                .ok(),
+        )
+    }
+
+    /// The properties for `player`: a probe started for the media engine, or read now.
+    fn finish(probe: Option<Self>, player: &Player, path: &Path) -> Option<VideoMeta> {
+        let read = || get_video_meta(path).map(|m| (*m).clone());
+        match player {
+            // Known already if the WDX columns read them; else they follow `LOADEDMETADATA`.
+            Player::Mpv(_) if is_video_meta_cached(path) => Some(read().unwrap_or_default()),
+            Player::Mpv(_) => Some(VideoMeta::default()),
+            Player::Mf(_) => match probe.and_then(|p| p.0) {
+                Some(thread) => thread.join().ok().flatten(),
+                None => read(),
+            },
+        }
     }
 }
 
-fn resume_point(path: &Path, info: &VideoMeta, enabled: bool) -> Option<f64> {
-    (enabled && info.duration_sec >= resume::MIN_DURATION_SEC)
+/// Chapters the container lists (Matroska, MP4 with Nero chapters).
+fn file_chapters(path: &Path) -> Vec<(f64, String)> {
+    get_video_tags(path).map_or_else(Vec::new, |t| t.chapters.clone())
+}
+
+/// Where to continue a video of `duration` seconds, if it was left there and is long enough.
+fn resume_point(path: &Path, duration: f64) -> Option<f64> {
+    (duration >= resume::MIN_DURATION_SEC)
         .then(|| resume::load(path))
         .flatten()
 }

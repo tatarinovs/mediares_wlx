@@ -10,13 +10,15 @@ use std::time::Instant;
 use mediares_core::probe::MediaType;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer};
 
 use crate::audio_view::{AudioView, PROGRESS_TIMER_ID};
 use crate::gdi::{self, Font};
 use crate::i18n::{self, tr};
 use crate::image_cache::DecodedImage;
-use crate::transport_bar::{self, BarControl, Click, Layout, Message, Transport};
+use crate::seek_preview::SeekPreview;
+use crate::transport_bar::{self, BarControl, Click, Hit, Layout, Marks, Message, Transport};
 use crate::video_view::{VideoView, RENDER_TIMER_ID};
 
 /// Clears a status message from the bar.
@@ -32,6 +34,8 @@ pub enum EventEffect {
     Relayout,
     /// Played to the end: the play queue decides what comes next.
     Ended,
+    /// Near the end: the next file of the queue can be decoded ahead.
+    PreloadNext,
 }
 
 pub enum Content {
@@ -64,6 +68,10 @@ pub struct MediaView {
     bar_host: Option<HWND>,
     /// Last arrow-key step (key auto-repeat is thinned out).
     last_seek_step: Option<Instant>,
+    /// The frame under the cursor on the timeline (video only), made on first hover.
+    seek_preview: Option<SeekPreview>,
+    /// A-B loop: its start once set, then its end (playback jumps back to the start there).
+    ab_loop: (Option<f64>, Option<f64>),
 }
 
 /// RealMedia, Ogg and the like are often sound only: those play in the audio view (tags, cover,
@@ -95,16 +103,19 @@ impl MediaView {
         path: &Path,
         kind: MediaType,
         resume: bool,
+        replay_gain: bool,
     ) -> Option<MediaView> {
         let kind = playable_kind(path, kind);
         if let Some(mut view) = previous {
             let reused = match &mut view.content {
                 Content::Video(v) if kind == MediaType::Video => v.open(path, resume),
-                Content::Audio(a) if kind == MediaType::Audio => a.open(path),
+                Content::Audio(a) if kind == MediaType::Audio => a.open(path, replay_gain),
                 _ => false,
             };
             if reused {
                 view.bar.cancel();
+                view.seek_preview = None;
+                view.ab_loop = (None, None);
                 view.file_name = file_name(path);
                 view.layout();
                 return Some(view);
@@ -114,7 +125,9 @@ impl MediaView {
         }
         let content = match kind {
             MediaType::Video => Content::Video(Box::new(VideoView::new(viewer, path, resume)?)),
-            MediaType::Audio => Content::Audio(Box::new(AudioView::new(viewer, path)?)),
+            MediaType::Audio => {
+                Content::Audio(Box::new(AudioView::new(viewer, path, replay_gain)?))
+            }
             _ => return None,
         };
         let view = MediaView {
@@ -127,6 +140,8 @@ impl MediaView {
             file_name: file_name(path),
             bar_host: None,
             last_seek_step: None,
+            seek_preview: None,
+            ab_loop: (None, None),
         };
         view.layout();
         Some(view)
@@ -255,7 +270,15 @@ impl MediaView {
             (None, Some(s)) => Message::Info(s),
             (None, None) => Message::Info(name.as_deref().unwrap_or(&self.file_name)),
         };
-        transport_bar::paint(dc, &layout, &bar, font, message, scale);
+        let marks = Marks {
+            chapters: match &self.content {
+                Content::Video(v) => v.chapters().iter().map(|(t, _)| *t).collect(),
+                Content::Audio(_) => Vec::new(),
+            },
+            loop_a: self.ab_loop.0,
+            loop_b: self.ab_loop.1,
+        };
+        transport_bar::paint(dc, &layout, &bar, &marks, font, message, scale);
     }
 
     /// `WM_PAINT` of the overlay window hosting the bar.
@@ -308,7 +331,23 @@ impl MediaView {
         self.bar.is_dragging()
     }
 
-    pub unsafe fn mouse_move(&mut self, x: i32) {
+    /// The cursor moved over the viewer (its client coordinates).
+    pub unsafe fn mouse_move(&mut self, x: i32, y: i32) {
+        self.drag_to(x);
+        if self.bar_host.is_none() {
+            self.update_preview(self.viewer, x, y);
+        }
+    }
+
+    /// The cursor moved over the overlay window hosting the bar (its client coordinates).
+    pub unsafe fn bar_host_mouse_move(&mut self, x: i32, y: i32) {
+        self.drag_to(x);
+        if let Some(host) = self.bar_host {
+            self.update_preview(host, x, y);
+        }
+    }
+
+    unsafe fn drag_to(&mut self, x: i32) {
         let layout = self.bar_layout();
         let duration = self.known_duration();
         if self
@@ -319,12 +358,100 @@ impl MediaView {
         }
     }
 
+    /// Shows the frame under the cursor while it is over the timeline (or drags it), else hides
+    /// the preview. `window` shows the bar; `x`, `y` are in its client coordinates.
+    unsafe fn update_preview(&mut self, window: HWND, x: i32, y: i32) {
+        let Content::Video(video) = &self.content else {
+            return;
+        };
+        let layout = self.bar_layout();
+        let fraction = if self.bar.is_dragging_timeline() {
+            Some(transport_bar::timeline_fraction(&layout, x))
+        } else {
+            match transport_bar::hit(&layout, x, y) {
+                Hit::Timeline(f) => Some(f),
+                _ => None,
+            }
+        };
+        let duration = self
+            .content
+            .transport()
+            .duration()
+            .max(self.known_duration());
+        let Some(fraction) = fraction.filter(|_| duration > 0.0) else {
+            self.hide_preview();
+            return;
+        };
+        if self
+            .seek_preview
+            .as_ref()
+            .is_none_or(|p| p.path() != video.path())
+        {
+            self.seek_preview = SeekPreview::new(self.viewer, video.path());
+        }
+        if let Some(preview) = &self.seek_preview {
+            let seconds = fraction * duration;
+            preview.show(
+                window,
+                x,
+                layout.bar.top,
+                seconds,
+                video.chapter_at(seconds),
+            );
+            // Hidden again when the cursor leaves the window (WM_MOUSELEAVE).
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: window,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+        }
+    }
+
+    pub unsafe fn hide_preview(&self) {
+        if let Some(preview) = &self.seek_preview {
+            preview.hide();
+        }
+    }
+
+    /// `WM_SEEK_PREVIEW`: a frame for the timeline preview arrived.
+    pub unsafe fn preview_ready(&self) {
+        if let Some(preview) = &self.seek_preview {
+            preview.frame_ready();
+        }
+    }
+
     pub unsafe fn mouse_up(&mut self, x: i32) {
         let layout = self.bar_layout();
         let duration = self.known_duration();
         self.bar
             .mouse_up(self.content.transport(), &layout, duration, x);
         self.invalidate_bar();
+    }
+
+    /// Decodes the next audio file ahead for gapless playback; false if it can't.
+    pub fn preload(&mut self, path: &Path) -> bool {
+        match &mut self.content {
+            Content::Audio(a) => a.preload(path),
+            Content::Video(_) => false,
+        }
+    }
+
+    /// The audio shown, if it is that.
+    pub fn audio_mut(&mut self) -> Option<&mut AudioView> {
+        match &mut self.content {
+            Content::Audio(a) => Some(a),
+            Content::Video(_) => None,
+        }
+    }
+
+    /// The audio shown, if it is that.
+    pub fn audio(&self) -> Option<&AudioView> {
+        match &self.content {
+            Content::Audio(a) => Some(a),
+            Content::Video(_) => None,
+        }
     }
 
     /// The video shown, if it is one.
@@ -445,8 +572,57 @@ impl MediaView {
         }
     }
 
+    /// A: sets the loop start, then its end; a third press ends the loop.
+    pub unsafe fn toggle_ab_loop(&mut self) {
+        let at = self.position();
+        let text = match self.ab_loop {
+            (None, _) => {
+                self.ab_loop = (Some(at), None);
+                format!("{} A: {}", tr("Loop"), transport_bar::format_time(at))
+            }
+            (Some(a), None) if at > a => {
+                self.ab_loop = (Some(a), Some(at));
+                format!(
+                    "{} A-B: {} - {}",
+                    tr("Loop"),
+                    transport_bar::format_time(a),
+                    transport_bar::format_time(at)
+                )
+            }
+            _ => {
+                self.ab_loop = (None, None);
+                tr("Loop off").to_string()
+            }
+        };
+        self.show_status(text);
+    }
+
+    /// Back to the loop start once its end is reached.
+    fn keep_in_loop(&self) {
+        if let (Some(a), Some(b)) = self.ab_loop {
+            let t = self.transport();
+            if t.position() >= b && t.is_playing() {
+                t.seek(a, false);
+            }
+        }
+    }
+
+    /// B: the next audio track of a video, announced on the bar.
+    pub unsafe fn cycle_audio_track(&mut self) {
+        let Content::Video(v) = &self.content else {
+            return;
+        };
+        let text = v
+            .cycle_audio_track()
+            .unwrap_or_else(|| tr("This file has one audio track").to_string());
+        self.show_status(text);
+    }
+
     /// `WM_TIMER`; `None` if the timer isn't ours.
     pub unsafe fn on_timer(&mut self, id: usize) -> Option<EventEffect> {
+        if matches!(id, RENDER_TIMER_ID | PROGRESS_TIMER_ID) {
+            self.keep_in_loop();
+        }
         match (&mut self.content, id) {
             (Content::Video(v), RENDER_TIMER_ID) => {
                 v.render();

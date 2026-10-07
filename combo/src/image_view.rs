@@ -1,5 +1,7 @@
 //! Photo view: zoom/pan/loupe geometry and GDI double-buffered rendering with the OSD overlay.
 
+use std::sync::Arc;
+
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetDeviceCaps, GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, COLORONCOLOR,
@@ -30,6 +32,30 @@ pub unsafe fn client_size(hwnd: HWND) -> Option<(f32, f32)> {
     GetClientRect(hwnd, &mut rc).ok()?;
     let (w, h) = ((rc.right - rc.left) as f32, (rc.bottom - rc.top) as f32);
     (w > 0.0 && h > 0.0).then_some((w, h))
+}
+
+/// Width of the line between the two photos compared.
+const DIVIDER: i32 = 2;
+
+/// The area the photo on screen is laid out in: the window, or its right half while comparing
+/// (see [`crate::state::Compare`]). Zoom, pan and the loupe work in it.
+pub unsafe fn view_size(state: &ViewerState) -> Option<(f32, f32)> {
+    let (w, h) = client_size(state.hwnd)?;
+    if state.compare.is_none() {
+        return Some((w, h));
+    }
+    Some((((w as i32 - DIVIDER) / 2).max(1) as f32, h))
+}
+
+/// A cursor position in the window as a position in the view (see [`view_size`]): over either
+/// half while comparing, so the loupe and wheel zoom act on the same spot of both photos.
+pub unsafe fn to_view(state: &ViewerState, (x, y): (i32, i32)) -> (i32, i32) {
+    match view_size(state) {
+        Some((w, _)) if state.compare.is_some() && x >= w as i32 + DIVIDER => {
+            (x - w as i32 - DIVIDER, y)
+        }
+        _ => (x, y),
+    }
 }
 
 /// Size of the whole picture: the geometry below works in its pixels (100% = one of them per
@@ -162,6 +188,36 @@ fn show_at(
     clamp_offset(state, img, view);
 }
 
+/// A zoomed-in view, independent of the picture: its scale and the point of the picture
+/// (fractions of the width and height) at the middle of the window.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct KeptView {
+    scale: f32,
+    point: (f32, f32),
+}
+
+/// The zoomed-in view of `img`, to show the next photo the same way; `None` when fitted.
+pub fn kept_view(state: &ViewerState, img: &DecodedImage, view: (f32, f32)) -> Option<KeptView> {
+    let ZoomMode::Custom(scale) = state.zoom else {
+        return None;
+    };
+    let (ox, oy) = origin(state, img, view);
+    let (iw, ih) = size(img);
+    Some(KeptView {
+        scale,
+        point: (
+            (view.0 / 2.0 - ox) / scale / iw,
+            (view.1 / 2.0 - oy) / scale / ih,
+        ),
+    })
+}
+
+/// Shows `img` as `kept` was.
+pub fn restore_view(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32), kept: KeptView) {
+    let middle = (view.0 / 2.0, view.1 / 2.0);
+    show_at(state, img, view, kept.scale, kept.point, middle);
+}
+
 /// Starts the loupe: magnify at the configured scale and map the cursor proportionally over the image.
 pub fn loupe_begin(
     state: &mut ViewerState,
@@ -206,7 +262,7 @@ pub fn loupe_end(state: &mut ViewerState) -> bool {
 /// Zoom as an integer percentage for the title/OSD.
 pub unsafe fn zoom_percent(state: &ViewerState) -> Option<i32> {
     let img = state.image.as_ref()?;
-    let view = client_size(state.hwnd)?;
+    let view = view_size(state)?;
     Some((scale(state, img, view) * 100.0).round() as i32)
 }
 
@@ -243,15 +299,35 @@ pub unsafe fn paint(
         let window = gdi::rect(win_w, win_h);
         gdi::fill(dc, window, bg);
         let Some(state) = state else { return };
+        // Comparing: the reference on the left, the photo on screen on the right.
+        let compare = state.compare.clone();
+        let (view, at) = match &compare {
+            Some(_) => {
+                let pane = (win_w - DIVIDER) / 2;
+                ((pane as f32, win_h as f32), (pane + DIVIDER, 0))
+            }
+            None => ((win_w as f32, win_h as f32), (0, 0)),
+        };
+        let area = view_rect(view, at);
+        if let Some(reference) = &compare {
+            let current = state.image.clone();
+            draw_reference(dc, state, reference, current.as_deref(), view);
+            let line = RECT {
+                left: view.0 as i32,
+                right: at.0,
+                ..window
+            };
+            gdi::fill(dc, line, muted_text_color(bg));
+        }
         if let Some(img) = state.image.clone() {
-            draw_image(dc, state, &img, (win_w as f32, win_h as f32));
+            draw_image(dc, state, img, view, at);
         } else if let Some(prev) = state.previous.clone().filter(|_| state.pending.is_some()) {
-            draw_fitted(dc, &prev, window, state.config.smooth_zoom);
+            draw_fitted(dc, &prev, area, state.config.smooth_zoom);
         } else if state.load_failed {
             let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
             gdi::text(
                 dc,
-                window,
+                area,
                 tr("Cannot open the image"),
                 Some(font),
                 muted_text_color(bg),
@@ -259,7 +335,16 @@ pub unsafe fn paint(
             );
         }
         if state.config.osd.photo() {
-            draw_osd(dc, state);
+            draw_osd(dc, state, at.0);
+            if let Some(reference) = &compare {
+                let name = reference
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let font = osd_font(dc, state);
+                draw_osd_text(dc, &name, font, state.config.osd_font_color);
+            }
         }
     });
 }
@@ -311,35 +396,121 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT, smooth: bool)
 
 /// The copy to draw at `scale` (of the whole picture): the one fitted to the screen while its
 /// pixels suffice, the whole picture beyond that once it has arrived.
-fn copy_for_scale<'a>(
-    state: &'a ViewerState,
-    img: &'a DecodedImage,
+fn copy_for_scale(
+    state: &mut ViewerState,
+    img: Arc<DecodedImage>,
     scale: f32,
-) -> &'a DecodedImage {
+) -> Arc<DecodedImage> {
     let needed = scale * img.full.0 as f32;
-    match &state.whole {
-        Some(whole) if needed > img.width as f32 + 0.5 => whole,
-        _ => img,
+    if needed > img.width as f32 + 0.5 {
+        if let Some(whole) = state.whole_turned() {
+            return whole;
+        }
+    }
+    img
+}
+
+/// The photo on screen laid out in `view`, drawn with the view's corner at `at`.
+unsafe fn draw_image(
+    dc: HDC,
+    state: &mut ViewerState,
+    img: Arc<DecodedImage>,
+    view: (f32, f32),
+    at: (i32, i32),
+) {
+    let s = scale(state, &img, view);
+    let origin = origin(state, &img, view);
+    let src = copy_for_scale(state, img.clone(), s);
+    draw_picture(dc, &src, img.full, s, origin, view, at, smooths(state, s));
+}
+
+/// Whether a picture drawn at `scale` is smoothed.
+fn smooths(state: &ViewerState, scale: f32) -> bool {
+    state.config.smooth_zoom && (state.zoom == ZoomMode::Fit || scale <= MAX_SMOOTH_ZOOM)
+}
+
+/// The view of size `view` with its corner at `at`, in window coordinates.
+fn view_rect(view: (f32, f32), at: (i32, i32)) -> RECT {
+    RECT {
+        left: at.0,
+        top: at.1,
+        right: at.0 + view.0 as i32,
+        bottom: at.1 + view.1 as i32,
     }
 }
 
-unsafe fn draw_image(dc: HDC, state: &ViewerState, img: &DecodedImage, view: (f32, f32)) {
-    let s = scale(state, img, view);
-    let (ox, oy) = origin(state, img, view);
-    let src = copy_for_scale(state, img, s);
+/// The reference photo in the left half, showing what the photo on screen shows: fitted when it
+/// is, else the same place at the same zoom relative to its size (photos of one scene shot at
+/// different resolutions line up).
+unsafe fn draw_reference(
+    dc: HDC,
+    state: &ViewerState,
+    reference: &crate::state::Compare,
+    current: Option<&DecodedImage>,
+    view: (f32, f32),
+) {
+    let img = &*reference.image;
+    let (iw, ih) = size(img);
+    let kept = current.and_then(|cur| Some((cur, kept_view(state, cur, view)?)));
+    let (s, origin) = match kept {
+        Some((cur, kept)) => {
+            let s = kept.scale * cur.full.0 as f32 / img.full.0 as f32;
+            let origin = (
+                (view.0 / 2.0 - kept.point.0 * iw * s).round(),
+                (view.1 / 2.0 - kept.point.1 * ih * s).round(),
+            );
+            (s, origin)
+        }
+        None => {
+            let s = fit_scale(state, img, view);
+            let origin = (
+                ((view.0 - iw * s) / 2.0).round(),
+                ((view.1 - ih * s) / 2.0).round(),
+            );
+            (s, origin)
+        }
+    };
+    let src = match &reference.whole {
+        Some(whole) if s * img.full.0 as f32 > img.width as f32 + 0.5 => whole,
+        _ => img,
+    };
+    draw_picture(
+        dc,
+        src,
+        img.full,
+        s,
+        origin,
+        view,
+        (0, 0),
+        smooths(state, s),
+    );
+}
+
+/// Draws `src`, a copy of a picture of size `full`, at `scale` (of the whole picture) with its
+/// corner at `origin` in `view`, the view's corner at `at`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_picture(
+    dc: HDC,
+    src: &DecodedImage,
+    full: (u32, u32),
+    scale: f32,
+    (ox, oy): (f32, f32),
+    view: (f32, f32),
+    at: (i32, i32),
+    smooth: bool,
+) {
     // Screen pixels per pixel of the copy drawn.
     let (sx, sy) = (
-        s * img.full.0 as f32 / src.width as f32,
-        s * img.full.1 as f32 / src.height as f32,
+        scale * full.0 as f32 / src.width as f32,
+        scale * full.1 as f32 / src.height as f32,
     );
-    if let (Some(x), Some(y)) = (
+    if let (Some((x0, xl, dx, dw)), Some((y0, yl, dy, dh))) = (
         visible_span(ox, sx, src.width, view.0),
         visible_span(oy, sy, src.height, view.1),
     ) {
-        let smooth =
-            state.config.smooth_zoom && (state.zoom == ZoomMode::Fit || s <= MAX_SMOOTH_ZOOM);
-        let window = gdi::rect(view.0 as i32, view.1 as i32);
-        stretch(dc, src, x, y, filter(sx, smooth), window);
+        let x = (x0, xl, dx + at.0, dw);
+        let y = (y0, yl, dy + at.1, dh);
+        stretch(dc, src, x, y, filter(sx, smooth), view_rect(view, at));
     }
 }
 
@@ -479,8 +650,13 @@ pub unsafe fn create_osd_font(face: &str, size_pt: i32, dpi: i32) -> Font {
 
 /// OSD text (may span lines) with a 1px black drop shadow, readable over any picture.
 pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
+    draw_osd_text_at(dc, (OSD_MARGIN, OSD_MARGIN), text, font, color);
+}
+
+/// [`draw_osd_text`] with its top left corner at `at`.
+unsafe fn draw_osd_text_at(dc: HDC, at: (i32, i32), text: &str, font: HFONT, color: u32) {
     for (offset, color) in [(1, 0), (0, color)] {
-        let (x, y) = (OSD_MARGIN + offset, OSD_MARGIN + offset);
+        let (x, y) = (at.0 + offset, at.1 + offset);
         let at = RECT {
             left: x,
             top: y,
@@ -492,10 +668,17 @@ pub unsafe fn draw_osd_text(dc: HDC, text: &str, font: HFONT, color: u32) {
     }
 }
 
-unsafe fn draw_osd(dc: HDC, state: &mut ViewerState) {
+/// The OSD of the photo on screen, `x` pixels from the left (the right half while comparing).
+unsafe fn draw_osd(dc: HDC, state: &mut ViewerState, x: i32) {
     let text = osd_text(state, zoom_percent(state));
     let font = osd_font(dc, state);
-    draw_osd_text(dc, &text, font, state.config.osd_font_color);
+    draw_osd_text_at(
+        dc,
+        (x + OSD_MARGIN, OSD_MARGIN),
+        &text,
+        font,
+        state.config.osd_font_color,
+    );
 }
 
 /// Client-relative cursor from a mouse message `LPARAM`.

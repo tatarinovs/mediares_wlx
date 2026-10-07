@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use mediares_core::cache::FileKey;
 use mediares_core::exif::ExifInfo;
 use mediares_core::image::DynamicImage;
-use mediares_core::image_decode::{decode_bytes, decode_oriented_fitted};
+use mediares_core::image_decode::{decode_bytes, decode_oriented_cancellable};
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -121,7 +121,7 @@ pub fn load(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Arc<
     if let Some(img) = cache().get(&key) {
         return Some(img);
     }
-    let img = Arc::new(decode(path, kind, options)?);
+    let img = Arc::new(decode(path, kind, options, &|| false)?);
     cache().insert(key, img.clone());
     Some(img)
 }
@@ -239,7 +239,7 @@ pub fn request_whole(
 /// Decodes the whole picture on the calling thread (to print or copy it before the background
 /// decode is done); not cached.
 pub fn decode_whole(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<DecodedImage> {
-    decode(path, kind, options.whole())
+    decode(path, kind, options.whole(), &|| false)
 }
 
 /// Replaces the prefetch queue with `paths` (most wanted first); stale requests from earlier
@@ -283,13 +283,16 @@ impl Ticket {
         };
         if queued {
             let job = &self.job;
-            return decode(&job.path, job.kind, job.key.options).map(Arc::new);
+            return decode(&job.path, job.kind, job.key.options, &|| false).map(Arc::new);
         }
+        // The worker sets the result before it takes the lock to announce it.
+        let pool = pool();
+        let mut q = pool.lock();
         loop {
             if let Some(result) = self.result() {
                 return result;
             }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            q = pool.finished.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
 }
@@ -334,6 +337,19 @@ impl Job {
     fn is_wanted(&self) -> bool {
         !self.lock_notify().is_empty()
     }
+
+    /// A whole picture whose window moved on: decoding it further is wasted.
+    fn is_abandoned(&self) -> bool {
+        self.key.options.fit == 0 && !self.is_wanted()
+    }
+}
+
+/// What a worker takes up next.
+enum Next {
+    Job(Arc<Job>),
+    /// A neighbour to prefetch: its file is looked up outside the queue lock (slow on network
+    /// drives), then it becomes a job unless it is done or under way by then.
+    Prefetch(PathBuf, DecodeOptions),
 }
 
 #[derive(Default)]
@@ -355,9 +371,9 @@ impl Queue {
     /// Neighbours wait until no decode that a window waits for is running: the viewer is often
     /// opened for a single file, and codecs like the HEIF one gain nothing from parallel decodes
     /// (three at once take as long as three in a row), so a prefetch would only delay the photo.
-    fn next_job(&mut self) -> Option<Arc<Job>> {
+    fn next_job(&mut self) -> Option<Next> {
         if let Some(job) = self.foreground.pop_front() {
-            return Some(job);
+            return Some(Next::Job(job));
         }
         if self.in_flight.iter().any(|job| job.is_wanted()) {
             return None;
@@ -366,31 +382,33 @@ impl Queue {
             // A window that moved on no longer waits for its whole picture.
             while let Some(job) = self.whole.pop_front() {
                 if job.is_wanted() {
-                    return Some(job);
+                    return Some(Next::Job(job));
                 }
             }
         }
         if self.workers > 1 && self.in_flight.len() + 1 >= self.workers {
             return None;
         }
-        while let Some((path, options)) = self.prefetch.pop_front() {
-            let Some(file) = FileKey::for_path(&path) else {
-                continue;
-            };
-            let key = Key { file, options };
-            if self.in_flight.iter().any(|job| job.key == key) || cache().contains(&key) {
-                continue;
-            }
-            let kind = probe_file(&path);
-            return Some(Job::new(key, path, kind, self.generation));
+        self.prefetch
+            .pop_front()
+            .map(|(path, options)| Next::Prefetch(path, options))
+    }
+
+    /// A job for a prefetch (keyed outside the lock), unless it is already done or running.
+    fn prefetch_job(&self, path: PathBuf, key: Key) -> Option<Arc<Job>> {
+        if self.in_flight.iter().any(|job| job.key == key) || cache().contains(&key) {
+            return None;
         }
-        None
+        let kind = probe_file(&path);
+        Some(Job::new(key, path, kind, self.generation))
     }
 }
 
 struct Pool {
     queue: Mutex<Queue>,
     wake: Condvar,
+    /// A job has its result (see [`Ticket::finish`]).
+    finished: Condvar,
 }
 
 impl Pool {
@@ -418,6 +436,7 @@ fn pool() -> &'static Pool {
                 ..Queue::default()
             }),
             wake: Condvar::new(),
+            finished: Condvar::new(),
         }
     })
 }
@@ -429,7 +448,16 @@ fn worker_loop() {
             let mut q = pool.lock();
             let job = loop {
                 match q.next_job() {
-                    Some(job) => break job,
+                    Some(Next::Job(job)) => break job,
+                    Some(Next::Prefetch(path, options)) => {
+                        drop(q);
+                        let file = FileKey::for_path(&path);
+                        q = pool.lock();
+                        let job = file.and_then(|file| q.prefetch_job(path, Key { file, options }));
+                        if let Some(job) = job {
+                            break job;
+                        }
+                    }
                     None => q = pool.wake.wait(q).unwrap_or_else(|e| e.into_inner()),
                 }
             };
@@ -441,7 +469,10 @@ fn worker_loop() {
         let cacheable = job.key.options.fit != 0;
         let cached = cacheable.then(|| cache().get(&job.key)).flatten();
         let result = cached.or_else(|| {
-            let decoded = std::panic::catch_unwind(|| decode(&job.path, job.kind, job.key.options));
+            let abandoned = || job.is_abandoned();
+            let decoded = std::panic::catch_unwind(|| {
+                decode(&job.path, job.kind, job.key.options, &abandoned)
+            });
             let img = decoded.ok().flatten().map(Arc::new)?;
             // Under the queue lock, so the cache cannot be emptied between check and insert.
             let q = pool.lock();
@@ -461,6 +492,7 @@ fn worker_loop() {
                 // Prefetching held back for this job may start now, on every idle worker.
                 pool.wake.notify_all();
             }
+            pool.finished.notify_all();
             notify
         };
         for hwnd in notify {
@@ -476,9 +508,16 @@ fn worker_loop() {
     }
 }
 
-fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<DecodedImage> {
+/// `cancelled`: give up a whole picture part way (see `decode_oriented_cancellable`).
+fn decode(
+    path: &Path,
+    kind: MediaType,
+    options: DecodeOptions,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<DecodedImage> {
     let fit = (options.fit != 0).then_some((options.fit, options.fit));
-    let (img, full, exif) = decode_oriented_fitted(path, kind, options.auto_rotate, fit)?;
+    let (img, full, exif) =
+        decode_oriented_cancellable(path, kind, options.auto_rotate, fit, cancelled)?;
     Some(DecodedImage {
         exif,
         full,
@@ -486,9 +525,27 @@ fn decode(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Decode
     })
 }
 
-/// Decodes an in-memory picture (e.g. embedded album art) for display; not cached.
+/// Album art never needs more pixels than this on a side, even fullscreen.
+const PICTURE_SIDE: u32 = 2048;
+
+/// Decodes an in-memory picture (e.g. embedded album art) for display; not cached. Scans of
+/// 3000 px and more are reduced while decoding where the codec can.
 pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
-    Some(to_bgra(decode_bytes(bytes)?, BACKGROUND, false))
+    use mediares_core::wic_decode::{decode_turned, Input};
+    let fit = (PICTURE_SIDE, PICTURE_SIDE);
+    let img = match decode_turned(Input::Memory(bytes), Some(fit), 1) {
+        Some((img, _)) => img,
+        None => {
+            let img = decode_bytes(bytes)?;
+            let (w, h) = mediares_core::image_decode::fitted_size((img.width(), img.height()), fit);
+            if (w, h) == (img.width(), img.height()) {
+                img
+            } else {
+                mediares_core::image_decode::thumbnail(&img, w, h)
+            }
+        }
+    };
+    Some(to_bgra(img, BACKGROUND, false))
 }
 
 /// Converts to BGRA in place, compositing alpha over the COLORREF `background`.
@@ -528,6 +585,46 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
 /// The picture turned by a quarter, clockwise or counter-clockwise.
 pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
     let (w, h) = (img.width as usize, img.height as usize);
+    let mut dst = vec![0u8; img.bgra.len()];
+    // Whole pixels, in tiles that stay in the CPU cache: column reads across a large picture
+    // would miss it on every pixel.
+    const TILE: usize = 64;
+    // SAFETY: every bit pattern is a valid `u32`; misaligned ends are checked below.
+    let aligned = unsafe { (img.bgra.align_to::<u32>(), dst.align_to_mut::<u32>()) };
+    let (src, dst32) = match aligned {
+        (([], src, []), ([], dst32, [])) => (src, dst32),
+        // Allocations are aligned in practice; a byte-wise turn would do otherwise.
+        _ => return rotated_bytes(img, clockwise),
+    };
+    for ty in (0..h).step_by(TILE) {
+        for tx in (0..w).step_by(TILE) {
+            for y in ty..(ty + TILE).min(h) {
+                let row = &src[y * w..(y + 1) * w];
+                for (x, &px) in row.iter().enumerate().take((tx + TILE).min(w)).skip(tx) {
+                    // The picture turned is `h` pixels wide.
+                    let (nx, ny) = if clockwise {
+                        (h - 1 - y, x)
+                    } else {
+                        (y, w - 1 - x)
+                    };
+                    dst32[ny * h + nx] = px;
+                }
+            }
+        }
+    }
+    DecodedImage {
+        width: img.height,
+        height: img.width,
+        full: (img.full.1, img.full.0),
+        bgra: dst,
+        is_preview: img.is_preview,
+        exif: img.exif.clone(),
+    }
+}
+
+/// [`rotated`] a byte at a time.
+fn rotated_bytes(img: &DecodedImage, clockwise: bool) -> DecodedImage {
+    let (w, h) = (img.width as usize, img.height as usize);
     let mut dst = Vec::with_capacity(img.bgra.len());
     // Output row `y` (of `w` rows, each `h` pixels wide) reads a source column.
     for y in 0..w {
@@ -566,6 +663,17 @@ pub fn to_dynamic(img: &DecodedImage) -> Option<DynamicImage> {
 mod tests {
     use super::*;
     use mediares_core::image::{Rgba, RgbaImage};
+
+    /// The next job as a worker gets it (a prefetch keyed on the spot).
+    fn take(q: &mut Queue) -> Option<Arc<Job>> {
+        match q.next_job()? {
+            Next::Job(job) => Some(job),
+            Next::Prefetch(path, options) => {
+                let file = FileKey::for_path(&path)?;
+                q.prefetch_job(path, Key { file, options })
+            }
+        }
+    }
 
     #[test]
     fn converts_to_bgra_over_background() {
@@ -673,7 +781,7 @@ mod tests {
         // Done (or no longer wanted): the neighbour may go.
         shown.lock_notify().clear();
         assert_eq!(
-            q.next_job().map(|j| j.path.clone()),
+            take(&mut q).map(|j| j.path.clone()),
             Some(file("src/lib.rs"))
         );
     }
@@ -729,13 +837,13 @@ mod tests {
             workers: 3,
             ..Queue::default()
         };
-        let next = q.next_job().expect("the neighbour");
+        let next = take(&mut q).expect("the neighbour");
         assert_eq!(next.path, neighbour.path);
         q.in_flight.push(next);
         assert!(q.next_job().is_none(), "a neighbour is still decoding");
         q.in_flight.clear();
         assert!(Arc::ptr_eq(
-            &q.next_job().expect("the whole picture"),
+            &take(&mut q).expect("the whole picture"),
             &whole
         ));
         // A window that moved on drops its ticket: nothing is decoded for it.

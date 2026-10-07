@@ -5,6 +5,7 @@
 
 mod audio_view;
 mod config;
+mod contact_sheet;
 mod dialog;
 mod exif_dialog;
 mod file_actions;
@@ -25,6 +26,7 @@ mod playlist;
 mod print;
 mod resume;
 mod save_as;
+mod seek_preview;
 mod settings_dialog;
 mod smooth;
 mod snapshot;

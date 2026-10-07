@@ -14,12 +14,18 @@ kbps=кбит/с
 kHz=кГц
 bit=бит
 ch=кан.
+Lyrics: Y=Текст песни: Y
+Album art: Y=Обложка: Y
 
 ; config.rs
 Hidden=Не показывать
 On photos=На фото
 On videos=На видео
 On photos and videos=На фото и видео
+
+; contact_sheet.rs
+Contact sheet saved=Раскадровка сохранена
+Could not make the contact sheet=Не удалось сделать раскадровку
 
 ; exif_dialog.rs
 No EXIF metadata found, or the format is not supported.=EXIF метаданные не найдены или формат не поддерживается.
@@ -65,6 +71,9 @@ RAW preview=превью RAW
 
 ; media_view.rs
 Speed=Скорость
+Loop=Повтор
+Loop off=Повтор фрагмента выключен
+This file has one audio track=В файле одна аудиодорожка
 Stepping back is not available for this file (inexact seeking)=Шаг назад недоступен для этого файла (неточная перемотка)
 Resuming from=Продолжение с
 
@@ -141,12 +150,17 @@ Browse...=Обзор...
 the program assigned in Windows=программа, назначенная в Windows
 Start in full screen=Запускать в полноэкранном режиме
 Auto-rotate by EXIF orientation=Автоповорот по ориентации EXIF
-Photos=Просмотр фото
+Photo=Фото
+Display=Экран
+General=Общие
 Loupe zoom (left click):=Масштаб лупы (ЛКМ):
 Background:=Цвет фона:
 Choose color...=Выбрать цвет...
 Don't enlarge small images=Не растягивать маленькие изображения
 Smooth enlarged images=Сглаживание при увеличении
+Keep the zoom on the next photo (Z)=Сохранять масштаб при переходе к следующему фото (Z)
+Skip RAW files that have a JPEG twin=Пропускать RAW, у которых есть JPEG с тем же именем
+Play audio at its ReplayGain loudness=Учитывать ReplayGain (громкость из тегов)
 Confirm moving to Recycle Bin (Del)=Спрашивать перед удалением в корзину (Del)
 Info line (OSD)=Информационная строка (OSD)
 Show OSD:=Показывать OSD:
@@ -160,7 +174,6 @@ Full screen=Полноэкранный режим
 Control bar over videos=Панель управления поверх видео
 Hide the bar when idle=Скрывать панель при бездействии
 Slideshow interval (F5):=Интервал слайд-шоу (F5):
-Audio and video=Аудио и видео
 Auto-advance to the next file=Автопереход к следующему файлу
 Repeat:=Повтор:
 Shuffle=Случайный порядок
@@ -191,6 +204,7 @@ Could not write to=Не удалось записать в
 Add it manually to the section=Добавьте вручную в секцию
 
 ; video_view.rs
+Audio track=Аудиодорожка
 decoding error=ошибка декодирования
 format or codec not supported=формат или кодек не поддерживается
 file is encrypted=файл зашифрован
@@ -198,23 +212,31 @@ playback error=ошибка воспроизведения
 Cannot play=Не удалось воспроизвести
 
 ; window.rs
+The tags hold no lyrics=В тегах нет текста песни
+Making the contact sheet...=Раскадровка готовится...
 Play / pause\tSpace=Воспроизведение / пауза\tПробел
 Mute\tM=Без звука\tM
 Full screen\tEnter / F=Полноэкранный режим\tEnter / F
 Copy image\tCtrl+C=Копировать изображение\tCtrl+C
 Save as...\tCtrl+S=Сохранить как...\tCtrl+S
 Save frame next to the video\tShift+S=Сохранить кадр рядом с видео\tShift+S
+Save contact sheet next to the video\tShift+C=Сохранить раскадровку рядом с видео\tShift+C
 Show OSD\tO=Отображать OSD\tO
 Slideshow\tF5=Слайд-шоу\tF5
 Rotate left\tL=Повернуть влево\tL
 Rotate right\tR=Повернуть вправо\tR
 Save rotation to file (JPEG, lossless)\tCtrl+R=Записать поворот в файл (JPEG, без потерь)\tCtrl+R
+Keep the zoom on the next photo\tZ=Сохранять масштаб на следующем фото\tZ
+Compare with this photo\tC=Сравнить с этим фото\tC
 Slower\t[=Медленнее\t[
 Faster\t]=Быстрее\t]
 Normal speed\t\\=Обычная скорость\t\\
 Previous frame\t,=Кадр назад\t,
 Next frame\t.=Кадр вперёд\t.
+A-B loop\tA=Повтор фрагмента A-B\tA
+Next audio track\tB=Следующая аудиодорожка\tB
 EXIF info...\tE=Просмотр EXIF...\tE
+Lyrics\tY=Текст песни\tY
 Open on map\tG=Открыть на карте\tG
 Open in editor\tF4=Открыть в редакторе\tF4
 Show in folder\tCtrl+Enter=Показать в папке\tCtrl+Enter

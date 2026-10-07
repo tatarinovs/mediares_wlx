@@ -4,12 +4,15 @@
 //! ```text
 //! cargo run -p mediares_combo --example lister_harness -- <file> <out_dir> [steps...]
 //! steps: wait:<ms>  shot:<name>  key:<vk hex>  click:<x>,<y>  dblclick:<x>,<y>
-//!        resize:<w>,<h>  wheel:<delta>  next:<file>  rects
+//!        resize:<w>,<h>  wheel:<delta>[,<x>,<y>]  next:<file>  rects
 //!        input:[ctrl+|shift+]<vk hex>   real keyboard input (modifiers are seen by GetKeyState)
 //!        oclick:top|bottom,<x>,<y>   click in the fullscreen panel
 //!        move:<x>,<y>    move the real cursor (screen coordinates)
 //!        copy:<name>     ListSendCommand(lc_copy), clipboard DIB saved as <name>.png
 //!        thumb:<w>,<h>,<name>[,<file>]  ListGetPreviewBitmapW saved as <name>.png
+//!        dialog:<name>[,<pages>]  put before the step that opens a modal dialog: waits for it,
+//!                        saves <name>_0.png, then Ctrl+Tab and <name>_<i>.png for each further
+//!                        page, and closes it (Cancel: nothing is saved)
 //! ```
 //! Screenshots cover the host window, or the whole monitor once the viewer went fullscreen.
 //! With `HARNESS_QUICKVIEW=1` the plugin is hosted in a child panel, like TC's Quick View (Ctrl+Q).
@@ -218,6 +221,54 @@ fn xy(s: &str) -> (i32, i32) {
     (a.trim().parse().expect("x"), b.trim().parse().expect("y"))
 }
 
+/// The visible modal dialog of thread `thread`, if one is open.
+unsafe fn find_dialog(thread: u32) -> Option<HWND> {
+    unsafe extern "system" fn each(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        if IsWindowVisible(hwnd).as_bool() && ex & WS_EX_DLGMODALFRAME.0 != 0 {
+            *(found.0 as *mut isize) = hwnd.0 as isize;
+            return false.into();
+        }
+        true.into()
+    }
+    let mut found: isize = 0;
+    let _ = EnumThreadWindows(
+        thread,
+        Some(each),
+        LPARAM(&mut found as *mut isize as isize),
+    );
+    (found != 0).then_some(HWND(found as *mut _))
+}
+
+/// Runs on its own thread while the main one sits in the dialog's modal loop.
+fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf) {
+    unsafe {
+        let until = Instant::now() + Duration::from_secs(10);
+        let dlg = loop {
+            if let Some(dlg) = find_dialog(thread) {
+                break dlg;
+            }
+            if Instant::now() > until {
+                println!("no dialog");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        std::thread::sleep(Duration::from_millis(400));
+        for page in 0..pages.max(1) {
+            if page > 0 {
+                let _ = SetForegroundWindow(dlg);
+                send_keys(&[(0x11, false), (0x09, false), (0x09, true), (0x11, true)]);
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            let mut rc = RECT::default();
+            let _ = GetWindowRect(dlg, &mut rc);
+            capture(rc, &out_dir.join(format!("{}_{}.png", name, page)));
+        }
+        let _ = PostMessageW(Some(dlg), WM_CLOSE, WPARAM(0), LPARAM(0));
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let file = PathBuf::from(&args[0]);
@@ -324,12 +375,18 @@ fn main() {
                     pump(50);
                 }
                 "wheel" => {
-                    let delta: i16 = arg.parse().expect("delta");
+                    // wheel:<delta>[,<x>,<y>] — the point in the viewer's client coordinates.
+                    let (delta, at) = arg.split_once(',').unwrap_or((arg, "0,0"));
+                    let delta: i16 = delta.parse().expect("delta");
+                    let (x, y) = xy(at);
+                    let mut pt = windows::Win32::Foundation::POINT { x, y };
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(viewer, &mut pt);
+                    let lp = LPARAM(((pt.y as isize) << 16) | (pt.x as isize & 0xFFFF));
                     let _ = PostMessageW(
                         Some(viewer),
                         WM_MOUSEWHEEL,
                         WPARAM((delta as u16 as usize) << 16),
-                        LPARAM(0),
+                        lp,
                     );
                     pump(50);
                 }
@@ -432,6 +489,13 @@ fn main() {
                     } else {
                         save_hbitmap(bitmap, &out_dir.join(format!("{}.png", parts[2])));
                     }
+                }
+                "dialog" => {
+                    let (name, pages) = arg.split_once(',').unwrap_or((arg, "1"));
+                    let (name, pages) = (name.to_string(), pages.parse().expect("pages"));
+                    let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+                    let out = out_dir.clone();
+                    std::thread::spawn(move || shoot_dialog(thread, name, pages, out));
                 }
                 other => panic!("unknown step {}", other),
             }

@@ -6,13 +6,16 @@
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH, HFONT};
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetDlgItem, GetDlgItemTextW,
     GetMessageW, GetWindow, GetWindowRect, GetWindowTextLengthW, IsDialogMessageW, IsWindow,
     PostQuitMessage, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_SETFONT,
-    WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP, WS_SYSMENU, WS_VISIBLE,
+    CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
+    WM_KEYDOWN, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP,
+    WS_SYSMENU, WS_VISIBLE,
 };
 
 use crate::gdi::{self, Font};
@@ -20,6 +23,10 @@ use crate::module;
 
 pub const SS_LEFT: u32 = 0x0000;
 pub const ES_AUTOHSCROLL: u32 = 0x0080;
+
+/// Sent by [`run_modal`] on Ctrl+Tab (`wparam` 0) and Ctrl+Shift+Tab (1); a dialog with pages
+/// turns the page and returns nonzero, any other dialog leaves it to `DefWindowProc` (0).
+pub const WM_TURN_PAGE: u32 = WM_APP + 0x30;
 
 /// `v` (at 96 DPI) in pixels of `hwnd`'s monitor.
 pub fn px(hwnd: HWND, v: i32) -> i32 {
@@ -141,6 +148,16 @@ pub unsafe fn run_modal(dlg: HWND, focus: HWND) {
             }
             -1 => break,
             _ => {}
+        }
+        // IsDialogMessage would take Ctrl+Tab for plain Tab.
+        if msg.message == WM_KEYDOWN
+            && msg.wParam.0 == usize::from(VK_TAB.0)
+            && GetKeyState(i32::from(VK_CONTROL.0)) < 0
+        {
+            let back = GetKeyState(i32::from(VK_SHIFT.0)) < 0;
+            if SendMessageW(dlg, WM_TURN_PAGE, Some(WPARAM(usize::from(back))), None).0 != 0 {
+                continue;
+            }
         }
         if !IsDialogMessageW(dlg, &msg).as_bool() {
             let _ = TranslateMessage(&msg);

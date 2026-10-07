@@ -1,13 +1,15 @@
 //! GDI plumbing shared by the viewer's painting code and the dialogs.
 
+use std::cell::RefCell;
+
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen, CreateSolidBrush,
-    DeleteDC, DeleteObject, DrawTextW, FillRect, IntersectClipRect, Polygon, SelectObject,
-    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLIP_DEFAULT_PRECIS,
-    DEFAULT_CHARSET, DEFAULT_QUALITY, DRAW_TEXT_FORMAT, FW_BOLD, FW_NORMAL, HBRUSH, HDC, HFONT,
-    HGDIOBJ, OUT_DEFAULT_PRECIS, PS_NULL, SRCCOPY, TRANSPARENT,
+    DeleteDC, DeleteObject, DrawTextW, FillRect, IntersectClipRect, Polygon, SelectClipRgn,
+    SelectObject, SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_QUALITY, DRAW_TEXT_FORMAT, FW_BOLD, FW_NORMAL,
+    HBITMAP, HBRUSH, HDC, HFONT, HGDIOBJ, OUT_DEFAULT_PRECIS, PS_NULL, SRCCOPY, TRANSPARENT,
 };
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -152,22 +154,88 @@ pub fn bitmap_info(width: u32, height: i32) -> BITMAPINFO {
     }
 }
 
+/// A memory DC with a bitmap of `size` selected into it.
+struct BackBuffer {
+    dc: HDC,
+    bitmap: HBITMAP,
+    old: HGDIOBJ,
+    size: (i32, i32),
+}
+
+impl BackBuffer {
+    unsafe fn new(hdc: HDC, width: i32, height: i32) -> Option<Self> {
+        let dc = CreateCompatibleDC(Some(hdc));
+        if dc.is_invalid() {
+            return None;
+        }
+        let bitmap = CreateCompatibleBitmap(hdc, width, height);
+        if bitmap.is_invalid() {
+            let _ = DeleteDC(dc);
+            return None;
+        }
+        let old = SelectObject(dc, bitmap.into());
+        Some(Self {
+            dc,
+            bitmap,
+            old,
+            size: (width, height),
+        })
+    }
+}
+
+impl Drop for BackBuffer {
+    fn drop(&mut self) {
+        unsafe {
+            SelectObject(self.dc, self.old);
+            let _ = DeleteObject(self.bitmap.into());
+            let _ = DeleteDC(self.dc);
+        }
+    }
+}
+
+/// The last few back buffers of this thread, most recently used last.
+struct BackBuffers(Vec<BackBuffer>);
+
+impl Drop for BackBuffers {
+    /// Thread-local destructors run when TC unloads the DLL, under the loader lock: whatever
+    /// [`release_buffers`] didn't free is left to the process.
+    fn drop(&mut self) {
+        std::mem::forget(std::mem::take(&mut self.0));
+    }
+}
+
+/// The viewer, its panel and a dialog may paint in turn, each at its own size.
+const KEPT_BUFFERS: usize = 3;
+
+thread_local! {
+    static BUFFERS: RefCell<BackBuffers> = const { RefCell::new(BackBuffers(Vec::new())) };
+}
+
+/// Frees this thread's back buffers; called when a viewer window closes.
+pub fn release_buffers() {
+    let _ = BUFFERS.try_with(|b| b.borrow_mut().0.clear());
+}
+
 /// Double-buffered painting of a `width` x `height` surface: `paint` draws into a memory DC
-/// clipped to `dirty`, and that part is copied to `hdc`.
+/// clipped to `dirty`, and that part is copied to `hdc`. The buffer is kept for the next paint
+/// of the same size: panning repaints on every mouse move, and a window-sized bitmap (33 MB at
+/// 4K) made and freed each time costs more than the drawing.
 pub unsafe fn with_buffer(hdc: HDC, width: i32, height: i32, dirty: RECT, paint: impl FnOnce(HDC)) {
     if width <= 0 || height <= 0 {
         return;
     }
-    let mem = CreateCompatibleDC(Some(hdc));
-    if mem.is_invalid() {
+    let kept = BUFFERS
+        .try_with(|b| {
+            let list = &mut b.borrow_mut().0;
+            let pos = list.iter().position(|buf| buf.size == (width, height))?;
+            Some(list.remove(pos))
+        })
+        .ok()
+        .flatten();
+    let Some(buffer) = kept.or_else(|| BackBuffer::new(hdc, width, height)) else {
         return;
-    }
-    let bmp = CreateCompatibleBitmap(hdc, width, height);
-    if bmp.is_invalid() {
-        let _ = DeleteDC(mem);
-        return;
-    }
-    let old = SelectObject(mem, bmp.into());
+    };
+    let mem = buffer.dc;
     IntersectClipRect(mem, dirty.left, dirty.top, dirty.right, dirty.bottom);
     paint(mem);
     let _ = BitBlt(
@@ -181,7 +249,12 @@ pub unsafe fn with_buffer(hdc: HDC, width: i32, height: i32, dirty: RECT, paint:
         dirty.top,
         SRCCOPY,
     );
-    SelectObject(mem, old);
-    let _ = DeleteObject(bmp.into());
-    let _ = DeleteDC(mem);
+    SelectClipRgn(mem, None);
+    let _ = BUFFERS.try_with(|b| {
+        let list = &mut b.borrow_mut().0;
+        list.push(buffer);
+        if list.len() > KEPT_BUFFERS {
+            list.remove(0);
+        }
+    });
 }

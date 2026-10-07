@@ -1,14 +1,15 @@
 //! Per-HWND viewer state for a Total Commander Lister instance.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mediares_core::image_decode::header_looks_decodable;
 use mediares_core::probe::{probe_file, MediaType};
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
 };
+use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::config::ViewerConfig;
 use crate::gdi::Font;
@@ -48,9 +49,11 @@ pub struct ViewerState {
     pub image: Option<Arc<DecodedImage>>,
     /// The photo being decoded in the background (then `image` is `None`).
     pub pending: Option<Ticket>,
-    /// The whole picture of `image` when that is a fitted copy, turned like it; drawn when
-    /// zoomed in beyond the copy's own pixels.
-    pub whole: Option<Arc<DecodedImage>>,
+    /// The whole picture of `image` when that is a fitted copy, as decoded (not turned).
+    whole_upright: Option<Arc<DecodedImage>>,
+    /// `whole_upright` turned like `image`, made when first needed (see [`Self::whole_turned`]):
+    /// turning 36 MP takes about 0.1 s, too long for every R / L press.
+    whole: Option<Arc<DecodedImage>>,
     /// The whole picture being decoded in the background.
     whole_pending: Option<Ticket>,
     /// The last photo shown, drawn while `pending` so switching doesn't flash an empty window.
@@ -66,6 +69,10 @@ pub struct ViewerState {
     pub offset: (f32, f32),
     pub drag: Option<Drag>,
     pub loupe: Option<Loupe>,
+    /// The zoomed-in view to give the photo being decoded ([`ViewerConfig::keep_zoom`]).
+    kept_view: Option<crate::image_view::KeptView>,
+    /// The photo the one on screen is compared with, side by side.
+    pub compare: Option<Compare>,
     /// The files navigated through: the folder's viewable files, or an M3U playlist's entries.
     pub dir_files: Vec<PathBuf>,
     pub current_idx: usize,
@@ -73,6 +80,10 @@ pub struct ViewerState {
     forward: bool,
     /// The M3U file `dir_files` came from.
     pub playlist: Option<PathBuf>,
+    /// The file decoded ahead to follow the current one (gapless), as picked by the queue.
+    preloaded: Option<usize>,
+    /// The folder being listed in the background; `dir_files` holds just the file meanwhile.
+    scan: Option<Arc<DirScan>>,
     /// Monitor rectangle while fullscreen; the window is pinned to it.
     pub fullscreen: Option<RECT>,
     /// Fullscreen extras (floating panel, idle cursor); present while fullscreen.
@@ -99,6 +110,7 @@ impl ViewerState {
             file_size: 0,
             image: None,
             pending: None,
+            whole_upright: None,
             whole: None,
             whole_pending: None,
             previous: None,
@@ -109,10 +121,14 @@ impl ViewerState {
             offset: (0.0, 0.0),
             drag: None,
             loupe: None,
+            kept_view: None,
+            compare: None,
             dir_files: Vec::new(),
             current_idx: 0,
             forward: true,
             playlist: None,
+            preloaded: None,
+            scan: None,
             fullscreen: None,
             overlay: None,
             slideshow: false,
@@ -138,20 +154,56 @@ impl ViewerState {
             self.dir_files = entries;
             self.current_idx = 0;
             self.playlist = Some(path.to_path_buf());
+            self.scan = None;
             return self.show(&first);
         }
         match self.dir_files.iter().position(|p| same_path(p, path)) {
             Some(pos) => self.current_idx = pos,
             None => {
-                (self.dir_files, self.current_idx) = scan_directory_media(path);
+                // The file is shown first; the folder (thousands of files, maybe on a network
+                // drive) is listed meanwhile.
+                (self.dir_files, self.current_idx) = (vec![path.to_path_buf()], 0);
                 self.playlist = None;
+                self.scan = Some(DirScan::start(path, self.config.skip_raw_twins, self.hwnd));
             }
         }
         self.show(path)
     }
 
+    /// Takes the folder listing that arrived ([`WM_DIR_SCANNED`]). False if it is stale.
+    pub fn dir_scanned(&mut self) -> bool {
+        let Some(files) = self.scan.as_ref().and_then(|s| s.take()) else {
+            return false;
+        };
+        self.scan = None;
+        let Some(idx) = files.iter().position(|p| same_path(p, &self.file_path)) else {
+            return false;
+        };
+        (self.dir_files, self.current_idx) = (files, idx);
+        let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
+        if let Some(media) = self.media.as_mut() {
+            media.set_skip(can_skip);
+        }
+        image_cache::prefetch(self.prefetch_candidates(), self.decode_options());
+        true
+    }
+
     fn show(&mut self, path: &Path) -> bool {
+        // Comparing a series: the next photo opens zoomed in on the same place.
+        let keep = self.config.keep_zoom || self.compare.is_some();
+        let kept = keep
+            .then(|| {
+                self.loupe
+                    .is_none()
+                    .then_some(self.image.as_ref())
+                    .flatten()
+            })
+            .flatten()
+            .zip(unsafe { crate::image_view::view_size(self) })
+            .and_then(|(img, view)| crate::image_view::kept_view(self, img, view));
         self.file_path = path.to_path_buf();
+        self.kept_view = kept;
+        self.preloaded = None;
         self.zoom = ZoomMode::Fit;
         self.offset = (0.0, 0.0);
         self.drag = None;
@@ -181,7 +233,8 @@ impl ViewerState {
         if let Some(result) = self.whole_pending.as_ref().and_then(Ticket::result) {
             self.whole_pending = None;
             if let Some(img) = result {
-                self.whole = Some(turned(img, self.quarter_turns));
+                self.whole_upright = Some(img);
+                self.whole = None;
                 arrived = Arrived::Whole;
             }
         }
@@ -200,15 +253,44 @@ impl ViewerState {
     /// Shows `img` (just decoded, so not turned yet) and, when it is a fitted copy, has the
     /// whole picture decoded in the background.
     fn set_image(&mut self, img: Arc<DecodedImage>) {
-        self.image = Some(img);
+        self.image = Some(img.clone());
+        self.apply_kept_view(&img);
         self.request_whole();
+    }
+
+    /// Zooms the photo just shown in as the previous one was (see [`Self::kept_view`]).
+    fn apply_kept_view(&mut self, img: &DecodedImage) {
+        let Some(kept) = self.kept_view.take() else {
+            return;
+        };
+        if let Some(view) = unsafe { crate::image_view::view_size(self) } {
+            crate::image_view::restore_view(self, img, view, kept);
+        }
+    }
+
+    /// Starts comparing other photos with the one on screen (its whole picture decoded now if it
+    /// is not there yet: zooming in on the reference needs it), or stops comparing.
+    pub fn toggle_compare(&mut self) -> bool {
+        if self.compare.take().is_some() {
+            return true;
+        }
+        let Some(image) = self.image.clone() else {
+            return false;
+        };
+        let whole = self.whole_image().filter(|w| !Arc::ptr_eq(w, &image));
+        self.compare = Some(Compare {
+            path: self.file_path.clone(),
+            image,
+            whole,
+        });
+        true
     }
 
     /// Queues the whole picture of a fitted photo on screen. Called after the neighbours are
     /// queued: it runs once they are done.
     fn request_whole(&mut self) {
         let fitted = self.image.as_ref().is_some_and(|img| !img.is_whole());
-        if fitted && self.whole.is_none() && self.whole_pending.is_none() {
+        if fitted && self.whole_upright.is_none() && self.whole_pending.is_none() {
             let kind = probe_file(&self.file_path);
             self.whole_pending =
                 image_cache::request_whole(&self.file_path, kind, self.decode_options(), self.hwnd);
@@ -222,7 +304,7 @@ impl ViewerState {
         if img.is_whole() {
             return Some(img);
         }
-        if self.whole.is_none() {
+        if self.whole_upright.is_none() {
             let whole = match self.whole_pending.take() {
                 Some(ticket) => ticket.finish()?,
                 None => {
@@ -231,7 +313,17 @@ impl ViewerState {
                     Arc::new(image_cache::decode_whole(&self.file_path, kind, options)?)
                 }
             };
-            self.whole = Some(turned(whole, self.quarter_turns));
+            self.whole_upright = Some(whole);
+        }
+        self.whole_turned()
+    }
+
+    /// The whole picture turned like the one on screen, if it has arrived; drawn when zoomed in
+    /// beyond the fitted copy's own pixels.
+    pub fn whole_turned(&mut self) -> Option<Arc<DecodedImage>> {
+        if self.whole.is_none() {
+            let upright = self.whole_upright.clone()?;
+            self.whole = Some(turned(upright, self.quarter_turns));
         }
         self.whole.clone()
     }
@@ -273,8 +365,28 @@ impl ViewerState {
         }
     }
 
+    /// Near the end of an audio file: has the one the queue plays next decoded ahead.
+    pub fn preload_next(&mut self) {
+        let EndAction::Play(idx) =
+            playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue)
+        else {
+            return;
+        };
+        let path = self.dir_files[idx].clone();
+        if probe_file(&path) != MediaType::Audio {
+            return;
+        }
+        if self.media.as_mut().is_some_and(|m| m.preload(&path)) {
+            self.preloaded = Some(idx);
+        }
+    }
+
     /// The current file played to its end. Returns whether another file is now shown.
     pub fn playback_ended(&mut self) -> bool {
+        // Already playing on (the shuffled pick included).
+        if let Some(idx) = self.preloaded.take() {
+            return self.go_to(idx);
+        }
         match playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue) {
             EndAction::Replay => {
                 if let Some(media) = &self.media {
@@ -305,6 +417,13 @@ impl ViewerState {
 
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
+        if config.skip_raw_twins != self.config.skip_raw_twins && self.playlist.is_none() {
+            self.scan = Some(DirScan::start(
+                &self.file_path,
+                config.skip_raw_twins,
+                self.hwnd,
+            ));
+        }
         i18n::set(config.language.resolve());
         self.config = config;
         self.osd_font = None;
@@ -325,9 +444,8 @@ impl ViewerState {
     pub fn rotate(&mut self, clockwise: bool) -> bool {
         let Some(img) = &self.image else { return false };
         self.image = Some(Arc::new(image_cache::rotated(img, clockwise)));
-        if let Some(whole) = &self.whole {
-            self.whole = Some(Arc::new(image_cache::rotated(whole, clockwise)));
-        }
+        // Turned again when needed (zooming in, printing...).
+        self.whole = None;
         self.quarter_turns = (self.quarter_turns + if clockwise { 1 } else { 3 }) % 4;
         self.zoom = ZoomMode::Fit;
         self.loupe = None;
@@ -344,6 +462,7 @@ impl ViewerState {
         }
         self.image = None;
         self.whole = None;
+        self.whole_upright = None;
         self.previous = None;
         if self.dir_files.is_empty() {
             self.pending = None;
@@ -370,14 +489,22 @@ impl ViewerState {
         let shown = self.image.take();
         self.pending = None;
         self.whole = None;
+        self.whole_upright = None;
         self.whole_pending = None;
         self.load_failed = false;
         if kind.is_playable() {
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
-            let resume = self.config.resume_video;
+            let (resume, replay_gain) = (self.config.resume_video, self.config.replay_gain);
             self.media = unsafe {
-                MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, resume)
+                MediaView::open(
+                    self.hwnd,
+                    self.media.take(),
+                    &self.file_path,
+                    kind,
+                    resume,
+                    replay_gain,
+                )
             };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
             if let Some(media) = self.media.as_mut() {
@@ -392,7 +519,8 @@ impl ViewerState {
                     .flatten();
                 match request {
                     Some(Request::Ready(img)) => {
-                        self.image = Some(img);
+                        self.image = Some(img.clone());
+                        self.apply_kept_view(&img);
                         self.previous = None;
                     }
                     Some(Request::Pending(ticket)) => {
@@ -435,6 +563,16 @@ impl ViewerState {
             .filter(|p| probe_file(p).is_image_kind())
             .collect()
     }
+}
+
+/// A photo kept on the left for comparison, as it was shown (turned) when picked.
+#[derive(Clone)]
+pub struct Compare {
+    pub path: PathBuf,
+    /// The copy fitted to the screen.
+    pub image: Arc<DecodedImage>,
+    /// The whole picture, when `image` is a fitted copy.
+    pub whole: Option<Arc<DecodedImage>>,
 }
 
 /// What [`ViewerState::image_ready`] took.
@@ -500,8 +638,51 @@ fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
             && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
 }
 
+/// Posted to the viewer when its folder listing is ready (see [`ViewerState::dir_scanned`]).
+pub const WM_DIR_SCANNED: u32 = WM_APP + 0x13;
+
+/// A folder listed on another thread.
+struct DirScan {
+    files: Mutex<Option<Vec<PathBuf>>>,
+}
+
+impl DirScan {
+    fn start(file: &Path, skip_raw_twins: bool, notify: HWND) -> Arc<Self> {
+        let scan = Arc::new(DirScan {
+            files: Mutex::new(None),
+        });
+        let hwnd = notify.0 as isize;
+        let list = {
+            let (result, file) = (scan.clone(), file.to_path_buf());
+            move || {
+                let (files, _) = scan_directory_media(&file, skip_raw_twins);
+                *result.files.lock().unwrap_or_else(|e| e.into_inner()) = Some(files);
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(hwnd as *mut _)),
+                        WM_DIR_SCANNED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+            }
+        };
+        let thread = std::thread::Builder::new().name("mediares-dir-scan".into());
+        if thread.spawn(list.clone()).is_err() {
+            list();
+        }
+        scan
+    }
+
+    fn take(&self) -> Option<Vec<PathBuf>> {
+        self.files.lock().unwrap_or_else(|e| e.into_inner()).take()
+    }
+}
+
 /// Lists the viewable files (images, videos, audio) in the file's directory in natural ("file2" < "file10") order.
-pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
+/// `skip_raw_twins`: RAW files with a standard image of the same name are left out (shot as
+/// RAW+JPEG, each picture comes once); `current_file` is always kept.
+pub fn scan_directory_media(current_file: &Path, skip_raw_twins: bool) -> (Vec<PathBuf>, usize) {
     let single = || (vec![current_file.to_path_buf()], 0);
     let Some(entries) = current_file
         .parent()
@@ -516,6 +697,9 @@ pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
         .map(|e| e.path())
         .filter(|p| is_viewable(probe_file(p)))
         .collect();
+    if skip_raw_twins {
+        drop_raw_twins(&mut files, current_file);
+    }
     if files.is_empty() {
         return single();
     }
@@ -526,6 +710,21 @@ pub fn scan_directory_media(current_file: &Path) -> (Vec<PathBuf>, usize) {
         .position(|p| same_path(p, current_file))
         .unwrap_or(0);
     (files, idx)
+}
+
+/// Removes the RAW files whose name (without extension, any case) a standard image shares.
+fn drop_raw_twins(files: &mut Vec<PathBuf>, keep: &Path) {
+    let stem = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().to_lowercase());
+    let developed: std::collections::HashSet<String> = files
+        .iter()
+        .filter(|p| probe_file(p) == MediaType::StandardImage)
+        .filter_map(|p| stem(p))
+        .collect();
+    files.retain(|p| {
+        probe_file(p) != MediaType::RawImage
+            || same_path(p, keep)
+            || !stem(p).is_some_and(|s| developed.contains(&s))
+    });
 }
 
 fn is_viewable(kind: MediaType) -> bool {
@@ -581,6 +780,17 @@ mod tests {
             Path::new(r"D:\Видео\Фильм.mkv"),
             Path::new(r"d:\видео\фильм.MKV")
         ));
+    }
+
+    #[test]
+    fn raw_twins_are_skipped_but_not_the_file_opened() {
+        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let mut files = paths(&["a.ARW", "A.jpg", "b.arw", "c.cr2", "c.heic", "d.mp4"]);
+        drop_raw_twins(&mut files, Path::new("c.cr2"));
+        assert_eq!(
+            files,
+            paths(&["A.jpg", "b.arw", "c.cr2", "c.heic", "d.mp4"])
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! Modal settings dialog for the viewer configuration.
 
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
@@ -11,20 +13,26 @@ use windows::Win32::UI::Controls::Dialogs::{
     ChooseColorW, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_FILEMUSTEXIST,
     OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
+use windows::Win32::UI::Controls::{
+    InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR, TCIF_TEXT, TCITEMW,
+    TCM_GETCURSEL, TCM_INSERTITEMW, TCM_SETCURSEL, TCN_SELCHANGE,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, MessageBoxW, SendDlgItemMessageW,
-    SetDlgItemTextW, SetWindowLongPtrW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX,
-    BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL,
-    CB_SETCURSEL, GWLP_USERDATA, IDCANCEL, IDOK, MB_ICONINFORMATION, MB_OK, WM_CLOSE, WM_COMMAND,
-    WM_CTLCOLORSTATIC, WM_NCDESTROY, WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetWindowLongPtrW, IsWindowVisible, MessageBoxW,
+    SendDlgItemMessageW, SendMessageW, SetDlgItemTextW, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX,
+    BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_ADDSTRING, CB_GETCURSEL, CB_SETCURSEL, GWLP_USERDATA,
+    HWND_BOTTOM, IDCANCEL, IDOK, MB_ICONINFORMATION, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SW_HIDE, SW_SHOWNA, WM_CLOSE, WM_COMMAND, WM_CTLCOLORSTATIC, WM_NCDESTROY, WM_NOTIFY,
+    WS_BORDER, WS_CLIPSIBLINGS, WS_TABSTOP, WS_VSCROLL,
 };
 
 use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog::{self, ES_AUTOHSCROLL, SS_LEFT};
 use crate::file_actions::show_error;
 use crate::gdi::{self, Brush};
-use crate::i18n::{tr, LangSetting};
+use crate::i18n::{n, tr, LangSetting};
 use crate::playlist::Repeat;
 use crate::snapshot::PictureFormat;
 use crate::tc_register::Registration;
@@ -64,6 +72,23 @@ const IDC_LANGUAGE: i32 = 129;
 const IDC_FRAME_FORMAT: i32 = 130;
 const IDC_SMOOTH_ZOOM: i32 = 131;
 const IDC_SEEK_STEP: i32 = 132;
+const IDC_KEEP_ZOOM: i32 = 133;
+const IDC_SKIP_RAW_TWINS: i32 = 134;
+const IDC_REPLAY_GAIN: i32 = 135;
+const IDC_TABS: i32 = 136;
+
+const PAGE_COUNT: usize = 4;
+const PAGE_TITLES: [&str; PAGE_COUNT] =
+    [n("Photo"), n("Video and audio"), n("Display"), n("General")];
+/// The page the dialog opens at: the one last looked at in this session.
+static LAST_PAGE: AtomicUsize = AtomicUsize::new(0);
+/// The controls of each page.
+type Pages = [Vec<HWND>; PAGE_COUNT];
+
+/// Left edge of a page's controls, of the controls inside a group box, and of the value column.
+const COLUMN: i32 = 25;
+const GROUPED: i32 = 33;
+const FIELD: i32 = 210;
 
 /// `EM_SETCUEBANNER`: grey hint text in an empty edit box.
 const EM_SETCUEBANNER: u32 = 0x1501;
@@ -105,13 +130,19 @@ struct Context {
     background_brush: Brush,
     /// Read from `wincmd.ini` on every opening: TC or the user may have changed the plugin list.
     registration: Option<Registration>,
+    pages: Pages,
     result: Option<ViewerConfig>,
 }
 
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
 pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> {
+    let controls = INITCOMMONCONTROLSEX {
+        dwSize: size_of::<INITCOMMONCONTROLSEX>() as u32,
+        dwICC: ICC_TAB_CLASSES,
+    };
+    let _ = InitCommonControlsEx(&controls);
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 850, 625)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 502, 470)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         initial: current.clone(),
@@ -128,12 +159,19 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         seek_steps: with_current(SEEK_STEPS, current.seek_step_sec, |a, b| a == b),
         background_brush: gdi::solid_brush(current.photo_background),
         registration: Registration::find(),
+        pages: Pages::default(),
         result: None,
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
     let font = dialog::font(dlg, "Segoe UI", -12);
-    let ok = build_controls(dlg, &*ctx, font.0);
+    let (ok, pages) = build_controls(dlg, &*ctx, font.0);
+    (*ctx).pages = pages;
+    show_page(
+        dlg,
+        &*ctx,
+        LAST_PAGE.load(Ordering::Relaxed).min(PAGE_COUNT - 1),
+    );
     dialog::run_modal(dlg, ok);
 
     // run_modal returns only after the window is destroyed, so nothing references `ctx` anymore.
@@ -154,15 +192,23 @@ fn with_current<T: Copy + PartialOrd>(
     options
 }
 
+/// Creates the tab strip, every page's controls and OK / Cancel; returns OK and the controls of
+/// each page (all pages are children of the dialog itself, hidden but for the open one).
 unsafe fn build_controls(
     dlg: HWND,
     ctx: &Context,
     font: windows::Win32::Graphics::Gdi::HFONT,
-) -> HWND {
+) -> (HWND, Pages) {
     let cfg = &ctx.config;
     let tab = WS_TABSTOP.0;
+    let pages: RefCell<Pages> = RefCell::default();
+    let page = Cell::new(PAGE_COUNT);
     let control = |class, text: &str, style: u32, rect, id: i32| {
-        dialog::control(dlg, class, text, style, rect, id as usize, font)
+        let hwnd = dialog::control(dlg, class, text, style, rect, id as usize, font);
+        if let Some(list) = pages.borrow_mut().get_mut(page.get()) {
+            list.push(hwnd);
+        }
+        hwnd
     };
     let checkbox = |text: &str, rect, id: i32, checked: bool| {
         control(w!("BUTTON"), text, tab | BS_AUTOCHECKBOX as u32, rect, id);
@@ -190,21 +236,25 @@ unsafe fn build_controls(
         }
         SendDlgItemMessageW(dlg, id, CB_SETCURSEL, WPARAM(selected), LPARAM(0));
     };
-    // "<label> [path] [Обзор...]" at label baseline `y` in the right column; empty = the system's choice.
+    // "<label>  [combo]" with the label baseline at `y`.
+    let label = |text: &str, y: i32| {
+        control(w!("STATIC"), text, SS_LEFT, (COLUMN, y, 175, 20), 0);
+    };
+    // "<label> [path] [Обзор...]" at label baseline `y`; empty = the system's choice.
     let program_row = |y: i32, label: &str, path: &str, edit_id: i32, browse_id: i32| {
-        control(w!("STATIC"), label, SS_LEFT, (438, y, 55, 20), 0);
+        control(w!("STATIC"), label, SS_LEFT, (GROUPED, y, 55, 20), 0);
         control(
             w!("EDIT"),
             path,
             tab | WS_BORDER.0 | ES_AUTOHSCROLL,
-            (495, y - 3, 235, 24),
+            (95, y - 3, 270, 24),
             edit_id,
         );
         control(
             w!("BUTTON"),
             tr("Browse..."),
             tab | BS_PUSHBUTTON as u32,
-            (738, y - 4, 72, 26),
+            (373, y - 4, 82, 26),
             browse_id,
         );
         let hint = HSTRING::from(tr("the program assigned in Windows"));
@@ -216,35 +266,47 @@ unsafe fn build_controls(
             LPARAM(hint.as_ptr() as isize),
         );
     };
+    let group = |text: &str, y: i32, height: i32| {
+        control(
+            w!("BUTTON"),
+            text,
+            BS_GROUPBOX as u32,
+            (COLUMN - 7, y, 446, height),
+            0,
+        );
+    };
 
-    // Left column: photos, OSD, fullscreen.
-    checkbox(
-        tr("Start in full screen"),
-        (20, 15, 380, 22),
-        IDC_START_FULLSCREEN,
-        cfg.start_fullscreen,
+    let tabs = control(
+        w!("SysTabControl32"),
+        "",
+        tab | WS_CLIPSIBLINGS.0,
+        (10, 10, 466, 372),
+        IDC_TABS,
     );
+    for (i, title) in PAGE_TITLES.iter().enumerate() {
+        let mut text: Vec<u16> = tr(title).encode_utf16().chain(Some(0)).collect();
+        let item = TCITEMW {
+            mask: TCIF_TEXT,
+            pszText: PWSTR(text.as_mut_ptr()),
+            ..Default::default()
+        };
+        SendMessageW(
+            tabs,
+            TCM_INSERTITEMW,
+            Some(WPARAM(i)),
+            Some(LPARAM(&item as *const _ as isize)),
+        );
+    }
+
+    // Photos.
+    page.set(0);
     checkbox(
         tr("Auto-rotate by EXIF orientation"),
-        (20, 42, 380, 22),
+        (COLUMN, 47, 430, 22),
         IDC_AUTO_ROTATE_EXIF,
         cfg.auto_rotate_exif,
     );
-
-    control(
-        w!("BUTTON"),
-        tr("Photos"),
-        BS_GROUPBOX as u32,
-        (15, 72, 395, 172),
-        0,
-    );
-    control(
-        w!("STATIC"),
-        tr("Loupe zoom (left click):"),
-        SS_LEFT,
-        (28, 98, 145, 20),
-        0,
-    );
+    label(tr("Loupe zoom (left click):"), 82);
     let loupe_labels = ctx
         .loupe_scales
         .iter()
@@ -255,158 +317,28 @@ unsafe fn build_controls(
         .iter()
         .position(|s| (s - cfg.loupe_scale).abs() < 0.05)
         .unwrap_or(0);
-    combo((175, 95, 90, 160), IDC_LOUPE_SCALE, loupe_labels, loupe_sel);
-    control(
-        w!("STATIC"),
-        tr("Background:"),
-        SS_LEFT,
-        (28, 133, 140, 20),
-        0,
+    combo(
+        (FIELD, 79, 90, 160),
+        IDC_LOUPE_SCALE,
+        loupe_labels,
+        loupe_sel,
     );
+    label(tr("Background:"), 117);
     control(
         w!("BUTTON"),
         tr("Choose color..."),
         tab | BS_PUSHBUTTON as u32,
-        (175, 130, 130, 26),
+        (FIELD, 114, 130, 26),
         IDC_CHOOSE_BACKGROUND,
     );
     control(
         w!("STATIC"),
         "",
         SS_SUNKEN,
-        (320, 130, 45, 26),
+        (FIELD + 145, 114, 45, 26),
         IDC_BACKGROUND_PREVIEW,
     );
-    checkbox(
-        tr("Don't enlarge small images"),
-        (28, 163, 365, 22),
-        IDC_NO_UPSCALE,
-        cfg.no_upscale,
-    );
-    checkbox(
-        tr("Smooth enlarged images"),
-        (28, 188, 365, 22),
-        IDC_SMOOTH_ZOOM,
-        cfg.smooth_zoom,
-    );
-    checkbox(
-        tr("Confirm moving to Recycle Bin (Del)"),
-        (28, 213, 365, 22),
-        IDC_CONFIRM_DELETE,
-        cfg.confirm_delete,
-    );
-
-    control(
-        w!("BUTTON"),
-        tr("Info line (OSD)"),
-        BS_GROUPBOX as u32,
-        (15, 254, 395, 170),
-        0,
-    );
-    control(
-        w!("STATIC"),
-        tr("Show OSD:"),
-        SS_LEFT,
-        (28, 282, 140, 20),
-        0,
-    );
-    let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
-    combo(
-        (175, 279, 190, 150),
-        IDC_SHOW_OSD,
-        osd_labels,
-        cfg.osd.index() as usize,
-    );
-    control(
-        w!("STATIC"),
-        tr("Font size:"),
-        SS_LEFT,
-        (28, 314, 140, 20),
-        0,
-    );
-    let size_labels = ctx.font_sizes.iter().map(|s| format!("{} pt", s)).collect();
-    let size_sel = ctx
-        .font_sizes
-        .iter()
-        .position(|&s| s == cfg.osd_font_size)
-        .unwrap_or(0);
-    combo((175, 311, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
-
-    control(
-        w!("STATIC"),
-        tr("Font color:"),
-        SS_LEFT,
-        (28, 350, 140, 20),
-        0,
-    );
-    control(
-        w!("BUTTON"),
-        tr("Choose color..."),
-        tab | BS_PUSHBUTTON as u32,
-        (175, 347, 130, 26),
-        IDC_CHOOSE_COLOR,
-    );
-    control(
-        w!("STATIC"),
-        "Aa",
-        SS_CENTER | SS_CENTERIMAGE,
-        (320, 347, 45, 26),
-        IDC_COLOR_PREVIEW,
-    );
-    control(
-        w!("STATIC"),
-        tr("Contents:"),
-        SS_LEFT,
-        (28, 387, 140, 20),
-        0,
-    );
-    control(
-        w!("BUTTON"),
-        tr("Photos..."),
-        tab | BS_PUSHBUTTON as u32,
-        (175, 384, 105, 26),
-        IDC_PHOTO_OSD,
-    );
-    control(
-        w!("BUTTON"),
-        tr("Videos..."),
-        tab | BS_PUSHBUTTON as u32,
-        (290, 384, 105, 26),
-        IDC_VIDEO_OSD,
-    );
-
-    control(
-        w!("BUTTON"),
-        tr("Full screen"),
-        BS_GROUPBOX as u32,
-        (15, 434, 395, 140),
-        0,
-    );
-    checkbox(
-        tr("⏮ ⏯ ⏭ buttons over photos"),
-        (28, 457, 365, 22),
-        IDC_OVERLAY_PHOTO,
-        cfg.overlay_photo,
-    );
-    checkbox(
-        tr("Control bar over videos"),
-        (28, 482, 365, 22),
-        IDC_OVERLAY_VIDEO,
-        cfg.overlay_video,
-    );
-    checkbox(
-        tr("Hide the bar when idle"),
-        (28, 507, 365, 22),
-        IDC_OVERLAY_AUTOHIDE,
-        cfg.overlay_autohide,
-    );
-    control(
-        w!("STATIC"),
-        tr("Slideshow interval (F5):"),
-        SS_LEFT,
-        (28, 540, 170, 20),
-        0,
-    );
+    label(tr("Slideshow interval (F5):"), 152);
     let slide_labels = ctx
         .slideshow_seconds
         .iter()
@@ -417,70 +349,80 @@ unsafe fn build_controls(
         .iter()
         .position(|&s| s == cfg.slideshow_seconds)
         .unwrap_or(0);
-    combo((205, 537, 90, 200), IDC_SLIDESHOW, slide_labels, slide_sel);
-
-    // Right column: audio / video, external editors.
-    control(
-        w!("BUTTON"),
-        tr("Audio and video"),
-        BS_GROUPBOX as u32,
-        (425, 15, 395, 195),
-        0,
+    combo(
+        (FIELD, 149, 90, 200),
+        IDC_SLIDESHOW,
+        slide_labels,
+        slide_sel,
     );
+    for (i, (text, id, checked)) in [
+        (
+            tr("Don't enlarge small images"),
+            IDC_NO_UPSCALE,
+            cfg.no_upscale,
+        ),
+        (
+            tr("Smooth enlarged images"),
+            IDC_SMOOTH_ZOOM,
+            cfg.smooth_zoom,
+        ),
+        (
+            tr("Keep the zoom on the next photo (Z)"),
+            IDC_KEEP_ZOOM,
+            cfg.keep_zoom,
+        ),
+        (
+            tr("Skip RAW files that have a JPEG twin"),
+            IDC_SKIP_RAW_TWINS,
+            cfg.skip_raw_twins,
+        ),
+        (
+            tr("Confirm moving to Recycle Bin (Del)"),
+            IDC_CONFIRM_DELETE,
+            cfg.confirm_delete,
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        checkbox(text, (COLUMN, 187 + 27 * i as i32, 430, 22), id, checked);
+    }
+
+    // Video and audio.
+    page.set(1);
     checkbox(
         tr("Auto-advance to the next file"),
-        (438, 40, 365, 22),
+        (COLUMN, 47, 430, 22),
         IDC_AUTO_ADVANCE,
         cfg.queue.auto_advance,
     );
-    control(w!("STATIC"), tr("Repeat:"), SS_LEFT, (438, 72, 140, 20), 0);
+    label(tr("Repeat:"), 82);
     let repeat_labels = Repeat::ALL.iter().map(|r| r.label().to_string()).collect();
     combo(
-        (585, 69, 190, 120),
+        (FIELD, 79, 190, 120),
         IDC_REPEAT,
         repeat_labels,
         cfg.queue.repeat.index() as usize,
     );
     checkbox(
         tr("Shuffle"),
-        (438, 100, 365, 22),
+        (COLUMN, 110, 430, 22),
         IDC_SHUFFLE,
         cfg.queue.shuffle,
     );
     checkbox(
         tr("Resume videos longer than 5 min where they stopped"),
-        (438, 125, 375, 22),
+        (COLUMN, 137, 430, 22),
         IDC_RESUME_VIDEO,
         cfg.resume_video,
     );
-    control(
-        w!("STATIC"),
-        tr("Frames (Shift+S):"),
-        SS_LEFT,
-        (438, 153, 140, 20),
-        0,
+    checkbox(
+        tr("Play audio at its ReplayGain loudness"),
+        (COLUMN, 164, 430, 22),
+        IDC_REPLAY_GAIN,
+        cfg.replay_gain,
     );
-    let frame_labels = PictureFormat::ALL
-        .iter()
-        .map(|f| f.label().to_string())
-        .collect();
-    let frame_sel = PictureFormat::ALL
-        .iter()
-        .position(|&f| f == cfg.frame_format)
-        .unwrap_or(0);
-    combo(
-        (585, 150, 190, 80),
-        IDC_FRAME_FORMAT,
-        frame_labels,
-        frame_sel,
-    );
-    control(
-        w!("STATIC"),
-        tr("Seek step (← →):"),
-        SS_LEFT,
-        (438, 183, 140, 20),
-        0,
-    );
+    label(tr("Seek step (← →):"), 202);
     let step_labels = ctx
         .seek_steps
         .iter()
@@ -491,91 +433,234 @@ unsafe fn build_controls(
         .iter()
         .position(|&s| s == cfg.seek_step_sec)
         .unwrap_or(0);
-    combo((585, 180, 90, 200), IDC_SEEK_STEP, step_labels, step_sel);
-
-    control(
-        w!("BUTTON"),
-        tr("External editors (\"Open in editor\")"),
-        BS_GROUPBOX as u32,
-        (425, 220, 395, 125),
-        0,
-    );
-    program_row(
-        248,
-        tr("Photo:"),
-        &cfg.photo_editor,
-        IDC_PHOTO_EDITOR,
-        IDC_BROWSE_PHOTO_EDITOR,
-    );
-    program_row(
-        280,
-        tr("Video:"),
-        &cfg.video_editor,
-        IDC_VIDEO_EDITOR,
-        IDC_BROWSE_VIDEO_EDITOR,
-    );
-    program_row(
-        312,
-        tr("Audio:"),
-        &cfg.audio_editor,
-        IDC_AUDIO_EDITOR,
-        IDC_BROWSE_AUDIO_EDITOR,
+    combo((FIELD, 199, 90, 200), IDC_SEEK_STEP, step_labels, step_sel);
+    label(tr("Frames (Shift+S):"), 237);
+    let frame_labels = PictureFormat::ALL
+        .iter()
+        .map(|f| f.label().to_string())
+        .collect();
+    let frame_sel = PictureFormat::ALL
+        .iter()
+        .position(|&f| f == cfg.frame_format)
+        .unwrap_or(0);
+    combo(
+        (FIELD, 234, 190, 80),
+        IDC_FRAME_FORMAT,
+        frame_labels,
+        frame_sel,
     );
 
-    control(
-        w!("BUTTON"),
-        tr("Content plugin (WDX)"),
-        BS_GROUPBOX as u32,
-        (425, 355, 395, 102),
-        0,
+    // Display: full screen and the info line.
+    page.set(2);
+    group(tr("Full screen"), 40, 140);
+    checkbox(
+        tr("Start in full screen"),
+        (GROUPED, 63, 420, 22),
+        IDC_START_FULLSCREEN,
+        cfg.start_fullscreen,
     );
-    let hint = tr("mediares fields for TC columns, duplicate search and multi-rename");
-    control(w!("STATIC"), hint, SS_LEFT, (438, 378, 370, 36), 0);
-    let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
-    let label = if registered {
-        registered_label()
-    } else {
-        tr("Register WDX")
-    };
-    let button = control(
-        w!("BUTTON"),
-        label,
-        tab | BS_PUSHBUTTON as u32,
-        (438, 418, 200, 26),
-        IDC_REGISTER_WDX,
+    checkbox(
+        tr("⏮ ⏯ ⏭ buttons over photos"),
+        (GROUPED, 90, 420, 22),
+        IDC_OVERLAY_PHOTO,
+        cfg.overlay_photo,
     );
-    let _ = EnableWindow(button, !registered);
+    checkbox(
+        tr("Control bar over videos"),
+        (GROUPED, 117, 420, 22),
+        IDC_OVERLAY_VIDEO,
+        cfg.overlay_video,
+    );
+    checkbox(
+        tr("Hide the bar when idle"),
+        (GROUPED, 144, 420, 22),
+        IDC_OVERLAY_AUTOHIDE,
+        cfg.overlay_autohide,
+    );
 
+    group(tr("Info line (OSD)"), 192, 170);
     control(
         w!("STATIC"),
-        &language_caption(),
+        tr("Show OSD:"),
         SS_LEFT,
-        (438, 480, 140, 20),
+        (GROUPED, 220, 160, 20),
         0,
     );
+    let osd_labels = OsdMode::ALL.iter().map(|m| m.label().to_string()).collect();
+    combo(
+        (FIELD, 217, 190, 150),
+        IDC_SHOW_OSD,
+        osd_labels,
+        cfg.osd.index() as usize,
+    );
+    control(
+        w!("STATIC"),
+        tr("Font size:"),
+        SS_LEFT,
+        (GROUPED, 252, 160, 20),
+        0,
+    );
+    let size_labels = ctx.font_sizes.iter().map(|s| format!("{} pt", s)).collect();
+    let size_sel = ctx
+        .font_sizes
+        .iter()
+        .position(|&s| s == cfg.osd_font_size)
+        .unwrap_or(0);
+    combo((FIELD, 249, 90, 200), IDC_FONT_SIZE, size_labels, size_sel);
+    control(
+        w!("STATIC"),
+        tr("Font color:"),
+        SS_LEFT,
+        (GROUPED, 288, 160, 20),
+        0,
+    );
+    control(
+        w!("BUTTON"),
+        tr("Choose color..."),
+        tab | BS_PUSHBUTTON as u32,
+        (FIELD, 285, 130, 26),
+        IDC_CHOOSE_COLOR,
+    );
+    control(
+        w!("STATIC"),
+        "Aa",
+        SS_CENTER | SS_CENTERIMAGE,
+        (FIELD + 145, 285, 45, 26),
+        IDC_COLOR_PREVIEW,
+    );
+    control(
+        w!("STATIC"),
+        tr("Contents:"),
+        SS_LEFT,
+        (GROUPED, 325, 160, 20),
+        0,
+    );
+    control(
+        w!("BUTTON"),
+        tr("Photos..."),
+        tab | BS_PUSHBUTTON as u32,
+        (FIELD, 322, 110, 26),
+        IDC_PHOTO_OSD,
+    );
+    control(
+        w!("BUTTON"),
+        tr("Videos..."),
+        tab | BS_PUSHBUTTON as u32,
+        (FIELD + 120, 322, 110, 26),
+        IDC_VIDEO_OSD,
+    );
+
+    // General: language, editors, WDX.
+    page.set(3);
+    label(&language_caption(), 50);
     let languages = LangSetting::all();
     let lang_labels = languages.iter().map(|l| l.label().to_string()).collect();
     let lang_sel = languages
         .iter()
         .position(|&l| l == cfg.language)
         .unwrap_or(0);
-    combo((585, 477, 225, 120), IDC_LANGUAGE, lang_labels, lang_sel);
+    combo((FIELD, 47, 225, 120), IDC_LANGUAGE, lang_labels, lang_sel);
 
+    group(tr("External editors (\"Open in editor\")"), 85, 125);
+    program_row(
+        113,
+        tr("Photo:"),
+        &cfg.photo_editor,
+        IDC_PHOTO_EDITOR,
+        IDC_BROWSE_PHOTO_EDITOR,
+    );
+    program_row(
+        145,
+        tr("Video:"),
+        &cfg.video_editor,
+        IDC_VIDEO_EDITOR,
+        IDC_BROWSE_VIDEO_EDITOR,
+    );
+    program_row(
+        177,
+        tr("Audio:"),
+        &cfg.audio_editor,
+        IDC_AUDIO_EDITOR,
+        IDC_BROWSE_AUDIO_EDITOR,
+    );
+
+    group(tr("Content plugin (WDX)"), 222, 102);
+    let hint = tr("mediares fields for TC columns, duplicate search and multi-rename");
+    control(w!("STATIC"), hint, SS_LEFT, (GROUPED, 245, 420, 36), 0);
+    let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
+    let wdx_label = if registered {
+        registered_label()
+    } else {
+        tr("Register WDX")
+    };
+    let button = control(
+        w!("BUTTON"),
+        wdx_label,
+        tab | BS_PUSHBUTTON as u32,
+        (GROUPED, 285, 200, 26),
+        IDC_REGISTER_WDX,
+    );
+    let _ = EnableWindow(button, !registered);
+
+    page.set(PAGE_COUNT);
     let ok = control(
         w!("BUTTON"),
         tr("OK"),
         tab | BS_DEFPUSHBUTTON as u32,
-        (615, 546, 95, 28),
+        (276, 392, 95, 28),
         IDOK.0,
     );
     control(
         w!("BUTTON"),
         tr("Cancel"),
         tab | BS_PUSHBUTTON as u32,
-        (725, 546, 95, 28),
+        (381, 392, 95, 28),
         IDCANCEL.0,
     );
-    ok
+
+    // Under the page controls, so its pane never paints over them; it then comes last in the
+    // Tab order too, between Cancel and the first control of the page, as in property sheets.
+    let _ = SetWindowPos(
+        tabs,
+        Some(HWND_BOTTOM),
+        0,
+        0,
+        0,
+        0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+    );
+    (ok, pages.into_inner())
+}
+
+/// Shows page `index` (and selects its tab), hides the others; keeps the keyboard focus visible.
+unsafe fn show_page(dlg: HWND, ctx: &Context, index: usize) {
+    LAST_PAGE.store(index, Ordering::Relaxed);
+    let Ok(tabs) = GetDlgItem(Some(dlg), IDC_TABS) else {
+        return;
+    };
+    SendMessageW(tabs, TCM_SETCURSEL, Some(WPARAM(index)), None);
+    for (i, list) in ctx.pages.iter().enumerate() {
+        let show = if i == index { SW_SHOWNA } else { SW_HIDE };
+        for &hwnd in list {
+            let _ = ShowWindow(hwnd, show);
+        }
+    }
+    // A hidden control can't keep the focus: hand it to the tab strip.
+    let focus = GetFocus();
+    if focus.is_invalid() || !IsWindowVisible(focus).as_bool() {
+        let _ = SetFocus(Some(tabs));
+    }
+}
+
+/// Ctrl+Tab / Ctrl+Shift+Tab from the modal loop: the next / previous page.
+unsafe fn turn_page(dlg: HWND, ctx: &Context, back: bool) {
+    let current = LAST_PAGE.load(Ordering::Relaxed).min(PAGE_COUNT - 1);
+    let next = if back {
+        (current + PAGE_COUNT - 1) % PAGE_COUNT
+    } else {
+        (current + 1) % PAGE_COUNT
+    };
+    show_page(dlg, ctx, next);
 }
 
 /// Opens the template editor; the result is kept in `ctx` and saved with OK.
@@ -673,6 +758,9 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.photo_background = ctx.background;
     cfg.no_upscale = is_checked(dlg, IDC_NO_UPSCALE);
     cfg.smooth_zoom = is_checked(dlg, IDC_SMOOTH_ZOOM);
+    cfg.keep_zoom = is_checked(dlg, IDC_KEEP_ZOOM);
+    cfg.skip_raw_twins = is_checked(dlg, IDC_SKIP_RAW_TWINS);
+    cfg.replay_gain = is_checked(dlg, IDC_REPLAY_GAIN);
     cfg.confirm_delete = is_checked(dlg, IDC_CONFIRM_DELETE);
     cfg.resume_video = is_checked(dlg, IDC_RESUME_VIDEO);
     cfg.seek_step_sec = selected(dlg, IDC_SEEK_STEP, &ctx.seek_steps).unwrap_or(cfg.seek_step_sec);
@@ -788,6 +876,20 @@ unsafe extern "system" fn wnd_proc(
                 SetBkColor(hdc, COLORREF(ctx.background));
                 SetTextColor(hdc, COLORREF(ctx.color));
                 LRESULT(ctx.background_brush.0 .0 as isize)
+            }
+            WM_NOTIFY => {
+                let header = &*(lparam.0 as *const NMHDR);
+                if header.idFrom == IDC_TABS as usize && header.code == TCN_SELCHANGE {
+                    let index = SendMessageW(header.hwndFrom, TCM_GETCURSEL, None, None).0;
+                    if let Ok(index) = usize::try_from(index) {
+                        show_page(hwnd, ctx, index);
+                    }
+                }
+                LRESULT(0)
+            }
+            dialog::WM_TURN_PAGE => {
+                turn_page(hwnd, ctx, wparam.0 != 0);
+                LRESULT(1)
             }
             WM_COMMAND => {
                 match dialog::loword(wparam) as i32 {

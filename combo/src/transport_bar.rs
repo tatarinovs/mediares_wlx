@@ -24,6 +24,8 @@ const ERROR_TEXT: u32 = 0x006060FF;
 /// Slider label over the filled part (the light [`FILL`]).
 const TEXT_ON_FILL: u32 = 0x00202020;
 const ERROR_ON_FILL: u32 = 0x000000A0;
+/// The ends of an A-B loop (orange).
+const LOOP_MARK: u32 = 0x0000A5FF;
 /// Height of the slider strips, which hold their label inside.
 const STRIP_HEIGHT: f32 = 18.0;
 /// Up / Down step for audio, which has no key frames.
@@ -165,6 +167,16 @@ pub fn bar_state(t: &dyn Transport, known_duration: f64) -> BarState {
         volume: t.volume(),
         muted: t.is_muted(),
     }
+}
+
+/// What is marked along the timeline, in seconds.
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct Marks {
+    /// Chapter starts (the first one, at 0, isn't drawn).
+    pub chapters: Vec<f64>,
+    /// Ends of the A-B loop set so far.
+    pub loop_a: Option<f64>,
+    pub loop_b: Option<f64>,
 }
 
 #[derive(Clone, Copy, Default, Debug, PartialEq)]
@@ -353,6 +365,11 @@ impl BarControl {
         self.drag.is_some()
     }
 
+    /// True while the timeline is being dragged.
+    pub fn is_dragging_timeline(&self) -> bool {
+        matches!(self.drag, Some(BarDrag::Timeline { .. }))
+    }
+
     /// Returns whether anything changed.
     pub fn mouse_move(
         &mut self,
@@ -466,6 +483,32 @@ pub enum Message<'a> {
     Info(&'a str),
 }
 
+/// Chapter starts as gaps across the timeline strip, the A-B loop as orange ticks through it.
+unsafe fn paint_marks(dc: HDC, r: RECT, duration: f64, marks: &Marks, dpi_scale: f32) {
+    let s = |v: f32| (v * dpi_scale).round() as i32;
+    let width = s(2.0).max(1);
+    let height = s(STRIP_HEIGHT);
+    let top = (r.top + r.bottom - height) / 2;
+    // A line `width` wide at `seconds`, reaching `overhang` beyond the strip on both sides.
+    let mark = |seconds: f64, overhang: i32, color: u32| {
+        let fraction = (seconds / duration).clamp(0.0, 1.0);
+        let left = r.left + ((r.right - r.left) as f64 * fraction).round() as i32 - width / 2;
+        let line = RECT {
+            left,
+            right: left + width,
+            top: top - overhang,
+            bottom: top + height + overhang,
+        };
+        fill(dc, line, color);
+    };
+    for &start in marks.chapters.iter().filter(|&&t| t > 0.0 && t < duration) {
+        mark(start, 0, BG);
+    }
+    for end in [marks.loop_a, marks.loop_b].into_iter().flatten() {
+        mark(end, s(4.0), LOOP_MARK);
+    }
+}
+
 /// Slider strip through the middle of `r` (the timeline, the volume), filled up to `value`
 /// (0..=1), with `label` inside: light over the track and dark over the filled part, so it reads
 /// on both.
@@ -527,6 +570,7 @@ pub unsafe fn paint(
     dc: HDC,
     l: &Layout,
     state: &BarState,
+    marks: &Marks,
     font: HFONT,
     message: Message<'_>,
     dpi_scale: f32,
@@ -555,6 +599,9 @@ pub unsafe fn paint(
         0.0
     };
     strip(dc, l.timeline, progress, message, DT_LEFT, dpi_scale);
+    if state.duration > 0.0 {
+        paint_marks(dc, l.timeline, state.duration, marks, dpi_scale);
+    }
 
     // Speaker: box + cone; a red bar when muted.
     let (sx, sy) = (

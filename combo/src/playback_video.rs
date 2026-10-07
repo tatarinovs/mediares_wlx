@@ -1,15 +1,20 @@
 //! Video playback via `IMFMediaEngine` (video + its audio track, A/V sync handled by MF). Also
 //! the fallback for audio formats the pure-Rust decoder doesn't cover (WMA, Opus, AC3).
 //!
-//! The engine runs in frame-server mode: on each render tick we ask it for the current frame
-//! (`OnVideoStreamTick`) and copy it with `TransferVideoFrame` into our own D3D11 swap chain on
-//! the surface HWND. (The engine's windowed mode binds to the window's composition target and
-//! breaks when the viewer is re-parented for fullscreen.) Engine events arrive on MF worker
+//! The engine runs in frame-server mode: a render thread asks it for the current frame
+//! (`OnVideoStreamTick`) once per desktop composition and copies a new one with
+//! `TransferVideoFrame` into our own D3D11 swap chain on the surface HWND. (The engine's windowed
+//! mode binds to the window's composition target and breaks when the viewer is re-parented for
+//! fullscreen.) Paced by a window timer instead, presents drifted against the display's refresh
+//! and about one frame in twenty never reached the screen. Engine events arrive on MF worker
 //! threads and are forwarded to the viewer as [`WM_MEDIA_EVENT`] (`wparam` = event, `lparam` =
 //! param 1).
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mediares_core::keyframes::KeyPicture;
@@ -25,6 +30,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC,
     D3D11_USAGE_DEFAULT, D3D11_USAGE_STAGING,
 };
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN, DXGI_SAMPLE_DESC,
 };
@@ -36,16 +42,18 @@ use windows::Win32::Graphics::Dxgi::{
 };
 use windows::Win32::Graphics::Gdi::{
     FillRect, GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, BLACK_BRUSH,
-    DIB_RGB_COLORS, HALFTONE, HBRUSH, SRCCOPY,
+    DIB_RGB_COLORS, HALFTONE, HBRUSH, HFONT, SRCCOPY,
 };
 use windows::Win32::Media::MediaFoundation::{
     CLSID_MFMediaEngineClassFactory, IMFAttributes, IMFDXGIDeviceManager, IMFMediaEngine,
     IMFMediaEngineClassFactory, IMFMediaEngineEx, IMFMediaEngineNotify, IMFMediaEngineNotify_Impl,
-    MFCreateAttributes, MFCreateDXGIDeviceManager, MFARGB, MF_MEDIA_ENGINE_CALLBACK,
-    MF_MEDIA_ENGINE_DXGI_MANAGER, MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE,
-    MF_MEDIA_ENGINE_SEEK_MODE_NORMAL, MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT,
+    MFCreateAttributes, MFCreateDXGIDeviceManager, MFMediaType_Audio, MFARGB,
+    MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_DXGI_MANAGER, MF_MEDIA_ENGINE_SEEK_MODE_APPROXIMATE,
+    MF_MEDIA_ENGINE_SEEK_MODE_NORMAL, MF_MEDIA_ENGINE_VIDEO_OUTPUT_FORMAT, MF_MT_MAJOR_TYPE,
+    MF_SD_LANGUAGE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Variant::{VT_CLSID, VT_LPWSTR};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::transport_bar::{clamp_to_duration, Transport};
@@ -88,8 +96,26 @@ struct Output {
 #[derive(Clone, Copy)]
 pub struct Osd<'a> {
     pub text: &'a str,
-    pub font: windows::Win32::Graphics::Gdi::HFONT,
+    pub font: HFONT,
     pub color: u32,
+}
+
+/// [`Osd`] handed over to the render thread.
+#[derive(PartialEq)]
+struct OwnedOsd {
+    text: String,
+    font: HFONT,
+    color: u32,
+}
+
+impl OwnedOsd {
+    fn borrowed(&self) -> Osd<'_> {
+        Osd {
+            text: &self.text,
+            font: self.font,
+            color: self.color,
+        }
+    }
 }
 
 impl Output {
@@ -206,7 +232,7 @@ unsafe fn create_device() -> windows::core::Result<ID3D11Device> {
     };
     let device =
         try_driver(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| try_driver(D3D_DRIVER_TYPE_WARP))?;
-    // The media engine uses the device from its own threads.
+    // The media engine and our render thread use the device from their own threads.
     if let Ok(mt) = device.cast::<ID3D11Multithread>() {
         let _ = mt.SetMultithreadProtected(true);
     }
@@ -249,19 +275,172 @@ struct Preview {
     ending: bool,
 }
 
-/// Field order matters: the engine is released before the output and COM.
+/// The output and what decides what goes on it, shared by the viewer and the render thread.
+struct Screen {
+    out: Output,
+    /// After an exact seek: it decodes from the key frame before the target, and the engine
+    /// hands out those frames on the way; showing them flashes an older picture first.
+    hold: Option<Hold>,
+    /// A picture decoded outside the engine, shown instead of its frames (see
+    /// [`VideoPlayer::show_picture`]).
+    preview: Option<Preview>,
+    /// The OSD to draw on the frames.
+    osd: Option<OwnedOsd>,
+}
+
+/// What the render thread needs. The engine is used from both threads: in frame-server mode it
+/// is meant to be (Microsoft's own sample renders on a thread of its own); the D3D device is
+/// multithread-protected.
+struct Shared {
+    engine: IMFMediaEngine,
+    screen: Mutex<Screen>,
+    stop: AtomicBool,
+}
+
+// SAFETY: the engine is free-threaded, and everything else is used under the `screen` lock.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Screen> {
+        self.screen.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// Composition ticks shorter than this mean the desktop isn't composing (a minimized window,
+/// some remote sessions): `DwmFlush` returns at once.
+const MIN_COMPOSITION_TICK: Duration = Duration::from_millis(2);
+/// The pace without composition.
+const FALLBACK_TICK: Duration = Duration::from_millis(10);
+
+/// Presents the engine's frames, once per desktop composition, until told to stop.
+fn render_loop(shared: Arc<Shared>) {
+    let _com = ComScope::new();
+    let mut quick = 0;
+    while !shared.stop.load(Ordering::Relaxed) {
+        let started = Instant::now();
+        let composed = unsafe { DwmFlush() }.is_ok();
+        quick = if composed && started.elapsed() >= MIN_COMPOSITION_TICK {
+            0
+        } else {
+            quick + 1
+        };
+        // One quick return happens when called right before a composition.
+        if quick > 2 {
+            std::thread::sleep(FALLBACK_TICK);
+        }
+        if shared.stop.load(Ordering::Relaxed) {
+            break;
+        }
+        let mut screen = shared.lock();
+        unsafe { screen.tick(&shared.engine) };
+    }
+}
+
+impl Screen {
+    /// Presents the engine's frame if there is a new one (or a redraw is pending, or the OSD text
+    /// changed). A preview stands in while there is none to show.
+    unsafe fn tick(&mut self, engine: &IMFMediaEngine) {
+        let osd_changed = self.out.last_osd.as_deref() != self.osd.as_ref().map(|o| &*o.text);
+        let (previewing, ending) = match &self.preview {
+            Some(p) => (!p.ending, p.ending),
+            None => (false, false),
+        };
+        // The engine's frames are pulled under a preview too: that is what carries its seeks
+        // through (one may be under way to where an earlier preview settled).
+        let frame = self
+            .presentable_frame(engine, self.out.dirty && !previewing && !ending)
+            .filter(|_| !previewing);
+        let osd = self.osd.as_ref().map(OwnedOsd::borrowed);
+        match frame {
+            Some(pts) => {
+                if (self.out.last_pts != Some(pts) || self.out.dirty || osd_changed)
+                    && present_frame(engine, &mut self.out, pts, osd)
+                {
+                    self.preview = None;
+                }
+            }
+            None => {
+                if let Some(preview) = &self.preview {
+                    if self.out.dirty || osd_changed {
+                        present_picture(&mut self.out, &preview.picture, osd);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The time of the engine's current frame if it may be shown. While seeking there is none:
+    /// presenting would flash a blank picture, and callers would take it for the seek's frame;
+    /// only a `redraw` (resize) shows the one the engine still holds after an approximate seek.
+    /// After an exact seek, nothing before the target's frame (see [`Hold`]).
+    unsafe fn presentable_frame(&mut self, engine: &IMFMediaEngine, redraw: bool) -> Option<i64> {
+        let pts = engine.OnVideoStreamTick().ok()?;
+        if engine.IsSeeking().as_bool() {
+            if let Some(hold) = &mut self.hold {
+                // The timeout runs from the end of the seek: slow sources take seconds.
+                hold.since = Instant::now();
+                return None;
+            }
+            return (redraw && pts != NO_FRAME).then_some(pts);
+        }
+        if let Some(hold) = self.hold {
+            if pts < hold.earliest && hold.since.elapsed() < HOLD_TIMEOUT {
+                return None;
+            }
+            self.hold = None;
+        }
+        Some(pts)
+    }
+}
+
+/// Transfers the engine's frame to the screen; false if it failed.
+unsafe fn present_frame(
+    engine: &IMFMediaEngine,
+    out: &mut Output,
+    pts: i64,
+    osd: Option<Osd<'_>>,
+) -> bool {
+    let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else {
+        return false;
+    };
+    let dst = RECT {
+        left: 0,
+        top: 0,
+        right: out.size.0 as i32,
+        bottom: out.size.1 as i32,
+    };
+    let black = MFARGB {
+        rgbBlue: 0,
+        rgbGreen: 0,
+        rgbRed: 0,
+        rgbAlpha: 255,
+    };
+    if engine
+        .TransferVideoFrame(&back_buffer, None, &dst, Some(&black))
+        .is_err()
+    {
+        return false;
+    }
+    drop(back_buffer);
+    if let Some(osd) = &osd {
+        draw_osd(&out.swap_chain, osd);
+    }
+    let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
+    out.last_pts = Some(pts);
+    out.dirty = false;
+    out.last_osd = osd.map(|o| o.text.to_string());
+    true
+}
+
+/// Field order matters: the engine is released before the device manager and COM.
 pub struct VideoPlayer {
     engine: IMFMediaEngine,
     engine_ex: Option<IMFMediaEngineEx>,
-    /// After an exact seek: it decodes from the key frame before the target, and the engine
-    /// hands out those frames on the way; showing them flashes an older picture first.
-    hold: Cell<Option<Hold>>,
     /// Frame length of the current file (see [`Self::set_frame_rate`]).
     frame: Cell<f64>,
-    /// A picture decoded outside the engine, shown instead of its frames (see
-    /// [`Self::show_picture`]).
-    preview: RefCell<Option<Preview>>,
-    output: RefCell<Output>,
+    shared: Arc<Shared>,
+    renderer: Option<JoinHandle<()>>,
     _manager: IMFDXGIDeviceManager,
     _com: ComScope,
 }
@@ -297,23 +476,46 @@ impl VideoPlayer {
 
         let engine = factory.CreateInstance(0, &attributes)?;
         let engine_ex = engine.cast::<IMFMediaEngineEx>().ok();
+        let shared = Arc::new(Shared {
+            engine: engine.clone(),
+            screen: Mutex::new(Screen {
+                out: output,
+                hold: None,
+                preview: None,
+                osd: None,
+            }),
+            stop: AtomicBool::new(false),
+        });
+        let renderer = {
+            let shared = shared.clone();
+            std::thread::Builder::new()
+                .name("mediares-video-render".into())
+                .spawn(move || render_loop(shared))
+                .map_err(|_| windows::core::Error::from(E_FAIL))?
+        };
         Ok(Self {
             engine,
             engine_ex,
-            output: RefCell::new(output),
-            hold: Cell::new(None),
             frame: Cell::new(FALLBACK_FRAME_SEC),
-            preview: RefCell::new(None),
+            shared,
+            renderer: Some(renderer),
             _manager: manager,
             _com: com,
         })
     }
 
+    fn screen(&self) -> MutexGuard<'_, Screen> {
+        self.shared.lock()
+    }
+
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
     pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
-        self.output.borrow_mut().last_pts = None;
-        self.hold.set(None);
-        self.preview.borrow_mut().take();
+        {
+            let mut screen = self.screen();
+            screen.out.last_pts = None;
+            screen.hold = None;
+            screen.preview = None;
+        }
         self.engine
             .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
         self.engine.Play()
@@ -322,121 +524,40 @@ impl VideoPlayer {
     /// Shows `picture` instead of the engine's frames until [`Self::end_preview`]: the viewer
     /// shows key frames it decoded itself where the engine's seeks take seconds.
     pub fn show_picture(&self, picture: KeyPicture) {
-        *self.preview.borrow_mut() = Some(Preview {
+        let mut screen = self.screen();
+        screen.preview = Some(Preview {
             picture,
             ending: false,
         });
-        if let Ok(mut out) = self.output.try_borrow_mut() {
-            out.dirty = true;
-        }
+        screen.out.dirty = true;
     }
 
     /// Back to the engine's frames. The picture stays on screen until the engine has one (it may
     /// not even have been drawn yet: a click on the timeline ends its preview at once).
     pub fn end_preview(&self) {
-        if let Some(preview) = self.preview.borrow_mut().as_mut() {
+        if let Some(preview) = self.screen().preview.as_mut() {
             preview.ending = true;
         }
     }
 
-    /// Render tick: presents the engine's frame if there is a new one (or a redraw is pending, or
-    /// the OSD text changed). A preview stands in while there is none to show.
+    /// The viewer's render tick: the OSD for the frames from now on (the render thread draws
+    /// them).
     pub unsafe fn render(&self, osd: Option<Osd<'_>>) {
-        let Ok(mut out) = self.output.try_borrow_mut() else {
-            return;
-        };
-        let osd_changed = out.last_osd.as_deref() != osd.as_ref().map(|o| o.text);
-        let (previewing, ending) = match self.preview.borrow().as_ref() {
-            Some(p) => (!p.ending, p.ending),
-            None => (false, false),
-        };
-        // The engine's frames are pulled under a preview too: that is what carries its seeks
-        // through (one may be under way to where an earlier preview settled).
-        let frame = self
-            .presentable_frame(out.dirty && !previewing && !ending)
-            .filter(|_| !previewing);
-        match frame {
-            Some(pts) => {
-                if (out.last_pts != Some(pts) || out.dirty || osd_changed)
-                    && self.present_frame(&mut out, pts, osd)
-                {
-                    self.preview.borrow_mut().take();
-                }
-            }
-            None => {
-                if let Some(preview) = self.preview.borrow().as_ref() {
-                    if out.dirty || osd_changed {
-                        present_picture(&mut out, &preview.picture, osd);
-                    }
-                }
-            }
+        let osd = osd.map(|o| OwnedOsd {
+            text: o.text.to_string(),
+            font: o.font,
+            color: o.color,
+        });
+        let mut screen = self.screen();
+        if screen.osd != osd {
+            screen.osd = osd;
         }
-    }
-
-    /// The time of the engine's current frame if it may be shown. While seeking there is none:
-    /// presenting would flash a blank picture, and callers would take it for the seek's frame;
-    /// only a `redraw` (resize) shows the one the engine still holds after an approximate seek.
-    /// After an exact seek, nothing before the target's frame (see [`Hold`]).
-    unsafe fn presentable_frame(&self, redraw: bool) -> Option<i64> {
-        let pts = self.engine.OnVideoStreamTick().ok()?;
-        if self.engine.IsSeeking().as_bool() {
-            if let Some(hold) = self.hold.get() {
-                // The timeout runs from the end of the seek: slow sources take seconds.
-                self.hold.set(Some(Hold {
-                    since: Instant::now(),
-                    ..hold
-                }));
-                return None;
-            }
-            return (redraw && pts != NO_FRAME).then_some(pts);
-        }
-        if let Some(hold) = self.hold.get() {
-            if pts < hold.earliest && hold.since.elapsed() < HOLD_TIMEOUT {
-                return None;
-            }
-            self.hold.set(None);
-        }
-        Some(pts)
-    }
-
-    /// Transfers the engine's frame to the screen; false if it failed.
-    unsafe fn present_frame(&self, out: &mut Output, pts: i64, osd: Option<Osd<'_>>) -> bool {
-        let Ok(back_buffer) = out.swap_chain.GetBuffer::<ID3D11Texture2D>(0) else {
-            return false;
-        };
-        let dst = RECT {
-            left: 0,
-            top: 0,
-            right: out.size.0 as i32,
-            bottom: out.size.1 as i32,
-        };
-        let black = MFARGB {
-            rgbBlue: 0,
-            rgbGreen: 0,
-            rgbRed: 0,
-            rgbAlpha: 255,
-        };
-        if self
-            .engine
-            .TransferVideoFrame(&back_buffer, None, &dst, Some(&black))
-            .is_err()
-        {
-            return false;
-        }
-        drop(back_buffer);
-        if let Some(osd) = &osd {
-            draw_osd(&out.swap_chain, osd);
-        }
-        let _ = out.swap_chain.Present(0, DXGI_PRESENT(0));
-        out.last_pts = Some(pts);
-        out.dirty = false;
-        out.last_osd = osd.map(|o| o.text.to_string());
-        true
     }
 
     /// Resizes the swap chain to the surface's new client size.
     pub unsafe fn resize(&self, width: i32, height: i32) {
-        let mut out = self.output.borrow_mut();
+        let mut screen = self.screen();
+        let out = &mut screen.out;
         let size = (width.max(1) as u32, height.max(1) as u32);
         if size != out.size
             && out
@@ -467,8 +588,8 @@ impl VideoPlayer {
     /// The current frame at its native size, as top-down BGRA rows.
     pub unsafe fn capture_frame(&self) -> Option<(u32, u32, Vec<u8>)> {
         let (width, height) = self.native_size()?;
-        let out = self.output.try_borrow().ok()?;
-        let device = &out.device;
+        let screen = self.screen();
+        let device = &screen.out.device;
         let mut desc = D3D11_TEXTURE2D_DESC {
             Width: width,
             Height: height,
@@ -555,7 +676,7 @@ impl VideoPlayer {
 
     /// Timestamp of the frame last put on screen.
     pub fn presented_pts(&self) -> Option<i64> {
-        self.output.try_borrow().ok()?.last_pts
+        self.screen().out.last_pts
     }
 
     /// Frame rate of the file being opened (0 if unknown).
@@ -567,9 +688,49 @@ impl VideoPlayer {
     pub unsafe fn error_code(&self) -> Option<u16> {
         self.engine.GetError().ok().map(|e| e.GetErrorCode())
     }
+
+    /// Switches to the next audio track of the file: its number (from 1), the count and its
+    /// language. `None` when there is only one.
+    pub unsafe fn cycle_audio_track(&self) -> Option<(usize, usize, Option<String>)> {
+        let ex = self.engine_ex.as_ref()?;
+        let streams = ex.GetNumberOfStreams().ok()?;
+        let audio: Vec<u32> = (0..streams)
+            .filter(|&i| stream_major_type(ex, i) == Some(MFMediaType_Audio))
+            .collect();
+        if audio.len() < 2 {
+            return None;
+        }
+        let current = audio
+            .iter()
+            .position(|&i| ex.GetStreamSelection(i).is_ok_and(|on| on.as_bool()))
+            .unwrap_or(0);
+        let next = (current + 1) % audio.len();
+        for (k, &i) in audio.iter().enumerate() {
+            let _ = ex.SetStreamSelection(i, k == next);
+        }
+        ex.ApplyStreamSelections().ok()?;
+        Some((next + 1, audio.len(), stream_language(ex, audio[next])))
+    }
 }
 
-// Engine calls are plain COM calls on the thread that created the player (the viewer's).
+unsafe fn stream_major_type(ex: &IMFMediaEngineEx, stream: u32) -> Option<windows::core::GUID> {
+    let value = ex.GetStreamAttribute(stream, &MF_MT_MAJOR_TYPE).ok()?;
+    let inner = &value.Anonymous.Anonymous;
+    (inner.vt == VT_CLSID && !inner.Anonymous.puuid.is_null()).then(|| *inner.Anonymous.puuid)
+}
+
+/// The stream's language tag ("eng", "rus"...), if the container names it.
+unsafe fn stream_language(ex: &IMFMediaEngineEx, stream: u32) -> Option<String> {
+    let value = ex.GetStreamAttribute(stream, &MF_SD_LANGUAGE).ok()?;
+    let inner = &value.Anonymous.Anonymous;
+    if inner.vt != VT_LPWSTR || inner.Anonymous.pwszVal.is_null() {
+        return None;
+    }
+    let text = inner.Anonymous.pwszVal.to_string().ok()?;
+    Some(text).filter(|t| !t.trim().is_empty())
+}
+
+// Playback control: plain engine calls on the viewer's thread.
 impl Transport for VideoPlayer {
     fn is_playing(&self) -> bool {
         unsafe { !self.engine.IsPaused().as_bool() && !self.engine.IsEnded().as_bool() }
@@ -599,10 +760,10 @@ impl Transport for VideoPlayer {
         let t = clamp_to_duration(seconds, self.duration());
         // The frame showing at `t` starts up to a frame earlier; the one before it, and the
         // frames decoded on the way from the key frame, start earlier still.
-        self.hold.set((!approximate).then(|| Hold {
+        self.screen().hold = (!approximate).then(|| Hold {
             earliest: ((t - self.frame.get() + 0.001) * 1e7) as i64,
             since: Instant::now(),
-        }));
+        });
         unsafe {
             match &self.engine_ex {
                 Some(ex) => {
@@ -643,6 +804,11 @@ impl Transport for VideoPlayer {
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        // The render thread stops within a composition tick, before the engine shuts down.
+        self.shared.stop.store(true, Ordering::Relaxed);
+        if let Some(renderer) = self.renderer.take() {
+            let _ = renderer.join();
+        }
         // Breaks the engine's internal reference cycles and stops events.
         unsafe {
             let _ = self.engine.Shutdown();

@@ -351,11 +351,23 @@ unsafe fn get_string(api: &Api, handle: Handle, name: &str) -> Option<String> {
 /// How long reading a file's streams may take.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// A file opened by mpv's demuxer, nothing decoded: its streams, for files Media Foundation can't
-/// open.
-struct Probe {
+/// Reads the properties of a file mpv has loaded.
+#[derive(Clone, Copy)]
+struct Props {
     api: &'static Api,
     handle: Handle,
+}
+
+/// A file opened by mpv's demuxer, nothing decoded: its streams, for files Media Foundation can't
+/// open.
+struct Probe(Props);
+
+impl std::ops::Deref for Probe {
+    type Target = Props;
+
+    fn deref(&self) -> &Props {
+        &self.0
+    }
 }
 
 impl Probe {
@@ -371,7 +383,7 @@ impl Probe {
                     ("idle", "yes"),
                 ],
             )?;
-            let probe = Self { api, handle };
+            let probe = Self(Props { api, handle });
             if !command(api, handle, &["loadfile", &path.to_string_lossy()]) {
                 return None;
             }
@@ -386,7 +398,9 @@ impl Probe {
             }
         }
     }
+}
 
+impl Props {
     fn f64(&self, name: &str) -> Option<f64> {
         unsafe { get_f64(self.api, self.handle, name) }
     }
@@ -425,7 +439,7 @@ impl Probe {
 
 impl Drop for Probe {
     fn drop(&mut self) {
-        unsafe { (self.api.terminate_destroy)(self.handle) };
+        unsafe { (self.0.api.terminate_destroy)(self.0.handle) };
     }
 }
 
@@ -487,6 +501,11 @@ fn is_lossless(codec: &str) -> bool {
 /// Stream properties of a video Media Foundation can't open.
 pub fn video_meta(path: &Path) -> Option<VideoMeta> {
     let probe = Probe::open(path)?;
+    stream_meta(&probe)
+}
+
+/// Stream properties of the loaded file.
+fn stream_meta(probe: &Props) -> Option<VideoMeta> {
     // RealMedia and the like are often audio only: still worth the duration and codec.
     let video = probe.track("video");
     let audio = probe.track("audio");
@@ -521,8 +540,15 @@ pub fn video_meta(path: &Path) -> Option<VideoMeta> {
             .map(|c| codec_name(&c)),
         audio_channels: audio_prop("demux-channel-count"),
         audio_sample_rate: audio_prop("demux-samplerate"),
-        rotation: None,
-        dynamic_range: None,
+        rotation: video_prop("demux-rotation").and_then(|p| probe.u32(&p)),
+        // Known once a frame is decoded (a playing file); a probe doesn't decode.
+        dynamic_range: probe
+            .string("video-params/gamma")
+            .map(|gamma| match gamma.as_str() {
+                "pq" => "HDR10",
+                "hlg" => "HLG",
+                _ => "SDR",
+            }),
     })
 }
 
@@ -792,6 +818,47 @@ impl MpvPlayer {
         }
     }
 
+    /// Stream properties of the file, once it is loaded (`LOADEDMETADATA`): what Media
+    /// Foundation would report, read from the player instead of opening the file once more.
+    pub fn stream_meta(&self) -> Option<VideoMeta> {
+        stream_meta(&Props {
+            api: self.api,
+            handle: self.handle,
+        })
+    }
+
+    /// Chapters of the loaded file (start in seconds, title), whatever the container.
+    pub fn chapters(&self) -> Vec<(f64, String)> {
+        let count = self.get_i64("chapter-list/count").unwrap_or(0).max(0);
+        (0..count)
+            .filter_map(|i| {
+                let time = self.get_f64(&format!("chapter-list/{i}/time"))?;
+                let title = self
+                    .get_string(&format!("chapter-list/{i}/title"))
+                    .unwrap_or_default();
+                Some((time, title))
+            })
+            .collect()
+    }
+
+    /// Switches to the next audio track: its number (from 1), the count and its language.
+    /// `None` when there is only one.
+    pub fn cycle_audio_track(&self) -> Option<(usize, usize, Option<String>)> {
+        let tracks = self.get_i64("track-list/count").unwrap_or(0).max(0);
+        let audio = (0..tracks)
+            .filter(|i| {
+                self.get_string(&format!("track-list/{i}/type")).as_deref() == Some("audio")
+            })
+            .count();
+        if audio < 2 {
+            return None;
+        }
+        self.command(&["cycle", "audio"]);
+        // `aid` counts the audio tracks from 1.
+        let number = self.get_i64("aid").and_then(|n| usize::try_from(n).ok())?;
+        Some((number, audio, self.get_string("current-tracks/audio/lang")))
+    }
+
     /// Display size (aspect ratio and rotation applied) once the video is decoded.
     pub fn native_size(&self) -> Option<(u32, u32)> {
         let w = self.get_i64("dwidth")?;
@@ -846,6 +913,11 @@ impl MpvPlayer {
             tags.bitrate_kbps = positive("file-size")
                 .map(|bytes| (bytes as f64 * 8.0 / duration / 1000.0).round() as u32);
         }
+    }
+
+    /// Track ReplayGain on or off (mpv reads the tags itself).
+    pub fn set_replay_gain(&self, on: bool) {
+        self.set("replaygain", if on { "track" } else { "no" });
     }
 
     pub fn set_rate(&self, rate: f64) {

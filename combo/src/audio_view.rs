@@ -12,8 +12,9 @@ use mediares_core::audio_tags::{read_tags, AudioTags};
 use mediares_core::probe::MediaType;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
-    DRAW_TEXT_FORMAT, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER,
-    HDC, HFONT,
+    DrawTextW, IntersectClipRect, InvalidateRect, RestoreDC, SaveDC, SelectObject,
+    DRAW_TEXT_FORMAT, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_EXPANDTABS, DT_LEFT, DT_NOPREFIX,
+    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, HDC, HFONT,
 };
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA,
@@ -35,6 +36,8 @@ use crate::video_view::{engine_error_text, is_progress_event, Surface};
 /// Viewer timer that refreshes the bar and notices the end of the track.
 pub const PROGRESS_TIMER_ID: usize = 0x4D53;
 const PROGRESS_INTERVAL_MS: u32 = 200;
+/// The next file of the queue is decoded ahead this long before the end (gapless playback).
+const PRELOAD_BEFORE_END_SEC: f64 = 4.0;
 
 /// Picture files used as album art when the track has none embedded, in order of preference.
 const COVER_STEMS: &[&str] = &["cover", "folder", "front", "albumart", "album"];
@@ -97,7 +100,28 @@ struct Fonts {
     text: Font,
     small: Font,
     note: Font,
+    lyrics: Font,
 }
+
+/// The song text shown in place of the album art.
+#[derive(Default)]
+struct LyricsBox {
+    /// Where it was last painted (client coordinates); empty while the art is shown.
+    rect: RECT,
+    /// Height of the whole text at that width; more than the box: it scrolls.
+    text_height: i32,
+    /// Height the text has inside the box (without the padding).
+    room: i32,
+    /// Scrolled by the wheel: stays put until the next track. Otherwise it follows the playback.
+    manual: Option<i32>,
+    /// The offset last painted, to repaint only when it moved.
+    painted: i32,
+}
+
+/// Room above and below the text inside its box, at 96 DPI.
+const LYRICS_PADDING: f32 = 16.0;
+/// Share of the track at its start and at its end while the text doesn't scroll.
+const LYRICS_HOLD: f64 = 0.1;
 
 pub struct AudioView {
     backend: Backend,
@@ -110,11 +134,18 @@ pub struct AudioView {
     error: Option<String>,
     end_reported: bool,
     fonts: Option<Fonts>,
+    /// Apply the tracks' ReplayGain.
+    replay_gain: bool,
+    /// The next file was asked for (once per track).
+    preload_asked: bool,
+    /// Y: the song text in place of the album art; kept for the next tracks.
+    show_lyrics: bool,
+    lyrics_box: LyricsBox,
 }
 
 impl AudioView {
     /// Starts playing `path`; `None` if neither decoder can play it.
-    pub unsafe fn new(viewer: HWND, path: &Path) -> Option<Self> {
+    pub unsafe fn new(viewer: HWND, path: &Path, replay_gain: bool) -> Option<Self> {
         let backend = Backend::create(viewer, path)?;
         SetTimer(Some(viewer), PROGRESS_TIMER_ID, PROGRESS_INTERVAL_MS, None);
         let mut view = Self {
@@ -127,13 +158,18 @@ impl AudioView {
             error: None,
             end_reported: false,
             fonts: None,
+            replay_gain,
+            preload_asked: false,
+            show_lyrics: false,
+            lyrics_box: LyricsBox::default(),
         };
         view.load_meta(path);
         Some(view)
     }
 
     /// Switches to another file, reusing the output device when possible.
-    pub unsafe fn open(&mut self, path: &Path) -> bool {
+    pub unsafe fn open(&mut self, path: &Path, replay_gain: bool) -> bool {
+        self.replay_gain = replay_gain;
         let reused = match &mut self.backend {
             Backend::Native(player) => player.open(path),
             Backend::Mpv(_) | Backend::Engine { .. } => false,
@@ -167,6 +203,34 @@ impl AudioView {
             .unwrap_or_default();
         self.error = None;
         self.end_reported = false;
+        self.preload_asked = false;
+        self.lyrics_box = LyricsBox::default();
+        self.apply_replay_gain();
+    }
+
+    /// The track's ReplayGain (or none) for the player.
+    fn apply_replay_gain(&self) {
+        match &self.backend {
+            Backend::Native(player) => {
+                let factor = self.tags.replay_gain_factor().filter(|_| self.replay_gain);
+                player.set_track_gain(factor.unwrap_or(1.0));
+            }
+            Backend::Mpv(player) => player.set_replay_gain(self.replay_gain),
+            Backend::Engine { .. } => {}
+        }
+    }
+
+    /// Decodes `path`, the next file of the queue, ahead so it follows without a gap. False if
+    /// the player can't (another sample rate, or not the built-in decoder).
+    pub fn preload(&mut self, path: &Path) -> bool {
+        let Backend::Native(player) = &mut self.backend else {
+            return false;
+        };
+        let gain = self
+            .replay_gain
+            .then(|| read_tags(path, false)?.replay_gain_factor())
+            .flatten();
+        player.preload(path, gain.unwrap_or(1.0))
     }
 
     pub fn transport(&self) -> &dyn Transport {
@@ -209,6 +273,7 @@ impl AudioView {
 
     /// `WM_TIMER` with [`PROGRESS_TIMER_ID`].
     pub fn on_tick(&mut self) -> EventEffect {
+        self.follow_playback();
         let Backend::Native(player) = &self.backend else {
             return EventEffect::None;
         };
@@ -218,6 +283,15 @@ impl AudioView {
         } else if !self.end_reported {
             self.end_reported = true;
             return EventEffect::Ended;
+        }
+        let left = player.duration() - player.position();
+        if !self.preload_asked
+            && player.is_playing()
+            && player.duration() > 0.0
+            && left < PRELOAD_BEFORE_END_SEC
+        {
+            self.preload_asked = true;
+            return EventEffect::PreloadNext;
         }
         if player.is_playing() {
             EventEffect::RepaintBar
@@ -246,7 +320,10 @@ impl AudioView {
                 }
                 EventEffect::Relayout
             }
-            e if is_progress_event(e) => EventEffect::RepaintBar,
+            e if is_progress_event(e) => {
+                self.follow_playback();
+                EventEffect::RepaintBar
+            }
             _ => EventEffect::None,
         }
     }
@@ -262,6 +339,7 @@ impl AudioView {
                     text: gdi::create_font("Segoe UI", px(17.0), false),
                     small: gdi::create_font("Segoe UI", px(13.0), false),
                     note: gdi::create_font("Segoe UI Symbol", px(96.0), false),
+                    lyrics: gdi::create_font("Segoe UI", px(15.0), false),
                 }
             });
         }
@@ -287,8 +365,13 @@ impl AudioView {
         let lines = self.text_lines();
         let cover = self.cover.clone();
         let fonts = self.fonts(scale);
-        let (title_font, text_font, small_font, note_font) =
-            (fonts.title.0, fonts.text.0, fonts.small.0, fonts.note.0);
+        let (title_font, text_font, small_font, note_font, lyrics_font) = (
+            fonts.title.0,
+            fonts.text.0,
+            fonts.small.0,
+            fonts.note.0,
+            fonts.lyrics.0,
+        );
         let line_h = |kind: LineKind| match kind {
             LineKind::Title => s(34.0),
             LineKind::Text => s(26.0),
@@ -300,10 +383,16 @@ impl AudioView {
         let wide = w as f32 > h as f32 * 1.4;
         let (art, text_rect, align) = if wide {
             let side = h.min(w * 2 / 5);
+            // Lines of a song text want more width than a square gives.
+            let width = if self.shown_lyrics().is_some() {
+                side.max(w / 2)
+            } else {
+                side
+            };
             let art = RECT {
                 left: inner.left,
                 top: inner.top + (h - side) / 2,
-                right: inner.left + side,
+                right: inner.left + width,
                 bottom: inner.top + (h - side) / 2 + side,
             };
             let top = inner.top + (h - text_h).max(0) / 2;
@@ -342,7 +431,11 @@ impl AudioView {
             )
         };
 
-        if art.right > art.left {
+        let lyrics = self.shown_lyrics().map(str::to_owned);
+        self.lyrics_box.rect = RECT::default();
+        if let (Some(lyrics), true) = (&lyrics, art.right > art.left) {
+            self.paint_lyrics(dc, art, lyrics, lyrics_font, s(LYRICS_PADDING));
+        } else if art.right > art.left {
             match &cover {
                 Some(img) => draw_fitted(dc, img, art, smooth),
                 None => {
@@ -394,7 +487,127 @@ impl AudioView {
             .collect::<Vec<_>>()
             .join(" · ");
         lines.push((format, LineKind::Small));
+        if t.lyrics.is_some() {
+            let hint = if self.show_lyrics {
+                tr("Album art: Y")
+            } else {
+                tr("Lyrics: Y")
+            };
+            lines.push((hint.to_string(), LineKind::Small));
+        }
         lines
+    }
+
+    /// Y: the song text in place of the album art and back. False if the tags hold no text.
+    pub fn toggle_lyrics(&mut self) -> bool {
+        if self.tags.lyrics.is_none() {
+            return false;
+        }
+        self.show_lyrics = !self.show_lyrics;
+        true
+    }
+
+    /// The song text, while it is shown in place of the album art.
+    fn shown_lyrics(&self) -> Option<&str> {
+        self.tags.lyrics.as_deref().filter(|_| self.show_lyrics)
+    }
+
+    /// The text box in the art's square `art`; scrolled to the playback position (or the wheel's).
+    unsafe fn paint_lyrics(&mut self, dc: HDC, art: RECT, lyrics: &str, font: HFONT, pad: i32) {
+        fill(dc, art, PLACEHOLDER);
+        let inner = RECT {
+            left: art.left + pad,
+            top: art.top + pad,
+            right: art.right - pad,
+            bottom: art.bottom - pad,
+        };
+        if inner.right <= inner.left || inner.bottom <= inner.top {
+            return;
+        }
+        let flags = DT_CENTER | DT_WORDBREAK | DT_NOPREFIX | DT_EXPANDTABS;
+        let mut wide: Vec<u16> = lyrics.encode_utf16().collect();
+        let mut measured = inner;
+        let old = SelectObject(dc, font.into());
+        DrawTextW(dc, &mut wide, &mut measured, flags | DT_CALCRECT);
+        SelectObject(dc, old);
+        let text_height = measured.bottom - measured.top;
+        let room = inner.bottom - inner.top;
+
+        let lb = &mut self.lyrics_box;
+        lb.rect = art;
+        lb.text_height = text_height;
+        lb.room = room;
+        let offset = self.lyrics_offset();
+        self.lyrics_box.painted = offset;
+        // Short texts sit in the middle of the box.
+        let top = if text_height < room {
+            inner.top + (room - text_height) / 2
+        } else {
+            inner.top - offset
+        };
+        let r = RECT {
+            top,
+            bottom: top + text_height,
+            ..inner
+        };
+        let saved = SaveDC(dc);
+        IntersectClipRect(dc, inner.left, inner.top, inner.right, inner.bottom);
+        gdi::text(dc, r, lyrics, Some(font), TEXT_COLOR, flags);
+        let _ = RestoreDC(dc, saved);
+    }
+
+    /// How far the text can scroll: its height beyond the box.
+    fn lyrics_offset_limit(&self) -> i32 {
+        let lb = &self.lyrics_box;
+        (lb.text_height - lb.room).max(0)
+    }
+
+    /// How far the text is scrolled: the wheel's choice, else in step with the playback.
+    fn lyrics_offset(&self) -> i32 {
+        let limit = self.lyrics_offset_limit();
+        if let Some(manual) = self.lyrics_box.manual {
+            return manual.clamp(0, limit);
+        }
+        let transport = self.transport();
+        let duration = transport.duration().max(self.known_duration());
+        if limit == 0 || duration <= 0.0 {
+            return 0;
+        }
+        // The first screen stays for the intro, the last one for the outro.
+        let progress = (transport.position() / duration - LYRICS_HOLD) / (1.0 - 2.0 * LYRICS_HOLD);
+        let progress = progress.clamp(0.0, 1.0);
+        (f64::from(limit) * progress).round() as i32
+    }
+
+    /// Repaints the text box once the playback has moved the text by a pixel.
+    fn follow_playback(&self) {
+        let lb = &self.lyrics_box;
+        if lb.rect.right <= lb.rect.left || lb.manual.is_some() {
+            return;
+        }
+        if self.lyrics_offset() != lb.painted {
+            unsafe {
+                let _ = InvalidateRect(Some(self.viewer), Some(&lb.rect), false);
+            }
+        }
+    }
+
+    /// The wheel over the text box scrolls it (`delta` as `WM_MOUSEWHEEL` gives it). False if the
+    /// point isn't over a text that scrolls: the wheel then does what it does elsewhere.
+    pub fn scroll_lyrics(&mut self, x: i32, y: i32, delta: i16) -> bool {
+        let r = self.lyrics_box.rect;
+        let over = x >= r.left && x < r.right && y >= r.top && y < r.bottom;
+        if !over || self.lyrics_offset_limit() == 0 {
+            return false;
+        }
+        let current = self.lyrics_offset();
+        // A notch scrolls a sixth of the box.
+        let step = -i32::from(delta) * (self.lyrics_box.room / 6).max(1) / 120;
+        self.lyrics_box.manual = Some((current + step).clamp(0, self.lyrics_offset_limit()));
+        unsafe {
+            let _ = InvalidateRect(Some(self.viewer), Some(&r), false);
+        }
+        true
     }
 }
 

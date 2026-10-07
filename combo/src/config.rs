@@ -172,10 +172,16 @@ pub struct ViewerConfig {
     pub no_upscale: bool,
     /// Enlarged photos and album art are smoothed (bicubic) instead of showing square pixels.
     pub smooth_zoom: bool,
+    /// Zoomed in, the next photo shows the same place at the same zoom (comparing a series).
+    pub keep_zoom: bool,
+    /// Navigation passes over RAW files whose JPEG (or HEIC) of the same name is in the folder.
+    pub skip_raw_twins: bool,
     /// Ask before Del moves the file to the Recycle Bin.
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
     pub resume_video: bool,
+    /// Audio plays at the loudness its ReplayGain tags ask for.
+    pub replay_gain: bool,
     /// Left / Right arrow step, seconds.
     pub seek_step_sec: u32,
     pub frame_format: PictureFormat,
@@ -207,8 +213,11 @@ impl Default for ViewerConfig {
             photo_background: crate::image_cache::BACKGROUND,
             no_upscale: false,
             smooth_zoom: true,
+            keep_zoom: false,
+            skip_raw_twins: false,
             confirm_delete: true,
             resume_video: true,
+            replay_gain: false,
             seek_step_sec: 5,
             frame_format: PictureFormat::Png,
             photo_editor: String::new(),
@@ -303,8 +312,11 @@ impl ViewerConfig {
                 & 0x00FF_FFFF,
             no_upscale: int(w!("NoUpscale"), d.no_upscale as i32) != 0,
             smooth_zoom: int(w!("SmoothZoom"), d.smooth_zoom as i32) != 0,
+            keep_zoom: int(w!("KeepZoom"), d.keep_zoom as i32) != 0,
+            skip_raw_twins: int(w!("SkipRawTwins"), d.skip_raw_twins as i32) != 0,
             confirm_delete: int(w!("ConfirmDelete"), d.confirm_delete as i32) != 0,
             resume_video: int(w!("ResumeVideo"), d.resume_video as i32) != 0,
+            replay_gain: int(w!("ReplayGain"), d.replay_gain as i32) != 0,
             seek_step_sec: int(w!("SeekStep"), d.seek_step_sec as i32)
                 .clamp(SEEK_STEP_RANGE.0, SEEK_STEP_RANGE.1) as u32,
             frame_format: PictureFormat::from_ini(&string(w!("FrameFormat"), "")),
@@ -323,7 +335,7 @@ impl ViewerConfig {
     }
 
     /// The settings as INI key / value pairs.
-    fn entries(&self) -> [(PCWSTR, String); 27] {
+    fn entries(&self) -> [(PCWSTR, String); 30] {
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
         [
             (w!("Language"), self.language.to_ini().to_string()),
@@ -344,8 +356,11 @@ impl ViewerConfig {
             (w!("PhotoBackground"), self.photo_background.to_string()),
             (w!("NoUpscale"), flag(self.no_upscale)),
             (w!("SmoothZoom"), flag(self.smooth_zoom)),
+            (w!("KeepZoom"), flag(self.keep_zoom)),
+            (w!("SkipRawTwins"), flag(self.skip_raw_twins)),
             (w!("ConfirmDelete"), flag(self.confirm_delete)),
             (w!("ResumeVideo"), flag(self.resume_video)),
+            (w!("ReplayGain"), flag(self.replay_gain)),
             (w!("SeekStep"), self.seek_step_sec.to_string()),
             (w!("FrameFormat"), self.frame_format.extension().to_string()),
             (w!("PhotoEditor"), self.photo_editor.clone()),

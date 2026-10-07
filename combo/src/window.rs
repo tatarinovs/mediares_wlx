@@ -31,15 +31,17 @@ use mediares_core::tc_api::{
 };
 
 use crate::config::ViewerConfig;
+use crate::contact_sheet::WM_CONTACT_SHEET;
 use crate::i18n::{n, tr};
 use crate::image_cache::WM_IMAGE_READY;
-use crate::image_view::{self, client_size, point_from_lparam};
+use crate::image_view::{self, point_from_lparam, view_size};
 use crate::media_view::EventEffect;
 use crate::menu_theme::{self, ThemedMenu};
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
 use crate::playback_video::WM_MEDIA_EVENT;
 use crate::playlist::Repeat;
-use crate::state::{Arrived, Drag, ViewerState, ZoomMode};
+use crate::seek_preview::WM_SEEK_PREVIEW;
+use crate::state::{Arrived, Drag, ViewerState, ZoomMode, WM_DIR_SCANNED};
 use crate::transport_bar::Click;
 use crate::{
     config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template, save_as,
@@ -48,6 +50,8 @@ use crate::{
 use mediares_core::exif::read_orientation;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
+/// `TrackMouseEvent` reports the cursor leaving (in `windows` only with the Controls feature).
+const WM_MOUSELEAVE: u32 = 0x02A3;
 
 /// The commands, numbered from 1 in this order (menu ids, posted messages); `ALL` lists them.
 macro_rules! commands {
@@ -110,6 +114,12 @@ commands! {
     OpenMap,
     Zoom200,
     Zoom300,
+    ToggleKeepZoom,
+    ToggleCompare,
+    AbLoop,
+    NextAudioTrack,
+    SaveContactSheet,
+    ShowLyrics,
 }
 
 impl Command {
@@ -124,6 +134,10 @@ impl Command {
             Command::SaveFrame,
             n("Save frame next to the video\tShift+S"),
         )),
+        Some((
+            Command::SaveContactSheet,
+            n("Save contact sheet next to the video\tShift+C"),
+        )),
         Some((Command::ToggleOsd, n("Show OSD\tO"))),
         Some((Command::ToggleSlideshow, n("Slideshow\tF5"))),
         Some((Command::RotateLeft, n("Rotate left\tL"))),
@@ -132,12 +146,19 @@ impl Command {
             Command::SaveRotation,
             n("Save rotation to file (JPEG, lossless)\tCtrl+R"),
         )),
+        Some((
+            Command::ToggleKeepZoom,
+            n("Keep the zoom on the next photo\tZ"),
+        )),
+        Some((Command::ToggleCompare, n("Compare with this photo\tC"))),
         None,
         Some((Command::Slower, n("Slower\t["))),
         Some((Command::Faster, n("Faster\t]"))),
         Some((Command::NormalSpeed, n("Normal speed\t\\"))),
         Some((Command::FrameBack, n("Previous frame\t,"))),
         Some((Command::FrameForward, n("Next frame\t."))),
+        Some((Command::AbLoop, n("A-B loop\tA"))),
+        Some((Command::NextAudioTrack, n("Next audio track\tB"))),
         None,
         Some((
             Command::ToggleAutoAdvance,
@@ -149,6 +170,7 @@ impl Command {
         Some((Command::ToggleShuffle, n("Shuffle"))),
         None,
         Some((Command::ShowExif, n("EXIF info...\tE"))),
+        Some((Command::ShowLyrics, n("Lyrics\tY"))),
         Some((Command::OpenMap, n("Open on map\tG"))),
         Some((Command::OpenInEditor, n("Open in editor\tF4"))),
         Some((Command::ShowInFolder, n("Show in folder\tCtrl+Enter"))),
@@ -166,11 +188,13 @@ impl Command {
     fn available(self, media: bool, video: bool) -> bool {
         use Command::*;
         match self {
-            SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward => video,
+            SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward
+            | NextAudioTrack | SaveContactSheet => video,
             TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
-            | ToggleShuffle => media,
+            | ToggleShuffle | AbLoop => media,
+            ShowLyrics => media && !video,
             ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SaveRotation | SetWallpaper
-            | SaveAs | OpenMap => !media,
+            | SaveAs | OpenMap | ToggleKeepZoom | ToggleCompare => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
         }
@@ -230,6 +254,9 @@ impl Command {
         if media && shift && !ctrl && vk == 0x53 {
             return Some(SaveFrame); // Shift+S, as in VLC
         }
+        if media && shift && !ctrl && vk == 0x43 {
+            return Some(SaveContactSheet); // Shift+C
+        }
         if media {
             let keyboard_media = match vk {
                 0xB0 => Some(NextTrack),     // VK_MEDIA_NEXT_TRACK
@@ -256,6 +283,9 @@ impl Command {
                 0xDC => Some(NormalSpeed),       // \
                 0xBC => Some(FrameBack),         // ,
                 0xBE => Some(FrameForward),      // .
+                0x41 => Some(AbLoop),            // A
+                0x59 => Some(ShowLyrics),        // Y
+                0x42 => Some(NextAudioTrack),    // B
                 _ => None,
             };
             if player.is_some() {
@@ -286,6 +316,8 @@ impl Command {
             0x53 => Some(ShowSettings),                   // S
             0x4C => Some(RotateLeft),                     // L
             0x52 => Some(RotateRight),                    // R
+            0x5A => Some(ToggleKeepZoom),                 // Z
+            0x43 => Some(ToggleCompare),                  // C
             0x2E => Some(Delete),                         // Del
             0x6A | 0x6F => Some(ZoomFit),                 // numpad * and /
             0x4E | 0x20 | 0x27 | 0x22 | 0x28 => Some(Next), // N, Space, Right, PgDn, Down
@@ -360,6 +392,7 @@ pub unsafe fn close_viewer(hwnd: HWND) {
     }
     let _ = DestroyWindow(hwnd);
     crate::smooth::release();
+    gdi::release_buffers();
 }
 
 /// `ListLoadNext`: shows `path` in the existing window. False if it can't be displayed.
@@ -568,7 +601,8 @@ pub unsafe fn overlay_message(
             });
             let _ = EndPaint(window, &ps);
         }
-        (WM_MOUSEMOVE, PanelKind::Video) => state.media.as_mut()?.mouse_move(pt.x),
+        (WM_MOUSEMOVE, PanelKind::Video) => state.media.as_mut()?.bar_host_mouse_move(pt.x, pt.y),
+        (WM_MOUSELEAVE, PanelKind::Video) => state.media.as_ref()?.hide_preview(),
         (WM_LBUTTONDOWN, PanelKind::Video) => {
             let media = state.media.as_mut()?;
             match media.bar_mouse_down(pt.x, pt.y) {
@@ -640,6 +674,16 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             image_view::loupe_end(state);
             fullscreen::toggle(state);
             refresh(state);
+        }
+        Command::ToggleCompare => {
+            if state.toggle_compare() {
+                refresh(state);
+            }
+        }
+        Command::ToggleKeepZoom => {
+            let before = state.config.clone();
+            state.config.keep_zoom = !before.keep_zoom;
+            state.config.save(&before);
         }
         Command::ToggleOsd => {
             // Switches the OSD for the kind of content shown (audio has none).
@@ -790,6 +834,51 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 });
             }
         }
+        Command::ShowLyrics => {
+            let Some(media) = state.media.as_mut() else {
+                return;
+            };
+            if media.audio_mut().is_some_and(|a| a.toggle_lyrics()) {
+                let _ = InvalidateRect(Some(hwnd), None, false);
+            } else if media.audio().is_some() {
+                media.show_status(tr("The tags hold no lyrics").to_string());
+            }
+        }
+        Command::SaveContactSheet => {
+            let (path, format, size) = (
+                state.file_path.clone(),
+                state.config.frame_format,
+                state.file_size,
+            );
+            let Some(media) = state.media.as_mut() else {
+                return;
+            };
+            let Some(video) = media.video_mut() else {
+                return;
+            };
+            let info = &video.info;
+            let duration = video.transport().duration().max(info.duration_sec);
+            let mut details = vec![format!("{}x{}", info.width, info.height)];
+            details.extend(info.codec.clone());
+            details.push(crate::transport_bar::format_time(duration));
+            details.push(image_view::format_size(size));
+            let sheet = crate::contact_sheet::SheetInfo {
+                duration,
+                details: details.join(" · "),
+            };
+            crate::contact_sheet::start(hwnd, &path, sheet, format);
+            media.show_status(tr("Making the contact sheet...").to_string());
+        }
+        Command::AbLoop => {
+            if let Some(media) = state.media.as_mut() {
+                media.toggle_ab_loop();
+            }
+        }
+        Command::NextAudioTrack => {
+            if let Some(media) = state.media.as_mut() {
+                media.cycle_audio_track();
+            }
+        }
         Command::FrameBack | Command::FrameForward => {
             if let Some(media) = state.media.as_mut() {
                 media.frame_step(command == Command::FrameForward);
@@ -816,7 +905,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             state.config.save(&before);
         }
         Command::ZoomIn | Command::ZoomOut => {
-            if let Some(view) = client_size(hwnd) {
+            if let Some(view) = view_size(state) {
                 zoom_at(
                     state,
                     view,
@@ -826,7 +915,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             }
         }
         Command::ZoomActualSize | Command::Zoom200 | Command::Zoom300 => {
-            if let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) {
+            if let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) {
                 let scale = match command {
                     Command::Zoom200 => 2.0,
                     Command::Zoom300 => 3.0,
@@ -1062,6 +1151,7 @@ unsafe fn apply_effect(hwnd: HWND, effect: EventEffect) {
                 media.invalidate_bar();
             }
         }
+        EventEffect::PreloadNext => state.preload_next(),
         EventEffect::None => {}
     }
 }
@@ -1112,6 +1202,8 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
                     Command::ToggleOsd => osd,
                     Command::ToggleAutoAdvance => queue.auto_advance,
                     Command::ToggleShuffle => queue.shuffle,
+                    Command::ToggleKeepZoom => state.config.keep_zoom,
+                    Command::ToggleCompare => state.compare.is_some(),
                     cmd => cmd.repeat_mode().is_some_and(|r| r == queue.repeat),
                 };
                 let label = cmd.media_label(media).unwrap_or(*label);
@@ -1205,6 +1297,30 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 execute(hwnd, cmd);
             }
         }
+        WM_MOUSELEAVE => {
+            if let Some(media) = &state.media {
+                media.hide_preview();
+            }
+        }
+        WM_CONTACT_SHEET => {
+            let text = crate::contact_sheet::take_message(lparam);
+            if let Some(media) = state.media.as_mut() {
+                media.show_status(text);
+            }
+        }
+        WM_SEEK_PREVIEW => {
+            if let Some(media) = &state.media {
+                media.preview_ready();
+            }
+        }
+        // The folder's files arrived: the position in the caption, the neighbours to prefetch.
+        WM_DIR_SCANNED => {
+            if state.dir_scanned() {
+                fullscreen::sync_overlay(state);
+                sync_video_osd(state);
+                update_title(state);
+            }
+        }
         WM_IMAGE_READY => match state.image_ready() {
             Arrived::Photo => {
                 if state.slideshow {
@@ -1273,7 +1389,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             if let Some(media) = &state.media {
                 media.layout();
             }
-            if let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) {
+            if let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) {
                 image_view::clamp_offset(state, &img, view);
             }
             let _ = InvalidateRect(Some(hwnd), None, false);
@@ -1303,11 +1419,12 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 }
                 return LRESULT(0);
             }
-            let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) else {
+            let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) else {
                 return LRESULT(0);
             };
             if state.zoom == ZoomMode::Fit {
-                image_view::loupe_begin(state, &img, view, (pt.x, pt.y));
+                let at = image_view::to_view(state, (pt.x, pt.y));
+                image_view::loupe_begin(state, &img, view, at);
                 refresh(state);
             } else {
                 state.drag = Some(Drag {
@@ -1323,10 +1440,10 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 fs.mouse_moved(hwnd);
             }
             if let Some(media) = state.media.as_mut() {
-                media.mouse_move(pt.x);
+                media.mouse_move(pt.x, pt.y);
                 return LRESULT(0);
             }
-            let (Some(img), Some(view)) = (state.image.clone(), client_size(hwnd)) else {
+            let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) else {
                 return LRESULT(0);
             };
             if let Some(drag) = state.drag {
@@ -1337,7 +1454,8 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 image_view::clamp_offset(state, &img, view);
                 redraw(hwnd);
             } else if state.loupe.is_some() {
-                image_view::loupe_follow(state, &img, view, (pt.x, pt.y));
+                let at = image_view::to_view(state, (pt.x, pt.y));
+                image_view::loupe_follow(state, &img, view, at);
                 redraw(hwnd);
             }
         }
@@ -1415,9 +1533,17 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     );
                 }
             } else if ctrl_down() {
-                if let Some(view) = client_size(hwnd) {
-                    zoom_at(state, view, delta > 0, (pt.x as f32, pt.y as f32));
+                if let Some(view) = view_size(state) {
+                    let (x, y) = image_view::to_view(state, (pt.x, pt.y));
+                    zoom_at(state, view, delta > 0, (x as f32, y as f32));
                 }
+            } else if state
+                .media
+                .as_mut()
+                .and_then(|m| m.audio_mut())
+                .is_some_and(|a| a.scroll_lyrics(pt.x, pt.y, delta))
+            {
+                // The wheel over a song text that doesn't fit scrolls it.
             } else if delta != 0 {
                 execute(
                     hwnd,
