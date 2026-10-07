@@ -51,12 +51,13 @@ shown; PSD/PSB.
 
 Neighbouring photos are loaded in advance, so paging is instant.
 
-  Next photo ............... Space, →, ↓, PgDn, N, mouse wheel
-  Previous photo ........... ←, ↑, PgUp, Backspace, P
+  Next photo ............... Space, PgDn, N, mouse wheel
+  Previous photo ........... PgUp, Backspace, P
                              (also the mouse side buttons)
+  Pan / page with arrows ... arrow keys: pan a zoomed-in photo, or page
+                             through photos while one fits the window
   Zoom in / out ............ + / −, Ctrl+wheel (towards the cursor)
   100% / fit to window ..... 1 / 0 (also * and / on the numeric keypad)
-  Move a zoomed photo ...... drag with the mouse
   Loupe .................... hold the left mouse button on the photo
   Rotate left / right ...... L / R (on screen only, the file is untouched)
   Keep the zoom ............ Z (the next photo at the same zoom and spot)
@@ -115,7 +116,7 @@ settings.
   Full screen .............. Enter, F, F11, double click; Esc to leave
   Save frame ............... Shift+S (next to the video; PNG or JPEG —
                              chosen in the settings)
-  Contact sheet ............ Shift+C (16 frames in one picture)
+  Contact sheet ............ Ctrl+Shift+S (16 frames in one picture)
   A-B loop ................. A (start, end, off)
   Audio track .............. B (next one)
   Lyrics ................... Y (in place of the album art)

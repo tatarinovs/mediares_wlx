@@ -8,8 +8,8 @@ use crate::state::same_path as same;
 
 const FILE_NAME: &str = "mediares_resume.txt";
 const MAX_ENTRIES: usize = 200;
-/// Shorter videos always start from the beginning.
-pub const MIN_DURATION_SEC: f64 = 300.0;
+/// Shorter videos always start from the beginning; the default of the configurable threshold.
+pub const DEFAULT_MIN_DURATION_SEC: f64 = 300.0;
 /// Stopping this close to the start or the end doesn't count as "left off".
 const EDGE_SEC: f64 = 30.0;
 
@@ -24,9 +24,10 @@ pub fn load(video: &Path) -> Option<f64> {
         .map(|(t, _)| t)
 }
 
-/// Remembers (or forgets, near the start or end) where `video` was left.
-pub fn store(video: &Path, position: f64, duration: f64) {
-    if duration < MIN_DURATION_SEC {
+/// Remembers (or forgets, near the start or end) where `video` was left. `min_duration` is the
+/// configured threshold below which videos always start from the beginning.
+pub fn store(video: &Path, position: f64, duration: f64, min_duration: f64) {
+    if duration < min_duration {
         return;
     }
     let file = config::local_path(FILE_NAME);

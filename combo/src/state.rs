@@ -164,7 +164,13 @@ impl ViewerState {
                 // drive) is listed meanwhile.
                 (self.dir_files, self.current_idx) = (vec![path.to_path_buf()], 0);
                 self.playlist = None;
-                self.scan = Some(DirScan::start(path, self.config.skip_raw_twins, self.hwnd));
+                // Stepping on while the folder is still being listed: that listing will have the
+                // new file too, so it is not started over (one full listing per keypress on a
+                // slow share otherwise).
+                let skip = self.config.skip_raw_twins;
+                if !self.scan.as_ref().is_some_and(|s| s.covers(path, skip)) {
+                    self.scan = Some(DirScan::start(path, skip, self.hwnd));
+                }
             }
         }
         self.show(path)
@@ -495,16 +501,14 @@ impl ViewerState {
         if kind.is_playable() {
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
-            let (resume, replay_gain) = (self.config.resume_video, self.config.replay_gain);
+            let options = crate::media_view::OpenOptions {
+                resume: self.config.resume_video,
+                resume_threshold: f64::from(self.config.resume_threshold_sec),
+                replay_gain: self.config.replay_gain,
+                seek_preview: self.config.seek_preview,
+            };
             self.media = unsafe {
-                MediaView::open(
-                    self.hwnd,
-                    self.media.take(),
-                    &self.file_path,
-                    kind,
-                    resume,
-                    replay_gain,
-                )
+                MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
             };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
             if let Some(media) = self.media.as_mut() {
@@ -633,29 +637,43 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 
 /// Case-insensitive name comparison, Unicode included (NTFS ignores the case of Cyrillic too).
 fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+    // Valid names are borrowed, not copied: no allocation per compared file.
     a.eq_ignore_ascii_case(b)
-        || (!a.is_ascii()
-            && a.to_string_lossy().to_lowercase() == b.to_string_lossy().to_lowercase())
+        || (!a.is_ascii() && {
+            let (a, b) = (a.to_string_lossy(), b.to_string_lossy());
+            a.chars()
+                .flat_map(char::to_lowercase)
+                .eq(b.chars().flat_map(char::to_lowercase))
+        })
 }
 
 /// Posted to the viewer when its folder listing is ready (see [`ViewerState::dir_scanned`]).
 pub const WM_DIR_SCANNED: u32 = WM_APP + 0x13;
 
-/// A folder listed on another thread.
+/// A folder listed on another thread. The thread holds it weakly: once the viewer drops it
+/// (another folder, window closed), the listing stops.
 struct DirScan {
+    file: PathBuf,
+    skip_raw_twins: bool,
     files: Mutex<Option<Vec<PathBuf>>>,
 }
 
 impl DirScan {
     fn start(file: &Path, skip_raw_twins: bool, notify: HWND) -> Arc<Self> {
         let scan = Arc::new(DirScan {
+            file: file.to_path_buf(),
+            skip_raw_twins,
             files: Mutex::new(None),
         });
         let hwnd = notify.0 as isize;
         let list = {
-            let (result, file) = (scan.clone(), file.to_path_buf());
+            let (result, file) = (Arc::downgrade(&scan), file.to_path_buf());
             move || {
-                let (files, _) = scan_directory_media(&file, skip_raw_twins);
+                let cancelled = || result.strong_count() == 0;
+                let (files, _) = scan_directory_media(&file, skip_raw_twins, &cancelled);
+                let Some(result) = result.upgrade() else {
+                    return;
+                };
                 *result.files.lock().unwrap_or_else(|e| e.into_inner()) = Some(files);
                 unsafe {
                     let _ = PostMessageW(
@@ -674,6 +692,15 @@ impl DirScan {
         scan
     }
 
+    /// Whether this listing has `file`'s folder, as listed with `skip_raw_twins`.
+    fn covers(&self, file: &Path, skip_raw_twins: bool) -> bool {
+        self.skip_raw_twins == skip_raw_twins
+            && match (self.file.parent(), file.parent()) {
+                (Some(a), Some(b)) => same_path(a, b),
+                _ => false,
+            }
+    }
+
     fn take(&self) -> Option<Vec<PathBuf>> {
         self.files.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
@@ -681,8 +708,13 @@ impl DirScan {
 
 /// Lists the viewable files (images, videos, audio) in the file's directory in natural ("file2" < "file10") order.
 /// `skip_raw_twins`: RAW files with a standard image of the same name are left out (shot as
-/// RAW+JPEG, each picture comes once); `current_file` is always kept.
-pub fn scan_directory_media(current_file: &Path, skip_raw_twins: bool) -> (Vec<PathBuf>, usize) {
+/// RAW+JPEG, each picture comes once); `current_file` is always kept. Once `cancelled`, the
+/// listing stops early and its result is meaningless.
+fn scan_directory_media(
+    current_file: &Path,
+    skip_raw_twins: bool,
+    cancelled: &dyn Fn() -> bool,
+) -> (Vec<PathBuf>, usize) {
     let single = || (vec![current_file.to_path_buf()], 0);
     let Some(entries) = current_file
         .parent()
@@ -692,11 +724,15 @@ pub fn scan_directory_media(current_file: &Path, skip_raw_twins: bool) -> (Vec<P
     };
 
     let mut files: Vec<PathBuf> = entries
+        .take_while(|_| !cancelled())
         .flatten()
         .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .map(|e| e.path())
         .filter(|p| is_viewable(probe_file(p)))
         .collect();
+    if cancelled() {
+        return single();
+    }
     if skip_raw_twins {
         drop_raw_twins(&mut files, current_file);
     }

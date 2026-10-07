@@ -274,6 +274,8 @@ pub struct VideoView {
     rate: f64,
     /// Remember where long videos are left and continue from there.
     resume: bool,
+    /// Videos shorter than this (seconds) always start from the beginning.
+    resume_threshold: f64,
     /// Once the file is loaded, look up where it was left (its duration decides).
     resume_pending: bool,
     /// Just continued from here (the bar says so).
@@ -315,10 +317,9 @@ impl SeekProfile {
     fn of(player: &Player, path: &Path) -> Self {
         use mediares_core::probe::{has_extension, is_transport_stream};
         match player {
-            Player::Mpv(_) => Self::Precise,
             Player::Mf(_) if is_transport_stream(path) => Self::Previewed,
             Player::Mf(_) if has_extension(path, &["mpg", "mpeg", "vob"]) => Self::Snapping,
-            Player::Mf(_) => Self::Precise,
+            _ => Self::Precise,
         }
     }
 }
@@ -400,7 +401,12 @@ pub struct OsdText {
 impl VideoView {
     /// Creates the surface inside `viewer` and starts playing `path`. `None` if Media Foundation
     /// cannot open the file (so TC can fall back to another plugin).
-    pub unsafe fn new(viewer: HWND, path: &Path, resume: bool) -> Option<Self> {
+    pub unsafe fn new(
+        viewer: HWND,
+        path: &Path,
+        resume: bool,
+        resume_threshold: f64,
+    ) -> Option<Self> {
         // The check that Media Foundation can open the file runs while the player starts up.
         let probe = (!playback_mpv::available()).then(|| Probe::start(path));
         let surface = Surface::new(viewer, true)?;
@@ -426,6 +432,7 @@ impl VideoView {
             osd: None,
             rate: 1.0,
             resume,
+            resume_threshold,
             resume_pending: resume,
             resumed_to: None,
             loaded: false,
@@ -439,7 +446,7 @@ impl VideoView {
     }
 
     /// Switches to another file, reusing the engine (and its speed).
-    pub unsafe fn open(&mut self, path: &Path, resume: bool) -> bool {
+    pub unsafe fn open(&mut self, path: &Path, resume: bool, resume_threshold: f64) -> bool {
         let probe = matches!(self.player, Player::Mf(_)).then(|| Probe::start(path));
         let Some(info) = Probe::finish(probe, &self.player, path) else {
             return false;
@@ -455,6 +462,7 @@ impl VideoView {
         self.back_target = None;
         self.key_seek = None;
         self.resume = resume;
+        self.resume_threshold = resume_threshold;
         self.resume_pending = resume;
         self.resumed_to = None;
         self.loaded = false;
@@ -470,7 +478,12 @@ impl VideoView {
     fn remember_position(&self) {
         if self.resume && self.loaded {
             let duration = self.player.duration().max(self.info.duration_sec);
-            resume::store(&self.path, self.player.position(), duration);
+            resume::store(
+                &self.path,
+                self.player.position(),
+                duration,
+                self.resume_threshold,
+            );
         }
     }
 
@@ -946,7 +959,7 @@ impl VideoView {
                     }
                     if std::mem::take(&mut self.resume_pending) {
                         let duration = self.player.duration().max(self.info.duration_sec);
-                        if let Some(t) = resume_point(&self.path, duration) {
+                        if let Some(t) = resume_point(&self.path, duration, self.resume_threshold) {
                             self.engine_seek(t, false);
                             self.resumed_to = Some(t);
                         }
@@ -1006,8 +1019,8 @@ fn file_chapters(path: &Path) -> Vec<(f64, String)> {
 }
 
 /// Where to continue a video of `duration` seconds, if it was left there and is long enough.
-fn resume_point(path: &Path, duration: f64) -> Option<f64> {
-    (duration >= resume::MIN_DURATION_SEC)
+fn resume_point(path: &Path, duration: f64, min_duration: f64) -> Option<f64> {
+    (duration >= min_duration)
         .then(|| resume::load(path))
         .flatten()
 }

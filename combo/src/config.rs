@@ -146,6 +146,8 @@ impl OsdMode {
 pub const LOUPE_SCALE_RANGE: (f32, f32) = (1.0, 5.0);
 pub const FONT_SIZE_RANGE: (i32, i32) = (8, 72);
 pub const SEEK_STEP_RANGE: (i32, i32) = (1, 600);
+pub const RESUME_THRESHOLD_RANGE: (i32, i32) = (10, 3600);
+pub const CONTACT_SHEET_GRID_RANGE: (i32, i32) = (1, 10);
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ViewerConfig {
@@ -185,6 +187,16 @@ pub struct ViewerConfig {
     /// Left / Right arrow step, seconds.
     pub seek_step_sec: u32,
     pub frame_format: PictureFormat,
+    /// Videos shorter than this (seconds) never offer to resume.
+    pub resume_threshold_sec: u32,
+    /// Grid of the contact sheet (Ctrl+Shift+S).
+    pub contact_sheet_columns: u32,
+    pub contact_sheet_rows: u32,
+    /// The frame under the cursor on the timeline while scrubbing a video.
+    pub seek_preview: bool,
+    /// The wheel over a photo zooms it; Ctrl+wheel then pages through the files instead of the
+    /// other way round.
+    pub wheel_zoom: bool,
     /// Programs for "Открыть в редакторе"; empty = the file type's Edit verb or default program.
     pub photo_editor: String,
     pub video_editor: String,
@@ -220,6 +232,11 @@ impl Default for ViewerConfig {
             replay_gain: false,
             seek_step_sec: 5,
             frame_format: PictureFormat::Png,
+            resume_threshold_sec: crate::resume::DEFAULT_MIN_DURATION_SEC as u32,
+            contact_sheet_columns: 4,
+            contact_sheet_rows: 4,
+            seek_preview: true,
+            wheel_zoom: false,
             photo_editor: String::new(),
             video_editor: String::new(),
             audio_editor: String::new(),
@@ -320,6 +337,17 @@ impl ViewerConfig {
             seek_step_sec: int(w!("SeekStep"), d.seek_step_sec as i32)
                 .clamp(SEEK_STEP_RANGE.0, SEEK_STEP_RANGE.1) as u32,
             frame_format: PictureFormat::from_ini(&string(w!("FrameFormat"), "")),
+            resume_threshold_sec: int(w!("ResumeThreshold"), d.resume_threshold_sec as i32)
+                .clamp(RESUME_THRESHOLD_RANGE.0, RESUME_THRESHOLD_RANGE.1)
+                as u32,
+            contact_sheet_columns: int(w!("ContactSheetColumns"), d.contact_sheet_columns as i32)
+                .clamp(CONTACT_SHEET_GRID_RANGE.0, CONTACT_SHEET_GRID_RANGE.1)
+                as u32,
+            contact_sheet_rows: int(w!("ContactSheetRows"), d.contact_sheet_rows as i32)
+                .clamp(CONTACT_SHEET_GRID_RANGE.0, CONTACT_SHEET_GRID_RANGE.1)
+                as u32,
+            seek_preview: int(w!("SeekPreview"), d.seek_preview as i32) != 0,
+            wheel_zoom: int(w!("WheelZoom"), d.wheel_zoom as i32) != 0,
             photo_editor: string(w!("PhotoEditor"), "").trim().to_string(),
             video_editor: string(w!("VideoEditor"), "").trim().to_string(),
             audio_editor: string(w!("AudioEditor"), "").trim().to_string(),
@@ -335,7 +363,7 @@ impl ViewerConfig {
     }
 
     /// The settings as INI key / value pairs.
-    fn entries(&self) -> [(PCWSTR, String); 30] {
+    fn entries(&self) -> [(PCWSTR, String); 35] {
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
         [
             (w!("Language"), self.language.to_ini().to_string()),
@@ -363,6 +391,14 @@ impl ViewerConfig {
             (w!("ReplayGain"), flag(self.replay_gain)),
             (w!("SeekStep"), self.seek_step_sec.to_string()),
             (w!("FrameFormat"), self.frame_format.extension().to_string()),
+            (w!("ResumeThreshold"), self.resume_threshold_sec.to_string()),
+            (
+                w!("ContactSheetColumns"),
+                self.contact_sheet_columns.to_string(),
+            ),
+            (w!("ContactSheetRows"), self.contact_sheet_rows.to_string()),
+            (w!("SeekPreview"), flag(self.seek_preview)),
+            (w!("WheelZoom"), flag(self.wheel_zoom)),
             (w!("PhotoEditor"), self.photo_editor.clone()),
             (w!("VideoEditor"), self.video_editor.clone()),
             (w!("AudioEditor"), self.audio_editor.clone()),

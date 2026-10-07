@@ -85,14 +85,13 @@ impl AudioDecoder {
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
-                Ok(None) => return None,
                 Err(Error::IoError(_)) | Err(Error::DecodeError(_))
                     if bad_packets < MAX_BAD_PACKETS =>
                 {
                     bad_packets += 1;
                     continue;
                 }
-                Err(_) => return None,
+                _ => return None,
             };
             if packet.track_id != self.track_id {
                 continue;

@@ -70,6 +70,8 @@ pub struct MediaView {
     last_seek_step: Option<Instant>,
     /// The frame under the cursor on the timeline (video only), made on first hover.
     seek_preview: Option<SeekPreview>,
+    /// Whether to show it at all (a setting).
+    seek_preview_enabled: bool,
     /// A-B loop: its start once set, then its end (playback jumps back to the start there).
     ab_loop: (Option<f64>, Option<f64>),
 }
@@ -94,6 +96,15 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
+/// The viewer configuration a file open needs, bundled so `open` stays under the lint's limit.
+pub struct OpenOptions {
+    pub resume: bool,
+    /// Videos shorter than this (seconds) never offer to resume.
+    pub resume_threshold: f64,
+    pub replay_gain: bool,
+    pub seek_preview: bool,
+}
+
 impl MediaView {
     /// Opens `path` (`kind` must be playable), reusing `previous` when it shows the same kind of
     /// content. `None` if the file can't be played.
@@ -102,19 +113,21 @@ impl MediaView {
         previous: Option<MediaView>,
         path: &Path,
         kind: MediaType,
-        resume: bool,
-        replay_gain: bool,
+        options: OpenOptions,
     ) -> Option<MediaView> {
         let kind = playable_kind(path, kind);
         if let Some(mut view) = previous {
             let reused = match &mut view.content {
-                Content::Video(v) if kind == MediaType::Video => v.open(path, resume),
-                Content::Audio(a) if kind == MediaType::Audio => a.open(path, replay_gain),
+                Content::Video(v) if kind == MediaType::Video => {
+                    v.open(path, options.resume, options.resume_threshold)
+                }
+                Content::Audio(a) if kind == MediaType::Audio => a.open(path, options.replay_gain),
                 _ => false,
             };
             if reused {
                 view.bar.cancel();
                 view.seek_preview = None;
+                view.seek_preview_enabled = options.seek_preview;
                 view.ab_loop = (None, None);
                 view.file_name = file_name(path);
                 view.layout();
@@ -124,9 +137,14 @@ impl MediaView {
             drop(view);
         }
         let content = match kind {
-            MediaType::Video => Content::Video(Box::new(VideoView::new(viewer, path, resume)?)),
+            MediaType::Video => Content::Video(Box::new(VideoView::new(
+                viewer,
+                path,
+                options.resume,
+                options.resume_threshold,
+            )?)),
             MediaType::Audio => {
-                Content::Audio(Box::new(AudioView::new(viewer, path, replay_gain)?))
+                Content::Audio(Box::new(AudioView::new(viewer, path, options.replay_gain)?))
             }
             _ => return None,
         };
@@ -141,6 +159,7 @@ impl MediaView {
             bar_host: None,
             last_seek_step: None,
             seek_preview: None,
+            seek_preview_enabled: options.seek_preview,
             ab_loop: (None, None),
         };
         view.layout();
@@ -364,6 +383,9 @@ impl MediaView {
         let Content::Video(video) = &self.content else {
             return;
         };
+        if !self.seek_preview_enabled {
+            return;
+        }
         let layout = self.bar_layout();
         let fraction = if self.bar.is_dragging_timeline() {
             Some(transport_bar::timeline_fraction(&layout, x))

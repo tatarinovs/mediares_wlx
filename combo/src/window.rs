@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use mediares_core::tc_api::{
-    LCP_DARKMODE, LCP_FITLARGERONLY, LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS,
+    LCP_CENTER, LCP_DARKMODE, LCP_FITLARGERONLY, LCP_FITTOWINDOW, LC_COPY, LC_NEWPARAMS,
 };
 
 use crate::config::ViewerConfig;
@@ -120,6 +120,10 @@ commands! {
     NextAudioTrack,
     SaveContactSheet,
     ShowLyrics,
+    PanLeft,
+    PanRight,
+    PanUp,
+    PanDown,
 }
 
 impl Command {
@@ -136,7 +140,7 @@ impl Command {
         )),
         Some((
             Command::SaveContactSheet,
-            n("Save contact sheet next to the video\tShift+C"),
+            n("Save contact sheet next to the video\tCtrl+Shift+S"),
         )),
         Some((Command::ToggleOsd, n("Show OSD\tO"))),
         Some((Command::ToggleSlideshow, n("Slideshow\tF5"))),
@@ -233,8 +237,10 @@ impl Command {
     }
 
     /// Hotkeys. With Ctrl held only zoom keys are ours; everything else goes to the Lister
-    /// (Ctrl+P print, Ctrl+C copy, ...). For audio/video, player keys take precedence.
-    fn from_key(vk: u16, ctrl: bool, shift: bool, media: bool) -> Option<Command> {
+    /// (Ctrl+P print, Ctrl+C copy, ...). For audio/video, player keys take precedence; for a
+    /// zoomed-in photo (`zoomed`, never set together with `media`), the arrows pan it instead of
+    /// paging to another file.
+    fn from_key(vk: u16, ctrl: bool, shift: bool, media: bool, zoomed: bool) -> Option<Command> {
         use Command::*;
         if ctrl && !shift && vk == 0x43 {
             return Some(Copy); // Ctrl+C: the picture, not the file (TC copies files in its panels)
@@ -254,8 +260,8 @@ impl Command {
         if media && shift && !ctrl && vk == 0x53 {
             return Some(SaveFrame); // Shift+S, as in VLC
         }
-        if media && shift && !ctrl && vk == 0x43 {
-            return Some(SaveContactSheet); // Shift+C
+        if media && ctrl && shift && vk == 0x53 {
+            return Some(SaveContactSheet); // Ctrl+Shift+S
         }
         if media {
             let keyboard_media = match vk {
@@ -290,6 +296,18 @@ impl Command {
             };
             if player.is_some() {
                 return player;
+            }
+        }
+        if zoomed && !ctrl {
+            let pan = match vk {
+                0x25 => Some(PanLeft),  // Left: reveal more of the left edge
+                0x27 => Some(PanRight), // Right
+                0x26 => Some(PanUp),    // Up
+                0x28 => Some(PanDown),  // Down
+                _ => None,
+            };
+            if pan.is_some() {
+                return pan;
             }
         }
         let zoom = match vk {
@@ -411,7 +429,8 @@ pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) 
 
 /// `ListSendCommand`. A toggled `LCP_FITTOWINDOW` means the user pressed TC's `F` hotkey,
 /// which we map to fullscreen (the viewer always fits the window anyway); a toggled
-/// `LCP_FITLARGERONLY` is TC's `L` ("fit larger only"), our rotate left.
+/// `LCP_FITLARGERONLY` is TC's `L` ("fit larger only"), our rotate left; a toggled `LCP_CENTER`
+/// is TC's `C` ("center images"), our compare.
 pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
     let Some(state) = get_state(hwnd) else {
         return false;
@@ -430,6 +449,8 @@ pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
         execute(hwnd, Command::RotateLeft);
     } else if toggled & LCP_FITTOWINDOW != 0 {
         execute(hwnd, Command::ToggleFullscreen);
+    } else if toggled & LCP_CENTER != 0 && state.media.is_none() {
+        execute(hwnd, Command::ToggleCompare);
     }
     true
 }
@@ -865,6 +886,8 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let sheet = crate::contact_sheet::SheetInfo {
                 duration,
                 details: details.join(" · "),
+                columns: state.config.contact_sheet_columns,
+                rows: state.config.contact_sheet_rows,
             };
             crate::contact_sheet::start(hwnd, &path, sheet, format);
             media.show_status(tr("Making the contact sheet...").to_string());
@@ -931,6 +954,10 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             state.zoom = ZoomMode::Fit;
             refresh(state);
         }
+        Command::PanLeft => pan_by(state, hwnd, (1.0, 0.0)),
+        Command::PanRight => pan_by(state, hwnd, (-1.0, 0.0)),
+        Command::PanUp => pan_by(state, hwnd, (0.0, 1.0)),
+        Command::PanDown => pan_by(state, hwnd, (0.0, -1.0)),
         Command::TogglePlay
         | Command::ToggleMute
         | Command::SeekBack
@@ -1161,6 +1188,21 @@ unsafe fn zoom_at(state: &mut ViewerState, view: (f32, f32), zoom_in: bool, anch
         image_view::zoom_step(state, &img, view, zoom_in, anchor);
         refresh(state);
     }
+}
+
+/// Pans a zoomed-in photo by `direction` (unit vector) times the DPI-scaled step.
+unsafe fn pan_by(state: &mut ViewerState, hwnd: HWND, direction: (f32, f32)) {
+    const STEP: f32 = 48.0;
+    let step = STEP * gdi::dpi_scale(hwnd);
+    let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) else {
+        return;
+    };
+    state.offset = (
+        state.offset.0 + direction.0 * step,
+        state.offset.1 + direction.1 * step,
+    );
+    image_view::clamp_offset(state, &img, view);
+    redraw(hwnd);
 }
 
 unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
@@ -1515,8 +1557,9 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             let mut pt = point_from_lparam(lparam.0);
             let _ = ScreenToClient(hwnd, &mut pt);
-            // Over the picture the wheel pages through the files whatever they are; volume is
-            // the wheel over the transport bar, or Ctrl+wheel.
+            // Over the picture the wheel pages through the files whatever they are, and Ctrl+wheel
+            // zooms photos (or the other way round, a setting); volume is the wheel over the
+            // transport bar, or Ctrl+wheel there.
             let volume = state
                 .media
                 .as_ref()
@@ -1532,7 +1575,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                         },
                     );
                 }
-            } else if ctrl_down() {
+            } else if state.media.is_none() && (ctrl_down() != state.config.wheel_zoom) {
                 if let Some(view) = view_size(state) {
                     let (x, y) = image_view::to_view(state, (pt.x, pt.y));
                     zoom_at(state, view, delta > 0, (x as f32, y as f32));
@@ -1565,10 +1608,11 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_KEYDOWN => {
             let vk = wparam.0 as u16;
+            let zoomed = state.media.is_none() && state.zoom != ZoomMode::Fit;
             if vk == VK_ESCAPE && state.fullscreen.is_some() {
                 execute(hwnd, Command::ToggleFullscreen);
             } else if let Some(cmd) =
-                Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some())
+                Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some(), zoomed)
             {
                 execute(hwnd, cmd);
             } else {
@@ -1595,24 +1639,24 @@ mod tests {
     #[test]
     fn ctrl_combinations_go_to_lister() {
         assert_eq!(
-            Command::from_key(0x50, false, false, false),
+            Command::from_key(0x50, false, false, false, false),
             Some(Command::Previous)
         ); // P
-        assert_eq!(Command::from_key(0x50, true, false, false), None); // Ctrl+P: print in Lister
+        assert_eq!(Command::from_key(0x50, true, false, false, false), None); // Ctrl+P: print in Lister
         assert_eq!(
-            Command::from_key(0x43, true, false, false),
+            Command::from_key(0x43, true, false, false, false),
             Some(Command::Copy)
         ); // Ctrl+C: the picture
         assert_eq!(
-            Command::from_key(0x53, false, true, true),
+            Command::from_key(0x53, false, true, true, false),
             Some(Command::SaveFrame)
         ); // Shift+S
         assert_eq!(
-            Command::from_key(0x53, false, false, true),
+            Command::from_key(0x53, false, false, true, false),
             Some(Command::ShowSettings)
         ); // S
         assert_eq!(
-            Command::from_key(0xBB, true, false, false),
+            Command::from_key(0xBB, true, false, false, false),
             Some(Command::ZoomIn)
         );
         for (vk, zoom) in [
@@ -1621,21 +1665,21 @@ mod tests {
             (0x62, Command::Zoom200),
             (0x33, Command::Zoom300),
         ] {
-            assert_eq!(Command::from_key(vk, true, false, false), Some(zoom));
+            assert_eq!(Command::from_key(vk, true, false, false, false), Some(zoom));
         }
-        assert_eq!(Command::from_key(0x31, false, false, false), None); // 1: Lister's text mode
+        assert_eq!(Command::from_key(0x31, false, false, false, false), None); // 1: Lister's text mode
         for media in [false, true] {
             assert_eq!(
-                Command::from_key(0x73, false, false, media),
+                Command::from_key(0x73, false, false, media, false),
                 Some(Command::OpenInEditor)
             ); // F4
             assert_eq!(
-                Command::from_key(0x0D, true, false, media),
+                Command::from_key(0x0D, true, false, media, false),
                 Some(Command::ShowInFolder)
             ); // Ctrl+Enter
         }
         assert_eq!(
-            Command::from_key(0x0D, false, false, false),
+            Command::from_key(0x0D, false, false, false, false),
             Some(Command::ToggleFullscreen)
         ); // Enter
     }
@@ -1643,79 +1687,100 @@ mod tests {
     #[test]
     fn video_keys_override_navigation() {
         assert_eq!(
-            Command::from_key(0x20, false, false, true),
+            Command::from_key(0x20, false, false, true, false),
             Some(Command::TogglePlay)
         ); // Space
         assert_eq!(
-            Command::from_key(0x20, false, false, false),
+            Command::from_key(0x20, false, false, false, false),
             Some(Command::Next)
         );
         assert_eq!(
-            Command::from_key(0x27, false, false, true),
+            Command::from_key(0x27, false, false, true, false),
             Some(Command::SeekForward)
         ); // Right
         assert_eq!(
-            Command::from_key(0x26, false, false, true),
+            Command::from_key(0x26, false, false, true, false),
             Some(Command::KeyframeForward)
         ); // Up
         assert_eq!(
-            Command::from_key(0x28, false, false, true),
+            Command::from_key(0x28, false, false, true, false),
             Some(Command::KeyframeBack)
         ); // Down
         assert_eq!(
-            Command::from_key(0xBB, false, false, true),
+            Command::from_key(0xBB, false, false, true, false),
             Some(Command::VolumeUp)
         ); // '+'
         assert_eq!(
-            Command::from_key(0xBB, false, false, false),
+            Command::from_key(0xBB, false, false, false, false),
             Some(Command::ZoomIn)
         ); // '+' on a photo
         assert_eq!(
-            Command::from_key(0x22, false, false, true),
+            Command::from_key(0x22, false, false, true, false),
             Some(Command::Next)
         ); // PgDn still navigates
         assert_eq!(
-            Command::from_key(0x4E, false, false, true),
+            Command::from_key(0x4E, false, false, true, false),
             Some(Command::Next)
         ); // N
         assert_eq!(
-            Command::from_key(0xB0, false, false, true),
+            Command::from_key(0xB0, false, false, true, false),
             Some(Command::NextTrack)
         ); // media key
         assert_eq!(
-            Command::from_key(0xB3, true, false, true),
+            Command::from_key(0xB3, true, false, true, false),
             Some(Command::TogglePlay)
         );
-        assert_eq!(Command::from_key(0xB0, false, false, false), None); // photos: to the Lister
+        assert_eq!(Command::from_key(0xB0, false, false, false, false), None); // photos: to the Lister
     }
 
     #[test]
     fn photo_and_video_tool_keys() {
         assert_eq!(
-            Command::from_key(0x52, false, false, false),
+            Command::from_key(0x52, false, false, false, false),
             Some(Command::RotateRight)
         ); // R
         assert_eq!(
-            Command::from_key(0x4C, false, false, false),
+            Command::from_key(0x4C, false, false, false, false),
             Some(Command::RotateLeft)
         ); // L
         assert_eq!(
-            Command::from_key(0x2E, false, false, false),
+            Command::from_key(0x2E, false, false, false, false),
             Some(Command::Delete)
         ); // Del
         assert_eq!(
-            Command::from_key(0x2E, false, false, true),
+            Command::from_key(0x2E, false, false, true, false),
             Some(Command::Delete)
         );
         assert_eq!(
-            Command::from_key(0xDD, false, false, true),
+            Command::from_key(0xDD, false, false, true, false),
             Some(Command::Faster)
         ); // ]
         assert_eq!(
-            Command::from_key(0xBC, false, false, true),
+            Command::from_key(0xBC, false, false, true, false),
             Some(Command::FrameBack)
         ); // ,
-        assert_eq!(Command::from_key(0xBE, false, false, false), None); // '.' on a photo: to the Lister
+        assert_eq!(Command::from_key(0xBE, false, false, false, false), None); // '.' on a photo: to the Lister
+    }
+
+    #[test]
+    fn zoomed_photo_arrows_pan_instead_of_paging() {
+        for (vk, pan) in [
+            (0x25, Command::PanLeft),
+            (0x27, Command::PanRight),
+            (0x26, Command::PanUp),
+            (0x28, Command::PanDown),
+        ] {
+            assert_eq!(Command::from_key(vk, false, false, false, true), Some(pan));
+            // Not zoomed: the same arrows page through files as usual.
+            assert_ne!(Command::from_key(vk, false, false, false, false), Some(pan));
+            // Ctrl+arrow is never claimed for panning (and today isn't bound to anything).
+            assert_eq!(Command::from_key(vk, true, false, false, true), None);
+        }
+        // `zoomed` never applies with media playing (video/audio has no photo zoom).
+        assert_eq!(
+            Command::from_key(0x25, false, false, true, true),
+            Some(Command::SeekBack)
+        );
     }
 
     #[test]

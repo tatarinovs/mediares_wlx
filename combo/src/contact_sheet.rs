@@ -24,8 +24,6 @@ use crate::transport_bar::format_time;
 /// the message for the bar.
 pub const WM_CONTACT_SHEET: u32 = WM_APP + 0x15;
 
-const COLUMNS: u32 = 4;
-const ROWS: u32 = 4;
 const CELL_WIDTH: u32 = 480;
 const MARGIN: i32 = 12;
 const GAP: i32 = 6;
@@ -39,6 +37,9 @@ pub struct SheetInfo {
     pub duration: f64,
     /// "1920x1080 · H.264 · 1:23:45 · 1.2 GB"
     pub details: String,
+    /// Grid size (a setting).
+    pub columns: u32,
+    pub rows: u32,
 }
 
 /// Makes the sheet of `video` in the background; `viewer` gets [`WM_CONTACT_SHEET`].
@@ -82,7 +83,10 @@ pub unsafe fn take_message(lparam: LPARAM) -> String {
 
 /// The saved file.
 fn make(video: &Path, info: &SheetInfo, format: PictureFormat) -> Option<PathBuf> {
-    let count = COLUMNS * ROWS;
+    if info.columns == 0 || info.rows == 0 {
+        return None;
+    }
+    let count = info.columns * info.rows;
     let times: Vec<f64> = (0..count)
         .map(|i| info.duration * (f64::from(i) + 0.5) / f64::from(count))
         .collect();
@@ -128,9 +132,10 @@ fn frames(video: &Path, duration: f64, times: &[f64]) -> Option<Vec<Option<Shot>
 unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Option<DecodedImage> {
     let first = &frames.iter().flatten().next()?.0;
     let (fw, fh) = (first.width, first.height);
+    let (columns, rows) = (info.columns as i32, info.rows as i32);
     let cell = (CELL_WIDTH as i32, (CELL_WIDTH * fh / fw.max(1)) as i32);
-    let width = 2 * MARGIN + COLUMNS as i32 * cell.0 + (COLUMNS as i32 - 1) * GAP;
-    let height = HEADER + MARGIN + ROWS as i32 * cell.1 + (ROWS as i32 - 1) * GAP;
+    let width = 2 * MARGIN + columns * cell.0 + (columns - 1) * GAP;
+    let height = HEADER + MARGIN + rows * cell.1 + (rows - 1) * GAP;
 
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
@@ -167,7 +172,7 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
     );
 
     for (i, shot) in frames.iter().enumerate() {
-        let (col, row) = (i as i32 % COLUMNS as i32, i as i32 / COLUMNS as i32);
+        let (col, row) = (i as i32 % columns, i as i32 / columns);
         let x = MARGIN + col * (cell.0 + GAP);
         let y = HEADER + row * (cell.1 + GAP);
         let Some((frame, time)) = shot else {

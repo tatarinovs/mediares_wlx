@@ -112,9 +112,9 @@ shows without waiting for it.
 
 | Action | Keys / mouse |
 |---|---|
-| Next / previous photo | Space, →, ↓, PgDn, N, wheel / ←, ↑, PgUp, Backspace, P; mouse side buttons |
-| Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
-| Pan / loupe | drag while zoomed in / hold left mouse button in fit mode |
+| Next / previous photo | Space, PgDn, N / PgUp, Backspace, P; mouse wheel (or the other way round — wheel zooms, a setting); mouse side buttons. →↓ / ←↑ do the same, but only in fit mode: zoomed in, they pan instead |
+| Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%, or the other way round — wheel zooms, Ctrl+wheel pages, a setting); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
+| Pan / loupe | arrow keys, or drag, while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
 | Keep the zoom while paging: the next photo opens at the same zoom on the same spot | Z (or the menu, a setting) |
 | Compare with this photo: the screen splits in two, the kept photo on the left, the ones you page through on the right; zoom, pan and the loupe are shared | C (C again to leave) |
@@ -129,6 +129,11 @@ shows without waiting for it.
 | Save as JPEG / PNG | Ctrl+S (or the menu) |
 | Print | Ctrl+P (or the menu) |
 | Open in editor / show in folder | F4 / Ctrl+Enter |
+
+**Paging through files, for any type and any zoom:** N / PgDn — next file, Backspace / PgUp —
+previous. Space, the arrows and the wheel only page while nothing else claims them (for photos, while
+the photo fits the window; zoomed in, the arrows pan instead); for video/audio Space pauses and the
+arrows seek or change the volume / step a frame.
 
 The right-click menu also has: **open in external editor**, **show in folder**, **set as desktop wallpaper**
 (JPEG/PNG/BMP — the file itself; RAW, PSD, rotated ones — saved to `mediares_wallpaper.png`).
@@ -185,7 +190,7 @@ repeat-list or repeat-one and shuffle — in the right-click menu and in setting
 | Copy the photo / video frame / cover art to the clipboard (pastes as both a picture and a file) | Ctrl+C |
 | OSD (name, resolution, size, position; time for video) on/off for the current type | O, I |
 | Save the current video frame next to the file (`name_1-23.456.png`; PNG or JPEG — in settings) | Shift+S |
-| Contact sheet: 16 frames along the whole video with their times and file details (`name_sheet.png`) | Shift+C |
+| Contact sheet: 16 frames along the whole video with their times and file details (`name_sheet.png`) | Ctrl+Shift+S |
 | A–B loop: the first press sets the start, the second the end, the third turns it off | A |
 | Next audio track of a video | B |
 | Lyrics from the tags in place of the album art (ID3 USLT or TXXX:LYRICS, Vorbis LYRICS); a long text scrolls along with the track, or with the mouse wheel; Y again brings the art back | Y |

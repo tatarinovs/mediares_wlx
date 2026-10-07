@@ -10,8 +10,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetDlgItem, GetDlgItemTextW,
-    GetMessageW, GetWindow, GetWindowRect, GetWindowTextLengthW, IsDialogMessageW, IsWindow,
+    CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetDlgItem, GetMessageW,
+    GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow,
     PostQuitMessage, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW,
     CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_KEYDOWN, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP,
@@ -38,12 +38,16 @@ pub unsafe fn font(dlg: HWND, face: &str, height: i32) -> Font {
     gdi::create_font(face, px(dlg, height), false)
 }
 
+/// The text of an already-resolved control window.
+pub unsafe fn window_text(hwnd: HWND) -> String {
+    let mut buf = vec![0u16; usize::try_from(GetWindowTextLengthW(hwnd)).unwrap_or(0) + 1];
+    let len = usize::try_from(GetWindowTextW(hwnd, &mut buf)).unwrap_or(0);
+    String::from_utf16_lossy(&buf[..len])
+}
+
 /// The text of the control `id`.
 pub unsafe fn item_text(dlg: HWND, id: i32) -> String {
-    let len = GetDlgItem(Some(dlg), id).map_or(0, |item| GetWindowTextLengthW(item));
-    let mut buf = vec![0u16; usize::try_from(len).unwrap_or(0) + 1];
-    let len = GetDlgItemTextW(dlg, id, &mut buf) as usize;
-    String::from_utf16_lossy(&buf[..len])
+    window_text(GetDlgItem(Some(dlg), id).unwrap_or_default())
 }
 
 /// Registers a dialog window class on this DLL. Repeated calls fail harmlessly.
