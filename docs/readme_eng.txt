@@ -59,6 +59,8 @@ Neighbouring photos are loaded in advance, so paging is instant.
   Move a zoomed photo ...... drag with the mouse
   Loupe .................... hold the left mouse button on the photo
   Rotate left / right ...... L / R (on screen only, the file is untouched)
+  Keep the zoom ............ Z (the next photo at the same zoom and spot)
+  Compare with this photo .. C (two photos side by side, shared zoom)
   Full screen .............. Enter, F, F11, double click; Esc to leave
   Info line (OSD) .......... O or I
   Slideshow ................ F5
@@ -81,6 +83,9 @@ is saved rotated.
 
 Copy (Ctrl+C): the image can be pasted both into an editor and into
 a folder as a file.
+
+Shooting RAW+JPEG, RAW files that have a JPEG of the same name can be
+skipped (a setting), so each shot comes up once.
 
 Open in editor (F4) uses the program Windows has for editing this file
 type. You can choose your own program in the settings.
@@ -110,12 +115,22 @@ settings.
   Full screen .............. Enter, F, F11, double click; Esc to leave
   Save frame ............... Shift+S (next to the video; PNG or JPEG —
                              chosen in the settings)
+  Contact sheet ............ Shift+C (16 frames in one picture)
+  A-B loop ................. A (start, end, off)
+  Audio track .............. B (next one)
+  Lyrics ................... Y (in place of the album art)
   Copy frame / album art ... Ctrl+C
   Open in editor ........... F4
   Show in folder ........... Ctrl+Enter
   Move to Recycle Bin ...... Del
 
 Videos longer than 5 minutes resume where they were closed.
+
+Hovering over the video's progress bar shows the frame of that spot and
+the chapter title; chapters show as gaps in the bar.
+
+The tracks of a folder play on without gaps. Loudness can follow the
+ReplayGain tags (a setting).
 
 
 4. FULL SCREEN, OSD, SLIDESHOW

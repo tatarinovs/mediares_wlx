@@ -104,7 +104,11 @@ OpenEXR is behind the `exr` cargo feature of `mediares_core` and off by default:
 frame is being prepared, the previous one stays on screen. Neighbouring photos (two ahead in the paging
 direction and one behind) are pre-decoded by a pool of 1–3 threads and show instantly; the cache holds up to
 512 MB. If a file's header is bad, `ListLoad` returns NULL and TC tries another plugin; if the file fails to
-decode later, the window shows a message.
+decode later, the window shows a message. A photo is first decoded at screen size: JPEG, HEIC and the preview
+embedded in a RAW shrink while decoding, and the EXIF rotation is applied right there. TC thumbnails of a RAW
+use its smallest preview that is big enough. The whole picture for zooming follows in the background and is
+dropped once you move to another file. The folder's file list is read in the background — the first file
+shows without waiting for it.
 
 | Action | Keys / mouse |
 |---|---|
@@ -112,6 +116,8 @@ decode later, the window shows a message.
 | Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
 | Pan / loupe | drag while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
+| Keep the zoom while paging: the next photo opens at the same zoom on the same spot | Z (or the menu, a setting) |
+| Compare with this photo: the screen splits in two, the kept photo on the left, the ones you page through on the right; zoom, pan and the loupe are shared | C (C again to leave) |
 | Write the rotation into the JPEG losslessly | Ctrl+R (or the menu) |
 | Fullscreen | Enter, F, F11, double-click; Esc to exit |
 | OSD on/off / slideshow | O or I / F5 |
@@ -136,6 +142,9 @@ the editor or Explorer, so its window doesn't end up underneath.
 is copied, and RAW → JPEG is the embedded RAW preview as is, with EXIF from the RAW (date, camera, lens,
 exposure, GPS, orientation). Otherwise the file is re-decoded at full resolution, rotated as shown on screen
 (L / R) and encoded with the core EXIF fields; transparency in JPEG is flattened onto white.
+
+**Skip RAW files that have a JPEG twin** (a setting): shooting RAW+JPEG, each shot comes up once while paging.
+The RAW you opened stays in the list.
 
 **Background color** around the photo (and under PNG/GIF transparency) is picked in settings; the palette has
 black, dark, mid-gray, light and white presets. Also there — **"Don't upscale small images"**: in fit mode a
@@ -176,9 +185,21 @@ repeat-list or repeat-one and shuffle — in the right-click menu and in setting
 | Copy the photo / video frame / cover art to the clipboard (pastes as both a picture and a file) | Ctrl+C |
 | OSD (name, resolution, size, position; time for video) on/off for the current type | O, I |
 | Save the current video frame next to the file (`name_1-23.456.png`; PNG or JPEG — in settings) | Shift+S |
+| Contact sheet: 16 frames along the whole video with their times and file details (`name_sheet.png`) | Shift+C |
+| A–B loop: the first press sets the start, the second the end, the third turns it off | A |
+| Next audio track of a video | B |
+| Lyrics from the tags in place of the album art (ID3 USLT or TXXX:LYRICS, Vorbis LYRICS); a long text scrolls along with the track, or with the mouse wheel; Y again brings the art back | Y |
 | Print the current frame / cover art | Ctrl+P |
 | Open in editor / show in folder | F4 / Ctrl+Enter |
 | Delete to recycle bin | Del |
+
+**Video timeline.** Hovering over the timeline pops up the frame of that spot (the nearest key frame) with the
+time and the chapter title. Chapters of MKV and MP4 (with libmpv, of any format) show as gaps in the timeline,
+the ends of an A–B loop as orange ticks.
+
+**Gapless audio.** A few seconds before a track ends, the next file of the queue is decoded ahead and starts
+right after it (when both have the same sample rate and channel count). The **"ReplayGain"** setting evens out
+loudness by the `REPLAYGAIN_TRACK_GAIN`/`_PEAK` tags without clipping.
 
 **Resume playback.** Videos longer than 5 minutes reopen where you left them (the panel shows "Resuming from
 12:34"); a stop within the first or last 30 s isn't remembered. Can be turned off in settings.
@@ -436,7 +457,8 @@ particular computer doesn't travel with a portable TC and lives in `%LOCALAPPDAT
 3 — both), `Repeat` (0 — none, 1 — list, 2 — file), `SeekStep` (the ← / → step in seconds, 1–600), `FrameFormat` (`png` / `jpg`), `PhotoEditor` /
 `VideoEditor` / `AudioEditor` (a program path, optionally with arguments and `%1`), `PhotoOSDTemplate` /
 `VideoOSDTemplate` (see OSD). Flags — 0/1: `StartFullscreen`, `AutoRotateExif`, `NoUpscale`, `SmoothZoom`,
-`ConfirmDelete`, `ResumeVideo`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`, `OverlayVideo`, `OverlayAutoHide`.
+`KeepZoom`, `SkipRawTwins`, `ConfirmDelete`, `ResumeVideo`, `ReplayGain`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`,
+`OverlayVideo`, `OverlayAutoHide`.
 
 The UI is in Russian and English. `auto` follows Total Commander's language (`LanguageIni` in `wincmd.ini`:
 `*RUS*` means Russian, otherwise English), and without a `wincmd.ini` it follows the Windows UI language.
