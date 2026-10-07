@@ -27,7 +27,7 @@ fn field(name: &str) -> i32 {
 #[test]
 fn test_supported_fields_enumeration() {
     let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
-    assert_eq!(fields.len(), 68);
+    assert_eq!(fields.len(), 73);
     let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     // Hashes for duplicate search come first.
     assert_eq!(
@@ -45,7 +45,7 @@ fn test_supported_fields_enumeration() {
     assert_eq!(names.last(), Some(&"Plugin_Version"));
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 68, "names are unique");
+    assert_eq!(names.len(), 73, "names are unique");
 
     for (name, kind) in [
         ("Image_dHash", FT_STRINGW),

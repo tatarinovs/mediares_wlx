@@ -10,10 +10,10 @@ use windows::Win32::Media::MediaFoundation::{
     MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
     MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_AUDIO_NUM_CHANNELS,
     MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE,
+    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_ROTATION, MF_PD_DURATION,
+    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::{VT_I8, VT_UI8};
@@ -57,6 +57,22 @@ pub struct VideoMeta {
     pub audio_codec: Option<String>,
     pub audio_channels: Option<u32>,
     pub audio_sample_rate: Option<u32>,
+    /// Clockwise turn the player applies (phone videos are often stored sideways): 90, 180, 270.
+    pub rotation: Option<u32>,
+    /// "HDR10" (PQ) or "HLG" for high dynamic range video, "SDR" otherwise; `None` if the stream
+    /// doesn't say.
+    pub dynamic_range: Option<&'static str>,
+}
+
+/// The dynamic range named by a stream's transfer function (`MFVideoTransferFunction`).
+pub fn dynamic_range_name(transfer: u32) -> Option<&'static str> {
+    // MFVideoTransFunc_2084 (SMPTE ST 2084, PQ) and MFVideoTransFunc_HLG.
+    match transfer {
+        0 => None,
+        15 => Some("HDR10"),
+        16 => Some("HLG"),
+        _ => Some("SDR"),
+    }
 }
 
 #[derive(Debug)]
@@ -160,6 +176,11 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
             audio_sample_rate: audio
                 .as_ref()
                 .and_then(|a| positive(a.GetUINT32(&MF_MT_AUDIO_SAMPLES_PER_SECOND))),
+            rotation: video.GetUINT32(&MF_MT_VIDEO_ROTATION).ok(),
+            dynamic_range: video
+                .GetUINT32(&MF_MT_TRANSFER_FUNCTION)
+                .ok()
+                .and_then(dynamic_range_name),
         })
     }
 }
@@ -308,33 +329,84 @@ pub fn analyze_video(
 /// Decodes the frame at `fraction` (0..1) of the duration as RGBA — for thumbnails. The source
 /// reader lands on the key frame before that position, which is fine for a preview.
 pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> {
-    let _com = mf_scope()?;
-    unsafe {
-        let reader = open_reader(path, true).ok()?;
-        set_output_format(&reader, &MFVideoFormat_RGB32).ok()?;
-        let geo = FrameGeometry::current(&reader, PixelFormat::Rgb32)?;
-        let (width, height) = (geo.width, geo.height);
-        if width == 0
-            || height == 0
-            || (width as u64) * (height as u64) > crate::image_decode::MAX_PIXELS
-        {
-            return None;
-        }
-        let at = (duration_hns(&reader) as f64 * fraction.clamp(0.0, 1.0)) as i64;
-        set_position(&reader, at).ok()?;
-        let buffer = next_sample(&reader)?.ConvertToContiguousBuffer().ok()?;
-        with_linear_frame(&buffer, &geo, |frame| {
-            let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-            for y in 0..height {
-                rgba.extend(
-                    frame
-                        .row(y)?
-                        .chunks_exact(4)
-                        .flat_map(|px| [px[2], px[1], px[0], 255]),
-                );
+    let grabber = FrameGrabber::open(path)?;
+    grabber
+        .frame_at(grabber.duration_sec() * fraction.clamp(0.0, 1.0), None)
+        .map(|(frame, _)| frame)
+}
+
+/// A video kept open to take frames from one after another (previews along the timeline): each
+/// is the key frame at or before the time asked for, so it costs one seek and one decoded frame.
+/// COM objects inside: used on the thread that opened it.
+pub struct FrameGrabber {
+    reader: IMFSourceReader,
+    geo: FrameGeometry,
+    duration_hns: u64,
+    _com: crate::mf_init::ComScope,
+}
+
+impl FrameGrabber {
+    pub fn open(path: &Path) -> Option<Self> {
+        let com = mf_scope()?;
+        unsafe {
+            let reader = open_reader(path, true).ok()?;
+            set_output_format(&reader, &MFVideoFormat_RGB32).ok()?;
+            let geo = FrameGeometry::current(&reader, PixelFormat::Rgb32)?;
+            let pixels = u64::from(geo.width) * u64::from(geo.height);
+            if pixels == 0 || pixels > crate::image_decode::MAX_PIXELS {
+                return None;
             }
-            image::RgbaImage::from_raw(width, height, rgba)
-        })
+            let duration_hns = duration_hns(&reader);
+            Some(Self {
+                reader,
+                geo,
+                duration_hns,
+                _com: com,
+            })
+        }
+    }
+
+    pub fn duration_sec(&self) -> f64 {
+        self.duration_hns as f64 / HNS_PER_SEC
+    }
+
+    /// The frame shown at `seconds` (the key frame at or before it) as RGBA, fitted into `fit`
+    /// (never enlarged) when given, with its own time in seconds.
+    pub fn frame_at(
+        &self,
+        seconds: f64,
+        fit: Option<(u32, u32)>,
+    ) -> Option<(image::RgbaImage, f64)> {
+        let (width, height) = (self.geo.width, self.geo.height);
+        let (frame, time) = unsafe {
+            set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
+            let sample = next_sample(&self.reader)?;
+            let time = sample
+                .GetSampleTime()
+                .map_or(seconds, |t| t as f64 / HNS_PER_SEC);
+            let buffer = sample.ConvertToContiguousBuffer().ok()?;
+            let frame = with_linear_frame(&buffer, &self.geo, |frame| {
+                let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+                for y in 0..height {
+                    rgba.extend(
+                        frame
+                            .row(y)?
+                            .chunks_exact(4)
+                            .flat_map(|px| [px[2], px[1], px[0], 255]),
+                    );
+                }
+                image::RgbaImage::from_raw(width, height, rgba)
+            })?;
+            (frame, time)
+        };
+        let Some(fit) = fit else {
+            return Some((frame, time));
+        };
+        let (w, h) = crate::image_decode::fitted_size((width, height), fit);
+        if (w, h) == (width, height) {
+            return Some((frame, time));
+        }
+        Some((image::imageops::thumbnail(&frame, w, h), time))
     }
 }
 

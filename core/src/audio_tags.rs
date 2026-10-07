@@ -44,6 +44,33 @@ pub struct AudioTags {
     pub has_cover: bool,
     /// Encoded front cover (JPEG/PNG...), or the first embedded picture.
     pub cover: Option<Vec<u8>>,
+    /// ReplayGain of the track: gain in dB and peak amplitude (1.0 = full scale).
+    pub replay_gain_db: Option<f32>,
+    pub replay_peak: Option<f32>,
+    /// Song text (ID3 USLT, Vorbis LYRICS...); read for the viewer only, like `cover`.
+    pub lyrics: Option<String>,
+}
+
+impl AudioTags {
+    /// The volume factor ReplayGain asks for, lowered where the peak would clip.
+    pub fn replay_gain_factor(&self) -> Option<f32> {
+        let gain = 10f32.powf(self.replay_gain_db? / 20.0);
+        let ceiling = self
+            .replay_peak
+            .filter(|&p| p > 0.0)
+            .map_or(f32::MAX, |p| 1.0 / p);
+        Some(gain.min(ceiling))
+    }
+}
+
+/// The number a ReplayGain value starts with ("-6.54 dB", "+1.2", "0.987654").
+fn replay_gain_number(value: &str) -> Option<f32> {
+    let value = value.trim();
+    let end = value
+        .char_indices()
+        .find(|&(i, c)| !(c.is_ascii_digit() || c == '.' || (i == 0 && (c == '-' || c == '+'))))
+        .map_or(value.len(), |(i, _)| i);
+    value[..end].parse().ok().filter(|v: &f32| v.is_finite())
 }
 
 /// Reads tags and stream properties; `None` if the file can't be parsed at all.
@@ -123,6 +150,11 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
                 tags.cover = front.map(|v| v.data.to_vec()).filter(|d| !d.is_empty());
             }
         }
+    }
+
+    if !with_cover {
+        // Only the viewer shows it; the column cache holds thousands of tags.
+        tags.lyrics = None;
     }
 
     let mut mss = format.into_inner();
@@ -434,12 +466,49 @@ impl AudioTags {
             TrackTotal(n) => fill_num(&mut self.track_total, *n),
             DiscNumber(n) => fill_num(&mut self.disc, *n),
             DiscTotal(n) => fill_num(&mut self.disc_total, *n),
+            ReplayGainTrackGain(v) => self.apply_replay_gain("REPLAYGAIN_TRACK_GAIN", v),
+            ReplayGainTrackPeak(v) => self.apply_replay_gain("REPLAYGAIN_TRACK_PEAK", v),
+            Lyrics(v) => self.set_lyrics(v),
             _ => {}
+        }
+    }
+
+    /// `REPLAYGAIN_TRACK_GAIN` / `_PEAK` however the tag format names it.
+    fn apply_replay_gain(&mut self, name: &str, value: &str) {
+        let slot = if name.eq_ignore_ascii_case("REPLAYGAIN_TRACK_GAIN") {
+            &mut self.replay_gain_db
+        } else if name.eq_ignore_ascii_case("REPLAYGAIN_TRACK_PEAK") {
+            &mut self.replay_peak
+        } else {
+            return;
+        };
+        if slot.is_none() {
+            *slot = replay_gain_number(value);
+        }
+    }
+
+    /// The first non-empty song text wins.
+    fn set_lyrics(&mut self, text: &str) {
+        if self.lyrics.is_none() && !text.trim().is_empty() {
+            self.lyrics = Some(text.trim().replace("\r\n", "\n").replace('\r', "\n"));
         }
     }
 
     /// Text tags symphonia leaves without a standard meaning.
     fn apply_unmapped(&mut self, tag: &Tag, latin1: bool) {
+        // ReplayGain as ID3 TXXX frames or iTunes free-form atoms.
+        if let RawValue::String(value) = &tag.raw.value {
+            let name = sub_field(tag, "DESCRIPTION")
+                .unwrap_or_else(|| tag.raw.key.rsplit(':').next().unwrap_or_default());
+            self.apply_replay_gain(name, value);
+            // Lyrics as TXXX:LYRICS / UNSYNCEDLYRICS (foobar2000), TXXX:lyrics-eng (ffmpeg).
+            let name = name.to_ascii_lowercase();
+            if name.starts_with("lyrics")
+                || name.starts_with("unsynced") && name.ends_with("lyrics")
+            {
+                self.set_lyrics(value);
+            }
+        }
         let text = match &tag.raw.value {
             RawValue::String(v) => v.to_string(),
             // ID3v2 frames padded with NULs come out as a list of one value and empty strings.
@@ -581,6 +650,25 @@ mod tests {
         assert_eq!(mpeg_frame_kbps([0xFF, 0xFD, 0xA0, 0x00]), Some(192)); // MPEG-1 Layer II
         assert_eq!(mpeg_frame_kbps([0xFF, 0xFB, 0x00, 0x00]), None); // free format
         assert_eq!(mpeg_frame_kbps([0x49, 0x44, 0x33, 0x03]), None);
+    }
+
+    #[test]
+    fn replay_gain_values() {
+        assert_eq!(replay_gain_number("-6.54 dB"), Some(-6.54));
+        assert_eq!(replay_gain_number(" +1.5dB"), Some(1.5));
+        assert_eq!(replay_gain_number("0.987654"), Some(0.987654));
+        assert_eq!(replay_gain_number("dB"), None);
+        let tags = |db, peak| AudioTags {
+            replay_gain_db: db,
+            replay_peak: peak,
+            ..AudioTags::default()
+        };
+        assert_eq!(tags(None, Some(0.5)).replay_gain_factor(), None);
+        let half = tags(Some(-6.0206), None).replay_gain_factor().unwrap();
+        assert!((half - 0.5).abs() < 1e-3);
+        // +6 dB would clip a peak of 0.8: held at 1 / 0.8.
+        let held = tags(Some(6.0), Some(0.8)).replay_gain_factor().unwrap();
+        assert!((held - 1.25).abs() < 1e-4);
     }
 
     #[test]

@@ -521,6 +521,8 @@ pub fn video_meta(path: &Path) -> Option<VideoMeta> {
             .map(|c| codec_name(&c)),
         audio_channels: audio_prop("demux-channel-count"),
         audio_sample_rate: audio_prop("demux-samplerate"),
+        rotation: None,
+        dynamic_range: None,
     })
 }
 

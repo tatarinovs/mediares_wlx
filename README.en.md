@@ -295,6 +295,9 @@ read, so these fields are never delayed.
 | `Image_Width`, `Image_Height` | number | Size in pixels, EXIF rotation not applied. For JPG/PNG/... — from the header; for RAW — from EXIF (`PixelXDimension`/`PixelYDimension`: the embedded preview can be downscaled — 1616x1080 for a 6000x4000 Sony ARW shot), without it and for PSD — the preview or composite size from analysis (delayed) |
 | `Image_Dimensions` | string | `WxH`, the source of the width and height above |
 | `Image_AspectRatio` | string | Ratio: `3:2`, `16:9`, `4:3`, `1:1`, `21:9`, otherwise a reduced fraction up to 20 or `1.85:1` (from the same size) |
+| `Image_Bit_Depth` | number | Bits per channel from the header: 8; 16 for 16-bit PNG/TIFF; 10–12 for HDR HEIC/AVIF; empty for RAW and PSD |
+| `Image_Has_Alpha` | yes/no | Whether there is an alpha channel (it may still be fully opaque) |
+| `Image_Sharpness` | number | Sharpness: the Laplacian variance of the photo shrunk to 1024 pixels. There is no absolute scale — sorting a folder of one session by it brings blurred and out-of-focus shots to the top. JPEG and RAW are shrunk while decoding (delayed) |
 | `Photo_Make`, `Photo_Model`, `Photo_Lens` | string | Camera make, model, lens |
 | `Photo_Date_Taken` | date/time | `DateTimeOriginal` (or `DateTime` if absent), in whatever time the camera's clock was set to |
 | `Photo_Exposure` | string | Exposure time: `1/250`, `2.5` |
@@ -320,6 +323,8 @@ noticeable amount of time, so these fields are delayed.
 | `Video_Dimensions` | string | `WxH` from analysis |
 | `Video_Frame_Rate` | float | Frames per second (29.97, 25) |
 | `Video_Codec` | string | H.264, HEVC, AV1, VP9, MPEG-4, MPEG-2, VC-1... or FOURCC |
+| `Video_HDR` | string | `HDR10` (PQ), `HLG` or `SDR` — from the stream's transfer function (MP4 from Media Foundation, MKV/WebM from the Colour element); empty if the file doesn't state it |
+| `Video_Rotation` | number | Clockwise turn applied on playback (0, 90, 180, 270): phone videos are often stored sideways |
 | `Video_Bitrate_kbps` | number | Overall file bitrate (size / duration) |
 | `Video_Audio_Codec` | string | AAC, AC-3, E-AC-3, MP3, DTS, Opus, FLAC...; empty if there's no audio |
 | `Video_Audio_Channels`, `Video_Audio_Sample_Rate_Hz` | number | Channels and sample rate of the first audio track |

@@ -218,6 +218,10 @@ Photos:
   Image_Width, Image_Height      Width and height in pixels
   Image_Dimensions               Size as text: 6000x4000
   Image_AspectRatio              Aspect ratio: 3:2, 16:9, 4:3...
+  Image_Bit_Depth                Bits per channel: 8, 16 for 16-bit PNG/TIFF, 10-12 for HDR HEIC/AVIF
+  Image_Has_Alpha                Whether there is an alpha channel (PNG, WebP, TIFF...)
+  Image_Sharpness                Shot sharpness (Laplacian variance): sorting by it finds
+                                 blurred and out-of-focus shots of one session (delayed)
   Photo_Make, Photo_Model        Camera make and model
   Photo_Lens                     Lens
   Photo_Date_Taken               Date and time taken
@@ -240,6 +244,8 @@ Video:
   Video_Dimensions               Size as text: 1920x1080
   Video_Frame_Rate               Frames per second
   Video_Codec                    Video codec: H.264, HEVC, AV1...
+  Video_HDR                      Dynamic range: HDR10 (PQ), HLG or SDR
+  Video_Rotation                 Clockwise turn applied on playback (phone videos): 0, 90...
   Video_Bitrate_kbps             Bitrate, kbps
   Video_Audio_Codec              Audio codec: AAC, AC-3...
   Video_Audio_Channels           Number of audio channels

@@ -5,7 +5,7 @@
 
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 /// TIFF-based files keep IFD0 and the Exif IFD near the start: this much is read first...
@@ -112,7 +112,7 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
         return Some(info);
     }
     let block = if magic.starts_with(&[0xFF, 0xD8]) {
-        read_jpeg_app1(&mut file)?
+        read_jpeg_app1(file)?
     } else if magic == b"II*\0" || magic == b"MM\0*" {
         // The head usually holds all the metadata (a Sony ARW's ends at about 43 KB); only if an
         // offset points past it is the longer scan read.
@@ -138,8 +138,11 @@ pub fn read_orientation(path: &Path) -> Option<u16> {
     read_exif(path)?.orientation
 }
 
-/// Returns the TIFF payload of the first `Exif\0\0` APP1 segment of a JPEG file.
-fn read_jpeg_app1(file: &mut File) -> Option<Vec<u8>> {
+/// Returns the TIFF payload of the first `Exif\0\0` APP1 segment of a JPEG file. The header
+/// segments are read through one buffer: a read per marker byte would be a round trip each on a
+/// network drive.
+fn read_jpeg_app1(file: File) -> Option<Vec<u8>> {
+    let mut file = BufReader::with_capacity(64 * 1024, file);
     file.seek(SeekFrom::Start(2)).ok()?;
     let mut byte = [0u8; 1];
     loop {
@@ -171,7 +174,7 @@ fn read_jpeg_app1(file: &mut File) -> Option<Vec<u8>> {
                 return Some(payload);
             }
         } else {
-            file.seek(SeekFrom::Current(payload_len as i64)).ok()?;
+            file.seek_relative(payload_len as i64).ok()?;
         }
     }
 }

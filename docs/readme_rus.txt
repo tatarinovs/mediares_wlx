@@ -225,6 +225,10 @@ Total Commander умеет искать дубликаты по полю пла�
   Image_Width, Image_Height      Ширина и высота в пикселях
   Image_Dimensions               Размер строкой: 6000x4000
   Image_AspectRatio              Пропорции: 3:2, 16:9, 4:3...
+  Image_Bit_Depth                Бит на канал: 8, 16 у 16-битных PNG/TIFF, 10-12 у HDR HEIC/AVIF
+  Image_Has_Alpha                Есть ли канал прозрачности (PNG, WebP, TIFF...)
+  Image_Sharpness                Резкость кадра (дисперсия лапласиана): сортировка находит
+                                 смазанные и нерезкие снимки одной съёмки (отложенное)
   Photo_Make, Photo_Model        Производитель и модель камеры
   Photo_Lens                     Объектив
   Photo_Date_Taken               Дата и время съёмки
@@ -247,6 +251,8 @@ Total Commander умеет искать дубликаты по полю пла�
   Video_Dimensions               Размер строкой: 1920x1080
   Video_Frame_Rate               Кадров в секунду
   Video_Codec                    Кодек видео: H.264, HEVC, AV1...
+  Video_HDR                      Динамический диапазон: HDR10 (PQ), HLG или SDR
+  Video_Rotation                 Поворот при показе по часовой стрелке (видео с телефона): 0, 90...
   Video_Bitrate_kbps             Битрейт, кбит/с
   Video_Audio_Codec              Кодек звука: AAC, AC-3...
   Video_Audio_Channels           Число каналов звука

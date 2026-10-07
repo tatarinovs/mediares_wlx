@@ -188,31 +188,93 @@ pub fn fitted_size((w, h): (u32, u32), (fit_w, fit_h): (u32, u32)) -> (u32, u32)
 }
 
 /// Like [`decode_file`], but fitted into `fit` (never enlarged), along with the size of the whole
-/// picture. JPEG and the WIC formats are reduced while decoding (HEIC about three times faster at
-/// a quarter of the size); the rest are decoded whole and then shrunk.
+/// picture. JPEG, RAW previews and the WIC formats are reduced while decoding (HEIC about three
+/// times faster at a quarter of the size); the rest are decoded whole and then shrunk.
 pub fn decode_file_fitted(
     path: &Path,
     kind: MediaType,
     fit: (u32, u32),
 ) -> Option<(DynamicImage, (u32, u32))> {
-    let by_wic = kind == MediaType::StandardImage
-        && !crate::svg::handles(path)
-        && (crate::wic_decode::handles(path) || is_jpeg(path));
-    if let Some(fitted) = by_wic
-        .then(|| crate::wic_decode::decode_fitted(path, Some(fit)))
-        .flatten()
-    {
-        return Some(fitted);
+    decode_turned_fitted(path, kind, fit, 1).map(|(img, full, _)| (img, full))
+}
+
+/// [`decode_file_fitted`] that also tries to turn the picture by the EXIF `orientation` while
+/// decoding. Returns the picture, the size of the whole picture before any turn, and whether
+/// the turn was made.
+fn decode_turned_fitted(
+    path: &Path,
+    kind: MediaType,
+    fit: (u32, u32),
+    orientation: u16,
+) -> Option<(DynamicImage, (u32, u32), bool)> {
+    use crate::wic_decode::{decode_turned, Input};
+    if by_wic(path, kind) {
+        if let Some((img, full)) = decode_turned(Input::File(path), Some(fit), orientation) {
+            return Some((img, full, true));
+        }
+    }
+    #[cfg(feature = "raw-preview")]
+    if kind == MediaType::RawImage {
+        let preview = crate::raw_preview::extract_raw_preview_for(path, Some(fit.0.max(fit.1)))?;
+        if let Some((img, full)) = decode_turned(Input::Memory(&preview), Some(fit), orientation) {
+            return Some((img, full, true));
+        }
+        let img = decode_bytes(&preview)?;
+        let full = (img.width(), img.height());
+        return Some((shrunk(img, fit), full, false));
     }
     let img = decode_file(path, kind)?;
     let full = (img.width(), img.height());
+    Some((shrunk(img, fit), full, false))
+}
+
+/// `img` fitted into `fit` (never enlarged).
+fn shrunk(img: DynamicImage, fit: (u32, u32)) -> DynamicImage {
+    let full = (img.width(), img.height());
     let (w, h) = fitted_size(full, fit);
-    let img = if (w, h) == full {
+    if (w, h) == full {
         img
     } else {
         thumbnail(&img, w, h)
+    }
+}
+
+/// The whole picture for display: through WIC where it can stop part way (as fast as the `image`
+/// crate on JPEG), else as [`decode_file`] does.
+fn decode_whole(
+    path: &Path,
+    kind: MediaType,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<DynamicImage> {
+    use crate::wic_decode::{decode_whole_cancellable, Input};
+    // A decode given up is not tried again another way.
+    let tried = |img: Option<DynamicImage>| match img {
+        Some(img) => Some(Some(img)),
+        None if cancelled() => Some(None),
+        None => None,
     };
-    Some((img, full))
+    if by_wic(path, kind) {
+        if let Some(result) = tried(decode_whole_cancellable(Input::File(path), cancelled)) {
+            return result;
+        }
+    }
+    #[cfg(feature = "raw-preview")]
+    if kind == MediaType::RawImage {
+        let preview = crate::raw_preview::extract_raw_preview(path)?;
+        if let Some(result) = tried(decode_whole_cancellable(Input::Memory(&preview), cancelled)) {
+            return result;
+        }
+        return decode_bytes(&preview);
+    }
+    decode_file(path, kind)
+}
+
+/// Decoded through WIC for display: its formats, and JPEG, whose decoder there scales while
+/// decoding and can stop part way.
+fn by_wic(path: &Path, kind: MediaType) -> bool {
+    kind == MediaType::StandardImage
+        && !crate::svg::handles(path)
+        && (crate::wic_decode::handles(path) || is_jpeg(path))
 }
 
 fn is_jpeg(path: &Path) -> bool {
@@ -262,6 +324,46 @@ pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
         .or_else(|| crate::wic_decode::dimensions(path))
 }
 
+/// How a standard image stores its pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PixelFormat {
+    /// 8 for most pictures; 16 for 16-bit PNG/TIFF, 10-12 for HDR HEIC/AVIF, 32 for float.
+    pub bits_per_channel: u32,
+    pub channels: u32,
+    /// Has an alpha channel (it may still be fully opaque).
+    pub alpha: bool,
+}
+
+/// [`PixelFormat`] of a standard image from its header, without decoding. SVG has none.
+pub fn header_pixel_format(path: &Path) -> Option<PixelFormat> {
+    use image::ImageDecoder;
+    if crate::svg::handles(path) {
+        return None;
+    }
+    if crate::wic_decode::handles(path) {
+        return crate::wic_decode::pixel_format(path);
+    }
+    let mut file = BufReader::new(File::open(path).ok()?);
+    if let Some(sof) = crate::jpeg::read_frame_header(&mut file) {
+        return Some(PixelFormat {
+            bits_per_channel: sof.precision.into(),
+            channels: sof.components.into(),
+            alpha: false,
+        });
+    }
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let decoder = reader(Source::File(file), Some(path))?
+        .into_decoder()
+        .ok()?;
+    let original = decoder.original_color_type();
+    let channels = u32::from(original.channel_count());
+    (channels > 0).then(|| PixelFormat {
+        bits_per_channel: u32::from(original.bits_per_pixel()) / channels,
+        channels,
+        alpha: decoder.color_type().has_alpha(),
+    })
+}
+
 /// `img` fitted into `max_w` x `max_h` (aspect kept) by averaging, like
 /// [`DynamicImage::thumbnail`], but only for the buffer types the decoders produce: that method
 /// compiles its filter for every pixel type (about 45 KB). Rarer types go through RGBA8.
@@ -309,23 +411,37 @@ pub fn decode_oriented_fitted(
     auto_rotate: bool,
     fit: Option<(u32, u32)>,
 ) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
-    let (mut img, (mut w, mut h)) = match fit {
-        Some(fit) => decode_file_fitted(path, kind, fit)?,
-        None => decode_file(path, kind).map(|img| {
-            let size = (img.width(), img.height());
-            (img, size)
-        })?,
-    };
+    decode_oriented_cancellable(path, kind, auto_rotate, fit, &|| false)
+}
+
+/// [`decode_oriented_fitted`]; a whole picture (`fit` = `None`) of JPEG, RAW and the WIC formats
+/// is decoded a strip at a time and given up (`None`) as soon as `cancelled` says so.
+pub fn decode_oriented_cancellable(
+    path: &Path,
+    kind: MediaType,
+    auto_rotate: bool,
+    fit: Option<(u32, u32)>,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
+    // Read first: the decoders that can turn the picture on the way get the orientation.
     let exif = crate::exif::read_exif(path);
-    if let Some(orientation) = exif
+    let orientation = exif
         .as_ref()
         .and_then(|e| e.orientation)
-        .filter(|_| auto_rotate)
-    {
+        .filter(|o| auto_rotate && (1..=8).contains(o))
+        .unwrap_or(1);
+    let (mut img, (mut w, mut h), turned) = match fit {
+        Some(fit) => decode_turned_fitted(path, kind, fit, orientation)?,
+        None => decode_whole(path, kind, cancelled).map(|img| {
+            let size = (img.width(), img.height());
+            (img, size, false)
+        })?,
+    };
+    if !turned {
         apply_exif_orientation(&mut img, orientation);
-        if (5..=8).contains(&orientation) {
-            (w, h) = (h, w);
-        }
+    }
+    if (5..=8).contains(&orientation) {
+        (w, h) = (h, w);
     }
     Some((img, (w, h), exif))
 }

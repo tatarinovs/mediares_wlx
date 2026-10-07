@@ -127,11 +127,39 @@ pub unsafe fn write_wide(dest: *mut u16, max_bytes: usize, text: &str) -> bool {
     if dest.is_null() || max_chars == 0 {
         return false;
     }
+    let mut units = text.encode_utf16();
     let mut i = 0;
-    for ch in text.encode_utf16().take(max_chars - 1) {
+    for ch in units.by_ref().take(max_chars - 1) {
         *dest.add(i) = ch;
         i += 1;
     }
+    // Cut short right after the first half of a surrogate pair: drop that half too.
+    if i > 0 && (0xD800..0xDC00).contains(&*dest.add(i - 1)) && units.next().is_some() {
+        i -= 1;
+    }
     *dest.add(i) = 0;
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wide(text: &str, max_chars: usize) -> Vec<u16> {
+        let mut buf = vec![0xFFFFu16; max_chars];
+        assert!(unsafe { write_wide(buf.as_mut_ptr(), max_chars * 2, text) });
+        let len = buf.iter().position(|&c| c == 0).expect("terminated");
+        buf.truncate(len);
+        buf
+    }
+
+    #[test]
+    fn wide_text_is_cut_on_character_boundaries() {
+        let units = |s: &str| s.encode_utf16().collect::<Vec<_>>();
+        assert_eq!(wide("abc", 8), units("abc"));
+        assert_eq!(wide("abc", 3), units("ab"));
+        // The emoji is a surrogate pair, which doesn't fit after "a" into 2 units.
+        assert_eq!(wide("a\u{1F600}", 3), units("a"));
+        assert_eq!(wide("a\u{1F600}", 4), units("a\u{1F600}"));
+    }
 }

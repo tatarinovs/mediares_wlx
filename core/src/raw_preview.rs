@@ -18,17 +18,24 @@ const SIGNATURE_SCAN_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Extract the largest decodable embedded JPEG preview from a RAW file.
 pub fn extract_raw_preview(path: &Path) -> Option<Vec<u8>> {
+    extract_raw_preview_for(path, None)
+}
+
+/// The smallest embedded preview whose longer side is at least `side` (the largest if none is
+/// that big); with `None`, the largest. A thumbnail then reads and decodes a 1616 px preview
+/// instead of the full-size one.
+pub fn extract_raw_preview_for(path: &Path, side: Option<u32>) -> Option<Vec<u8>> {
     let mut file = File::open(path).ok()?;
     let file_len = file.metadata().ok()?.len();
     if file_len < 1024 {
         return None;
     }
-    tiff_preview(&mut file, file_len).or_else(|| signature_preview(&mut file))
+    tiff_preview(&mut file, file_len, side).or_else(|| signature_preview(&mut file))
 }
 
 /// Structured path: walk IFD0, its chain and SubIFDs collecting JPEG candidates
 /// (`JPEGInterchangeFormat` or single-strip JPEG-compressed images as in CR2).
-fn tiff_preview(file: &mut File, file_len: u64) -> Option<Vec<u8>> {
+fn tiff_preview(file: &mut File, file_len: u64, side: Option<u32>) -> Option<Vec<u8>> {
     let mut header = [0u8; 8];
     file.seek(SeekFrom::Start(0)).ok()?;
     file.read_exact(&mut header).ok()?;
@@ -73,18 +80,41 @@ fn tiff_preview(file: &mut File, file_len: u64) -> Option<Vec<u8>> {
 
     candidates.sort_by_key(|&(_, len)| std::cmp::Reverse(len));
     candidates.dedup();
+    candidates.retain(|&(_, len)| len as usize >= MIN_PREVIEW_LEN);
+    if let Some(side) = side {
+        // Smallest first; one too small for `side` is passed over.
+        let big_enough = |(w, h): (u32, u32)| w.max(h) >= side;
+        if let Some(preview) = candidates
+            .iter()
+            .rev()
+            .find_map(|&(off, len)| read_candidate(file, off, len as usize, Some(&big_enough)))
+        {
+            return Some(preview);
+        }
+    }
     candidates
         .into_iter()
-        .filter(|&(_, len)| len as usize >= MIN_PREVIEW_LEN)
-        .find_map(|(off, len)| read_candidate(file, off, len as usize))
+        .find_map(|(off, len)| read_candidate(file, off, len as usize, None))
 }
 
-fn read_candidate(file: &mut File, offset: u64, len: usize) -> Option<Vec<u8>> {
+/// The JPEG at `offset`, if it is decodable (and its size passes `accept`).
+fn read_candidate(
+    file: &mut File,
+    offset: u64,
+    len: usize,
+    accept: Option<&dyn Fn((u32, u32)) -> bool>,
+) -> Option<Vec<u8>> {
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut buf = vec![0u8; len.min(HEADER_PROBE_LEN)];
     file.read_exact(&mut buf).ok()?;
     if !jpeg::is_decodable(&buf) {
         return None;
+    }
+    if let Some(accept) = accept {
+        let size = jpeg::read_dimensions(&mut std::io::Cursor::new(&buf[..]))?;
+        if !accept(size) {
+            return None;
+        }
     }
     buf.resize(len, 0);
     file.read_exact(&mut buf[HEADER_PROBE_LEN.min(len)..])

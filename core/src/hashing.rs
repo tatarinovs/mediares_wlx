@@ -106,6 +106,51 @@ fn compute_phash(gray: &GrayImage) -> u64 {
         .fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
+/// Longest side the sharpness is measured at: values compare between photos of any size.
+pub const SHARPNESS_SIZE: u32 = 1024;
+
+/// Sharpness of a picture fitted into [`SHARPNESS_SIZE`]: the variance of its Laplacian (edge
+/// response). Blurred and shaken shots score low, crisp ones high; there is no fixed scale, it
+/// is for sorting photos of one scene.
+pub fn sharpness(img: &DynamicImage) -> u32 {
+    let (w, h) = (img.width(), img.height());
+    let gray = if w.max(h) > SHARPNESS_SIZE {
+        crate::image_decode::thumbnail(img, SHARPNESS_SIZE, SHARPNESS_SIZE).to_luma8()
+    } else {
+        img.to_luma8()
+    };
+    laplacian_variance(&gray).round().min(u32::MAX as f64) as u32
+}
+
+fn laplacian_variance(gray: &GrayImage) -> f64 {
+    let (w, h) = (gray.width() as usize, gray.height() as usize);
+    if w < 3 || h < 3 {
+        return 0.0;
+    }
+    let px = gray.as_raw();
+    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+    for y in 1..h - 1 {
+        let (up, row, down) = (
+            &px[(y - 1) * w..y * w],
+            &px[y * w..(y + 1) * w],
+            &px[(y + 1) * w..(y + 2) * w],
+        );
+        for x in 1..w - 1 {
+            let lap = 4 * i32::from(row[x])
+                - i32::from(row[x - 1])
+                - i32::from(row[x + 1])
+                - i32::from(up[x])
+                - i32::from(down[x]);
+            let lap = f64::from(lap);
+            sum += lap;
+            sum_sq += lap * lap;
+        }
+    }
+    let n = ((w - 2) * (h - 2)) as f64;
+    let mean = sum / n;
+    sum_sq / n - mean * mean
+}
+
 pub fn compute_aspect_ratio(w: u32, h: u32) -> String {
     if h == 0 || w == 0 {
         return "Unknown".to_string();
@@ -151,6 +196,18 @@ mod tests {
         assert_eq!(compute_aspect_ratio(6000, 4000), "3:2");
         assert_eq!(compute_aspect_ratio(500, 400), "5:4");
         assert_eq!(compute_aspect_ratio(0, 10), "Unknown");
+    }
+
+    #[test]
+    fn blur_lowers_sharpness() {
+        let sharp = DynamicImage::ImageLuma8(GrayImage::from_fn(400, 300, |x, y| {
+            image::Luma([if (x / 4 + y / 4) % 2 == 0 { 30 } else { 220 }])
+        }));
+        let blurred = sharp.blur(3.0);
+        let flat = DynamicImage::ImageLuma8(GrayImage::from_pixel(400, 300, image::Luma([128])));
+        let (s, b) = (sharpness(&sharp), sharpness(&blurred));
+        assert!(s > 10 * b.max(1), "sharp {s}, blurred {b}");
+        assert_eq!(sharpness(&flat), 0);
     }
 
     #[test]

@@ -14,6 +14,11 @@ pub struct VideoTags {
     pub date: Option<String>,
     pub genre: Option<String>,
     pub comment: Option<String>,
+    /// Transfer characteristics of the video track (ITU-T H.273 code: 16 is PQ, 18 is HLG), where
+    /// the container states them (Matroska's Colour element).
+    pub transfer: Option<u64>,
+    /// Chapters: start in seconds and name (may be empty), in order.
+    pub chapters: Vec<(f64, String)>,
 }
 
 impl VideoTags {
@@ -32,6 +37,17 @@ impl VideoTags {
 
     pub fn is_empty(&self) -> bool {
         *self == Self::default()
+    }
+
+    /// "HDR10", "HLG" or "SDR" from [`Self::transfer`].
+    pub fn dynamic_range(&self) -> Option<&'static str> {
+        match self.transfer? {
+            // 2: unspecified.
+            2 => None,
+            16 => Some("HDR10"),
+            18 => Some("HLG"),
+            _ => Some("SDR"),
+        }
     }
 }
 
@@ -185,9 +201,39 @@ fn parse_udta(udta: &[u8], tags: &mut VideoTags) {
             b"titl" | b"auth" | b"perf" | b"dscp" | b"gnre" | b"yrrc" => {
                 apply_mp4(&kind, threegpp_text(&kind, payload), tags)
             }
+            b"chpl" if tags.chapters.is_empty() => tags.chapters = nero_chapters(payload),
             _ => {}
         }
     }
+}
+
+/// Nero `chpl` chapters (ffmpeg writes them into MP4): version and flags, 4 reserved bytes, the
+/// count, then per chapter its start (100 ns units, 64 bits) and a length-prefixed UTF-8 title.
+fn nero_chapters(payload: &[u8]) -> Vec<(f64, String)> {
+    let Some((&count, mut rest)) = payload.get(8..).and_then(<[u8]>::split_first) else {
+        return Vec::new();
+    };
+    let mut chapters = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        let Some(start) = rest
+            .get(..8)
+            .map(|b| u64::from_be_bytes(b.try_into().unwrap()))
+        else {
+            break;
+        };
+        let Some(&len) = rest.get(8) else { break };
+        let Some(title) = rest.get(9..9 + len as usize) else {
+            break;
+        };
+        chapters.push((start as f64 / 1e7, utf8_title(title)));
+        rest = &rest[9 + len as usize..];
+    }
+    chapters.sort_by(|a, b| a.0.total_cmp(&b.0));
+    chapters
+}
+
+fn utf8_title(bytes: &[u8]) -> String {
+    clean(&String::from_utf8_lossy(bytes)).unwrap_or_default()
 }
 
 fn apply_mp4(kind: &[u8; 4], value: Option<String>, tags: &mut VideoTags) {
@@ -261,6 +307,21 @@ const SIMPLE_TAG: u32 = 0x67C8;
 const TAG_NAME: u32 = 0x45A3;
 const TAG_STRING: u32 = 0x4487;
 const CLUSTER: u32 = 0x1F43_B675;
+const TRACKS: u32 = 0x1654_AE6B;
+const TRACK_ENTRY: u32 = 0xAE;
+const TRACK_TYPE: u32 = 0x83;
+const VIDEO_TRACK: u64 = 1;
+const VIDEO: u32 = 0xE0;
+const COLOUR: u32 = 0x55B0;
+const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
+const CHAPTERS: u32 = 0x1043_A770;
+const EDITION_ENTRY: u32 = 0x45B9;
+const EDITION_FLAG_HIDDEN: u32 = 0x45BD;
+const CHAPTER_ATOM: u32 = 0xB6;
+const CHAPTER_TIME_START: u32 = 0x91;
+const CHAPTER_FLAG_HIDDEN: u32 = 0x98;
+const CHAPTER_DISPLAY: u32 = 0x80;
+const CHAP_STRING: u32 = 0x85;
 
 /// Larger Info / Tags / SeekHead elements are not read.
 const MAX_ELEMENT: u64 = 4 << 20;
@@ -340,8 +401,11 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     let segment_end = segment_start.saturating_add(segment_size);
 
     let mut tags = VideoTags::default();
-    let (mut info_seen, mut tags_seen) = (false, false);
-    let (mut info_at, mut tags_at) = (None, None);
+    // Read in place or found through the SeekHead, for Info, Tags, Tracks and Chapters.
+    const WANTED: [u32; 4] = [INFO, TAGS, TRACKS, CHAPTERS];
+    let mut seen = [false; 4];
+    let mut at: [Option<u64>; 4] = [None; 4];
+    let slot = |id: u32| WANTED.iter().position(|&w| w == id);
 
     // Top-level elements in order, up to the first cluster (the frames); Info and Tags usually
     // come before it, and SeekHead says where they are if not.
@@ -356,30 +420,20 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
             break;
         }
         match id {
-            SEEK_HEAD | INFO | TAGS if size <= MAX_ELEMENT => {
+            SEEK_HEAD | INFO | TAGS | TRACKS | CHAPTERS if size <= MAX_ELEMENT => {
                 let mut data = vec![0u8; size as usize];
                 if r.read_exact(&mut data).is_err() {
                     break;
                 }
-                match id {
-                    SEEK_HEAD => {
-                        for (seek_id, seek_pos) in seek_entries(&data) {
-                            let at = segment_start.checked_add(seek_pos);
-                            match seek_id {
-                                INFO => info_at = info_at.or(at),
-                                TAGS => tags_at = tags_at.or(at),
-                                _ => {}
-                            }
+                if id == SEEK_HEAD {
+                    for (seek_id, seek_pos) in seek_entries(&data) {
+                        if let Some(i) = slot(seek_id) {
+                            at[i] = at[i].or(segment_start.checked_add(seek_pos));
                         }
                     }
-                    INFO => {
-                        info_seen = true;
-                        parse_info(&data, &mut tags);
-                    }
-                    _ => {
-                        tags_seen = true;
-                        parse_tags(&data, &mut tags);
-                    }
+                } else if let Some(i) = slot(id) {
+                    seen[i] = true;
+                    parse_element(id, &data, &mut tags);
                 }
             }
             _ => {
@@ -391,20 +445,71 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         }
     }
 
-    for (seen, at, want) in [(info_seen, info_at, INFO), (tags_seen, tags_at, TAGS)] {
-        if seen {
+    for (i, want) in WANTED.into_iter().enumerate() {
+        if seen[i] {
             continue;
         }
-        let Some(data) = at.and_then(|at| read_element_at(r, at, want)) else {
-            continue;
-        };
-        if want == INFO {
-            parse_info(&data, &mut tags);
-        } else {
-            parse_tags(&data, &mut tags);
+        if let Some(data) = at[i].and_then(|at| read_element_at(r, at, want)) {
+            parse_element(want, &data, &mut tags);
         }
     }
     Some(tags)
+}
+
+fn parse_element(id: u32, data: &[u8], tags: &mut VideoTags) {
+    match id {
+        INFO => parse_info(data, tags),
+        TAGS => parse_tags(data, tags),
+        TRACKS => parse_tracks(data, tags),
+        CHAPTERS => parse_chapters(data, tags),
+        _ => {}
+    }
+}
+
+/// The transfer characteristics of the first video track.
+fn parse_tracks(data: &[u8], tags: &mut VideoTags) {
+    let video = children(data)
+        .filter(|(id, _)| *id == TRACK_ENTRY)
+        .find(|(_, entry)| {
+            children(entry).any(|(id, v)| id == TRACK_TYPE && uint(v) == VIDEO_TRACK)
+        });
+    tags.transfer = video
+        .into_iter()
+        .flat_map(|(_, entry)| children(entry))
+        .filter(|(id, _)| *id == VIDEO)
+        .flat_map(|(_, video)| children(video))
+        .filter(|(id, _)| *id == COLOUR)
+        .flat_map(|(_, colour)| children(colour))
+        .find(|(id, _)| *id == TRANSFER_CHARACTERISTICS)
+        .map(|(_, v)| uint(v));
+}
+
+/// The chapters of the first edition that isn't hidden (top-level atoms only).
+fn parse_chapters(data: &[u8], tags: &mut VideoTags) {
+    let hidden =
+        |element: &[u8], flag: u32| children(element).any(|(id, v)| id == flag && uint(v) != 0);
+    let Some((_, edition)) = children(data)
+        .filter(|(id, _)| *id == EDITION_ENTRY)
+        .find(|(_, e)| !hidden(e, EDITION_FLAG_HIDDEN))
+    else {
+        return;
+    };
+    let mut chapters: Vec<(f64, String)> = children(edition)
+        .filter(|(id, atom)| *id == CHAPTER_ATOM && !hidden(atom, CHAPTER_FLAG_HIDDEN))
+        .filter_map(|(_, atom)| {
+            let start = children(atom).find(|(id, _)| *id == CHAPTER_TIME_START)?.1;
+            let name = children(atom)
+                .filter(|(id, _)| *id == CHAPTER_DISPLAY)
+                .flat_map(|(_, display)| children(display))
+                .find(|(id, _)| *id == CHAP_STRING)
+                .and_then(|(_, s)| utf8(s))
+                .unwrap_or_default();
+            // Nanoseconds.
+            Some((uint(start) as f64 / 1e9, name))
+        })
+        .collect();
+    chapters.sort_by(|a, b| a.0.total_cmp(&b.0));
+    tags.chapters = chapters;
 }
 
 fn read_element_at<R: Read + Seek>(r: &mut R, at: u64, want: u32) -> Option<Vec<u8>> {
@@ -556,6 +661,72 @@ mod tests {
         assert_eq!(tags.artist.as_deref(), Some("Кто-то"));
         assert_eq!(tags.date.as_deref(), Some("2019"));
         assert_eq!(tags.genre, None);
+    }
+
+    #[test]
+    fn nero_chapters_in_mp4() {
+        let mut chpl = vec![1, 0, 0, 0, 0, 0, 0, 0, 2];
+        for (start, title) in [(600_000_000u64, "Второй"), (0, "Intro")] {
+            chpl.extend(start.to_be_bytes());
+            chpl.push(title.len() as u8);
+            chpl.extend(title.as_bytes());
+        }
+        assert_eq!(
+            nero_chapters(&chpl),
+            vec![(0.0, "Intro".to_string()), (60.0, "Второй".to_string())]
+        );
+        // Cut short: what is complete stays.
+        assert_eq!(nero_chapters(&chpl[..chpl.len() - 3]).len(), 1);
+        assert!(nero_chapters(&[1, 0, 0]).is_empty());
+    }
+
+    #[test]
+    fn video_colour_and_chapters() {
+        let track = |kind: u8, transfer: u8| {
+            el(
+                TRACK_ENTRY,
+                &cat(&[
+                    el(TRACK_TYPE, &[kind]),
+                    el(
+                        VIDEO,
+                        &el(COLOUR, &el(TRANSFER_CHARACTERISTICS, &[transfer])),
+                    ),
+                ]),
+            )
+        };
+        // An audio track listed first must not count.
+        let tracks = el(TRACKS, &cat(&[track(2, 1), track(1, 16)]));
+        let atom = |start_ns: u64, name: &str, hidden: bool| {
+            el(
+                CHAPTER_ATOM,
+                &cat(&[
+                    el(CHAPTER_TIME_START, &start_ns.to_be_bytes()),
+                    el(CHAPTER_FLAG_HIDDEN, &[hidden as u8]),
+                    el(CHAPTER_DISPLAY, &el(CHAP_STRING, name.as_bytes())),
+                ]),
+            )
+        };
+        let edition = el(
+            EDITION_ENTRY,
+            &cat(&[
+                atom(90_000_000_000, "Вторая", false),
+                atom(0, "Первая", false),
+                atom(5_000_000_000, "Скрытая", true),
+            ]),
+        );
+        let data = file(&cat(&[
+            tracks,
+            el(CHAPTERS, &edition),
+            el(CLUSTER, &[0; 8]),
+        ]));
+
+        let tags = read_matroska(&mut Cursor::new(data)).unwrap();
+        assert_eq!(tags.transfer, Some(16));
+        assert_eq!(tags.dynamic_range(), Some("HDR10"));
+        assert_eq!(
+            tags.chapters,
+            vec![(0.0, "Первая".to_string()), (90.0, "Вторая".to_string())]
+        );
     }
 
     #[test]

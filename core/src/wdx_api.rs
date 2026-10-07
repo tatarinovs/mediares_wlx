@@ -94,6 +94,11 @@ enum Field {
     VideoYear,
     VideoGenre,
     VideoComment,
+    ImageSharpness,
+    ImageBitDepth,
+    ImageHasAlpha,
+    VideoRotation,
+    VideoDynamicRange,
 }
 
 /// Where a field's value comes from; decides whether it is worth delaying.
@@ -110,6 +115,10 @@ enum Source {
     Exif,
     /// Image header for standard formats, EXIF for RAW, the full analysis as a fallback.
     ImageSize,
+    /// How a standard image stores its pixels: its header.
+    PixelFormat,
+    /// Decoding at a reduced size.
+    Sharpness,
     /// Media Foundation stream properties: no decoding, but slow to open.
     VideoMeta,
     /// Video container tags: headers only, but MP4 keeps them in `moov`, often at the end of the file.
@@ -125,11 +134,14 @@ impl Field {
             PluginVersion => Source::Constant,
             MediaTypeName => Source::Probe,
             ImageWidth | ImageHeight | ImageDimensions | ImageAspectRatio => Source::ImageSize,
+            ImageBitDepth | ImageHasAlpha => Source::PixelFormat,
+            ImageSharpness => Source::Sharpness,
             PhotoMake | PhotoModel | PhotoLens | PhotoDateTaken | PhotoExposure | PhotoFNumber
             | PhotoIso | PhotoFocalLength | PhotoFocalLength35 | PhotoFlash | PhotoOrientation
             | PhotoSoftware | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
             VideoWidth | VideoHeight | VideoLength | VideoFrameRate | VideoCodec | VideoBitrate
-            | VideoAudioCodec | VideoAudioChannels | VideoAudioSampleRate => Source::VideoMeta,
+            | VideoAudioCodec | VideoAudioChannels | VideoAudioSampleRate | VideoRotation
+            | VideoDynamicRange => Source::VideoMeta,
             VideoTitle | VideoArtist | VideoDirector | VideoDate | VideoYear | VideoGenre
             | VideoComment => Source::VideoTags,
             _ if self.is_tag() => Source::Tags,
@@ -184,6 +196,9 @@ const FIELDS: &[(Field, &str, c_int)] = &[
     (Field::ImageHeight, "Image_Height", FT_NUMERIC_32),
     (Field::ImageDimensions, "Image_Dimensions", FT_STRINGW),
     (Field::ImageAspectRatio, "Image_AspectRatio", FT_STRINGW),
+    (Field::ImageBitDepth, "Image_Bit_Depth", FT_NUMERIC_32),
+    (Field::ImageHasAlpha, "Image_Has_Alpha", FT_BOOLEAN),
+    (Field::ImageSharpness, "Image_Sharpness", FT_NUMERIC_32),
     (Field::PhotoMake, "Photo_Make", FT_STRINGW),
     (Field::PhotoModel, "Photo_Model", FT_STRINGW),
     (Field::PhotoLens, "Photo_Lens", FT_STRINGW),
@@ -227,6 +242,8 @@ const FIELDS: &[(Field, &str, c_int)] = &[
         FT_NUMERIC_FLOATING,
     ),
     (Field::VideoCodec, "Video_Codec", FT_STRINGW),
+    (Field::VideoDynamicRange, "Video_HDR", FT_STRINGW),
+    (Field::VideoRotation, "Video_Rotation", FT_NUMERIC_32),
     (Field::VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32),
     (Field::VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW),
     (
@@ -391,23 +408,33 @@ unsafe fn get_value(
     }
 
     let kind = probe_file(&path);
-    if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
-        return FT_DELAYED;
+    if kind == MediaType::Unsupported && field.source() != Source::Constant {
+        return FT_FIELDEMPTY;
     }
+    crate::cache::with_file_key(&path, || {
+        if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
+            return FT_DELAYED;
+        }
+        let out = Output {
+            dest: field_value,
+            max_bytes: max_len.max(0) as usize,
+            unicode,
+        };
+        out.value(compute(&path, field, kind))
+    })
+}
 
-    let out = Output {
-        dest: field_value,
-        max_bytes: max_len.max(0) as usize,
-        unicode,
-    };
-    match compute(&path, field, kind) {
-        Some(Value::Text(text)) => out.text(&text),
-        Some(Value::Int(n)) => out.int(n),
-        Some(Value::Bool(b)) => out.boolean(b),
-        Some(Value::Time(seconds)) => out.time(seconds),
-        Some(Value::Float(x)) => out.float(x),
-        Some(Value::DateTime(filetime)) => out.datetime(filetime),
-        None => FT_FIELDEMPTY,
+impl Output {
+    unsafe fn value(&self, value: Option<Value>) -> c_int {
+        match value {
+            Some(Value::Text(text)) => self.text(&text),
+            Some(Value::Int(n)) => self.int(n),
+            Some(Value::Bool(b)) => self.boolean(b),
+            Some(Value::Time(seconds)) => self.time(seconds),
+            Some(Value::Float(x)) => self.float(x),
+            Some(Value::DateTime(filetime)) => self.datetime(filetime),
+            None => FT_FIELDEMPTY,
+        }
     }
 }
 
@@ -431,7 +458,13 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && crate::video_tags::has_tag_reader(path)
                 && !crate::cache::is_video_tags_cached(path)
         }
-        Source::ImageSize if needs_codec() => !crate::cache::is_codec_image_size_cached(path),
+        Source::PixelFormat => {
+            kind == MediaType::StandardImage
+                && needs_codec()
+                && !crate::cache::is_pixel_format_cached(path)
+        }
+        Source::Sharpness => kind.is_image_kind() && !crate::cache::is_sharpness_cached(path),
+        Source::ImageSize if needs_codec() => !crate::cache::is_image_size_cached(path),
         Source::ImageSize => {
             kind != MediaType::StandardImage
                 && analysis_pending()
@@ -475,6 +508,22 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
+        Source::PixelFormat => {
+            let format = (kind == MediaType::StandardImage)
+                .then(|| crate::cache::get_pixel_format(path))
+                .flatten()?;
+            return Some(match field {
+                ImageBitDepth => int(format.bits_per_channel),
+                _ => Value::Bool(format.alpha),
+            });
+        }
+        Source::Sharpness => {
+            return kind
+                .is_image_kind()
+                .then(|| crate::cache::get_sharpness(path))
+                .flatten()
+                .map(int)
+        }
         Source::ImageSize => {
             if let Some((w, h)) = header_size(path, kind) {
                 return match field {
@@ -513,10 +562,7 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
 /// preview is often downscaled, e.g. 1616x1080 for a 6000x4000 Sony ARW).
 fn header_size(path: &Path, kind: MediaType) -> Option<(u32, u32)> {
     match kind {
-        MediaType::StandardImage if crate::image_decode::header_needs_codec(path) => {
-            crate::cache::get_codec_image_size(path)
-        }
-        MediaType::StandardImage => crate::image_decode::header_dimensions(path),
+        MediaType::StandardImage => crate::cache::get_image_size(path),
         MediaType::RawImage => {
             let exif = crate::cache::get_exif(path)?;
             exif.width.zip(exif.height).filter(|&(w, h)| w > 0 && h > 0)
@@ -585,6 +631,12 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
         VideoAudioCodec => meta.audio_codec.clone().map(Value::Text),
         VideoAudioChannels => meta.audio_channels.map(int),
         VideoAudioSampleRate => meta.audio_sample_rate.map(int),
+        VideoRotation => meta.rotation.map(int),
+        // Media Foundation's Matroska source doesn't pass the colour description on.
+        VideoDynamicRange => meta
+            .dynamic_range
+            .or_else(|| crate::cache::get_video_tags(path)?.dynamic_range())
+            .map(|s| Value::Text(s.into())),
         _ => None,
     }
 }

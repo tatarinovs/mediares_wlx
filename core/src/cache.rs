@@ -1,5 +1,6 @@
 //! MediaCache: in-memory LRU cache of image, video and audio analysis results.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,8 +12,12 @@ use crate::image_decode::decode_file;
 use crate::probe::{probe_file, MediaType};
 use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoError, VideoMeta};
 
-const CAPACITY: usize = 1024;
-const META_CAPACITY: usize = 512;
+/// Analysis results are small (hashes); a folder of thousands of files stays cached while TC
+/// sorts and re-sorts it.
+const CAPACITY: usize = 8192;
+/// Metadata entries are a few hundred bytes; sorting a big folder by a column reads every file,
+/// and a smaller cache would read them all again on the next sort.
+const META_CAPACITY: usize = 8192;
 
 #[derive(Debug, Clone)]
 pub enum CachedMedia {
@@ -40,8 +45,18 @@ pub struct FileKey {
     modified: Option<SystemTime>,
 }
 
+thread_local! {
+    /// The key of the file a TC call is about, while [`with_file_key`] runs.
+    static SCOPED_KEY: RefCell<Option<FileKey>> = const { RefCell::new(None) };
+}
+
 impl FileKey {
     pub fn for_path(path: &Path) -> Option<Self> {
+        let scoped = SCOPED_KEY.with_borrow(|k| k.as_ref().filter(|k| k.path == path).cloned());
+        scoped.or_else(|| Self::stat(path))
+    }
+
+    fn stat(path: &Path) -> Option<Self> {
         let meta = fs::metadata(path).ok()?;
         Some(FileKey {
             path: path.to_path_buf(),
@@ -49,6 +64,16 @@ impl FileKey {
             modified: meta.modified().ok(),
         })
     }
+}
+
+/// Runs `f` with the version of `path` looked up once: TC asks for each column separately, and
+/// every cache lookup on the way would otherwise ask the file system again (slow on network
+/// drives and under antivirus scanners).
+pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+    let previous = SCOPED_KEY.replace(FileKey::stat(path));
+    let result = f();
+    SCOPED_KEY.set(previous);
+    result
 }
 
 /// Least-recently-used map from file versions to values, shared between threads.
@@ -203,21 +228,59 @@ pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
         .get_or_read(path, crate::exif::read_exif)
 }
 
-fn codec_size_cache() -> &'static MetaCache<(u32, u32)> {
+fn image_size_cache() -> &'static MetaCache<(u32, u32)> {
     static SIZES: OnceLock<MetaCache<(u32, u32)>> = OnceLock::new();
     SIZES.get_or_init(MetaCache::new)
 }
 
-/// Size of a picture whose header is read by a system codec (see `header_needs_codec`): cheap
-/// once the codec is loaded, but not free like a JPEG header.
-pub fn get_codec_image_size(path: &Path) -> Option<(u32, u32)> {
-    codec_size_cache()
+/// Size of a standard image from its header, read once for all the size columns. For formats a
+/// system codec reads (see `header_needs_codec`) that is cheap once the codec is loaded, but not
+/// free like a JPEG header.
+pub fn get_image_size(path: &Path) -> Option<(u32, u32)> {
+    image_size_cache()
         .get_or_read(path, crate::image_decode::header_dimensions)
         .map(|s| *s)
 }
 
-pub fn is_codec_image_size_cached(path: &Path) -> bool {
-    codec_size_cache().contains(path)
+pub fn is_image_size_cached(path: &Path) -> bool {
+    image_size_cache().contains(path)
+}
+
+fn pixel_format_cache() -> &'static MetaCache<crate::image_decode::PixelFormat> {
+    static FORMATS: OnceLock<MetaCache<crate::image_decode::PixelFormat>> = OnceLock::new();
+    FORMATS.get_or_init(MetaCache::new)
+}
+
+/// Bit depth and alpha of a standard image, from its header.
+pub fn get_pixel_format(path: &Path) -> Option<crate::image_decode::PixelFormat> {
+    pixel_format_cache()
+        .get_or_read(path, crate::image_decode::header_pixel_format)
+        .map(|f| *f)
+}
+
+pub fn is_pixel_format_cached(path: &Path) -> bool {
+    pixel_format_cache().contains(path)
+}
+
+fn sharpness_cache() -> &'static MetaCache<u32> {
+    static SHARPNESS: OnceLock<MetaCache<u32>> = OnceLock::new();
+    SHARPNESS.get_or_init(MetaCache::new)
+}
+
+/// Sharpness of a photo (see `hashing::sharpness`): decoded at the measuring size only, so
+/// JPEG and RAW previews shrink while decoding and nothing else pays for it.
+pub fn get_sharpness(path: &Path) -> Option<u32> {
+    sharpness_cache()
+        .get_or_read(path, |p| {
+            let side = crate::hashing::SHARPNESS_SIZE;
+            let (img, _) = crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
+            Some(crate::hashing::sharpness(&img))
+        })
+        .map(|s| *s)
+}
+
+pub fn is_sharpness_cached(path: &Path) -> bool {
+    sharpness_cache().contains(path)
 }
 
 fn video_meta_cache() -> &'static MetaCache<VideoMeta> {
@@ -329,5 +392,20 @@ mod tests {
         assert!(cache.contains(&a) && cache.contains(&c) && !cache.contains(&b));
         assert_eq!(cache.get_or_compute(&b, |_| None), None);
         assert!(!cache.contains(&b));
+    }
+
+    #[test]
+    fn scoped_key_is_used_for_its_file_only() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let (a, b) = (dir.join("Cargo.toml"), dir.join("src/lib.rs"));
+        let real = FileKey::for_path(&a).expect("exists");
+        with_file_key(&a, || {
+            assert_eq!(FileKey::for_path(&a), Some(real.clone()));
+            assert_eq!(FileKey::for_path(&b), FileKey::stat(&b));
+        });
+        assert!(SCOPED_KEY.with_borrow(Option::is_none));
+        // A file that doesn't exist has no key, scoped or not.
+        let gone = dir.join("no_such_file");
+        with_file_key(&gone, || assert_eq!(FileKey::for_path(&gone), None));
     }
 }

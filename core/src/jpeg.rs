@@ -8,6 +8,20 @@ pub const EXIF_HEADER: &[u8] = b"Exif\0\0";
 /// Width and height from the SOF segment of a baseline/extended/progressive JPEG, reading only the
 /// header segments: the `image` decoder loads the whole file just to report them.
 pub fn read_dimensions(r: &mut (impl BufRead + Seek)) -> Option<(u32, u32)> {
+    read_frame_header(r).map(|f| (f.width, f.height))
+}
+
+/// The SOF segment of a DCT JPEG: size, bits per sample and number of components.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FrameHeader {
+    pub width: u32,
+    pub height: u32,
+    pub precision: u8,
+    pub components: u8,
+}
+
+/// [`read_dimensions`] with the sample precision and the component count.
+pub fn read_frame_header(r: &mut (impl BufRead + Seek)) -> Option<FrameHeader> {
     let mut word = [0u8; 2];
     r.read_exact(&mut word).ok()?;
     if word != [0xFF, 0xD8] {
@@ -25,13 +39,18 @@ pub fn read_dimensions(r: &mut (impl BufRead + Seek)) -> Option<(u32, u32)> {
         match byte[0] {
             0x01 | 0xD0..=0xD7 => continue,
             0xC0..=0xC2 => {
-                // Length, precision, height, width.
-                let mut sof = [0u8; 7];
+                // Length, precision, height, width, component count.
+                let mut sof = [0u8; 8];
                 r.read_exact(&mut sof).ok()?;
                 let h = u16::from_be_bytes([sof[3], sof[4]]);
                 let w = u16::from_be_bytes([sof[5], sof[6]]);
                 // Height 0 means it comes later in a DNL segment.
-                return (w > 0 && h > 0).then_some((w.into(), h.into()));
+                return (w > 0 && h > 0).then_some(FrameHeader {
+                    width: w.into(),
+                    height: h.into(),
+                    precision: sof[2],
+                    components: sof[7],
+                });
             }
             0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF | 0xDA | 0xD9 => return None,
             _ => {
