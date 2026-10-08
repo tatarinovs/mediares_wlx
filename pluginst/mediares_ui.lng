@@ -276,3 +276,4 @@ Same as Total Commander=Как в Total Commander
 
 ; settings_dialog.rs
 Language=Язык
+Could not save the settings to this file; they apply until Total Commander is closed:=Не удалось сохранить настройки в этот файл; они действуют до закрытия Total Commander:

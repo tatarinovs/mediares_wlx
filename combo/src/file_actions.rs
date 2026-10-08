@@ -80,7 +80,7 @@ unsafe fn shell_execute(
 /// (`"C:\Program Files\X\x.exe" -n`) or not: an unquoted path with spaces runs up to the first
 /// prefix that is an existing file or ends in an executable extension, else up to the first space
 /// (`code -n` with `code` on PATH).
-fn split_command(command: &str, is_file: impl Fn(&str) -> bool) -> (&str, &str) {
+pub fn split_command(command: &str, is_file: impl Fn(&str) -> bool) -> (&str, &str) {
     let command = command.trim();
     if let Some(rest) = command.strip_prefix('"') {
         return match rest.find('"') {

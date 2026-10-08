@@ -70,10 +70,16 @@ impl FileKey {
 /// every cache lookup on the way would otherwise ask the file system again (slow on network
 /// drives and under antivirus scanners).
 pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
-    let previous = SCOPED_KEY.replace(FileKey::stat(path));
-    let result = f();
-    SCOPED_KEY.set(previous);
-    result
+    /// Puts the previous key back, also when `f` panics (the FFI guard catches it, and a key
+    /// left behind would make later lookups miss edits of the file).
+    struct Restore(Option<FileKey>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = SCOPED_KEY.try_with(|k| k.replace(self.0.take()));
+        }
+    }
+    let _restore = Restore(SCOPED_KEY.replace(FileKey::stat(path)));
+    f()
 }
 
 /// Least-recently-used map from file versions to values, shared between threads.

@@ -45,9 +45,12 @@ The fields then appear in the "mediares" group.
 2. VIEWING PHOTOS
 -----------------
 
-Formats: JPEG, PNG, GIF, WEBP, BMP, TIFF, ICO; RAW (CR2, CR3, CRW, NEF,
-ARW, ORF, RW2, DNG, RAF, PEF, RAW) — the preview embedded in the file is
-shown; PSD/PSB.
+Formats: JPEG, PNG, GIF, WEBP, BMP, ICO, TGA, HDR, TIFF, JPEG XR (JXR),
+DDS; SVG/SVGZ; HEIC/HEIF, AVIF and JPEG XL when the Microsoft Store
+extensions are installed ("HEIF Image Extensions" with "HEVC Video
+Extensions", "AV1 Video Extension", "JPEG XL Image Extension"); RAW
+(CR2, CR3, CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — the preview
+embedded in the file is shown; PSD/PSB.
 
 Neighbouring photos are loaded in advance, so paging is instant.
 
@@ -57,15 +60,19 @@ Neighbouring photos are loaded in advance, so paging is instant.
   Pan / page with arrows ... arrow keys: pan a zoomed-in photo, or page
                              through photos while one fits the window
   Zoom in / out ............ + / −, Ctrl+wheel (towards the cursor)
-  100% / fit to window ..... 1 / 0 (also * and / on the numeric keypad)
+  100% / fit to window ..... Ctrl+1 / Ctrl+0 (fit: also * and / on the
+                             numeric keypad)
+  200% / 300% .............. Ctrl+2 / Ctrl+3
   Loupe .................... hold the left mouse button on the photo
   Rotate left / right ...... L / R (on screen only, the file is untouched)
+  Save rotation to JPEG .... Ctrl+R (no re-encoding)
   Keep the zoom ............ Z (the next photo at the same zoom and spot)
   Compare with this photo .. C (two photos side by side, shared zoom)
   Full screen .............. Enter, F, F11, double click; Esc to leave
   Info line (OSD) .......... O or I
   Slideshow ................ F5
   EXIF info ................ E
+  Where it was taken ....... G (OpenStreetMap; photos with GPS)
   Copy image ............... Ctrl+C
   Save as .................. Ctrl+S
   Print .................... Ctrl+P
@@ -81,6 +88,14 @@ where possible: a file already in that format is simply copied, and
 a RAW is saved to JPEG as is, with all shooting details (date, camera,
 lens, exposure, GPS). If the photo was rotated with L / R, the new file
 is saved rotated.
+
+Save rotation (Ctrl+R) writes the turn made with L / R into the JPEG
+file itself: only the EXIF orientation tag changes, the image is not
+re-encoded.
+
+The EXIF window (E) has "Open on map" and "Clear EXIF" buttons; the
+latter removes the camera details, dates, GPS, XMP and comments from a
+JPEG, keeping the orientation and size; the image is not re-encoded.
 
 Copy (Ctrl+C): the image can be pasted both into an editor and into
 a folder as a file.
@@ -100,6 +115,24 @@ and more — whatever the Windows codecs can play.
 
 Audio: MP3, FLAC, WAV, OGG, M4A, AAC, AIFF, WMA, Opus, AC3 and more.
 Album art, title, artist, album and year are shown.
+
+Optional: libmpv. Put a 64-bit libmpv-2.dll (a full build, e.g. by
+shinchiro or zhongfly) next to the plugin (mediares.wlx64) or next to
+totalcmd64.exe and restart Total Commander: video then plays through
+libmpv, with its own codecs, whatever the Windows codecs are. It adds
+video such as M2TS, RM/RMVB, OGV, DIVX, F4V, MXF, audio such as APE,
+WavPack, DSD (DSF, DFF), TTA, Musepack, TAK, DTS, AMR, tracker music
+(MOD, XM, IT, S3M), and opens HEIC, AVIF and JPEG XL photos without the
+Microsoft Store extensions. The plugin's fields cover these formats too
+when the fields are connected from mediares.wlx64.
+
+Where to get it: the mpv-dev-x86_64-<date>.7z archive (not
+"mpv-x86_64", that is the player without the library) holds
+libmpv-2.dll:
+  https://github.com/shinchiro/mpv-winbuild-cmake/releases
+  https://sourceforge.net/projects/mpv-player-windows/files/libmpv/
+The x86_64-v3 variant is faster but needs a CPU no older than Intel
+Haswell / AMD Excavator; if unsure, take x86_64.
 
 The files of the folder (or of an opened .m3u playlist) play one after
 another. Repeat and shuffle are in the right-click menu and in the

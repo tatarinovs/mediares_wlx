@@ -126,7 +126,11 @@ pub fn on_end(files: &[PathBuf], current: usize, options: &QueueOptions) -> EndA
     match next {
         Some(i) => EndAction::Play(i),
         // A single file with "repeat list" loops it.
-        None if options.repeat == Repeat::All && is_playable(&files[current]) => EndAction::Replay,
+        None if options.repeat == Repeat::All
+            && files.get(current).is_some_and(|f| is_playable(f)) =>
+        {
+            EndAction::Replay
+        }
         None => EndAction::Stop,
     }
 }
@@ -149,7 +153,8 @@ fn next_random() -> u64 {
 }
 
 /// Reads an M3U / M3U8 playlist: entries that exist as files, relative ones resolved against
-/// the playlist's folder. `#` lines (EXTINF etc.) and URLs are skipped.
+/// the playlist's folder, `file:///` URLs included. `#` lines (EXTINF etc.) and other URLs are
+/// skipped.
 pub fn read_m3u(path: &Path) -> Vec<PathBuf> {
     let Ok(bytes) = std::fs::read(path) else {
         return Vec::new();
@@ -172,16 +177,56 @@ fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
     };
     text.lines()
         .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#') && !line.contains("://"))
-        .map(|line| {
-            let entry = Path::new(line.strip_prefix("file:///").unwrap_or(line));
-            if entry.is_absolute() || entry.has_root() {
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| {
+            // file:///D:/x.mp3 is a local path, file://server/share/x.mp3 a network one.
+            let line = match line.get(..7) {
+                Some(scheme) if scheme.eq_ignore_ascii_case("file://") => {
+                    let rest = &line[7..];
+                    percent_decoded(
+                        &rest
+                            .strip_prefix('/')
+                            .map_or(format!("//{rest}"), str::to_owned),
+                    )
+                }
+                _ => line.to_string(),
+            };
+            if line.contains("://") {
+                return None;
+            }
+            let entry = Path::new(&line);
+            Some(if entry.is_absolute() || entry.has_root() {
                 entry.to_path_buf()
             } else {
                 base.join(entry)
-            }
+            })
         })
         .collect()
+}
+
+/// A URL path with its `%XX` escapes decoded (as UTF-8); a malformed escape stays as written.
+fn percent_decoded(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .filter(|_| bytes[i] == b'%')
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(b) => {
+                out.push(b);
+                i += 3;
+            }
+            None => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[cfg(test)]
@@ -237,5 +282,17 @@ mod tests {
                 PathBuf::from(r"C:\abs\b.flac")
             ]
         );
+        // VLC and foobar2000 write file URLs.
+        let urls = "FILE:///D:/%D0%9C%D1%83%D0%B7%D1%8B%D0%BA%D0%B0/a%20b.mp3\nfile:///C:/100%25.flac\nfile://nas/music/c.ogg\n";
+        assert_eq!(
+            parse_m3u(urls.as_bytes(), base),
+            [
+                PathBuf::from("D:/Музыка/a b.mp3"),
+                PathBuf::from("C:/100%.flac"),
+                PathBuf::from("//nas/music/c.ogg")
+            ]
+        );
+        assert!(Path::new("//nas/music/c.ogg").has_root());
+        assert_eq!(percent_decoded("a%2"), "a%2");
     }
 }

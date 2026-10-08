@@ -172,6 +172,19 @@ which symphonia doesn't have, play through Media Foundation. Shown: cover art (e
 
 If a file can't be opened, `ListLoad` returns NULL and TC tries another plugin.
 
+**Optional: libmpv.** With a 64-bit `libmpv-2.dll` (a full build, e.g. by shinchiro or zhongfly) next to the
+plugin or next to `totalcmd64.exe`, video plays through it — with its own FFmpeg codecs, whatever Media Foundation
+has (mpv's window inside the viewer, its shader cache in `%LOCALAPPDATA%\mediares\mpv_shader_cache`). Audio that
+symphonia can't decode goes through it too, video thumbnails come from it, and it decodes HEIC/HEIF/AVIF/JXL photos
+when WIC lacks the Store extension. With it, the formats only it plays are recognized: video M2TS, M2T, RM, RMVB,
+OGV, DIVX, F4V, MXF, Y4M, DAV, NUT, DV; audio APE, WV, DSF, DFF, TTA, MPC, TAK, DTS, EAC3, THD, MLP, SPX, SHN, W64,
+AMR, AU, RA and tracker music MOD, XM, IT, S3M, MPTM — and the combo file's WDX fields are filled for them from
+mpv. The library is looked for once per TC session (restart after adding it); it is not part of the plugin.
+Download: the `mpv-dev-x86_64-<date>.7z` archive (`mpv-dev` specifically: `mpv-x86_64` has no library) from
+[shinchiro's releases](https://github.com/shinchiro/mpv-winbuild-cmake/releases) or from
+[SourceForge](https://sourceforge.net/projects/mpv-player-windows/files/libmpv/); the `x86_64-v3` variant is faster
+but needs a CPU no older than Intel Haswell / AMD Excavator.
+
 **Playlist** — either the current folder's files (photos are skipped) or the entries of an open
 `.m3u`/`.m3u8`. The next file starts automatically when one ends (auto-advance can be turned off); there's
 repeat-list or repeat-one and shuffle — in the right-click menu and in settings.

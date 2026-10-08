@@ -1,6 +1,7 @@
 //! Modal settings dialog for the viewer configuration.
 
 use std::cell::Cell;
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -10,8 +11,9 @@ use windows::Win32::Graphics::Gdi::{
     InvalidateRect, MapWindowPoints, SetBkColor, SetBkMode, SetTextColor, HDC, OPAQUE,
 };
 use windows::Win32::UI::Controls::Dialogs::{
-    ChooseColorW, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW, OFN_FILEMUSTEXIST,
-    OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
+    ChooseColorW, CommDlgExtendedError, GetOpenFileNameW, CC_FULLOPEN, CC_RGBINIT, CHOOSECOLORW,
+    FNERR_INVALIDFILENAME, OFN_FILEMUSTEXIST, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST,
+    OPENFILENAMEW,
 };
 use windows::Win32::UI::Controls::{
     EnableThemeDialogTexture, InitCommonControlsEx, ICC_TAB_CLASSES, INITCOMMONCONTROLSEX, NMHDR,
@@ -32,7 +34,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::{OsdMode, ViewerConfig};
 use crate::dialog::{self, ES_AUTOHSCROLL, SS_LEFT};
-use crate::file_actions::show_error;
+use crate::file_actions::{show_error, split_command};
 use crate::gdi::{self, Brush};
 use crate::i18n::{n, tr, LangSetting};
 use crate::playlist::Repeat;
@@ -474,10 +476,14 @@ unsafe fn build_controls(
         IDC_RESUME_VIDEO,
         cfg.resume_video,
     );
+    // Whole minutes; a value set in the INI by hand may be seconds.
     let threshold_labels = ctx
         .resume_thresholds
         .iter()
-        .map(|s| format!("{} {}", s / 60, tr("min")))
+        .map(|s| match s % 60 {
+            0 => format!("{} {}", s / 60, tr("min")),
+            _ => format!("{} {}", s, tr("s")),
+        })
         .collect();
     let threshold_sel = ctx
         .resume_thresholds
@@ -992,7 +998,16 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.photo_editor = edit_text(dlg, pages, IDC_PHOTO_EDITOR);
     cfg.video_editor = edit_text(dlg, pages, IDC_VIDEO_EDITOR);
     cfg.audio_editor = edit_text(dlg, pages, IDC_AUDIO_EDITOR);
-    cfg.save(&ctx.initial);
+    if !cfg.save(&ctx.initial) {
+        show_error(
+            dlg,
+            &format!(
+                "{}\n\n{}",
+                tr("Could not save the settings to this file; they apply until Total Commander is closed:"),
+                crate::config::ini_path().display()
+            ),
+        );
+    }
     ctx.result = Some(cfg.clone());
 }
 
@@ -1031,30 +1046,43 @@ unsafe fn edit_text(dlg: HWND, pages: &Pages, id: i32) -> String {
     dialog::window_text(item(dlg, pages, id)).trim().to_string()
 }
 
-/// "Обзор...": picks a program and puts its path into the edit box `edit_id`.
+/// "Обзор...": picks a program and puts its path into the edit box `edit_id`, keeping the
+/// arguments already written after the old one.
 unsafe fn browse_program(dlg: HWND, pages: &Pages, edit_id: i32) {
-    // The dialog opens at the current program (surrounding quotes dropped).
-    let mut file = [0u16; 1024];
-    let current: Vec<u16> = edit_text(dlg, pages, edit_id)
-        .trim_matches('"')
-        .encode_utf16()
-        .take(file.len() - 1)
-        .collect();
-    file[..current.len()].copy_from_slice(&current);
+    let command = edit_text(dlg, pages, edit_id);
+    let (program, args) = split_command(&command, |p| Path::new(p).is_file());
     let filter = HSTRING::from(tr("Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0"));
     let title = HSTRING::from(tr("Choose an editor"));
-    let mut ofn = OPENFILENAMEW {
-        lStructSize: size_of::<OPENFILENAMEW>() as u32,
-        hwndOwner: dlg,
-        lpstrFilter: PCWSTR(filter.as_ptr()),
-        lpstrFile: PWSTR(file.as_mut_ptr()),
-        nMaxFile: file.len() as u32,
-        lpstrTitle: PCWSTR(title.as_ptr()),
-        Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
-        ..Default::default()
-    };
-    if GetOpenFileNameW(&mut ofn).as_bool() {
-        let _ = SetWindowTextW(item(dlg, pages, edit_id), PCWSTR(file.as_ptr()));
+    // The dialog opens at the current program; a name it rejects (it refuses to open at all
+    // then) is dropped.
+    for initial in [program, ""] {
+        let mut file = [0u16; 1024];
+        let name: Vec<u16> = initial.encode_utf16().take(file.len() - 1).collect();
+        file[..name.len()].copy_from_slice(&name);
+        let mut ofn = OPENFILENAMEW {
+            lStructSize: size_of::<OPENFILENAMEW>() as u32,
+            hwndOwner: dlg,
+            lpstrFilter: PCWSTR(filter.as_ptr()),
+            lpstrFile: PWSTR(file.as_mut_ptr()),
+            nMaxFile: file.len() as u32,
+            lpstrTitle: PCWSTR(title.as_ptr()),
+            Flags: OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
+            ..Default::default()
+        };
+        if GetOpenFileNameW(&mut ofn).as_bool() {
+            let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
+            let picked = String::from_utf16_lossy(&file[..len]);
+            let text = if args.is_empty() {
+                picked
+            } else {
+                format!("\"{picked}\" {args}")
+            };
+            let _ = SetWindowTextW(item(dlg, pages, edit_id), &HSTRING::from(text));
+            return;
+        }
+        if initial.is_empty() || CommDlgExtendedError() != FNERR_INVALIDFILENAME {
+            return;
+        }
     }
 }
 

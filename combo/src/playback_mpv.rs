@@ -845,18 +845,27 @@ impl MpvPlayer {
     /// `None` when there is only one.
     pub fn cycle_audio_track(&self) -> Option<(usize, usize, Option<String>)> {
         let tracks = self.get_i64("track-list/count").unwrap_or(0).max(0);
-        let audio = (0..tracks)
+        // Audio tracks as (track id, place in the track list).
+        let audio: Vec<(i64, i64)> = (0..tracks)
             .filter(|i| {
                 self.get_string(&format!("track-list/{i}/type")).as_deref() == Some("audio")
             })
-            .count();
-        if audio < 2 {
+            .filter_map(|i| Some((self.get_i64(&format!("track-list/{i}/id"))?, i)))
+            .collect();
+        if audio.len() < 2 {
             return None;
         }
-        self.command(&["cycle", "audio"]);
-        // `aid` counts the audio tracks from 1.
-        let number = self.get_i64("aid").and_then(|n| usize::try_from(n).ok())?;
-        Some((number, audio, self.get_string("current-tracks/audio/lang")))
+        // Not `cycle audio`: after the last track it switches the sound off ("no") before
+        // coming back to the first.
+        let current = self.get_i64("aid");
+        let next = audio
+            .iter()
+            .position(|&(id, _)| Some(id) == current)
+            .map_or(0, |k| (k + 1) % audio.len());
+        let (id, index) = audio[next];
+        self.set("aid", &id.to_string());
+        let language = self.get_string(&format!("track-list/{index}/lang"));
+        Some((next + 1, audio.len(), language))
     }
 
     /// Display size (aspect ratio and rotation applied) once the video is decoded.

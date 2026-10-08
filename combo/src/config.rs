@@ -31,7 +31,8 @@ pub fn set_tc_ini_path(ini: &Path) {
     }
 }
 
-fn ini_path() -> PathBuf {
+/// The INI the settings are read from and written to.
+pub fn ini_path() -> PathBuf {
     let portable = dll_dir().map(|d| d.join(INI_NAME));
     if let Some(p) = portable.as_ref().filter(|p| p.exists()) {
         return p.clone();
@@ -64,7 +65,9 @@ pub fn load_volume() -> f64 {
 }
 
 pub fn save_volume(volume: f64) {
-    let ini = HSTRING::from(ini_path().as_os_str());
+    let path = ini_path();
+    prepare_unicode(&path);
+    let ini = HSTRING::from(path.as_os_str());
     let percent = (volume.clamp(0.0, 1.0) * 100.0).round() as i32;
     unsafe {
         let _ = WritePrivateProfileStringW(
@@ -73,6 +76,42 @@ pub fn save_volume(volume: f64) {
             &HSTRING::from(percent.to_string()),
             &ini,
         );
+    }
+}
+
+/// Readies `ini` for writing in UTF-16. `WritePrivateProfileStringW` writes the ANSI code page
+/// unless the file already starts with a UTF-16 byte order mark, and an editor path or an OSD
+/// template with a character outside that code page would come back as "?". A missing file is
+/// created with the mark; one in another encoding (older versions, a hand edit) is converted
+/// once, read as UTF-8 if it is valid UTF-8 and in the ANSI code page otherwise.
+fn prepare_unicode(ini: &Path) {
+    let bytes = match std::fs::read(ini) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        // Unreadable now (locked...): left alone rather than risk its content.
+        Err(_) => return,
+    };
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        return;
+    }
+    let body = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(&bytes);
+    let text = match std::str::from_utf8(body) {
+        Ok(text) => text.to_owned(),
+        Err(_) => match mediares_core::ffi::ansi_to_os_string(body) {
+            Some(text) => text.to_string_lossy().into_owned(),
+            None => return,
+        },
+    };
+    let wide: Vec<u8> = [0xFEFFu16]
+        .into_iter()
+        .chain(text.encode_utf16())
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    // Replaced only once written whole.
+    let mut temp = ini.as_os_str().to_owned();
+    temp.push(".tmp");
+    if std::fs::write(&temp, wide).is_err() || std::fs::rename(&temp, ini).is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
 }
 
@@ -473,13 +512,23 @@ impl ViewerConfig {
     /// another viewer window or the user changed in the meantime are kept. Returns false if any
     /// write failed (e.g. read-only location).
     pub fn save(&self, before: &ViewerConfig) -> bool {
-        let ini = HSTRING::from(ini_path().as_os_str());
-        self.entries()
+        let changed: Vec<(PCWSTR, String)> = self
+            .entries()
             .into_iter()
             .zip(before.entries())
             .filter(|((_, value), (_, old))| value != old)
+            .map(|(entry, _)| entry)
+            .collect();
+        if changed.is_empty() {
+            return true;
+        }
+        let path = ini_path();
+        prepare_unicode(&path);
+        let ini = HSTRING::from(path.as_os_str());
+        changed
+            .into_iter()
             // Every write is attempted, so one failure doesn't drop the rest.
-            .filter(|((key, value), _)| unsafe {
+            .filter(|(key, value)| unsafe {
                 WritePrivateProfileStringW(SECTION, *key, &HSTRING::from(value), &ini).is_err()
             })
             .count()
@@ -578,5 +627,40 @@ mod tests {
         for (key, (api, ours)) in ints.iter().zip(numbers) {
             assert_eq!(api, ours, "int {key}");
         }
+    }
+
+    /// Text outside the ANSI code page survives a save, in a new INI and in one an older version
+    /// wrote in ANSI (whose content is kept).
+    #[test]
+    fn ini_is_written_in_utf16() {
+        let dir = std::env::temp_dir().join(format!("mediares_ini16_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let value = r"C:\Jürgen\編集\ed.exe {name} × — 😀";
+        for (name, old) in [
+            ("new.ini", None),
+            ("old.ini", Some("[Settings]\r\nVolume=40\r\n")),
+        ] {
+            let path = dir.join(name);
+            if let Some(old) = old {
+                std::fs::write(&path, old).unwrap();
+            }
+            prepare_unicode(&path);
+            assert!(std::fs::read(&path).unwrap().starts_with(&[0xFF, 0xFE]));
+            let ini = HSTRING::from(path.as_os_str());
+            unsafe {
+                WritePrivateProfileStringW(SECTION, w!("PhotoEditor"), &HSTRING::from(value), &ini)
+                    .unwrap();
+            }
+            let section = Section::read(&ini);
+            assert_eq!(section.string("PhotoEditor", ""), value, "{name}");
+            if old.is_some() {
+                assert_eq!(section.int("Volume", 0), 40);
+            }
+            // Already UTF-16: left as it is.
+            let before = std::fs::read(&path).unwrap();
+            prepare_unicode(&path);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

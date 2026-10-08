@@ -126,6 +126,9 @@ impl MediaView {
             };
             if reused {
                 view.bar.cancel();
+                // "Frame saved..." was about the previous file.
+                view.status = None;
+                let _ = KillTimer(Some(viewer), STATUS_TIMER_ID);
                 view.seek_preview = None;
                 view.seek_preview_enabled = options.seek_preview;
                 view.ab_loop = (None, None);

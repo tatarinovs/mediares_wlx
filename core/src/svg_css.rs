@@ -268,7 +268,8 @@ fn styled_tag(tag: &str, rules: &[Rule]) -> String {
     if let Some(own) = own {
         style.push(own.value);
     }
-    let style = style.join(";");
+    // Written in double quotes: a value that was in single ones may hold them (font names).
+    let style = style.join(";").replace('"', "'");
     match own {
         Some(own) => format!(
             "<{}style=\"{}\"{}",
@@ -319,6 +320,17 @@ mod tests {
         assert!(
             out.contains(r#"<rect style="fill:blue;fill:green;fill:red" id="x" class="c"/>"#),
             "{out}"
+        );
+    }
+
+    #[test]
+    fn own_style_in_single_quotes_stays_well_formed() {
+        let xml =
+            r#"<svg><style>.t{fill:red}</style><g class="t" style='font-family:"Arial"'/></svg>"#;
+        assert!(
+            run(xml).contains(r#"<g class="t" style="fill:red;font-family:'Arial'"/>"#),
+            "{}",
+            run(xml)
         );
     }
 
