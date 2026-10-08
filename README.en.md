@@ -70,7 +70,7 @@ mediares_wlx/
 │   ├── playlist.rs             # Queue: auto-advance, repeat, shuffle, reading M3U
 │   ├── transport_bar.rs        # Control panel: ⏮ play/pause ⏭, time, timeline, volume
 │   ├── config.rs               # mediares.ini settings
-│   ├── i18n.rs                 # UI language (Russian / English), tr("…", "…")
+│   ├── i18n.rs                 # UI language: tr("…") through the mediares_ui.lng catalog
 │   ├── dialog.rs               # Shared modal dialog helpers
 │   ├── gdi.rs                  # Shared GDI helpers: double buffering, fonts, text, fills, DPI
 │   ├── exif_dialog.rs          # EXIF metadata window
@@ -190,7 +190,7 @@ repeat-list or repeat-one and shuffle — in the right-click menu and in setting
 | Copy the photo / video frame / cover art to the clipboard (pastes as both a picture and a file) | Ctrl+C |
 | OSD (name, resolution, size, position; time for video) on/off for the current type | O, I |
 | Save the current video frame next to the file (`name_1-23.456.png`; PNG or JPEG — in settings) | Shift+S |
-| Contact sheet: 16 frames along the whole video with their times and file details (`name_sheet.png`) | Ctrl+Shift+S |
+| Contact sheet: a grid of frames along the whole video (4×4, the size is a setting) with their times and file details (`name_sheet.png`) | Ctrl+Shift+S |
 | A–B loop: the first press sets the start, the second the end, the third turns it off | A |
 | Next audio track of a video | B |
 | Lyrics from the tags in place of the album art (ID3 USLT or TXXX:LYRICS, Vorbis LYRICS); a long text scrolls along with the track, or with the mouse wheel; Y again brings the art back | Y |
@@ -206,8 +206,9 @@ the ends of an A–B loop as orange ticks.
 right after it (when both have the same sample rate and channel count). The **"ReplayGain"** setting evens out
 loudness by the `REPLAYGAIN_TRACK_GAIN`/`_PEAK` tags without clipping.
 
-**Resume playback.** Videos longer than 5 minutes reopen where you left them (the panel shows "Resuming from
-12:34"); a stop within the first or last 30 s isn't remembered. Can be turned off in settings.
+**Resume playback.** Videos longer than 5 minutes (the threshold is a setting) reopen where you left them (the
+panel shows "Resuming from 12:34"); a stop within the first or last 30 s isn't remembered. Can be turned off in
+settings.
 
 **Fullscreen mode.** The picture fills the whole monitor; the cursor hides after 2.5 s of inactivity.
 - Video: the control panel sits semi-transparent over the frame (or, if disabled, underneath it).
@@ -457,18 +458,21 @@ is looked for next to the DLL (a portable install); if it's not there, TC's plug
 particular computer doesn't travel with a portable TC and lives in `%LOCALAPPDATA%\mediares`:
 `mediares_resume.txt` (video positions, up to 200 entries), `mediares_wallpaper.png` and `mpv_shader_cache`.
 
-`[Settings]` keys with a non-obvious format: `Language` (`auto`, `en`, `ru`), `PhotoBackground` and
-`OSDFontColor` (a COLORREF `0x00BBGGRR` as a decimal number), `OSDMode` (0 — off, 1 — on photos, 2 — on video,
-3 — both), `Repeat` (0 — none, 1 — list, 2 — file), `SeekStep` (the ← / → step in seconds, 1–600), `FrameFormat` (`png` / `jpg`), `PhotoEditor` /
-`VideoEditor` / `AudioEditor` (a program path, optionally with arguments and `%1`), `PhotoOSDTemplate` /
-`VideoOSDTemplate` (see OSD). Flags — 0/1: `StartFullscreen`, `AutoRotateExif`, `NoUpscale`, `SmoothZoom`,
-`KeepZoom`, `SkipRawTwins`, `ConfirmDelete`, `ResumeVideo`, `ReplayGain`, `AutoAdvance`, `Shuffle`, `OverlayPhoto`,
-`OverlayVideo`, `OverlayAutoHide`.
+`[Settings]` keys with a non-obvious format: `Language` (`auto` or a language section code: `eng`, `rus`...),
+`PhotoBackground` and `OSDFontColor` (a COLORREF `0x00BBGGRR` as a decimal number), `OSDFontName` (a font name),
+`OSDMode` (0 — off, 1 — on photos, 2 — on video, 3 — both), `Repeat` (0 — none, 1 — list, 2 — file), `SeekStep`
+(the ← / → step in seconds, 1–600), `ResumeThreshold` (the shortest video that resumes, in seconds, 10–3600),
+`ContactSheetColumns` / `ContactSheetRows` (the contact sheet grid, 1–10), `FrameFormat` (`png` / `jpg`),
+`PhotoEditor` / `VideoEditor` / `AudioEditor` (a program path, optionally with arguments and `%1`),
+`PhotoOSDTemplate` / `VideoOSDTemplate` (see OSD). Flags — 0/1: `StartFullscreen`, `AutoRotateExif`, `NoUpscale`,
+`SmoothZoom`, `KeepZoom`, `SkipRawTwins`, `ConfirmDelete`, `ResumeVideo`, `ReplayGain`, `AutoAdvance`, `Shuffle`,
+`OverlayPhoto`, `OverlayVideo`, `OverlayAutoHide`, `SeekPreview`, `WheelZoom`.
 
-The UI is in Russian and English. `auto` follows Total Commander's language (`LanguageIni` in `wincmd.ini`:
-`*RUS*` means Russian, otherwise English), and without a `wincmd.ini` it follows the Windows UI language.
-Strings are written inline as pairs, `tr("русский", "English")` (`combo/src/i18n.rs`). WDX field names are not
-translated.
+The UI is in Russian and English; more languages come with a `mediares_ui.lng` file. `auto` follows Total
+Commander's language (`LanguageIni` in `wincmd.ini`: `wcmd_rus.lng` → section `[Rus]`), and without a
+`wincmd.ini` it follows the Windows UI language. Strings are written in English in the code, `tr("Settings")`,
+and translated through the built-in `pluginst/mediares_ui.lng` (`combo/src/i18n.rs`); a test checks that every
+language translates every string. WDX field names are not translated.
 
 ## Building and testing
 

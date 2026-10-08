@@ -86,7 +86,7 @@ pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
         );
     }
     // Only JPEG can lose its metadata without re-encoding the picture.
-    if crate::window::is_jpeg_file(file_path) {
+    if mediares_core::image_decode::is_jpeg(file_path) {
         dialog::control(
             dlg,
             w!("BUTTON"),

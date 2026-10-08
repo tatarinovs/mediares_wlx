@@ -433,8 +433,22 @@ impl ViewerState {
         i18n::set(config.language.resolve());
         self.config = config;
         self.osd_font = None;
+        let options = self.open_options();
+        if let Some(media) = self.media.as_mut() {
+            media.apply_options(&options);
+        }
         if old != self.decode_options() && self.shows_photo() {
             self.load_media();
+        }
+    }
+
+    /// What opening a video or audio file takes from the config.
+    fn open_options(&self) -> crate::media_view::OpenOptions {
+        crate::media_view::OpenOptions {
+            resume: self.config.resume_video,
+            resume_threshold: f64::from(self.config.resume_threshold_sec),
+            replay_gain: self.config.replay_gain,
+            seek_preview: self.config.seek_preview,
         }
     }
 
@@ -501,12 +515,7 @@ impl ViewerState {
         if kind.is_playable() {
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
-            let options = crate::media_view::OpenOptions {
-                resume: self.config.resume_video,
-                resume_threshold: f64::from(self.config.resume_threshold_sec),
-                replay_gain: self.config.replay_gain,
-                seek_preview: self.config.seek_preview,
-            };
+            let options = self.open_options();
             self.media = unsafe {
                 MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
             };

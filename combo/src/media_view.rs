@@ -170,6 +170,19 @@ impl MediaView {
         self.content.transport()
     }
 
+    /// Settings changed while the file is shown: they apply to it right away.
+    pub fn apply_options(&mut self, options: &OpenOptions) {
+        self.seek_preview_enabled = options.seek_preview;
+        if !options.seek_preview {
+            // Its popup and frame thread go too.
+            self.seek_preview = None;
+        }
+        match &mut self.content {
+            Content::Video(v) => v.set_resume(options.resume, options.resume_threshold),
+            Content::Audio(a) => a.set_replay_gain(options.replay_gain),
+        }
+    }
+
     pub fn is_video(&self) -> bool {
         matches!(self.content, Content::Video(_))
     }

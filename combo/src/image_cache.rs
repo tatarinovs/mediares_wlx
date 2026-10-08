@@ -526,7 +526,7 @@ fn decode(
 }
 
 /// Album art never needs more pixels than this on a side, even fullscreen.
-const PICTURE_SIDE: u32 = 2048;
+pub const PICTURE_SIDE: u32 = 2048;
 
 /// Decodes an in-memory picture (e.g. embedded album art) for display; not cached. Scans of
 /// 3000 px and more are reduced while decoding where the codec can.

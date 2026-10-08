@@ -122,15 +122,11 @@ impl<V: Clone> FileCache<V> {
         let now = lru.clock;
         lru.map.insert(key, (value.clone(), now));
         if lru.map.len() > lru.capacity {
-            // Only when full: a scan over at most `capacity` entries.
-            let oldest = lru
-                .map
-                .iter()
-                .min_by_key(|(_, (_, used))| *used)
-                .map(|(k, _)| k.clone());
-            if let Some(oldest) = oldest {
-                lru.map.remove(&oldest);
-            }
+            // The least recently used eighth at once: finding them scans the whole map, too slow
+            // to repeat for every new file of a folder larger than the cache.
+            let ticks = lru.map.values().map(|&(_, used)| used).collect();
+            let newest_dropped = nth_smallest(ticks, lru.capacity / 8);
+            lru.map.retain(|_, (_, used)| *used > newest_dropped);
         }
         Some(value)
     }
@@ -142,6 +138,14 @@ impl<V: Clone> FileCache<V> {
     fn clear(&self) {
         self.lock().map.clear();
     }
+}
+
+/// The `n`-th smallest of `values` (0 = the smallest). Not generic and not inlined: each cached
+/// value type would carry a copy of the selection otherwise.
+#[inline(never)]
+fn nth_smallest(mut values: Vec<u64>, n: usize) -> u64 {
+    let n = n.min(values.len().saturating_sub(1));
+    *values.select_nth_unstable(n).1
 }
 
 pub struct MediaCache(FileCache<CachedMedia>);
@@ -392,6 +396,25 @@ mod tests {
         assert!(cache.contains(&a) && cache.contains(&c) && !cache.contains(&b));
         assert_eq!(cache.get_or_compute(&b, |_| None), None);
         assert!(!cache.contains(&b));
+    }
+
+    #[test]
+    fn a_full_cache_drops_its_oldest_eighth() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let files: Vec<PathBuf> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .take(17)
+            .collect();
+        assert_eq!(files.len(), 17, "enough source files");
+        let cache = FileCache::new(16);
+        for (i, f) in files.iter().enumerate() {
+            assert_eq!(cache.get_or_compute(f, |_| Some(i)), Some(i));
+        }
+        // 17 > 16: the three oldest (16 / 8 + 1) went, the rest stayed.
+        assert!(files[..3].iter().all(|f| !cache.contains(f)));
+        assert!(files[3..].iter().all(|f| cache.contains(f)));
     }
 
     #[test]

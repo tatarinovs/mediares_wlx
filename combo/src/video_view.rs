@@ -447,16 +447,20 @@ impl VideoView {
 
     /// Switches to another file, reusing the engine (and its speed).
     pub unsafe fn open(&mut self, path: &Path, resume: bool, resume_threshold: f64) -> bool {
+        // As in `new`, the check that Media Foundation can open the file runs while the player
+        // opens it. A file failing it isn't played: the caller drops this view.
         let probe = matches!(self.player, Player::Mf(_)).then(|| Probe::start(path));
-        let Some(info) = Probe::finish(probe, &self.player, path) else {
-            return false;
-        };
         self.remember_position();
+        // Done: if this view is dropped below, the player is already on the new file.
+        self.loaded = false;
         self.finish_step();
-        self.player.set_frame_rate(info.frame_rate);
         if !self.player.open(path) {
             return false;
         }
+        let Some(info) = Probe::finish(probe, &self.player, path) else {
+            return false;
+        };
+        self.player.set_frame_rate(info.frame_rate);
         self.seek_profile = SeekProfile::of(&self.player, path);
         self.preview.set(None);
         self.back_target = None;
@@ -485,6 +489,12 @@ impl VideoView {
                 self.resume_threshold,
             );
         }
+    }
+
+    /// The resume settings changed: they decide whether this file's position is remembered.
+    pub fn set_resume(&mut self, resume: bool, threshold: f64) {
+        self.resume = resume;
+        self.resume_threshold = threshold;
     }
 
     /// Where playback continued from, once (for a status message).

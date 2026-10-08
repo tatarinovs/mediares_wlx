@@ -208,6 +208,14 @@ impl AudioView {
         self.apply_replay_gain();
     }
 
+    /// The ReplayGain setting changed: the track playing follows it.
+    pub fn set_replay_gain(&mut self, on: bool) {
+        if self.replay_gain != on {
+            self.replay_gain = on;
+            self.apply_replay_gain();
+        }
+    }
+
     /// The track's ReplayGain (or none) for the player.
     fn apply_replay_gain(&self) {
         match &self.backend {
@@ -648,7 +656,8 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
         DecodeOptions {
             auto_rotate: false,
             background: BACKGROUND,
-            fit: 0,
+            // Scans of several thousand pixels are reduced while decoding, like embedded art.
+            fit: image_cache::PICTURE_SIDE,
         },
     )
 }

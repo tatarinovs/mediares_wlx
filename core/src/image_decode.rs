@@ -277,7 +277,8 @@ fn by_wic(path: &Path, kind: MediaType) -> bool {
         && (crate::wic_decode::handles(path) || is_jpeg(path))
 }
 
-fn is_jpeg(path: &Path) -> bool {
+/// The file starts like a JPEG stream, whatever its extension.
+pub fn is_jpeg(path: &Path) -> bool {
     let mut magic = [0u8; 3];
     File::open(path)
         .and_then(|mut f| f.read_exact(&mut magic))

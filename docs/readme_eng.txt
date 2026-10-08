@@ -116,7 +116,8 @@ settings.
   Full screen .............. Enter, F, F11, double click; Esc to leave
   Save frame ............... Shift+S (next to the video; PNG or JPEG —
                              chosen in the settings)
-  Contact sheet ............ Ctrl+Shift+S (16 frames in one picture)
+  Contact sheet ............ Ctrl+Shift+S (a grid of frames in one
+                             picture; 4x4, set in the settings)
   A-B loop ................. A (start, end, off)
   Audio track .............. B (next one)
   Lyrics ................... Y (in place of the album art)
@@ -125,7 +126,8 @@ settings.
   Show in folder ........... Ctrl+Enter
   Move to Recycle Bin ...... Del
 
-Videos longer than 5 minutes resume where they were closed.
+Videos longer than 5 minutes (the threshold is a setting) resume where
+they were closed.
 
 Hovering over the video's progress bar shows the frame of that spot and
 the chapter title; chapters show as gaps in the bar.
@@ -308,13 +310,18 @@ the right-click menu. You can set:
   * "Smooth enlarged images": enlarged photos and album art look smooth
     instead of made of square pixels (zooming in beyond 400% shows the 
     pixels as they are);
+  * keeping the zoom on the next photo, skipping RAW files that have a
+    JPEG twin;
+  * the mouse wheel: paging or zooming photos;
   * confirmation before moving to the Recycle Bin;
-  * the OSD: where to show it, font, color and contents;
+  * the OSD: where to show it, font size and family, color and contents;
   * full screen: buttons and panels over the picture, hiding them;
   * the slideshow interval;
   * auto-advance to the next file, repeat, shuffle;
-  * resuming long videos where they stopped;
-  * the format of saved frames (PNG or JPEG);
+  * resuming videos where they stopped, and how long they must be;
+  * the frame preview over the progress bar, ReplayGain loudness;
+  * the arrow-key seek step;
+  * the format of saved frames (PNG or JPEG) and the contact sheet grid;
   * programs for "Open in editor" — separately for photos, video
     and audio;
   * connecting the fields ("Register WDX" button).

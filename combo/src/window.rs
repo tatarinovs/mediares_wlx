@@ -48,6 +48,7 @@ use crate::{
     settings_dialog, snapshot,
 };
 use mediares_core::exif::read_orientation;
+use mediares_core::image_decode::is_jpeg;
 
 const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 /// `TrackMouseEvent` reports the cursor leaving (in `windows` only with the Controls feature).
@@ -689,6 +690,12 @@ unsafe fn forward_to_lister(state: &ViewerState, wparam: WPARAM, lparam: LPARAM)
 
 unsafe fn execute(hwnd: HWND, command: Command) {
     let Some(state) = get_state(hwnd) else { return };
+    // Keys of the other kind of content (Z, E, L... on a video) do nothing, as the menu has no
+    // such items there.
+    let video = state.media.as_ref().is_some_and(|m| m.is_video());
+    if !command.available(state.media.is_some(), video) {
+        return;
+    }
     match command {
         Command::ToggleFullscreen => {
             state.drag = None;
@@ -710,7 +717,6 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             // Switches the OSD for the kind of content shown (audio has none).
             let before = state.config.clone();
             let osd = before.osd;
-            let video = state.media.as_ref().is_some_and(|m| m.is_video());
             state.config.osd = match (video, state.shows_photo()) {
                 (true, _) => osd.with(osd.photo(), !osd.video()),
                 (false, true) => osd.with(!osd.photo(), osd.video()),
@@ -1046,7 +1052,7 @@ unsafe fn save_rotation(hwnd: HWND) {
         file_actions::show_error(owner, tr("Turn the photo with L / R first."));
         return;
     }
-    if !is_jpeg_file(&path) {
+    if !is_jpeg(&path) {
         file_actions::show_error(
             owner,
             tr("Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S)."),
@@ -1083,13 +1089,6 @@ unsafe fn save_rotation(hwnd: HWND) {
             tr("Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it."),
         );
     }
-}
-
-pub fn is_jpeg_file(path: &Path) -> bool {
-    let mut magic = [0u8; 3];
-    std::fs::File::open(path)
-        .and_then(|mut f| std::io::Read::read_exact(&mut f, &mut magic))
-        .is_ok_and(|_| magic == [0xFF, 0xD8, 0xFF])
 }
 
 /// The photo as the desktop wallpaper: the file itself when Windows can show it as is, otherwise
@@ -1413,10 +1412,22 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_APPCOMMAND if state.media.is_some() => {
             // Multimedia keys delivered as app commands (GET_APPCOMMAND_LPARAM).
-            let command = match ((lparam.0 >> 16) & 0x0FFF) as u32 {
+            let code = ((lparam.0 >> 16) & 0x0FFF) as u32;
+            let command = match code {
                 11 => Some(Command::NextTrack),     // APPCOMMAND_MEDIA_NEXTTRACK
                 12 => Some(Command::PreviousTrack), // APPCOMMAND_MEDIA_PREVIOUSTRACK
-                14 | 46 | 47 => Some(Command::TogglePlay), // PLAY_PAUSE, PLAY, PAUSE
+                14 => Some(Command::TogglePlay),    // APPCOMMAND_MEDIA_PLAY_PAUSE
+                // MEDIA_PLAY / MEDIA_PAUSE (remotes with separate keys) set the state.
+                46 | 47 => {
+                    if let Some(media) = &state.media {
+                        match code {
+                            46 => media.transport().play(),
+                            _ => media.pause(),
+                        }
+                        media.invalidate_bar();
+                    }
+                    return LRESULT(1);
+                }
                 _ => None,
             };
             match command {
@@ -1576,7 +1587,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                     );
                 }
             } else if state.media.is_none() && (ctrl_down() != state.config.wheel_zoom) {
-                if let Some(view) = view_size(state) {
+                if let Some(view) = view_size(state).filter(|_| delta != 0) {
                     let (x, y) = image_view::to_view(state, (pt.x, pt.y));
                     zoom_at(state, view, delta > 0, (x as f32, y as f32));
                 }
@@ -1781,6 +1792,19 @@ mod tests {
             Command::from_key(0x25, false, false, true, true),
             Some(Command::SeekBack)
         );
+    }
+
+    #[test]
+    fn photo_keys_do_not_apply_to_media() {
+        // Z, E, L: their commands exist for photos only (`execute` ignores them elsewhere).
+        for vk in [0x5A, 0x45, 0x4C] {
+            let cmd = Command::from_key(vk, false, false, true, false).expect("mapped");
+            assert!(cmd.available(false, false), "{cmd:?} on a photo");
+            assert!(!cmd.available(true, true), "{cmd:?} on a video");
+        }
+        // Player keys of video only don't act on audio either.
+        let faster = Command::from_key(0xDD, false, false, true, false).expect("mapped");
+        assert!(faster.available(true, true) && !faster.available(true, false));
     }
 
     #[test]
