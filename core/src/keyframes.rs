@@ -37,6 +37,8 @@ use crate::video_frame::{
 const MAX_SCAN_FRAMES: usize = 3000;
 /// Samples without a time read in a row before the stream counts as ended.
 const MAX_UNTIMED_SAMPLES: usize = 64;
+/// A key frame's access unit larger than this is not gathered (an 8K intra frame is a few MB).
+const MAX_KEY_FRAME_BYTES: usize = 32 << 20;
 
 /// A key frame found by [`KeyframeIndex`].
 pub struct KeyFrame {
@@ -195,9 +197,15 @@ impl KeyframeIndex {
                 data: None,
             });
         }
+        let mut complete = true;
         while let Some(next) = next_sample(&self.reader) {
             if next.GetSampleTime().is_ok() {
                 *self.pending.borrow_mut() = Some(next);
+                break;
+            }
+            if data.len() > MAX_KEY_FRAME_BYTES {
+                // A damaged stream without times further on: the rest of the file would be read.
+                complete = false;
                 break;
             }
             data.extend(sample_bytes(&next).unwrap_or_default());
@@ -205,7 +213,7 @@ impl KeyframeIndex {
         Some(Frame {
             time,
             key: true,
-            data: Some(data),
+            data: complete.then_some(data),
         })
     }
 

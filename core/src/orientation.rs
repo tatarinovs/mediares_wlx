@@ -3,7 +3,7 @@
 
 use std::fs::OpenOptions;
 use std::io::{self, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::exif::{build_exif, Endian, ExifInfo};
 
@@ -173,19 +173,62 @@ pub fn clear_jpeg_metadata(path: &Path) -> io::Result<()> {
 
 /// Writes `bytes` over the file at `path` (whose content is `old`) in place, so its creation
 /// time, attributes and permissions stay; a full copy of `old` is kept next to it until the write
-/// has succeeded.
+/// has succeeded. A failed write puts `old` back; if even that fails, the copy stays and the error
+/// names it.
 fn overwrite(path: &Path, old: &[u8], bytes: &[u8]) -> io::Result<()> {
-    let mut backup = path.as_os_str().to_owned();
-    backup.push(".mediares-backup");
-    std::fs::write(&backup, old)?;
-    let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
+    let backup = write_backup(path, old)?;
+    let write = |content: &[u8]| -> io::Result<()> {
+        let mut file = OpenOptions::new().write(true).truncate(true).open(path)?;
+        file.write_all(content)?;
+        file.sync_all()
+    };
+    if let Err(e) = write(bytes) {
+        if write(old).is_ok() {
+            let _ = std::fs::remove_file(&backup);
+            return Err(e);
+        }
+        return Err(io::Error::new(
+            e.kind(),
+            format!("{e}\nThe original photo is kept in\n{}", backup.display()),
+        ));
+    }
     // The photo is already safely written; a backup briefly held open by an antivirus
     // or the indexer is left behind rather than reported as a failed write.
     let _ = std::fs::remove_file(&backup);
     Ok(())
+}
+
+/// Writes `old` into a new file next to `path`. An existing backup is never written over: one
+/// left by a write that failed for good may be the only intact copy of the photo, while the file
+/// itself is half-written and would be "backed up" on the next attempt.
+fn write_backup(path: &Path, old: &[u8]) -> io::Result<PathBuf> {
+    for n in 1..=100 {
+        let mut name = path.as_os_str().to_owned();
+        name.push(".mediares-backup");
+        if n > 1 {
+            name.push(format!("-{n}"));
+        }
+        let backup = PathBuf::from(name);
+        let mut file = match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        };
+        if let Err(e) = file.write_all(old).and_then(|()| file.sync_all()) {
+            drop(file);
+            let _ = std::fs::remove_file(&backup);
+            return Err(e);
+        }
+        return Ok(backup);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        "too many backup copies next to the photo",
+    ))
 }
 
 #[cfg(test)]
@@ -308,5 +351,23 @@ mod tests {
         };
         assert_eq!(orientation_of(&out), Some(3));
         assert!(rewrite(b"GIF89a", 3).is_err());
+    }
+
+    /// A backup left by a write that failed for good is never written over by the next attempt
+    /// (the file may be half-written then); a new one is used and removed after success.
+    #[test]
+    fn earlier_backup_is_kept() {
+        let dir = std::env::temp_dir().join(format!("mediares_backup_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = dir.join("a.jpg");
+        let earlier = dir.join("a.jpg.mediares-backup");
+        std::fs::write(&photo, jpeg_with(None)).unwrap();
+        std::fs::write(&earlier, b"intact original").unwrap();
+
+        set_jpeg_orientation(&photo, 6).unwrap();
+        assert_eq!(orientation_of(&std::fs::read(&photo).unwrap()), Some(6));
+        assert_eq!(std::fs::read(&earlier).unwrap(), b"intact original");
+        assert!(!dir.join("a.jpg.mediares-backup-2").exists());
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

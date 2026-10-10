@@ -13,6 +13,8 @@ const PALETTE_LEN: usize = 768;
 const MAX_RESOURCE_SECTION: usize = 8 * 1024 * 1024;
 const SIGNATURE_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const MIN_FALLBACK_JPEG: usize = 8 * 1024;
+/// Photoshop's own limit.
+const MAX_CHANNELS: usize = 56;
 
 const MODE_GRAYSCALE: u16 = 1;
 const MODE_INDEXED: u16 = 2;
@@ -121,7 +123,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     ) {
         return None;
     }
-    if width == 0 || height == 0 || channels == 0 {
+    if width == 0 || height == 0 || channels == 0 || channels > MAX_CHANNELS {
         return None;
     }
     let num_pixels = (width as u64) * (height as u64);
@@ -192,14 +194,16 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
         _ => 1,
     };
     let active = channels.min(color_channels + usize::from(transparent));
-    let mut planes: Vec<Vec<u8>> = vec![Vec::with_capacity(num_pixels); active];
+    // Reserved only once the file is known to hold that much data.
+    let new_planes = || -> Vec<Vec<u8>> { vec![Vec::with_capacity(num_pixels); active] };
 
-    match compression {
+    let planes = match compression {
         0 => {
             let plane_bytes = (num_pixels * bytes_per_sample) as u64;
             if (channels as u64) * plane_bytes > remaining {
                 return None;
             }
+            let mut planes = new_planes();
             let mut row = vec![0u8; row_bytes];
             for plane in planes.iter_mut() {
                 for _ in 0..h {
@@ -207,13 +211,16 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
                     push_row(plane, &row, bytes_per_sample);
                 }
             }
+            planes
         }
         1 => {
             let entry_size = if is_psb { 4 } else { 2 };
-            let mut table = vec![0u8; channels * h * entry_size];
-            if table.len() as u64 > remaining {
+            // Checked before allocating: the header's sizes may be anything.
+            let table_len = (channels as u64) * (h as u64) * (entry_size as u64);
+            if table_len > remaining {
                 return None;
             }
+            let mut table = vec![0u8; table_len as usize];
             reader.read_exact(&mut table).ok()?;
             let line_lens: Vec<usize> = table
                 .chunks_exact(entry_size)
@@ -224,6 +231,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
                 return None;
             }
 
+            let mut planes = new_planes();
             let mut packed = Vec::new();
             let mut unpacked = Vec::with_capacity(row_bytes);
             for (c, lens) in line_lens.chunks_exact(h).enumerate() {
@@ -239,10 +247,11 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
                     push_row(plane, &unpacked, bytes_per_sample);
                 }
             }
+            planes
         }
         // ZIP-compressed composites are not supported.
         _ => return None,
-    }
+    };
 
     let rgba = compose_rgba(color_mode, &planes, &palette, num_pixels);
     RgbaImage::from_raw(width, height, rgba).map(DynamicImage::ImageRgba8)
@@ -393,6 +402,19 @@ mod tests {
         for len in 0..TEST_PSD_2X2.len() {
             let _ = load("mediares_test_trunc.psd", &TEST_PSD_2X2[..len]);
         }
+    }
+
+    /// A tiny RLE file whose header claims 64 M rows of 56 channels: rejected without allocating
+    /// the line table (several GB), which would abort the process.
+    #[test]
+    fn huge_rle_header_is_rejected_cheaply() {
+        let mut psd = TEST_PSD_2X2.to_vec();
+        psd[12..14].copy_from_slice(&56u16.to_be_bytes());
+        psd[14..18].copy_from_slice(&64_000_000u32.to_be_bytes());
+        psd[18..22].copy_from_slice(&1u32.to_be_bytes());
+        assert!(load("mediares_test_huge.psd", &psd).is_none());
+        psd[12..14].copy_from_slice(&57u16.to_be_bytes());
+        assert!(load("mediares_test_channels.psd", &psd).is_none());
     }
 
     #[test]

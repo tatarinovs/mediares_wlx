@@ -542,7 +542,7 @@ unsafe fn build_controls(
         frame_labels,
         frame_sel,
     );
-    label(tr("Contact sheet grid (Ctrl+Shift+S):"), 299);
+    label(tr("Contact sheet (Ctrl+Shift+S):"), 299);
     let grid_combo = |options: &[u32], current: u32, x: i32, id: i32| {
         let labels = options.iter().map(u32::to_string).collect();
         let sel = options.iter().position(|&v| v == current).unwrap_or(0);
