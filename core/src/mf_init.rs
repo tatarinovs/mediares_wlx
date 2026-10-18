@@ -5,8 +5,11 @@
 
 use std::sync::Mutex;
 
+use windows::core::GUID;
 use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION};
+use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Variant::{VT_CLSID, VT_I8, VT_LPWSTR, VT_UI2, VT_UI4, VT_UI8};
 
 /// Initializes COM on the current thread for the lifetime of the value.
 /// If the thread already has a different apartment, COM is usable as-is and nothing is undone.
@@ -32,6 +35,55 @@ impl Drop for ComScope {
         if self.initialized {
             unsafe { CoUninitialize() };
         }
+    }
+}
+
+/// A `PROPVARIANT` a COM call filled in, cleared on drop: the raw type has no destructor, and the
+/// GUIDs, strings and arrays it may hold were allocated by COM.
+#[derive(Default)]
+pub struct PropVariant(pub PROPVARIANT);
+
+impl PropVariant {
+    /// A 16-bit unsigned value (a TIFF SHORT).
+    pub fn u16(&self) -> Option<u16> {
+        let inner = unsafe { &self.0.Anonymous.Anonymous };
+        (inner.vt == VT_UI2).then(|| unsafe { inner.Anonymous.uiVal })
+    }
+
+    /// An unsigned value of up to 32 bits (a TIFF SHORT or LONG).
+    pub fn u32(&self) -> Option<u32> {
+        let inner = unsafe { &self.0.Anonymous.Anonymous };
+        match inner.vt {
+            VT_UI4 => Some(unsafe { inner.Anonymous.ulVal }),
+            _ => self.u16().map(u32::from),
+        }
+    }
+
+    /// A 64-bit value, signed or not (Media Foundation times and durations).
+    pub fn u64(&self) -> Option<u64> {
+        let inner = unsafe { &self.0.Anonymous.Anonymous };
+        (inner.vt == VT_UI8 || inner.vt == VT_I8).then(|| unsafe { inner.Anonymous.uhVal })
+    }
+
+    pub fn guid(&self) -> Option<GUID> {
+        let inner = unsafe { &self.0.Anonymous.Anonymous };
+        let ptr = unsafe { inner.Anonymous.puuid };
+        (inner.vt == VT_CLSID && !ptr.is_null()).then(|| unsafe { *ptr })
+    }
+
+    pub fn string(&self) -> Option<String> {
+        let inner = unsafe { &self.0.Anonymous.Anonymous };
+        let ptr = unsafe { inner.Anonymous.pwszVal };
+        if inner.vt != VT_LPWSTR || ptr.is_null() {
+            return None;
+        }
+        unsafe { ptr.to_string() }.ok()
+    }
+}
+
+impl Drop for PropVariant {
+    fn drop(&mut self) {
+        let _ = unsafe { PropVariantClear(&mut self.0) };
     }
 }
 

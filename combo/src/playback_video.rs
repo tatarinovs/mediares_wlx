@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use mediares_core::keyframes::KeyPicture;
-use mediares_core::mf_init::{mf_scope, ComScope};
+use mediares_core::mf_init::{mf_scope, ComScope, PropVariant};
 use windows::core::{implement, Interface, BSTR};
 use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Direct3D::{
@@ -53,7 +53,6 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SD_LANGUAGE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Variant::{VT_CLSID, VT_LPWSTR};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::transport_bar::{clamp_to_duration, Transport};
@@ -714,19 +713,12 @@ impl VideoPlayer {
 }
 
 unsafe fn stream_major_type(ex: &IMFMediaEngineEx, stream: u32) -> Option<windows::core::GUID> {
-    let value = ex.GetStreamAttribute(stream, &MF_MT_MAJOR_TYPE).ok()?;
-    let inner = &value.Anonymous.Anonymous;
-    (inner.vt == VT_CLSID && !inner.Anonymous.puuid.is_null()).then(|| *inner.Anonymous.puuid)
+    PropVariant(ex.GetStreamAttribute(stream, &MF_MT_MAJOR_TYPE).ok()?).guid()
 }
 
 /// The stream's language tag ("eng", "rus"...), if the container names it.
 unsafe fn stream_language(ex: &IMFMediaEngineEx, stream: u32) -> Option<String> {
-    let value = ex.GetStreamAttribute(stream, &MF_SD_LANGUAGE).ok()?;
-    let inner = &value.Anonymous.Anonymous;
-    if inner.vt != VT_LPWSTR || inner.Anonymous.pwszVal.is_null() {
-        return None;
-    }
-    let text = inner.Anonymous.pwszVal.to_string().ok()?;
+    let text = PropVariant(ex.GetStreamAttribute(stream, &MF_SD_LANGUAGE).ok()?).string()?;
     Some(text).filter(|t| !t.trim().is_empty())
 }
 

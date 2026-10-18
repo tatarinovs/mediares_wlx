@@ -59,7 +59,8 @@ Neighbouring photos are loaded in advance, so paging is instant.
                              (also the mouse side buttons)
   Pan / page with arrows ... arrow keys: pan a zoomed-in photo, or page
                              through photos while one fits the window
-  TIFF pages ............... → / ← and the mouse wheel; past the last
+  TIFF pages ............... → / ← and the mouse wheel (zoomed in:
+                             Ctrl+PgDn / Ctrl+PgUp); past the last
                              page — the next file
   Zoom in / out ............ + / −, Ctrl+wheel (towards the cursor)
   100% / fit to window ..... Ctrl+1 / Ctrl+0 (fit: also * and / on the

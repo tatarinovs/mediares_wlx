@@ -386,6 +386,8 @@ pub struct OsdStyle {
 struct VideoOsd {
     style: OsdStyle,
     font: crate::gdi::Font,
+    /// The DPI `font` was made for.
+    dpi: i32,
     /// Parsed once per change, rendered on every frame.
     template: crate::osd_template::Template,
     fields: HashMap<&'static str, String>,
@@ -469,7 +471,6 @@ impl VideoView {
         self.resume_threshold = resume_threshold;
         self.resume_pending = resume;
         self.resumed_to = None;
-        self.loaded = false;
         self.info = info;
         self.path = path.to_path_buf();
         self.keyframes = OnceCell::new();
@@ -631,6 +632,13 @@ impl VideoView {
 
     /// `WM_TIMER` with [`RENDER_TIMER_ID`].
     pub unsafe fn render(&mut self) {
+        self.push_osd();
+        self.advance_step();
+        self.advance_key_seek();
+    }
+
+    /// Hands the OSD, with the text for the current position, to the player.
+    unsafe fn push_osd(&self) {
         match &self.osd {
             Some(osd) => {
                 let position = format_time(self.position());
@@ -648,8 +656,6 @@ impl VideoView {
             }
             None => self.player.render(None),
         }
-        self.advance_step();
-        self.advance_key_seek();
     }
 
     /// Tags of the current file (read once, then cached).
@@ -659,29 +665,30 @@ impl VideoView {
 
     /// Shows (`Some`) or hides the OSD.
     pub unsafe fn set_osd(&mut self, style: Option<OsdStyle>, text: OsdText) {
-        let Some(style) = style else {
-            self.osd = None;
-            return;
-        };
-        let template = crate::osd_template::Template::parse(&text.template);
-        let fields = text.fields;
-        self.osd = Some(match self.osd.take() {
-            Some(osd) if osd.style == style => VideoOsd {
-                template,
-                fields,
-                ..osd
-            },
-            _ => {
-                let dpi = (crate::gdi::dpi_scale(self.viewer) * 96.0).round() as i32;
-                let font = crate::image_view::create_osd_font(&style.face, style.size_pt, dpi);
-                VideoOsd {
-                    style,
-                    font,
+        let new = style.map(|style| {
+            let template = crate::osd_template::Template::parse(&text.template);
+            let fields = text.fields;
+            let dpi = crate::image_view::osd_dpi(self.viewer);
+            match self.osd.take() {
+                Some(osd) if osd.style == style && osd.dpi == dpi => VideoOsd {
                     template,
                     fields,
-                }
+                    ..osd
+                },
+                _ => VideoOsd {
+                    font: crate::image_view::create_osd_font(&style.face, style.size_pt, dpi),
+                    style,
+                    dpi,
+                    template,
+                    fields,
+                },
             }
         });
+        // The render thread draws with the font it was given last: it gets the new one before
+        // the old one is deleted.
+        let old = std::mem::replace(&mut self.osd, new);
+        self.push_osd();
+        drop(old);
     }
 
     /// Stretches the surface over `area` (viewer client coordinates). The engine letterboxes the

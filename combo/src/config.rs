@@ -392,7 +392,8 @@ impl ViewerConfig {
             .trim()
             .replace(',', ".")
             .parse::<f32>()
-            .ok();
+            .ok()
+            .filter(|v| v.is_finite());
 
         Self {
             language: LangSetting::from_ini(&string("Language", "")),

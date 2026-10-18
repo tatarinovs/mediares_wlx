@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use mediares_core::image_decode::header_looks_decodable;
+use mediares_core::image_decode::{header_looks_decodable, may_have_pages};
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
@@ -62,8 +62,10 @@ pub struct ViewerState {
     pub load_failed: bool,
     /// Page of a multi-page file shown, from 0.
     pub page: u32,
-    /// Pages of the file, known once a page of it is decoded (1 until then).
+    /// Pages of the file (1 until a page of it is decoded).
     pub pages: u32,
+    /// Whether `pages` is known: a TIFF's count comes with its first decoded page.
+    pages_known: bool,
     /// Quarter turns clockwise made with R / L (the picture on screen differs from the file).
     pub quarter_turns: u8,
     /// Present while a video or audio file is shown (then `image` is `None`).
@@ -73,6 +75,8 @@ pub struct ViewerState {
     pub offset: (f32, f32),
     pub drag: Option<Drag>,
     pub loupe: Option<Loupe>,
+    /// Part of a wheel notch turned so far (touchpads send fractions; see `WM_MOUSEWHEEL`).
+    pub wheel_rest: i32,
     /// The zoomed-in view to give the photo being decoded ([`ViewerConfig::keep_zoom`]).
     kept_view: Option<crate::image_view::KeptView>,
     /// The photo the one on screen is compared with, side by side.
@@ -97,8 +101,8 @@ pub struct ViewerState {
     pub config: ViewerConfig,
     /// Last TC show flags (`LCP_*`), to detect which option a `LC_NEWPARAMS` toggled.
     pub show_flags: i32,
-    /// Lazily created OSD font; dropped whenever the config changes.
-    pub osd_font: Option<Font>,
+    /// Lazily created OSD font and the DPI it was made for; dropped whenever the config changes.
+    pub osd_font: Option<(i32, Font)>,
     /// Keeps the image cache while this window lives.
     _cache_hold: image_cache::ViewerHold,
 }
@@ -121,12 +125,14 @@ impl ViewerState {
             load_failed: false,
             page: 0,
             pages: 1,
+            pages_known: true,
             quarter_turns: 0,
             media: None,
             zoom: ZoomMode::Fit,
             offset: (0.0, 0.0),
             drag: None,
             loupe: None,
+            wheel_rest: 0,
             kept_view: None,
             compare: None,
             dir_files: Vec::new(),
@@ -204,6 +210,7 @@ impl ViewerState {
         self.file_path = path.to_path_buf();
         self.page = 0;
         self.pages = 1;
+        self.pages_known = !may_have_pages(path, probe_file(path));
         self.show_page()
     }
 
@@ -274,6 +281,7 @@ impl ViewerState {
     fn set_image(&mut self, img: Arc<DecodedImage>) {
         self.image = Some(img.clone());
         self.apply_kept_view(&img);
+        self.pages_known = true;
         if self.pages != img.pages {
             // A multi-page file just opened: its next page goes ahead of the neighbours.
             self.pages = img.pages;
@@ -441,19 +449,33 @@ impl ViewerState {
 
     /// Turns to the next/previous page of a multi-page file; past its first or last page (and
     /// in a file of one page) moves to the adjacent file, which opens at its first page.
+    /// While the first page of a TIFF is still decoding, its page count is unknown and nothing
+    /// happens (a held key would skip the whole file otherwise).
     pub fn turn_page(&mut self, forward: bool) -> bool {
-        let page = if forward {
-            Some(self.page + 1).filter(|&p| p < self.pages)
-        } else {
-            self.page.checked_sub(1)
-        };
-        let Some(page) = page else {
+        if !self.pages_known && self.pending.is_some() {
+            return false;
+        }
+        let Some(page) = self.adjacent_page(forward) else {
             return self.navigate(forward);
         };
         self.page = page;
         self.forward = forward;
         self.show_page();
         true
+    }
+
+    /// The page before or after the one shown, if the file has it.
+    fn adjacent_page(&self, forward: bool) -> Option<u32> {
+        if forward {
+            Some(self.page + 1).filter(|&p| p < self.pages)
+        } else {
+            self.page.checked_sub(1)
+        }
+    }
+
+    /// The page shown, when the file has others.
+    pub fn shown_page(&self) -> Option<u32> {
+        (self.pages > 1).then_some(self.page)
     }
 
     pub fn apply_config(&mut self, config: ViewerConfig) {
@@ -569,6 +591,7 @@ impl ViewerState {
                     Some(Request::Ready(img)) => {
                         self.image = Some(img.clone());
                         self.pages = img.pages;
+                        self.pages_known = true;
                         self.apply_kept_view(&img);
                         self.previous = None;
                     }
@@ -595,12 +618,8 @@ impl ViewerState {
     /// behind.
     fn prefetch_candidates(&self) -> Vec<(PathBuf, DecodeOptions)> {
         let options = self.decode_options();
-        let next_page = if self.forward {
-            Some(self.page + 1).filter(|&p| p < self.pages)
-        } else {
-            self.page.checked_sub(1)
-        };
-        let mut pictures: Vec<_> = next_page
+        let mut pictures: Vec<_> = self
+            .adjacent_page(self.forward)
             .map(|page| (self.file_path.clone(), DecodeOptions { page, ..options }))
             .into_iter()
             .collect();

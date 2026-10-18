@@ -3,15 +3,21 @@
 //! The metadata block is read into memory once and parsed from a slice, so every access is
 //! bounds-checked and malformed offsets simply yield missing fields.
 
-use std::cell::Cell;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
-/// TIFF-based files keep IFD0 and the Exif IFD near the start: this much is read first...
+/// TIFF-based files mostly keep IFD0 and the Exif IFD near the start: this much is read first,
+/// and as much again wherever the structure points further on.
 const TIFF_HEAD_BYTES: u64 = 64 * 1024;
-/// ...and this much if their values lie further on.
-const TIFF_SCAN_BYTES: u64 = 1024 * 1024;
+/// The most read at once for a value that is longer still.
+const TIFF_PIECE_MAX_BYTES: u64 = 1024 * 1024;
+/// Rounds of further reads: IFD0, then its values and sub-IFDs, then theirs.
+const TIFF_READ_ROUNDS: usize = 4;
+/// Further reads per round (a damaged file may point anywhere).
+const TIFF_READS_PER_ROUND: usize = 16;
 const MAX_STRING_LEN: usize = 4096;
 
 const TYPE_BYTE: u16 = 1;
@@ -111,27 +117,48 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
         info.orientation = None;
         return Some(info);
     }
-    let block = if magic.starts_with(&[0xFF, 0xD8]) {
-        read_jpeg_app1(file)?
+    if magic.starts_with(&[0xFF, 0xD8]) {
+        parse_tiff(&read_jpeg_app1(file)?)
     } else if magic == b"II*\0" || magic == b"MM\0*" {
-        // The head usually holds all the metadata (a Sony ARW's ends at about 43 KB); only if an
-        // offset points past it is the longer scan read.
-        let read_head = |file: &mut File, len: u64| {
-            let mut data = Vec::new();
-            file.seek(SeekFrom::Start(0)).ok()?;
-            file.take(len).read_to_end(&mut data).ok()?;
-            Some(data)
-        };
-        let head = read_head(&mut file, TIFF_HEAD_BYTES)?;
-        let (info, cut_short) = parse_tiff_checked(&head);
-        if !cut_short || head.len() < TIFF_HEAD_BYTES as usize {
+        read_tiff_exif(&mut file)
+    } else {
+        None
+    }
+}
+
+/// The metadata of a TIFF-based file. The head usually holds all of it (a Sony ARW's ends at
+/// about 43 KB); what the structure points to past it is read where it lies: TIFFs written by
+/// libtiff, Photoshop or WIC keep IFD0 after the picture, megabytes into the file.
+fn read_tiff_exif(file: &mut File) -> Option<ExifInfo> {
+    let file_len = file.metadata().ok()?.len();
+    let mut read_at = |offset: u64, len: u64| {
+        let mut data = Vec::new();
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        file.by_ref().take(len).read_to_end(&mut data).ok()?;
+        (!data.is_empty()).then_some(data)
+    };
+    let mut pieces = Pieces(vec![(0, read_at(0, TIFF_HEAD_BYTES)?.into())]);
+    let mut tried = Vec::new();
+    let mut round = 0;
+    loop {
+        let (info, missing) = parse_pieces(&pieces);
+        let wanted: Vec<(usize, usize)> = missing
+            .into_iter()
+            .filter(|&(offset, _)| (offset as u64) < file_len && !tried.contains(&offset))
+            .take(TIFF_READS_PER_ROUND)
+            .collect();
+        if wanted.is_empty() || round == TIFF_READ_ROUNDS {
             return info;
         }
-        read_head(&mut file, TIFF_SCAN_BYTES)?
-    } else {
-        return None;
-    };
-    parse_tiff(&block)
+        round += 1;
+        for (offset, len) in wanted {
+            tried.push(offset);
+            let len = (len as u64).clamp(TIFF_HEAD_BYTES, TIFF_PIECE_MAX_BYTES);
+            if let Some(data) = read_at(offset as u64, len) {
+                pieces.0.push((offset, data.into()));
+            }
+        }
+    }
 }
 
 pub fn read_orientation(path: &Path) -> Option<u16> {
@@ -181,24 +208,38 @@ fn read_jpeg_app1(file: File) -> Option<Vec<u8>> {
 
 /// Parses a TIFF structure (`II*\0` / `MM\0*` header) from memory.
 fn parse_tiff(data: &[u8]) -> Option<ExifInfo> {
-    parse_tiff_checked(data).0
+    parse_pieces(&Pieces(vec![(0, Cow::Borrowed(data))])).0
 }
 
-/// [`parse_tiff`], and whether something it looked for lay past the end of `data` (a file's
-/// head, which may then be read further).
-fn parse_tiff_checked(data: &[u8]) -> (Option<ExifInfo>, bool) {
-    let le = match data.get(..4) {
+/// Parts of a TIFF structure at their offsets in it: the whole block of a JPEG's or HEIF's EXIF,
+/// or the pieces of a TIFF file read so far.
+struct Pieces<'a>(Vec<(usize, Cow<'a, [u8]>)>);
+
+impl Pieces<'_> {
+    /// `len` bytes at `offset`, if one piece holds them all.
+    fn get(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len)?;
+        self.0.iter().find_map(|(start, data)| {
+            let from = offset.checked_sub(*start)?;
+            data.get(from..end - start)
+        })
+    }
+}
+
+/// The metadata found in `pieces`, and what was looked for but isn't there (offset, length).
+fn parse_pieces(pieces: &Pieces) -> (Option<ExifInfo>, Vec<(usize, usize)>) {
+    let le = match pieces.get(0, 4) {
         Some(b"II*\0") => true,
         Some(b"MM\0*") => false,
-        _ => return (None, false),
+        _ => return (None, Vec::new()),
     };
     let tiff = Tiff {
-        data,
+        pieces,
         rd: Endian(le),
-        cut_short: Cell::new(false),
+        missing: RefCell::new(Vec::new()),
     };
     let info = tiff.parse();
-    (info, tiff.cut_short.get())
+    (info, tiff.missing.into_inner())
 }
 
 /// Offsets of the Exif and GPS IFDs referenced from IFD0.
@@ -233,11 +274,18 @@ impl Endian {
 }
 
 struct Tiff<'a> {
-    data: &'a [u8],
+    pieces: &'a Pieces<'a>,
     rd: Endian,
-    /// A read went past the end of `data`.
-    cut_short: Cell<bool>,
+    /// Reads no piece could serve (offset, length).
+    missing: RefCell<Vec<(usize, usize)>>,
 }
+
+/// Tags whose values are read (IFD0, Exif and GPS IFDs); others are passed over without
+/// looking for their values (strip offsets of a big TIFF may be far away).
+const READ_TAGS: &[u16] = &[
+    0x0001, 0x0002, 0x0003, 0x0004, 0x010F, 0x0110, 0x0112, 0x0131, 0x0132, 0x8769, 0x8825, 0x829A,
+    0x829D, 0x8827, 0x9003, 0x9209, 0x920A, 0xA002, 0xA003, 0xA405, 0xA434,
+];
 
 struct Entry<'a> {
     tag: u16,
@@ -263,18 +311,20 @@ impl<'a> Tiff<'a> {
     }
 
     fn bytes(&self, offset: usize, len: usize) -> Option<&'a [u8]> {
-        let end = offset.checked_add(len)?;
-        if end > self.data.len() {
-            self.cut_short.set(true);
+        let found = self.pieces.get(offset, len);
+        if found.is_none() {
+            self.missing.borrow_mut().push((offset, len));
         }
-        self.data.get(offset..end)
+        found
     }
 
     fn u32(&self, offset: usize) -> Option<u32> {
         self.bytes(offset, 4).map(|b| self.rd.u32(b))
     }
 
-    /// Decodes the 12-byte IFD entry at `offset`; values up to 4 bytes are stored inline.
+    /// Decodes the 12-byte IFD entry at `offset`; values up to 4 bytes are stored inline. The value
+    /// is empty when it can't be read or isn't one of [`READ_TAGS`]: the entries after it still
+    /// count.
     fn entry(&self, offset: usize) -> Option<Entry<'a>> {
         let raw = self.bytes(offset, 12)?;
         let tag = self.rd.u16(&raw[0..2]);
@@ -294,11 +344,12 @@ impl<'a> Tiff<'a> {
                 })
             }
         };
-        let size = (count as usize).checked_mul(unit)?;
-        let value = if size <= 4 {
-            &raw[8..8 + size]
-        } else {
-            self.bytes(self.rd.u32(&raw[8..12]) as usize, size)?
+        let value = match (count as usize).checked_mul(unit) {
+            Some(size) if size <= 4 => &raw[8..8 + size],
+            Some(size) if READ_TAGS.contains(&tag) => self
+                .bytes(self.rd.u32(&raw[8..12]) as usize, size)
+                .unwrap_or(&[]),
+            _ => &[],
         };
         Some(Entry {
             tag,
@@ -688,14 +739,52 @@ mod tests {
         t.extend_from_slice(&1u16.to_le_bytes());
         t.extend_from_slice(&[0x27, 0x88, 3, 0, 1, 0, 0, 0, 0x90, 0x01, 0, 0]);
         t.extend_from_slice(&0u32.to_le_bytes());
-        assert!(parse_tiff_checked(&t[..TIFF_HEAD_BYTES as usize]).1);
-        assert!(!parse_tiff_checked(&t).1);
+        let head = Pieces(vec![(0, Cow::Borrowed(&t[..TIFF_HEAD_BYTES as usize]))]);
+        assert_eq!(parse_pieces(&head).1, vec![(far, 2)]);
+        assert!(parse_pieces(&Pieces(vec![(0, Cow::Borrowed(&t))]))
+            .1
+            .is_empty());
 
         let path = std::env::temp_dir().join(format!("mediares_{}_far.tif", std::process::id()));
         std::fs::write(&path, &t).unwrap();
         let iso = read_exif(&path).and_then(|e| e.iso);
         std::fs::remove_file(&path).ok();
         assert_eq!(iso, Some(400));
+    }
+
+    /// IFD0 after megabytes of picture, as libtiff, Photoshop and WIC write it, with its strip
+    /// offsets (an array) and Make out of line: read where it lies.
+    #[test]
+    fn ifd0_after_the_picture_is_found() {
+        let picture = 3 * 1024 * 1024;
+        let strips = 2000u32;
+        let mut t = b"II*\0".to_vec();
+        let ifd0 = 8 + picture;
+        t.extend_from_slice(&(ifd0 as u32).to_le_bytes());
+        t.resize(ifd0, 0x55);
+        let entries = 3usize;
+        let values = ifd0 + 2 + entries * 12 + 4;
+        let make = b"Scanner\0";
+        t.extend_from_slice(&(entries as u16).to_le_bytes());
+        // Make (ASCII, out of line), Orientation 8, StripOffsets (LONG array, out of line).
+        t.extend_from_slice(&[0x0F, 0x01, 2, 0]);
+        t.extend_from_slice(&(make.len() as u32).to_le_bytes());
+        t.extend_from_slice(&(values as u32).to_le_bytes());
+        t.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 8, 0, 0, 0]);
+        t.extend_from_slice(&[0x11, 0x01, 4, 0]);
+        t.extend_from_slice(&strips.to_le_bytes());
+        t.extend_from_slice(&((values + make.len()) as u32).to_le_bytes());
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t.extend_from_slice(make);
+        t.extend((0..strips).flat_map(|i| (8 + i).to_le_bytes()));
+
+        let path = std::env::temp_dir().join(format!("mediares_{}_tail.tif", std::process::id()));
+        std::fs::write(&path, &t).unwrap();
+        let info = read_exif(&path);
+        std::fs::remove_file(&path).ok();
+        let info = info.expect("read");
+        assert_eq!(info.orientation, Some(8));
+        assert_eq!(info.make.as_deref(), Some("Scanner"));
     }
 
     #[test]

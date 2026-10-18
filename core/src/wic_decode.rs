@@ -9,23 +9,21 @@
 use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
-use windows::core::{w, Interface, HSTRING, PCWSTR};
+use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapDecoder,
-    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, IWICPixelFormatInfo2,
-    WICBitmapCacheOnLoad, WICBitmapDitherTypeNone, WICBitmapInterpolationModeFant,
-    WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal, WICBitmapTransformFlipVertical,
-    WICBitmapTransformOptions, WICBitmapTransformRotate0, WICBitmapTransformRotate180,
-    WICBitmapTransformRotate270, WICBitmapTransformRotate90, WICDecodeMetadataCacheOnDemand,
-    WICRect,
+    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, IWICMetadataQueryReader,
+    IWICPixelFormatInfo2, WICBitmapCacheOnLoad, WICBitmapDitherTypeNone,
+    WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal,
+    WICBitmapTransformFlipVertical, WICBitmapTransformOptions, WICBitmapTransformRotate0,
+    WICBitmapTransformRotate180, WICBitmapTransformRotate270, WICBitmapTransformRotate90,
+    WICDecodeMetadataCacheOnDemand, WICRect,
 };
-use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::Win32::System::Variant::VT_UI2;
 
 use crate::image_decode::{MAX_DIMENSION, MAX_PIXELS};
-use crate::mf_init::ComScope;
+use crate::mf_init::{ComScope, PropVariant};
 
 /// Whether the file is of a kind only WIC decodes (the `image` crate has no decoder for it).
 pub fn handles(path: &Path) -> bool {
@@ -49,8 +47,9 @@ struct Frame {
     factory: IWICImagingFactory,
 }
 
-/// Frame `page` (from 0) of the input: the pages of a multi-page TIFF; other formats have one.
-fn open_frame(input: Input<'_>, page: u32) -> Option<Frame> {
+/// Frame `frame` (from 0) of the input: a page of a multi-page TIFF (see [`tiff_pages`]); other
+/// formats are shown by their first.
+fn open_frame(input: Input<'_>, frame: u32) -> Option<Frame> {
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
@@ -79,7 +78,7 @@ fn open_frame(input: Input<'_>, page: u32) -> Option<Frame> {
                     .ok()?
             }
         };
-        let frame = decoder.GetFrame(page).ok()?;
+        let frame = decoder.GetFrame(frame).ok()?;
         Some(Frame {
             frame,
             decoder,
@@ -103,31 +102,53 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     frame_size(&frame.frame)
 }
 
-/// Number of pages (frames) in the file; 1 when it cannot be read.
-pub fn page_count(path: &Path) -> u32 {
-    let _com = ComScope::new();
-    // A local, released before `_com` (see `dimensions`).
-    let frame = open_frame(Input::File(path), 0);
-    frame
-        .and_then(|f| unsafe { f.decoder.GetFrameCount() }.ok())
-        .unwrap_or(1)
-        .max(1)
+/// A page of a multi-page TIFF: the frame holding it and the page's own Orientation (1..=8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TiffPage {
+    pub frame: u32,
+    pub orientation: Option<u16>,
 }
 
-/// The TIFF Orientation (1..=8) of page `page`: each page keeps its own in its IFD, while the
-/// EXIF reader only looks at the first.
-pub fn page_orientation(path: &Path, page: u32) -> Option<u16> {
+/// Frames looked at in a TIFF at most (a fax archive has hundreds of pages).
+const MAX_TIFF_FRAMES: u32 = 10_000;
+
+/// The pages of a TIFF: its frames (IFDs) other than reduced-resolution copies and transparency
+/// masks (NewSubfileType bits 0 and 2), each with its orientation. `None` if WIC can't open it.
+pub fn tiff_pages(path: &Path) -> Option<Vec<TiffPage>> {
     let _com = ComScope::new();
     // Locals, released before `_com` (see `dimensions`).
-    let frame = open_frame(Input::File(path), page)?;
-    let reader = unsafe { frame.frame.GetMetadataQueryReader() }.ok()?;
-    let mut value = PROPVARIANT::default();
-    unsafe { reader.GetMetadataByName(w!("/ifd/{ushort=274}"), &mut value) }.ok()?;
-    // A SHORT holds no allocation: nothing to clear.
-    let inner = unsafe { &value.Anonymous.Anonymous };
-    (inner.vt == VT_UI2)
-        .then(|| unsafe { inner.Anonymous.uiVal })
-        .filter(|o| (1..=8).contains(o))
+    let first = open_frame(Input::File(path), 0)?;
+    let count = unsafe { first.decoder.GetFrameCount() }
+        .ok()?
+        .min(MAX_TIFF_FRAMES);
+    let (mut frames, mut pages) = (Vec::new(), Vec::new());
+    for index in 0..count {
+        let Ok(frame) = (unsafe { first.decoder.GetFrame(index) }) else {
+            continue;
+        };
+        let reader = unsafe { frame.GetMetadataQueryReader() }.ok();
+        let tag = |id: u16| reader.as_ref().and_then(|r| ifd_tag(r, id));
+        let page = TiffPage {
+            frame: index,
+            orientation: tag(274)
+                .and_then(|v| v.u16())
+                .filter(|o| (1..=8).contains(o)),
+        };
+        frames.push(page);
+        if tag(254).and_then(|v| v.u32()).unwrap_or(0) & 0b101 == 0 {
+            pages.push(page);
+        }
+    }
+    // A file of nothing but such copies still shows them.
+    Some(if pages.is_empty() { frames } else { pages })
+}
+
+/// Tag `id` of a TIFF frame's IFD.
+fn ifd_tag(reader: &IWICMetadataQueryReader, id: u16) -> Option<PropVariant> {
+    let mut value = PropVariant::default();
+    let name = HSTRING::from(format!("/ifd/{{ushort={id}}}"));
+    unsafe { reader.GetMetadataByName(&name, &mut value.0) }.ok()?;
+    Some(value)
 }
 
 /// Bits per channel, channel count and transparency of the first frame's stored pixels.
@@ -163,7 +184,7 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
     decode_turned(Input::File(path), 0, None, 1).map(|(img, _)| img)
 }
 
-/// Decodes frame `page` to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
+/// Decodes frame `frame` to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
 /// along with the frame's full size (before the turn). Decoders that can (HEIF, JPEG) produce the
 /// smaller picture directly, which is several times faster than decoding it whole. The size
 /// limits apply to the full frame, so a picture is either shown at every size or not at all.
@@ -171,12 +192,12 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
 /// decoding pipeline, so the picture is not copied once more to turn it.
 pub fn decode_turned(
     input: Input<'_>,
-    page: u32,
+    frame: u32,
     fit: Option<(u32, u32)>,
     orientation: u16,
 ) -> Option<(DynamicImage, (u32, u32))> {
     let _com = ComScope::new();
-    let Frame { frame, factory, .. } = &open_frame(input, page)?;
+    let Frame { frame, factory, .. } = &open_frame(input, frame)?;
     let (w, h) = frame_size(frame)?;
     if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
@@ -235,15 +256,15 @@ pub fn decode_turned(
 /// (JPEG, TIFF, PNG) decode no further than asked.
 const STRIP_ROWS: u32 = 256;
 
-/// The whole frame `page` as RGBA, decoded a strip of rows at a time: when `cancelled` says so
+/// The whole frame `frame` as RGBA, decoded a strip of rows at a time: when `cancelled` says so
 /// between strips, the decode stops (`None`). The picture is not turned.
 pub fn decode_whole_cancellable(
     input: Input<'_>,
-    page: u32,
+    frame: u32,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<DynamicImage> {
     let _com = ComScope::new();
-    let Frame { frame, factory, .. } = &open_frame(input, page)?;
+    let Frame { frame, factory, .. } = &open_frame(input, frame)?;
     let (w, h) = frame_size(frame)?;
     if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
@@ -303,11 +324,12 @@ mod tests {
 
     /// Uncompressed little-endian RGB TIFF, 2x1: red, green.
     fn rgb_tiff() -> Vec<u8> {
-        rgb_tiff_pages(&[(2, 1, 1, &[255, 0, 0, 0, 255, 0])])
+        rgb_tiff_pages(&[(2, 1, 1, 0, &[255, 0, 0, 0, 255, 0])])
     }
 
-    /// Uncompressed little-endian RGB TIFF with a page per (width, height, orientation, pixels).
-    fn rgb_tiff_pages(pages: &[(u16, u16, u16, &[u8])]) -> Vec<u8> {
+    /// Uncompressed little-endian RGB TIFF with an IFD per (width, height, orientation,
+    /// NewSubfileType, pixels).
+    fn rgb_tiff_pages(pages: &[(u16, u16, u16, u32, &[u8])]) -> Vec<u8> {
         let short = |tag: u16, v: u16| {
             [
                 &tag.to_le_bytes()[..],
@@ -327,13 +349,14 @@ mod tests {
         };
         let mut t = b"II*\0".to_vec();
         t.extend_from_slice(&8u32.to_le_bytes());
-        for (i, &(w, h, orientation, pixels)) in pages.iter().enumerate() {
-            // IFD (10 entries), then BitsPerSample values, then the pixels, padded to a word.
+        for (i, &(w, h, orientation, subfile, pixels)) in pages.iter().enumerate() {
+            // IFD (11 entries), then BitsPerSample values, then the pixels, padded to a word.
             let ifd = t.len() as u32;
-            let bits = ifd + 2 + 10 * 12 + 4;
+            let bits = ifd + 2 + 11 * 12 + 4;
             let data = bits + 6;
             let next = data + pixels.len().next_multiple_of(2) as u32;
-            t.extend_from_slice(&10u16.to_le_bytes());
+            t.extend_from_slice(&11u16.to_le_bytes());
+            t.extend(long(254, subfile));
             t.extend(short(256, w));
             t.extend(short(257, h));
             t.extend(
@@ -364,10 +387,12 @@ mod tests {
     fn tiff_pages_decode_with_their_own_orientation() {
         use crate::image_decode::{decode_oriented_cancellable, page_count};
         let path = std::env::temp_dir().join(format!("mediares_{}_pages.tif", std::process::id()));
-        // Page 2 is 1x2 (blue above white), stored turned: Orientation 6 shows it as 2x1.
+        // Page 2 is 1x2 (blue above white), stored turned: Orientation 6 shows it as 2x1. Between
+        // the pages, a reduced-resolution copy of page 1 that is not a page of its own.
         let tiff = rgb_tiff_pages(&[
-            (2, 1, 1, &[255, 0, 0, 0, 255, 0]),
-            (1, 2, 6, &[0, 0, 255, 255, 255, 255]),
+            (2, 1, 1, 0, &[255, 0, 0, 0, 255, 0]),
+            (1, 1, 1, 1, &[255, 0, 0]),
+            (1, 2, 6, 0, &[0, 0, 255, 255, 255, 255]),
         ]);
         std::fs::write(&path, tiff).unwrap();
         let kind = MediaType::StandardImage;

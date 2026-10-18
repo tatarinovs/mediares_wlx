@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
-    GetDeviceCaps, GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, COLORONCOLOR,
+    GetStockObject, SetBrushOrgEx, SetStretchBltMode, StretchDIBits, COLORONCOLOR,
     DEFAULT_GUI_FONT, DIB_RGB_COLORS, DT_CENTER, DT_EXPANDTABS, DT_LEFT, DT_NOCLIP, DT_NOPREFIX,
-    DT_SINGLELINE, DT_TOP, DT_VCENTER, HALFTONE, HDC, HFONT, LOGPIXELSY, SRCCOPY,
+    DT_SINGLELINE, DT_TOP, DT_VCENTER, HALFTONE, HDC, HFONT, SRCCOPY,
 };
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -342,7 +342,7 @@ pub unsafe fn paint(
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy();
-                let font = osd_font(dc, state);
+                let font = osd_font(state);
                 draw_osd_text(dc, &name, font, state.config.osd_font_color);
             }
         }
@@ -640,18 +640,27 @@ fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
     })
 }
 
-unsafe fn osd_font(dc: HDC, state: &mut ViewerState) -> HFONT {
+/// The OSD font for the DPI of the monitor the viewer is on (the video OSD's is made the same way).
+unsafe fn osd_font(state: &mut ViewerState) -> HFONT {
+    let dpi = osd_dpi(state.hwnd);
     let config = &state.config;
+    if state
+        .osd_font
+        .as_ref()
+        .is_none_or(|(made_for, _)| *made_for != dpi)
+    {
+        let font = create_osd_font(&config.osd_font_name, config.osd_font_size, dpi);
+        state.osd_font = Some((dpi, font));
+    }
     state
         .osd_font
-        .get_or_insert_with(|| unsafe {
-            create_osd_font(
-                &config.osd_font_name,
-                config.osd_font_size,
-                GetDeviceCaps(Some(dc), LOGPIXELSY),
-            )
-        })
-        .0
+        .as_ref()
+        .map_or(HFONT::default(), |(_, font)| font.0)
+}
+
+/// The DPI OSD fonts are made for: the one of the monitor `hwnd` is on.
+pub fn osd_dpi(hwnd: HWND) -> i32 {
+    (gdi::dpi_scale(hwnd) * 96.0).round() as i32
 }
 
 /// The OSD font (bold, `size_pt` points at `dpi`); shared by the photo and video OSD.
@@ -682,7 +691,7 @@ unsafe fn draw_osd_text_at(dc: HDC, at: (i32, i32), text: &str, font: HFONT, col
 /// The OSD of the photo on screen, `x` pixels from the left (the right half while comparing).
 unsafe fn draw_osd(dc: HDC, state: &mut ViewerState, x: i32) {
     let text = osd_text(state, zoom_percent(state));
-    let font = osd_font(dc, state);
+    let font = osd_font(state);
     draw_osd_text_at(
         dc,
         (x + OSD_MARGIN, OSD_MARGIN),

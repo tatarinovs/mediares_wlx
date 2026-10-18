@@ -187,8 +187,8 @@ impl Command {
         None,
         Some((Command::ShowSettings, n("Settings...\tS"))),
         None,
-        Some((Command::NextPage, n("Next page\tRight"))),
-        Some((Command::PreviousPage, n("Previous page\tLeft"))),
+        Some((Command::NextPage, n("Next page\tRight / Ctrl+PgDn"))),
+        Some((Command::PreviousPage, n("Previous page\tLeft / Ctrl+PgUp"))),
         Some((Command::Next, n("Next file\tSpace / Down"))),
         Some((Command::Previous, n("Previous file\tBackspace / Up"))),
     ];
@@ -327,6 +327,9 @@ impl Command {
                 0x31 | 0x61 => Some(ZoomActualSize), // Ctrl+1
                 0x32 | 0x62 => Some(Zoom200),        // Ctrl+2
                 0x33 | 0x63 => Some(Zoom300),        // Ctrl+3
+                // Pages also while zoomed in, when the arrows pan.
+                0x22 if !media => Some(NextPage),     // Ctrl+PgDn
+                0x21 if !media => Some(PreviousPage), // Ctrl+PgUp
                 _ => None,
             });
         }
@@ -678,14 +681,15 @@ pub unsafe fn overlay_message(
             }
         }
         (WM_MOUSEMOVE, _) => {}
-        // Wheel over the floating bar: volume (over the picture it pages through the files).
+        // Wheel over the floating bar: volume.
         (WM_MOUSEWHEEL, PanelKind::Video) => {
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            if delta != 0 {
-                let media = state.media.as_mut()?;
-                media.change_volume(delta > 0);
-                media.invalidate_bar();
+            let notches = wheel_notches(&mut state.wheel_rest, delta);
+            let media = state.media.as_mut()?;
+            for _ in 0..notches.unsigned_abs().min(MAX_WHEEL_NOTCHES) {
+                media.change_volume(notches > 0);
             }
+            media.invalidate_bar();
         }
         _ => return None,
     }
@@ -776,15 +780,30 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 Some(media) => {
                     let picture = media.current_picture();
                     let file = picture.as_ref().and_then(|img| {
-                        snapshot::save_temp_png(
-                            img,
-                            &state.file_path,
-                            media.is_video().then(|| media.position()),
-                        )
+                        let suffix = if media.is_video() {
+                            snapshot::time_label(media.position())
+                        } else {
+                            "cover".to_string()
+                        };
+                        snapshot::save_temp_png(img, &state.file_path, &suffix)
                     });
                     (picture, file)
                 }
-                None => (state.whole_image(), Some(state.file_path.clone())),
+                None => {
+                    let picture = state.whole_image();
+                    // A page of a multi-page file is pasted as a file of its own.
+                    let file = match state.shown_page() {
+                        Some(page) => picture.as_ref().and_then(|img| {
+                            snapshot::save_temp_png(
+                                img,
+                                &state.file_path,
+                                &format!("p{}", page + 1),
+                            )
+                        }),
+                        None => Some(state.file_path.clone()),
+                    };
+                    (picture, file)
+                }
             };
             let copied =
                 picture.is_some_and(|img| snapshot::copy_to_clipboard(hwnd, &img, file.as_deref()));
@@ -863,7 +882,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         Command::SaveAs => {
             if state.media.is_none() && state.image.is_some() {
                 let (path, turns) = (state.file_path.clone(), state.quarter_turns);
-                let page = (state.pages > 1).then_some(state.page);
+                let page = state.shown_page();
                 let auto_rotate = state.config.auto_rotate_exif;
                 save_as::save_as(dialog::modal_owner(hwnd), &path, page, turns, auto_rotate);
             }
@@ -1589,48 +1608,48 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
             let mut pt = point_from_lparam(lparam.0);
             let _ = ScreenToClient(hwnd, &mut pt);
-            // Over the picture the wheel pages through the files whatever they are, and Ctrl+wheel
-            // zooms photos (or the other way round, a setting); volume is the wheel over the
-            // transport bar, or Ctrl+wheel there.
+            // Over the picture the wheel pages through the files (and the pages of a photo), and
+            // Ctrl+wheel zooms photos (or the other way round, a setting); volume is the wheel over
+            // the transport bar, or Ctrl+wheel there.
             let volume = state
                 .media
                 .as_ref()
                 .is_some_and(|m| ctrl_down() || m.over_bar(pt.x, pt.y));
-            if volume {
-                if delta != 0 {
-                    execute(
-                        hwnd,
-                        if delta > 0 {
-                            Command::VolumeUp
-                        } else {
-                            Command::VolumeDown
-                        },
-                    );
-                }
-            } else if state.media.is_none() && (ctrl_down() != state.config.wheel_zoom) {
-                if let Some(view) = view_size(state).filter(|_| delta != 0) {
-                    let (x, y) = image_view::to_view(state, (pt.x, pt.y));
-                    zoom_at(state, view, delta > 0, (x as f32, y as f32));
-                }
-            } else if state
-                .media
-                .as_mut()
-                .and_then(|m| m.audio_mut())
-                .is_some_and(|a| a.scroll_lyrics(pt.x, pt.y, delta))
+            // The wheel over a song text that doesn't fit scrolls it, by as much as it turned.
+            if !volume
+                && state
+                    .media
+                    .as_mut()
+                    .and_then(|m| m.audio_mut())
+                    .is_some_and(|a| a.scroll_lyrics(pt.x, pt.y, delta))
             {
-                // The wheel over a song text that doesn't fit scrolls it.
-            } else if delta != 0 {
-                // Through the pages of a multi-page photo, on to the next file past the last.
-                let photo = state.media.is_none();
-                execute(
-                    hwnd,
-                    match (delta < 0, photo) {
-                        (true, true) => Command::NextPage,
-                        (false, true) => Command::PreviousPage,
-                        (true, false) => Command::Next,
-                        (false, false) => Command::Previous,
-                    },
-                );
+                return LRESULT(0);
+            }
+            let notches = wheel_notches(&mut state.wheel_rest, delta);
+            let up = notches > 0;
+            let photo = state.media.is_none();
+            let command = match (volume, photo && (ctrl_down() != state.config.wheel_zoom)) {
+                (true, _) if up => Some(Command::VolumeUp),
+                (true, _) => Some(Command::VolumeDown),
+                (false, true) => None,
+                (false, false) => Some(match (up, photo) {
+                    (false, true) => Command::NextPage,
+                    (true, true) => Command::PreviousPage,
+                    (false, false) => Command::Next,
+                    (true, false) => Command::Previous,
+                }),
+            };
+            for _ in 0..notches.unsigned_abs().min(MAX_WHEEL_NOTCHES) {
+                match command {
+                    Some(cmd) => execute(hwnd, cmd),
+                    None => {
+                        let Some(state) = get_state(hwnd) else { break };
+                        if let Some(view) = view_size(state) {
+                            let (x, y) = image_view::to_view(state, (pt.x, pt.y));
+                            zoom_at(state, view, up, (x as f32, y as f32));
+                        }
+                    }
+                }
             }
         }
         WM_XBUTTONDOWN => {
@@ -1657,6 +1676,24 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
     }
     LRESULT(0)
+}
+
+/// Most steps one wheel message makes (a fast flick of a free-spinning wheel).
+const MAX_WHEEL_NOTCHES: u32 = 10;
+
+/// Whole notches turned with `delta` (`WM_MOUSEWHEEL`; up is positive); the rest stays in `rest`
+/// for the next message: touchpads and smooth wheels send a fraction of a notch at a time. A turn
+/// the other way starts afresh.
+fn wheel_notches(rest: &mut i32, delta: i16) -> i32 {
+    const WHEEL_DELTA: i32 = 120;
+    let delta = i32::from(delta);
+    if (*rest > 0 && delta < 0) || (*rest < 0 && delta > 0) {
+        *rest = 0;
+    }
+    *rest += delta;
+    let notches = *rest / WHEEL_DELTA;
+    *rest -= notches * WHEEL_DELTA;
+    notches
 }
 
 unsafe fn ctrl_down() -> bool {
@@ -1828,6 +1865,40 @@ mod tests {
         assert_eq!(key(0x22), Some(Command::Next)); // PgDn
                                                     // Pages are a photo's: on audio/video the arrows seek.
         assert!(!Command::NextPage.available(true, false));
+    }
+
+    #[test]
+    fn wheel_fractions_add_up_to_notches() {
+        let mut rest = 0;
+        // A touchpad: a notch over several messages.
+        let steps: Vec<i32> = [30, 30, 30, 30, 30]
+            .map(|d| wheel_notches(&mut rest, d))
+            .into();
+        assert_eq!(steps, [0, 0, 0, 1, 0]);
+        assert_eq!(rest, 30);
+        // Turned back: the rest of the other way is dropped.
+        assert_eq!(wheel_notches(&mut rest, -60), 0);
+        assert_eq!(wheel_notches(&mut rest, -60), -1);
+        // A mouse: a notch per message, two in a fast one.
+        assert_eq!(wheel_notches(&mut rest, -120), -1);
+        assert_eq!(wheel_notches(&mut rest, 240), 2);
+        assert_eq!(rest, 0);
+    }
+
+    #[test]
+    fn ctrl_page_keys_turn_pages_even_when_zoomed() {
+        for zoomed in [false, true] {
+            assert_eq!(
+                Command::from_key(0x22, true, false, false, zoomed),
+                Some(Command::NextPage)
+            );
+            assert_eq!(
+                Command::from_key(0x21, true, false, false, zoomed),
+                Some(Command::PreviousPage)
+            );
+        }
+        // Audio / video: Ctrl+PgDn stays the Lister's.
+        assert_eq!(Command::from_key(0x22, true, false, true, false), None);
     }
 
     #[test]

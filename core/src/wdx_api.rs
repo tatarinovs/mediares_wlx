@@ -380,7 +380,7 @@ pub unsafe fn content_get_detect_string(detect_string: *mut c_char, max_len: c_i
 }
 
 pub fn content_plugin_unloading() {
-    get_cache().clear();
+    crate::cache::clear_all();
 }
 
 unsafe fn get_value(

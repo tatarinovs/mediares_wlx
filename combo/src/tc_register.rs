@@ -215,9 +215,13 @@ fn ini_value(dll: &Path, commander_path: Option<&str>) -> String {
         .map(|r| r.trim_end_matches('\\'))
         .filter(|r| !r.is_empty())
     {
-        let prefix = format!("{}\\", root.to_lowercase());
-        if full.to_lowercase().starts_with(&prefix) {
-            return format!("%COMMANDER_PATH%\\{}", &full[prefix.len()..]);
+        // Compared within the path itself: changing the case may change the length in bytes.
+        let len = root.len() + 1;
+        let inside = full
+            .get(..len)
+            .is_some_and(|head| head.to_lowercase() == format!("{}\\", root.to_lowercase()));
+        if inside {
+            return format!("%COMMANDER_PATH%\\{}", &full[len..]);
         }
     }
     full

@@ -213,6 +213,10 @@ impl<T> MetaCache<T> {
     fn contains(&self, path: &Path) -> bool {
         self.0.contains(path)
     }
+
+    fn clear(&self) {
+        self.0.clear();
+    }
 }
 
 #[cfg(feature = "tags")]
@@ -232,10 +236,24 @@ pub fn is_tags_cached(path: &Path) -> bool {
     tags_cache().contains(path)
 }
 
-pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
+fn exif_cache() -> &'static MetaCache<crate::exif::ExifInfo> {
     static EXIF: OnceLock<MetaCache<crate::exif::ExifInfo>> = OnceLock::new();
     EXIF.get_or_init(MetaCache::new)
-        .get_or_read(path, crate::exif::read_exif)
+}
+
+pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
+    exif_cache().get_or_read(path, crate::exif::read_exif)
+}
+
+fn tiff_pages_cache() -> &'static MetaCache<Vec<crate::wic_decode::TiffPage>> {
+    static PAGES: OnceLock<MetaCache<Vec<crate::wic_decode::TiffPage>>> = OnceLock::new();
+    PAGES.get_or_init(MetaCache::new)
+}
+
+/// The pages of a TIFF (see `wic_decode::tiff_pages`), looked up once per file version: every
+/// page decoded (fitted, whole, ahead) needs them.
+pub fn get_tiff_pages(path: &Path) -> Option<Arc<Vec<crate::wic_decode::TiffPage>>> {
+    tiff_pages_cache().get_or_read(path, crate::wic_decode::tiff_pages)
 }
 
 fn image_size_cache() -> &'static MetaCache<(u32, u32)> {
@@ -368,6 +386,21 @@ pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> 
 
 pub fn is_video_tags_cached(path: &Path) -> bool {
     video_tags_cache().contains(path)
+}
+
+/// Empties every cache (the plugin is being unloaded).
+pub fn clear_all() {
+    get_cache().clear();
+    #[cfg(feature = "tags")]
+    tags_cache().clear();
+    exif_cache().clear();
+    tiff_pages_cache().clear();
+    image_size_cache().clear();
+    pixel_format_cache().clear();
+    sharpness_cache().clear();
+    video_meta_cache().clear();
+    audio_meta_cache().clear();
+    video_tags_cache().clear();
 }
 
 pub fn get_cache() -> &'static MediaCache {

@@ -16,9 +16,9 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
-use windows::Win32::System::Variant::{VT_I8, VT_UI8};
+use windows::Win32::System::Variant::VT_I8;
 
-use crate::mf_init::mf_scope;
+use crate::mf_init::{mf_scope, PropVariant};
 
 #[derive(Debug, Clone)]
 pub struct VideoAnalysis {
@@ -121,7 +121,7 @@ pub(crate) unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
     reader
         .GetPresentationAttribute(MF_SOURCE_READER_MEDIASOURCE.0 as u32, &MF_PD_DURATION)
         .ok()
-        .and_then(|v| propvariant_u64(&v))
+        .and_then(|v| PropVariant(v).u64())
         .unwrap_or(0)
 }
 
@@ -618,10 +618,6 @@ pub(crate) unsafe fn set_position(reader: &IMFSourceReader, hns: i64) -> windows
 }
 
 pub(crate) const HNS_PER_SEC: f64 = 10_000_000.0;
-unsafe fn propvariant_u64(var: &PROPVARIANT) -> Option<u64> {
-    let inner = &var.Anonymous.Anonymous;
-    (inner.vt == VT_UI8 || inner.vt == VT_I8).then(|| inner.Anonymous.uhVal)
-}
 
 #[cfg(test)]
 mod tests {

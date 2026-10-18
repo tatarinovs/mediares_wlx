@@ -12,7 +12,9 @@ use mediares_core::image_decode::{decode_bytes, decode_oriented_fitted};
 use mediares_core::probe::{probe_file, MediaType};
 use mediares_core::video_frame::video_frame_rgba;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
-use windows::Win32::Graphics::Gdi::{CreateDIBSection, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP};
+use windows::Win32::Graphics::Gdi::{
+    CreateDIBSection, DeleteObject, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
+};
 use windows::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
@@ -83,9 +85,9 @@ fn temp_dir() -> PathBuf {
     std::env::temp_dir().join("Mediares")
 }
 
-/// Saves `img` as "<name>_<time>.png" (or "<name>_cover.png") in the temp folder, clearing out
-/// earlier ones. Returns the file for `CF_HDROP`.
-pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -> Option<PathBuf> {
+/// Saves `img` as "<name>_<suffix>.png" (a frame's time, "cover", a page) in the temp folder,
+/// clearing out earlier ones. Returns the file for `CF_HDROP`.
+pub fn save_temp_png(img: &DecodedImage, source: &Path, suffix: &str) -> Option<PathBuf> {
     let dir = temp_dir();
     // Files from the last minute are kept: a paste of them may still be in progress, possibly
     // from another Total Commander instance sharing the folder.
@@ -103,13 +105,8 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, position: Option<f64>) -
         }
     }
     std::fs::create_dir_all(&dir).ok()?;
-    let name = match position {
-        Some(t) => frame_file_name(source, t, PictureFormat::Png)
-            .file_name()?
-            .to_os_string(),
-        None => format!("{}_cover.png", source.file_stem()?.to_string_lossy()).into(),
-    };
-    let path = dir.join(name);
+    let stem = source.file_stem()?.to_string_lossy();
+    let path = dir.join(format!("{stem}_{suffix}.png"));
     save_png(img, &path).then_some(path)
 }
 
@@ -150,15 +147,24 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
     ok
 }
 
-/// "clip_0-01-23.456.png" next to the video; " (2)", " (3)"... if taken.
+/// "clip_1-23.456.png" next to the video; " (2)", " (3)"... if taken.
 pub fn frame_file_name(video: &Path, position: f64, format: PictureFormat) -> PathBuf {
     let stem = video
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let millis = ((position.max(0.0) * 1000.0).round() as u64) % 1000;
-    let time = format!("{}.{:03}", format_time(position), millis).replace(':', "-");
-    unique_path(video, &format!("{}_{}", stem, time), format)
+    unique_path(video, &format!("{}_{}", stem, time_label(position)), format)
+}
+
+/// A video position for a file name: "1-23.456" (no colons), rounded to the millisecond.
+pub fn time_label(position: f64) -> String {
+    let millis = (position.max(0.0) * 1000.0).round() as u64;
+    format!(
+        "{}.{:03}",
+        format_time((millis / 1000) as f64),
+        millis % 1000
+    )
+    .replace(':', "-")
 }
 
 /// "<stem>.<ext>" next to `neighbour`; " (2)", " (3)"... if taken.
@@ -282,6 +288,7 @@ pub unsafe fn to_hbitmap(img: &DecodedImage) -> Option<HBITMAP> {
     let mut bits = std::ptr::null_mut();
     let bitmap = CreateDIBSection(None, &bmi, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
     if bits.is_null() {
+        let _ = DeleteObject(bitmap.into());
         return None;
     }
     std::ptr::copy_nonoverlapping(img.bgra.as_ptr(), bits as *mut u8, img.bgra.len());
@@ -312,6 +319,8 @@ mod tests {
                 .unwrap(),
             "clip_1-23.457.jpg"
         );
+        // Rounding up to the next second carries over.
+        assert_eq!(time_label(83.9996), "1-24.000");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

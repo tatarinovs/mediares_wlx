@@ -68,6 +68,11 @@ impl Backend {
                 return Some(Backend::Native(player));
             }
         }
+        Self::fallback(viewer, path)
+    }
+
+    /// libmpv, else Media Foundation: for what the pure-Rust player can't decode.
+    unsafe fn fallback(viewer: HWND, path: &Path) -> Option<Self> {
         if playback_mpv::available() {
             let player = MpvPlayer::new_audio(viewer)?;
             transport_bar::restore_audio_level(&player);
@@ -170,15 +175,17 @@ impl AudioView {
     /// Switches to another file, reusing the output device when possible.
     pub unsafe fn open(&mut self, path: &Path, replay_gain: bool) -> bool {
         self.replay_gain = replay_gain;
-        let reused = match &mut self.backend {
-            Backend::Native(player) => player.open(path),
-            Backend::Mpv(_) | Backend::Engine { .. } => false,
-        };
-        if !reused {
-            match Backend::create(self.viewer, path) {
-                Some(backend) => self.backend = backend,
-                None => return false,
+        let backend = match &mut self.backend {
+            Backend::Native(player) => {
+                // A file the pure-Rust player just failed on isn't tried with it again.
+                (!player.open(path)).then(|| Backend::fallback(self.viewer, path))
             }
+            Backend::Mpv(_) | Backend::Engine { .. } => Some(Backend::create(self.viewer, path)),
+        };
+        match backend {
+            None => {}
+            Some(Some(backend)) => self.backend = backend,
+            Some(None) => return false,
         }
         self.load_meta(path);
         true

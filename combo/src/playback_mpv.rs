@@ -1118,8 +1118,10 @@ impl Transport for MpvPlayer {
         } else {
             "absolute+exact"
         };
-        if self.command(&["seek", &format!("{t:.6}"), flags]) {
-            self.shared.seeking.store(true, Ordering::SeqCst);
+        // Set before the command: mpv may report the seek done before the call returns.
+        self.shared.seeking.store(true, Ordering::SeqCst);
+        if !self.command(&["seek", &format!("{t:.6}"), flags]) {
+            self.shared.seeking.store(false, Ordering::SeqCst);
         }
     }
 

@@ -198,24 +198,24 @@ pub fn decode_file_fitted(
     decode_turned_fitted(path, kind, 0, fit, 1).map(|(img, full, _)| (img, full))
 }
 
-/// [`decode_file_fitted`] of page `page` that also tries to turn the picture by the EXIF
-/// `orientation` while decoding. Returns the picture, the size of the whole picture before any
+/// [`decode_file_fitted`] of WIC frame `frame` (a page of a TIFF) that also tries to turn the
+/// picture by the EXIF `orientation` while decoding. Returns the picture, the size of the whole picture before any
 /// turn, and whether the turn was made.
 fn decode_turned_fitted(
     path: &Path,
     kind: MediaType,
-    page: u32,
+    frame: u32,
     fit: (u32, u32),
     orientation: u16,
 ) -> Option<(DynamicImage, (u32, u32), bool)> {
     use crate::wic_decode::{decode_turned, Input};
     if by_wic(path, kind) {
-        if let Some((img, full)) = decode_turned(Input::File(path), page, Some(fit), orientation) {
+        if let Some((img, full)) = decode_turned(Input::File(path), frame, Some(fit), orientation) {
             return Some((img, full, true));
         }
     }
-    // Only WIC reads the further pages: the decoders below would show the first one instead.
-    if page > 0 {
+    // Only WIC reads the further frames: the decoders below would show the first one instead.
+    if frame > 0 {
         return None;
     }
     #[cfg(feature = "raw-preview")]
@@ -245,12 +245,12 @@ fn shrunk(img: DynamicImage, fit: (u32, u32)) -> DynamicImage {
     }
 }
 
-/// The whole picture of page `page` for display: through WIC where it can stop part way (as fast
+/// The whole picture of WIC frame `frame` (a page of a TIFF) for display: through WIC where it can stop part way (as fast
 /// as the `image` crate on JPEG), else as [`decode_file`] does.
 fn decode_whole(
     path: &Path,
     kind: MediaType,
-    page: u32,
+    frame: u32,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<DynamicImage> {
     use crate::wic_decode::{decode_whole_cancellable, Input};
@@ -261,12 +261,16 @@ fn decode_whole(
         None => None,
     };
     if by_wic(path, kind) {
-        if let Some(result) = tried(decode_whole_cancellable(Input::File(path), page, cancelled)) {
+        if let Some(result) = tried(decode_whole_cancellable(
+            Input::File(path),
+            frame,
+            cancelled,
+        )) {
             return result;
         }
     }
     // See `decode_turned_fitted`.
-    if page > 0 {
+    if frame > 0 {
         return None;
     }
     #[cfg(feature = "raw-preview")]
@@ -294,13 +298,23 @@ fn by_wic(path: &Path, kind: MediaType) -> bool {
 
 /// Number of pages of a photo: the pages of a multi-page TIFF, 1 for everything else.
 pub fn page_count(path: &Path, kind: MediaType) -> u32 {
-    if kind == MediaType::StandardImage
+    tiff_pages(path, kind).map_or(1, |pages| pages.len().max(1) as u32)
+}
+
+/// Whether the file may have several pages (a TIFF); how many is known once it is read.
+pub fn may_have_pages(path: &Path, kind: MediaType) -> bool {
+    kind == MediaType::StandardImage
         && crate::probe::has_extension(path, crate::probe::MULTI_PAGE_EXTS)
-    {
-        crate::wic_decode::page_count(path)
-    } else {
-        1
-    }
+}
+
+/// The pages of a TIFF, read once per file version; `None` for other files.
+fn tiff_pages(
+    path: &Path,
+    kind: MediaType,
+) -> Option<std::sync::Arc<Vec<crate::wic_decode::TiffPage>>> {
+    may_have_pages(path, kind)
+        .then(|| crate::cache::get_tiff_pages(path))
+        .flatten()
 }
 
 /// The file starts like a JPEG stream, whatever its extension.
@@ -455,20 +469,25 @@ pub fn decode_oriented_cancellable(
     fit: Option<(u32, u32)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
-    // Read first: the decoders that can turn the picture on the way get the orientation. The
-    // EXIF block describes the file (its first page); a further page has its own orientation.
-    let exif = crate::exif::read_exif(path);
-    let orientation = if page == 0 {
-        exif.as_ref().and_then(|e| e.orientation)
-    } else {
-        crate::wic_decode::page_orientation(path, page)
+    // A TIFF's pages are frames, each with an orientation of its own. The EXIF block (camera,
+    // dates, GPS) describes the first page only.
+    let (frame, own_orientation) = match tiff_pages(path, kind) {
+        Some(pages) => {
+            let page = pages.get(page as usize)?;
+            (page.frame, Some(page.orientation))
+        }
+        None if page == 0 => (0, None),
+        None => return None,
     };
-    let orientation = orientation
+    // Read first: the decoders that can turn the picture on the way get the orientation.
+    let exif = (page == 0).then(|| crate::exif::read_exif(path)).flatten();
+    let orientation = own_orientation
+        .unwrap_or_else(|| exif.as_ref().and_then(|e| e.orientation))
         .filter(|o| auto_rotate && (1..=8).contains(o))
         .unwrap_or(1);
     let (mut img, (mut w, mut h), turned) = match fit {
-        Some(fit) => decode_turned_fitted(path, kind, page, fit, orientation)?,
-        None => decode_whole(path, kind, page, cancelled).map(|img| {
+        Some(fit) => decode_turned_fitted(path, kind, frame, fit, orientation)?,
+        None => decode_whole(path, kind, frame, cancelled).map(|img| {
             let size = (img.width(), img.height());
             (img, size, false)
         })?,

@@ -114,7 +114,7 @@ shows without waiting for it.
 | Action | Keys / mouse |
 |---|---|
 | Next / previous photo | Space, PgDn, N / PgUp, Backspace, P; mouse wheel (or the other way round — wheel zooms, a setting); mouse side buttons. ↓ / ↑ do the same, but only in fit mode: zoomed in, they pan instead |
-| Pages of a multi-page TIFF | → / ← and the mouse wheel; past the last page — the next file, before the first — the previous one (it opens at its first page). In a file of one page → / ← page through the files, zoomed in they pan |
+| Pages of a multi-page TIFF | → / ← and the mouse wheel, zoomed in — Ctrl+PgDn / Ctrl+PgUp; past the last page — the next file, before the first — the previous one (it opens at its first page). In a file of one page → / ← page through the files, zoomed in they pan. Ctrl+C on a page offers its PNG for pasting into a folder, not the whole file |
 | Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%, or the other way round — wheel zooms, Ctrl+wheel pages, a setting); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
 | Pan / loupe | arrow keys, or drag, while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
