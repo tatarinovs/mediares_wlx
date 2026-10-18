@@ -607,11 +607,22 @@ fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
         // Still decoding: only what is known without the picture.
         return osd_template::render("{name}< [ {index} / {count} ]>", file);
     };
+    // Page fields are empty in a file of one page, dropping their `<...>` block.
+    let paged = state.pages > 1;
+    let page = |text: String| if paged { text } else { String::new() };
     osd_template::render(&state.config.photo_osd, |key| {
         file(key)
             .or_else(|| osd_template::exif_field(img.exif.as_ref(), key))
             .or_else(|| {
                 Some(match key {
+                    "page" => page((state.page + 1).to_string()),
+                    "pages" => page(state.pages.to_string()),
+                    "page_of" => page(format!(
+                        "{} {} / {}",
+                        tr("page"),
+                        state.page + 1,
+                        state.pages
+                    )),
                     "width" => img.full.0.to_string(),
                     "height" => img.full.1.to_string(),
                     "mp" => format!("{:.2}", img.full.0 as f64 * img.full.1 as f64 / 1_000_000.0),
@@ -745,6 +756,7 @@ mod tests {
                 .flat_map(|i| if i % 4 < 2 { [0, 0, 0, 255] } else { [255; 4] })
                 .collect(),
             is_preview: false,
+            pages: 1,
             exif: None,
         };
         let height = (4.0 * scale) as i32;

@@ -68,6 +68,7 @@ Unknown=Неизвестно
 ; image_view.rs
 Cannot open the image=Не удалось открыть изображение
 RAW preview=превью RAW
+page=стр.
 
 ; media_view.rs
 Speed=Скорость
@@ -95,6 +96,9 @@ Height=Высота
 Megapixels=Мегапиксели
 Zoom, %=Масштаб, %
 "RAW preview" for an embedded preview=«превью RAW» для встроенного превью
+"page 2 / 5" in a multi-page file=«стр. 2 / 5» в многостраничном файле
+Page=Страница
+Pages=Число страниц
 EXIF=EXIF
 Camera (make and model)=Камера (производитель и модель)
 Model=Модель
@@ -250,8 +254,10 @@ Set as desktop background=Сделать обоями рабочего стол�
 Print...\tCtrl+P=Печать...\tCtrl+P
 Move to Recycle Bin\tDel=Удалить в корзину\tDel
 Settings...\tS=Настройки...\tS
-Next file\tSpace / Right=Следующий файл\tПробел / Right
-Previous file\tBackspace / Left=Предыдущий файл\tBackspace / Left
+Next page\tRight=Следующая страница\tRight
+Previous page\tLeft=Предыдущая страница\tLeft
+Next file\tSpace / Down=Следующий файл\tПробел / Down
+Previous file\tBackspace / Up=Предыдущий файл\tBackspace / Up
 Next file\tN / PgDn=Следующий файл\tN / PgDn
 Previous file\tBackspace / PgUp=Предыдущий файл\tBackspace / PgUp
  [slideshow]= [слайд-шоу]

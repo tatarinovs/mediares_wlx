@@ -34,10 +34,17 @@ use crate::state::same_path;
 /// The format chosen last time; the dialog offers it again.
 static LAST_PNG: AtomicBool = AtomicBool::new(false);
 
-/// Asks for a target and saves the photo `source`, turned by `quarter_turns` clockwise like on
-/// screen (`auto_rotate`: EXIF orientation applied, as in the viewer).
-pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate: bool) {
-    let Some((target, format)) = ask_target(owner, source) else {
+/// Asks for a target and saves the photo `source` (`page`: the page shown of a multi-page file),
+/// turned by `quarter_turns` clockwise like on screen (`auto_rotate`: EXIF orientation applied,
+/// as in the viewer).
+pub unsafe fn save_as(
+    owner: HWND,
+    source: &Path,
+    page: Option<u32>,
+    quarter_turns: u8,
+    auto_rotate: bool,
+) {
+    let Some((target, format)) = ask_target(owner, source, page) else {
         return;
     };
     LAST_PNG.store(format == Format::Png, Ordering::Relaxed);
@@ -46,7 +53,15 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
         return;
     }
     let previous = LoadCursorW(None, IDC_WAIT).map(|c| SetCursor(Some(c)));
-    let ok = write(source, &target, format, quarter_turns % 4, auto_rotate);
+    let page = page.unwrap_or(0);
+    let ok = write(
+        source,
+        page,
+        &target,
+        format,
+        quarter_turns % 4,
+        auto_rotate,
+    );
     if let Ok(previous) = previous {
         SetCursor(Some(previous));
     }
@@ -62,6 +77,7 @@ pub unsafe fn save_as(owner: HWND, source: &Path, quarter_turns: u8, auto_rotate
 /// existing file the user chose to overwrite as it was.
 fn write(
     source: &Path,
+    page: u32,
     target: &Path,
     format: Format,
     quarter_turns: u8,
@@ -70,7 +86,7 @@ fn write(
     let mut temp = target.as_os_str().to_owned();
     temp.push(".mediares-tmp");
     let temp = PathBuf::from(temp);
-    let ok = write_to(source, &temp, format, quarter_turns, auto_rotate)
+    let ok = write_to(source, page, &temp, format, quarter_turns, auto_rotate)
         && std::fs::rename(&temp, target).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&temp);
@@ -80,6 +96,7 @@ fn write(
 
 fn write_to(
     source: &Path,
+    page: u32,
     target: &Path,
     format: Format,
     quarter_turns: u8,
@@ -91,7 +108,7 @@ fn write_to(
             return std::fs::write(target, bytes).is_ok();
         }
     }
-    let Some((mut img, exif)) = decode_oriented(source, kind, auto_rotate) else {
+    let Some((mut img, exif)) = decode_oriented(source, kind, auto_rotate, page) else {
         return false;
     };
     for _ in 0..quarter_turns {
@@ -176,21 +193,29 @@ fn on_white(img: DynamicImage) -> RgbImage {
     })
 }
 
-/// "<name>.jpg" next to the source, " (2)", " (3)"... if taken.
-fn free_name(source: &Path, format: Format) -> PathBuf {
-    let stem = source.file_stem().unwrap_or_default().to_string_lossy();
+/// "<name>.jpg" next to the source ("<name>_p3.jpg" for page 3 of a multi-page file), " (2)",
+/// " (3)"... if taken.
+fn free_name(source: &Path, page: Option<u32>, format: Format) -> PathBuf {
+    let mut stem = source
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned();
+    if let Some(page) = page {
+        stem.push_str(&format!("_p{}", page + 1));
+    }
     unique_path(source, &stem, format)
 }
 
 /// The save dialog. The format follows the typed extension, else the selected file type (whose
 /// extension is then added).
-unsafe fn ask_target(owner: HWND, source: &Path) -> Option<(PathBuf, Format)> {
+unsafe fn ask_target(owner: HWND, source: &Path, page: Option<u32>) -> Option<(PathBuf, Format)> {
     let format = if LAST_PNG.load(Ordering::Relaxed) {
         Format::Png
     } else {
         Format::Jpeg
     };
-    let initial = free_name(source, format);
+    let initial = free_name(source, page, format);
     let mut file = [0u16; 1024];
     let name: Vec<u16> = initial
         .file_name()
@@ -269,14 +294,21 @@ mod tests {
         );
         assert_eq!(lossless(&png, MediaType::StandardImage, Format::Jpeg), None);
         assert_eq!(
-            free_name(&png, Format::Png).file_name().unwrap(),
+            free_name(&png, None, Format::Png).file_name().unwrap(),
             "a (2).png"
         );
-        assert_eq!(free_name(&png, Format::Jpeg).file_name().unwrap(), "a.jpg");
+        assert_eq!(
+            free_name(&png, None, Format::Jpeg).file_name().unwrap(),
+            "a.jpg"
+        );
+        assert_eq!(
+            free_name(&png, Some(2), Format::Jpeg).file_name().unwrap(),
+            "a_p3.jpg"
+        );
 
         // Turned: re-encoded; the JPEG gets the pixels turned and no alpha.
         let jpg = dir.join("b.jpg");
-        assert!(write(&png, &jpg, Format::Jpeg, 1, true));
+        assert!(write(&png, 0, &jpg, Format::Jpeg, 1, true));
         let back = mediares_core::image::open(&jpg).unwrap();
         assert_eq!((back.width(), back.height()), (1, 2));
         assert!(!back.color().has_alpha());
@@ -292,7 +324,7 @@ mod tests {
         std::fs::write(&broken, [0xFF, 0xD8, 0xFF, 0x00, 0x13, 0x37]).unwrap();
         std::fs::write(&target, b"precious").unwrap();
 
-        assert!(!write(&broken, &target, Format::Png, 1, true));
+        assert!(!write(&broken, 0, &target, Format::Png, 1, true));
         assert_eq!(std::fs::read(&target).unwrap(), b"precious");
         let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
         assert_eq!(left.len(), 2, "no temporary file left behind");
@@ -302,7 +334,7 @@ mod tests {
         RgbaImage::from_pixel(2, 1, mediares_core::image::Rgba([1, 2, 3, 255]))
             .save(&png)
             .unwrap();
-        assert!(write(&png, &target, Format::Png, 1, true));
+        assert!(write(&png, 0, &target, Format::Png, 1, true));
         assert_eq!(mediares_core::image::open(&target).unwrap().width(), 1);
         let _ = std::fs::remove_dir_all(dir);
     }

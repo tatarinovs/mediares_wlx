@@ -9,7 +9,7 @@
 use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
-use windows::core::{Interface, HSTRING, PCWSTR};
+use windows::core::{w, Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
     CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapDecoder,
@@ -20,7 +20,9 @@ use windows::Win32::Graphics::Imaging::{
     WICBitmapTransformRotate270, WICBitmapTransformRotate90, WICDecodeMetadataCacheOnDemand,
     WICRect,
 };
+use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+use windows::Win32::System::Variant::VT_UI2;
 
 use crate::image_decode::{MAX_DIMENSION, MAX_PIXELS};
 use crate::mf_init::ComScope;
@@ -38,16 +40,17 @@ pub enum Input<'a> {
     Memory(&'a [u8]),
 }
 
-/// The first frame of the input with the factory and decoder that opened it. COM must be
-/// initialized. The decoder has to outlive the frame: the built-in DDS decoder's frames do not
-/// keep it alive and crash once it is gone.
+/// A frame of the input with the factory and decoder that opened it. COM must be initialized.
+/// The decoder has to outlive the frame: the built-in DDS decoder's frames do not keep it alive
+/// and crash once it is gone.
 struct Frame {
     frame: IWICBitmapFrameDecode,
-    _decoder: IWICBitmapDecoder,
+    decoder: IWICBitmapDecoder,
     factory: IWICImagingFactory,
 }
 
-fn first_frame(input: Input<'_>) -> Option<Frame> {
+/// Frame `page` (from 0) of the input: the pages of a multi-page TIFF; other formats have one.
+fn open_frame(input: Input<'_>, page: u32) -> Option<Frame> {
     unsafe {
         let factory: IWICImagingFactory =
             CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
@@ -76,10 +79,10 @@ fn first_frame(input: Input<'_>) -> Option<Frame> {
                     .ok()?
             }
         };
-        let frame = decoder.GetFrame(0).ok()?;
+        let frame = decoder.GetFrame(page).ok()?;
         Some(Frame {
             frame,
-            _decoder: decoder,
+            decoder,
             factory,
         })
     }
@@ -96,15 +99,42 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     let _com = ComScope::new();
     // A local, not a temporary of the tail expression: those are dropped after `_com`, i.e.
     // released after `CoUninitialize`, which crashes the built-in DDS and JPEG XR codecs.
-    let frame = first_frame(Input::File(path))?;
+    let frame = open_frame(Input::File(path), 0)?;
     frame_size(&frame.frame)
+}
+
+/// Number of pages (frames) in the file; 1 when it cannot be read.
+pub fn page_count(path: &Path) -> u32 {
+    let _com = ComScope::new();
+    // A local, released before `_com` (see `dimensions`).
+    let frame = open_frame(Input::File(path), 0);
+    frame
+        .and_then(|f| unsafe { f.decoder.GetFrameCount() }.ok())
+        .unwrap_or(1)
+        .max(1)
+}
+
+/// The TIFF Orientation (1..=8) of page `page`: each page keeps its own in its IFD, while the
+/// EXIF reader only looks at the first.
+pub fn page_orientation(path: &Path, page: u32) -> Option<u16> {
+    let _com = ComScope::new();
+    // Locals, released before `_com` (see `dimensions`).
+    let frame = open_frame(Input::File(path), page)?;
+    let reader = unsafe { frame.frame.GetMetadataQueryReader() }.ok()?;
+    let mut value = PROPVARIANT::default();
+    unsafe { reader.GetMetadataByName(w!("/ifd/{ushort=274}"), &mut value) }.ok()?;
+    // A SHORT holds no allocation: nothing to clear.
+    let inner = unsafe { &value.Anonymous.Anonymous };
+    (inner.vt == VT_UI2)
+        .then(|| unsafe { inner.Anonymous.uiVal })
+        .filter(|o| (1..=8).contains(o))
 }
 
 /// Bits per channel, channel count and transparency of the first frame's stored pixels.
 pub fn pixel_format(path: &Path) -> Option<crate::image_decode::PixelFormat> {
     let _com = ComScope::new();
     // Locals, released before `_com` (see `dimensions`).
-    let frame = first_frame(Input::File(path))?;
+    let frame = open_frame(Input::File(path), 0)?;
     let info = unsafe {
         let guid = frame.frame.GetPixelFormat().ok()?;
         frame
@@ -130,10 +160,10 @@ pub fn pixel_format(path: &Path) -> Option<crate::image_decode::PixelFormat> {
 
 /// Decodes the first frame to RGBA under the shared size limits.
 pub fn decode(path: &Path) -> Option<DynamicImage> {
-    decode_turned(Input::File(path), None, 1).map(|(img, _)| img)
+    decode_turned(Input::File(path), 0, None, 1).map(|(img, _)| img)
 }
 
-/// Decodes the first frame to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
+/// Decodes frame `page` to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
 /// along with the frame's full size (before the turn). Decoders that can (HEIF, JPEG) produce the
 /// smaller picture directly, which is several times faster than decoding it whole. The size
 /// limits apply to the full frame, so a picture is either shown at every size or not at all.
@@ -141,11 +171,12 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
 /// decoding pipeline, so the picture is not copied once more to turn it.
 pub fn decode_turned(
     input: Input<'_>,
+    page: u32,
     fit: Option<(u32, u32)>,
     orientation: u16,
 ) -> Option<(DynamicImage, (u32, u32))> {
     let _com = ComScope::new();
-    let Frame { frame, factory, .. } = &first_frame(input)?;
+    let Frame { frame, factory, .. } = &open_frame(input, page)?;
     let (w, h) = frame_size(frame)?;
     if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
@@ -204,14 +235,15 @@ pub fn decode_turned(
 /// (JPEG, TIFF, PNG) decode no further than asked.
 const STRIP_ROWS: u32 = 256;
 
-/// The whole first frame as RGBA, decoded a strip of rows at a time: when `cancelled` says so
+/// The whole frame `page` as RGBA, decoded a strip of rows at a time: when `cancelled` says so
 /// between strips, the decode stops (`None`). The picture is not turned.
 pub fn decode_whole_cancellable(
     input: Input<'_>,
+    page: u32,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<DynamicImage> {
     let _com = ComScope::new();
-    let Frame { frame, factory, .. } = &first_frame(input)?;
+    let Frame { frame, factory, .. } = &open_frame(input, page)?;
     let (w, h) = frame_size(frame)?;
     if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
         return None;
@@ -271,6 +303,11 @@ mod tests {
 
     /// Uncompressed little-endian RGB TIFF, 2x1: red, green.
     fn rgb_tiff() -> Vec<u8> {
+        rgb_tiff_pages(&[(2, 1, 1, &[255, 0, 0, 0, 255, 0])])
+    }
+
+    /// Uncompressed little-endian RGB TIFF with a page per (width, height, orientation, pixels).
+    fn rgb_tiff_pages(pages: &[(u16, u16, u16, &[u8])]) -> Vec<u8> {
         let short = |tag: u16, v: u16| {
             [
                 &tag.to_le_bytes()[..],
@@ -288,30 +325,68 @@ mod tests {
             ]
             .concat()
         };
-        // Header, IFD (9 entries) at 8, BitsPerSample values at 122, pixels at 128.
         let mut t = b"II*\0".to_vec();
         t.extend_from_slice(&8u32.to_le_bytes());
-        t.extend_from_slice(&9u16.to_le_bytes());
-        t.extend(short(256, 2));
-        t.extend(short(257, 1));
-        t.extend(
-            [
-                &258u16.to_le_bytes()[..],
-                &[3, 0, 3, 0, 0, 0],
-                &122u32.to_le_bytes(),
-            ]
-            .concat(),
-        );
-        t.extend(short(259, 1));
-        t.extend(short(262, 2));
-        t.extend(long(273, 128));
-        t.extend(short(277, 3));
-        t.extend(short(278, 1));
-        t.extend(long(279, 6));
-        t.extend_from_slice(&0u32.to_le_bytes());
-        t.extend([8u16, 8, 8].iter().flat_map(|v| v.to_le_bytes()));
-        t.extend_from_slice(&[255, 0, 0, 0, 255, 0]);
+        for (i, &(w, h, orientation, pixels)) in pages.iter().enumerate() {
+            // IFD (10 entries), then BitsPerSample values, then the pixels, padded to a word.
+            let ifd = t.len() as u32;
+            let bits = ifd + 2 + 10 * 12 + 4;
+            let data = bits + 6;
+            let next = data + pixels.len().next_multiple_of(2) as u32;
+            t.extend_from_slice(&10u16.to_le_bytes());
+            t.extend(short(256, w));
+            t.extend(short(257, h));
+            t.extend(
+                [
+                    &258u16.to_le_bytes()[..],
+                    &[3, 0, 3, 0, 0, 0],
+                    &bits.to_le_bytes(),
+                ]
+                .concat(),
+            );
+            t.extend(short(259, 1));
+            t.extend(short(262, 2));
+            t.extend(long(273, data));
+            t.extend(short(274, orientation));
+            t.extend(short(277, 3));
+            t.extend(short(278, h));
+            t.extend(long(279, pixels.len() as u32));
+            let last = i + 1 == pages.len();
+            t.extend_from_slice(&if last { 0 } else { next }.to_le_bytes());
+            t.extend([8u16, 8, 8].iter().flat_map(|v| v.to_le_bytes()));
+            t.extend_from_slice(pixels);
+            t.resize(next as usize, 0);
+        }
         t
+    }
+
+    #[test]
+    fn tiff_pages_decode_with_their_own_orientation() {
+        use crate::image_decode::{decode_oriented_cancellable, page_count};
+        let path = std::env::temp_dir().join(format!("mediares_{}_pages.tif", std::process::id()));
+        // Page 2 is 1x2 (blue above white), stored turned: Orientation 6 shows it as 2x1.
+        let tiff = rgb_tiff_pages(&[
+            (2, 1, 1, &[255, 0, 0, 0, 255, 0]),
+            (1, 2, 6, &[0, 0, 255, 255, 255, 255]),
+        ]);
+        std::fs::write(&path, tiff).unwrap();
+        let kind = MediaType::StandardImage;
+        let pages = page_count(&path, kind);
+        let decode = |page, fit| {
+            decode_oriented_cancellable(&path, kind, true, page, fit, &|| false)
+                .map(|(img, full, _)| (img.into_rgba8(), full))
+        };
+        let (first, second, beyond) = (decode(0, None), decode(1, Some((64, 64))), decode(2, None));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(pages, 2);
+        let (first, full) = first.expect("page 1");
+        assert_eq!((full, first.get_pixel(0, 0).0), ((2, 1), [255, 0, 0, 255]));
+        let (second, full) = second.expect("page 2");
+        assert_eq!(full, (2, 1), "turned upright");
+        // Turned clockwise: the top (blue) ends up on the right.
+        assert_eq!(second.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(second.get_pixel(1, 0).0, [0, 0, 255, 255]);
+        assert!(beyond.is_none(), "no third page");
     }
 
     #[test]
@@ -345,7 +420,7 @@ mod tests {
             .write_image(src.as_raw(), 5, 600, ExtendedColorType::L8)
             .unwrap();
         let input = super::Input::Memory(&png);
-        let whole = super::decode_whole_cancellable(input, &|| false).expect("decoded");
+        let whole = super::decode_whole_cancellable(input, 0, &|| false).expect("decoded");
         let expected = RgbaImage::from_fn(5, 600, |x, y| {
             let v = src.get_pixel(x, y).0[0];
             Rgba([v, v, v, 255])
@@ -357,7 +432,7 @@ mod tests {
             strips.set(strips.get() + 1);
             strips.get() > 1
         };
-        assert!(super::decode_whole_cancellable(input, &cancel).is_none());
+        assert!(super::decode_whole_cancellable(input, 0, &cancel).is_none());
         assert_eq!(strips.get(), 2);
     }
 
@@ -373,8 +448,9 @@ mod tests {
             .write_image(src.as_raw(), 3, 2, ExtendedColorType::Rgba8)
             .unwrap();
         for orientation in 1..=8u16 {
-            let (wic, full) = super::decode_turned(super::Input::Memory(&png), None, orientation)
-                .expect("decoded");
+            let (wic, full) =
+                super::decode_turned(super::Input::Memory(&png), 0, None, orientation)
+                    .expect("decoded");
             let mut expected = DynamicImage::ImageRgba8(src.clone());
             crate::image_decode::apply_exif_orientation(&mut expected, orientation);
             assert_eq!(full, (3, 2));

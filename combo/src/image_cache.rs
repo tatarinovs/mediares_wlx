@@ -17,7 +17,7 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use mediares_core::cache::FileKey;
 use mediares_core::exif::ExifInfo;
 use mediares_core::image::DynamicImage;
-use mediares_core::image_decode::{decode_bytes, decode_oriented_cancellable};
+use mediares_core::image_decode::{decode_bytes, decode_oriented_cancellable, page_count};
 use mediares_core::probe::{probe_file, MediaType};
 use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
@@ -44,6 +44,8 @@ pub struct DecodedImage {
     pub is_preview: bool,
     /// Read along with the picture (it is needed for the orientation anyway); shown in the OSD.
     pub exif: Option<ExifInfo>,
+    /// Pages of the file (a multi-page TIFF); 1 for everything else.
+    pub pages: u32,
 }
 
 /// How a photo is prepared for display; part of the cache key.
@@ -55,6 +57,8 @@ pub struct DecodeOptions {
     /// Longest side of the picture to decode (a square box, so turning the photo keeps it
     /// sharp); 0 = the whole picture.
     pub fit: u32,
+    /// Page of a multi-page file, from 0.
+    pub page: u32,
 }
 
 impl DecodeOptions {
@@ -242,12 +246,12 @@ pub fn decode_whole(path: &Path, kind: MediaType, options: DecodeOptions) -> Opt
     decode(path, kind, options.whole(), &|| false)
 }
 
-/// Replaces the prefetch queue with `paths` (most wanted first); stale requests from earlier
-/// navigation are dropped.
-pub fn prefetch(paths: Vec<PathBuf>, options: DecodeOptions) {
+/// Replaces the prefetch queue with `pictures` (most wanted first: the next page of the file,
+/// neighbouring files); stale requests from earlier navigation are dropped.
+pub fn prefetch(pictures: Vec<(PathBuf, DecodeOptions)>) {
     let pool = pool();
     let mut q = pool.lock();
-    q.prefetch = paths.into_iter().map(|p| (p, options)).collect();
+    q.prefetch = pictures.into();
     pool.wake.notify_all();
 }
 
@@ -516,11 +520,18 @@ fn decode(
     cancelled: &dyn Fn() -> bool,
 ) -> Option<DecodedImage> {
     let fit = (options.fit != 0).then_some((options.fit, options.fit));
-    let (img, full, exif) =
-        decode_oriented_cancellable(path, kind, options.auto_rotate, fit, cancelled)?;
+    let (img, full, exif) = decode_oriented_cancellable(
+        path,
+        kind,
+        options.auto_rotate,
+        options.page,
+        fit,
+        cancelled,
+    )?;
     Some(DecodedImage {
         exif,
         full,
+        pages: page_count(path, kind),
         ..to_bgra(img, options.background, kind == MediaType::RawImage)
     })
 }
@@ -533,7 +544,7 @@ pub const PICTURE_SIDE: u32 = 2048;
 pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
     use mediares_core::wic_decode::{decode_turned, Input};
     let fit = (PICTURE_SIDE, PICTURE_SIDE);
-    let img = match decode_turned(Input::Memory(bytes), Some(fit), 1) {
+    let img = match decode_turned(Input::Memory(bytes), 0, Some(fit), 1) {
         Some((img, _)) => img,
         None => {
             let img = decode_bytes(bytes)?;
@@ -578,6 +589,7 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
         full: (width, height),
         bgra,
         is_preview,
+        pages: 1,
         exif: None,
     }
 }
@@ -618,6 +630,7 @@ pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
         full: (img.full.1, img.full.0),
         bgra: dst,
         is_preview: img.is_preview,
+        pages: img.pages,
         exif: img.exif.clone(),
     }
 }
@@ -644,6 +657,7 @@ fn rotated_bytes(img: &DecodedImage, clockwise: bool) -> DecodedImage {
         full: (img.full.1, img.full.0),
         bgra: dst,
         is_preview: img.is_preview,
+        pages: img.pages,
         exif: img.exif.clone(),
     }
 }
@@ -698,6 +712,7 @@ mod tests {
             full: (2, 1),
             bgra: vec![0, 0, 255, 255, 0, 255, 0, 255],
             is_preview: false,
+            pages: 1,
             exif: None,
         };
         let cw = rotated(&img, true);
@@ -714,6 +729,7 @@ mod tests {
             full: (2, 2),
             bgra: (0..16).collect(),
             is_preview: false,
+            pages: 1,
             exif: None,
         };
         let back = (0..4).fold(square, |img, _| rotated(&img, true));
@@ -729,6 +745,7 @@ mod tests {
                 full: (1, 1),
                 bgra: vec![0; n],
                 is_preview: false,
+                pages: 1,
                 exif: None,
             })
         };
@@ -739,6 +756,7 @@ mod tests {
                 auto_rotate: true,
                 background: BACKGROUND,
                 fit: 0,
+                page: 0,
             },
         };
         let (a, b, c) = (key("Cargo.toml"), key("src/lib.rs"), key("src/config.rs"));
@@ -760,6 +778,7 @@ mod tests {
             auto_rotate: true,
             background: BACKGROUND,
             fit: 0,
+            page: 0,
         };
         let file = |name: &str| Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
         let job = |name: &str| {
@@ -795,6 +814,7 @@ mod tests {
                 auto_rotate: false,
                 background: 0,
                 fit: 0,
+                page: 0,
             },
         };
         let img = Arc::new(DecodedImage {
@@ -803,6 +823,7 @@ mod tests {
             full: (1, 1),
             bgra: vec![0; 4],
             is_preview: false,
+            pages: 1,
             exif: None,
         });
         let (first, second) = (ViewerHold::new(), ViewerHold::new());
@@ -819,6 +840,7 @@ mod tests {
             auto_rotate: true,
             background: BACKGROUND,
             fit: 1920,
+            page: 0,
         };
         let file = |name: &str| Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
         let job = |name: &str, options: DecodeOptions| {

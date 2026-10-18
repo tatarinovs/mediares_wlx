@@ -25,6 +25,9 @@ const STANDARD_IMAGE_EXTS: &[&str] = &[
 pub const WIC_IMAGE_EXTS: &[&str] = &[
     "tiff", "tif", "heic", "heif", "hif", "avif", "jxl", "jxr", "wdp", "hdp", "dds",
 ];
+/// Whose further WIC frames are pages to turn. Other formats' frames are not: the sizes of an
+/// icon, the mip levels of a DDS texture, the thumbnails and bursts of a HEIF.
+pub const MULTI_PAGE_EXTS: &[&str] = &["tiff", "tif"];
 /// Rendered by Direct2D.
 pub const SVG_EXTS: &[&str] = &["svg", "svgz"];
 #[cfg(feature = "exr")]

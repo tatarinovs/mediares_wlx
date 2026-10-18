@@ -60,6 +60,10 @@ pub struct ViewerState {
     pub previous: Option<Arc<DecodedImage>>,
     /// The current photo could not be decoded.
     pub load_failed: bool,
+    /// Page of a multi-page file shown, from 0.
+    pub page: u32,
+    /// Pages of the file, known once a page of it is decoded (1 until then).
+    pub pages: u32,
     /// Quarter turns clockwise made with R / L (the picture on screen differs from the file).
     pub quarter_turns: u8,
     /// Present while a video or audio file is shown (then `image` is `None`).
@@ -115,6 +119,8 @@ impl ViewerState {
             whole_pending: None,
             previous: None,
             load_failed: false,
+            page: 0,
+            pages: 1,
             quarter_turns: 0,
             media: None,
             zoom: ZoomMode::Fit,
@@ -190,11 +196,19 @@ impl ViewerState {
         if let Some(media) = self.media.as_mut() {
             media.set_skip(can_skip);
         }
-        image_cache::prefetch(self.prefetch_candidates(), self.decode_options());
+        image_cache::prefetch(self.prefetch_candidates());
         true
     }
 
     fn show(&mut self, path: &Path) -> bool {
+        self.file_path = path.to_path_buf();
+        self.page = 0;
+        self.pages = 1;
+        self.show_page()
+    }
+
+    /// Shows page `self.page` of `self.file_path`, resetting the view.
+    fn show_page(&mut self) -> bool {
         // Comparing a series: the next photo opens zoomed in on the same place.
         let keep = self.config.keep_zoom || self.compare.is_some();
         let kept = keep
@@ -207,7 +221,6 @@ impl ViewerState {
             .flatten()
             .zip(unsafe { crate::image_view::view_size(self) })
             .and_then(|(img, view)| crate::image_view::kept_view(self, img, view));
-        self.file_path = path.to_path_buf();
         self.kept_view = kept;
         self.preloaded = None;
         self.zoom = ZoomMode::Fit;
@@ -261,6 +274,11 @@ impl ViewerState {
     fn set_image(&mut self, img: Arc<DecodedImage>) {
         self.image = Some(img.clone());
         self.apply_kept_view(&img);
+        if self.pages != img.pages {
+            // A multi-page file just opened: its next page goes ahead of the neighbours.
+            self.pages = img.pages;
+            image_cache::prefetch(self.prefetch_candidates());
+        }
         self.request_whole();
     }
 
@@ -421,6 +439,23 @@ impl ViewerState {
         true
     }
 
+    /// Turns to the next/previous page of a multi-page file; past its first or last page (and
+    /// in a file of one page) moves to the adjacent file, which opens at its first page.
+    pub fn turn_page(&mut self, forward: bool) -> bool {
+        let page = if forward {
+            Some(self.page + 1).filter(|&p| p < self.pages)
+        } else {
+            self.page.checked_sub(1)
+        };
+        let Some(page) = page else {
+            return self.navigate(forward);
+        };
+        self.page = page;
+        self.forward = forward;
+        self.show_page();
+        true
+    }
+
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
         if config.skip_raw_twins != self.config.skip_raw_twins && self.playlist.is_none() {
@@ -457,6 +492,7 @@ impl ViewerState {
             auto_rotate: self.config.auto_rotate_exif,
             background: self.config.photo_background,
             fit: screen_side(self.hwnd),
+            page: self.page,
         }
     }
 
@@ -495,8 +531,7 @@ impl ViewerState {
 
     /// Shows the current file again (e.g. after its player was closed to free the file).
     pub fn reload(&mut self) {
-        let path = self.file_path.clone();
-        self.show(&path);
+        self.show_page();
     }
 
     fn load_media(&mut self) {
@@ -533,6 +568,7 @@ impl ViewerState {
                 match request {
                     Some(Request::Ready(img)) => {
                         self.image = Some(img.clone());
+                        self.pages = img.pages;
                         self.apply_kept_view(&img);
                         self.previous = None;
                     }
@@ -550,16 +586,27 @@ impl ViewerState {
             }
         }
 
-        image_cache::prefetch(self.prefetch_candidates(), options);
+        image_cache::prefetch(self.prefetch_candidates());
         self.request_whole();
     }
 
-    /// Neighbouring photos to warm up, most likely next first: two ahead in the direction of the
-    /// last move, one behind.
-    fn prefetch_candidates(&self) -> Vec<PathBuf> {
+    /// Pictures to warm up, most likely next first: the page that turning on in the direction
+    /// of the last move shows, then neighbouring photos, two ahead in that direction and one
+    /// behind.
+    fn prefetch_candidates(&self) -> Vec<(PathBuf, DecodeOptions)> {
+        let options = self.decode_options();
+        let next_page = if self.forward {
+            Some(self.page + 1).filter(|&p| p < self.pages)
+        } else {
+            self.page.checked_sub(1)
+        };
+        let mut pictures: Vec<_> = next_page
+            .map(|page| (self.file_path.clone(), DecodeOptions { page, ..options }))
+            .into_iter()
+            .collect();
         let total = self.dir_files.len();
         if total <= 1 {
-            return Vec::new();
+            return pictures;
         }
         let at =
             |step: isize| (self.current_idx as isize + step).rem_euclid(total as isize) as usize;
@@ -570,11 +617,15 @@ impl ViewerState {
                 indices.push(i);
             }
         }
-        indices
-            .into_iter()
-            .map(|i| self.dir_files[i].clone())
-            .filter(|p| probe_file(p).is_image_kind())
-            .collect()
+        let first_page = DecodeOptions { page: 0, ..options };
+        pictures.extend(
+            indices
+                .into_iter()
+                .map(|i| self.dir_files[i].clone())
+                .filter(|p| probe_file(p).is_image_kind())
+                .map(|p| (p, first_page)),
+        );
+        pictures
     }
 }
 

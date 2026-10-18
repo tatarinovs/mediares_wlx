@@ -658,6 +658,7 @@ pub fn folder_cover(track: &Path) -> Option<Arc<DecodedImage>> {
             background: BACKGROUND,
             // Scans of several thousand pixels are reduced while decoding, like embedded art.
             fit: image_cache::PICTURE_SIDE,
+            page: 0,
         },
     )
 }

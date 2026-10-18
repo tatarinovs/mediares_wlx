@@ -195,28 +195,34 @@ pub fn decode_file_fitted(
     kind: MediaType,
     fit: (u32, u32),
 ) -> Option<(DynamicImage, (u32, u32))> {
-    decode_turned_fitted(path, kind, fit, 1).map(|(img, full, _)| (img, full))
+    decode_turned_fitted(path, kind, 0, fit, 1).map(|(img, full, _)| (img, full))
 }
 
-/// [`decode_file_fitted`] that also tries to turn the picture by the EXIF `orientation` while
-/// decoding. Returns the picture, the size of the whole picture before any turn, and whether
-/// the turn was made.
+/// [`decode_file_fitted`] of page `page` that also tries to turn the picture by the EXIF
+/// `orientation` while decoding. Returns the picture, the size of the whole picture before any
+/// turn, and whether the turn was made.
 fn decode_turned_fitted(
     path: &Path,
     kind: MediaType,
+    page: u32,
     fit: (u32, u32),
     orientation: u16,
 ) -> Option<(DynamicImage, (u32, u32), bool)> {
     use crate::wic_decode::{decode_turned, Input};
     if by_wic(path, kind) {
-        if let Some((img, full)) = decode_turned(Input::File(path), Some(fit), orientation) {
+        if let Some((img, full)) = decode_turned(Input::File(path), page, Some(fit), orientation) {
             return Some((img, full, true));
         }
+    }
+    // Only WIC reads the further pages: the decoders below would show the first one instead.
+    if page > 0 {
+        return None;
     }
     #[cfg(feature = "raw-preview")]
     if kind == MediaType::RawImage {
         let preview = crate::raw_preview::extract_raw_preview_for(path, Some(fit.0.max(fit.1)))?;
-        if let Some((img, full)) = decode_turned(Input::Memory(&preview), Some(fit), orientation) {
+        if let Some((img, full)) = decode_turned(Input::Memory(&preview), 0, Some(fit), orientation)
+        {
             return Some((img, full, true));
         }
         let img = decode_bytes(&preview)?;
@@ -239,11 +245,12 @@ fn shrunk(img: DynamicImage, fit: (u32, u32)) -> DynamicImage {
     }
 }
 
-/// The whole picture for display: through WIC where it can stop part way (as fast as the `image`
-/// crate on JPEG), else as [`decode_file`] does.
+/// The whole picture of page `page` for display: through WIC where it can stop part way (as fast
+/// as the `image` crate on JPEG), else as [`decode_file`] does.
 fn decode_whole(
     path: &Path,
     kind: MediaType,
+    page: u32,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<DynamicImage> {
     use crate::wic_decode::{decode_whole_cancellable, Input};
@@ -254,14 +261,22 @@ fn decode_whole(
         None => None,
     };
     if by_wic(path, kind) {
-        if let Some(result) = tried(decode_whole_cancellable(Input::File(path), cancelled)) {
+        if let Some(result) = tried(decode_whole_cancellable(Input::File(path), page, cancelled)) {
             return result;
         }
+    }
+    // See `decode_turned_fitted`.
+    if page > 0 {
+        return None;
     }
     #[cfg(feature = "raw-preview")]
     if kind == MediaType::RawImage {
         let preview = crate::raw_preview::extract_raw_preview(path)?;
-        if let Some(result) = tried(decode_whole_cancellable(Input::Memory(&preview), cancelled)) {
+        if let Some(result) = tried(decode_whole_cancellable(
+            Input::Memory(&preview),
+            0,
+            cancelled,
+        )) {
             return result;
         }
         return decode_bytes(&preview);
@@ -275,6 +290,17 @@ fn by_wic(path: &Path, kind: MediaType) -> bool {
     kind == MediaType::StandardImage
         && !crate::svg::handles(path)
         && (crate::wic_decode::handles(path) || is_jpeg(path))
+}
+
+/// Number of pages of a photo: the pages of a multi-page TIFF, 1 for everything else.
+pub fn page_count(path: &Path, kind: MediaType) -> u32 {
+    if kind == MediaType::StandardImage
+        && crate::probe::has_extension(path, crate::probe::MULTI_PAGE_EXTS)
+    {
+        crate::wic_decode::page_count(path)
+    } else {
+        1
+    }
 }
 
 /// The file starts like a JPEG stream, whatever its extension.
@@ -394,46 +420,55 @@ pub fn apply_exif_orientation(img: &mut DynamicImage, orientation: u16) {
     }
 }
 
-/// Decodes a photo turned upright by its EXIF orientation (when `auto_rotate`); the EXIF block is
-/// returned along with it, since reading the orientation needs it anyway.
+/// Decodes page `page` of a photo (see [`page_count`]) turned upright by its EXIF orientation
+/// (when `auto_rotate`); the EXIF block is returned along with it, since reading the orientation
+/// needs it anyway.
 pub fn decode_oriented(
     path: &Path,
     kind: MediaType,
     auto_rotate: bool,
+    page: u32,
 ) -> Option<(DynamicImage, Option<crate::exif::ExifInfo>)> {
-    decode_oriented_fitted(path, kind, auto_rotate, None).map(|(img, _, exif)| (img, exif))
+    decode_oriented_cancellable(path, kind, auto_rotate, page, None, &|| false)
+        .map(|(img, _, exif)| (img, exif))
 }
 
-/// [`decode_oriented`] fitted into `fit` when given (see [`decode_file_fitted`]); also returns
-/// the size of the whole upright picture.
+/// [`decode_oriented`] of the first page, fitted into `fit` when given (see
+/// [`decode_file_fitted`]); also returns the size of the whole upright picture.
 pub fn decode_oriented_fitted(
     path: &Path,
     kind: MediaType,
     auto_rotate: bool,
     fit: Option<(u32, u32)>,
 ) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
-    decode_oriented_cancellable(path, kind, auto_rotate, fit, &|| false)
+    decode_oriented_cancellable(path, kind, auto_rotate, 0, fit, &|| false)
 }
 
-/// [`decode_oriented_fitted`]; a whole picture (`fit` = `None`) of JPEG, RAW and the WIC formats
-/// is decoded a strip at a time and given up (`None`) as soon as `cancelled` says so.
+/// [`decode_oriented_fitted`] of page `page`; a whole picture (`fit` = `None`) of JPEG, RAW and
+/// the WIC formats is decoded a strip at a time and given up (`None`) as soon as `cancelled`
+/// says so.
 pub fn decode_oriented_cancellable(
     path: &Path,
     kind: MediaType,
     auto_rotate: bool,
+    page: u32,
     fit: Option<(u32, u32)>,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<(DynamicImage, (u32, u32), Option<crate::exif::ExifInfo>)> {
-    // Read first: the decoders that can turn the picture on the way get the orientation.
+    // Read first: the decoders that can turn the picture on the way get the orientation. The
+    // EXIF block describes the file (its first page); a further page has its own orientation.
     let exif = crate::exif::read_exif(path);
-    let orientation = exif
-        .as_ref()
-        .and_then(|e| e.orientation)
+    let orientation = if page == 0 {
+        exif.as_ref().and_then(|e| e.orientation)
+    } else {
+        crate::wic_decode::page_orientation(path, page)
+    };
+    let orientation = orientation
         .filter(|o| auto_rotate && (1..=8).contains(o))
         .unwrap_or(1);
     let (mut img, (mut w, mut h), turned) = match fit {
-        Some(fit) => decode_turned_fitted(path, kind, fit, orientation)?,
-        None => decode_whole(path, kind, cancelled).map(|img| {
+        Some(fit) => decode_turned_fitted(path, kind, page, fit, orientation)?,
+        None => decode_whole(path, kind, page, cancelled).map(|img| {
             let size = (img.width(), img.height());
             (img, size, false)
         })?,

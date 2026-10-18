@@ -10,7 +10,7 @@ use mediares_core::video_tags::VideoTags;
 use crate::i18n::{n, tr};
 
 /// Photo OSD as it was before templates.
-pub const DEFAULT_PHOTO: &str = "{name} ( {width} x {height} = {mp} MP , {size_kb} KB )< [ {index} / {count} ]><  {zoom}%><  [{preview}]>";
+pub const DEFAULT_PHOTO: &str = "{name} ( {width} x {height} = {mp} MP , {size_kb} KB )< [ {index} / {count} ]><  {page_of}><  {zoom}%><  [{preview}]>";
 /// Video OSD as it was before templates.
 pub const DEFAULT_VIDEO: &str =
     "{name} ( {width} x {height} , {size} )< [ {index} / {count} ]>   {time} / {duration}";
@@ -56,6 +56,9 @@ pub const PHOTO_FIELDS: FieldGroups = &[
             f("mp", n("Megapixels")),
             f("zoom", n("Zoom, %")),
             f("preview", n("\"RAW preview\" for an embedded preview")),
+            f("page_of", n("\"page 2 / 5\" in a multi-page file")),
+            f("page", n("Page")),
+            f("pages", n("Pages")),
         ],
     ),
     (

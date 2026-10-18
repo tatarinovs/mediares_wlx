@@ -920,6 +920,7 @@ impl VideoView {
             full: (width, height),
             bgra,
             is_preview: false,
+            pages: 1,
             exif: None,
         })
     }

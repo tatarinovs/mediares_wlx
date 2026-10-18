@@ -125,6 +125,8 @@ commands! {
     PanRight,
     PanUp,
     PanDown,
+    NextPage,
+    PreviousPage,
 }
 
 impl Command {
@@ -185,8 +187,10 @@ impl Command {
         None,
         Some((Command::ShowSettings, n("Settings...\tS"))),
         None,
-        Some((Command::Next, n("Next file\tSpace / Right"))),
-        Some((Command::Previous, n("Previous file\tBackspace / Left"))),
+        Some((Command::NextPage, n("Next page\tRight"))),
+        Some((Command::PreviousPage, n("Previous page\tLeft"))),
+        Some((Command::Next, n("Next file\tSpace / Down"))),
+        Some((Command::Previous, n("Previous file\tBackspace / Up"))),
     ];
 
     /// Whether the item applies to the current content (photo, or audio/video).
@@ -199,7 +203,7 @@ impl Command {
             | ToggleShuffle | AbLoop => media,
             ShowLyrics => media && !video,
             ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SaveRotation | SetWallpaper
-            | SaveAs | OpenMap | ToggleKeepZoom | ToggleCompare => !media,
+            | SaveAs | OpenMap | ToggleKeepZoom | ToggleCompare | NextPage | PreviousPage => !media,
             ToggleOsd | Print => !media || video,
             _ => true,
         }
@@ -339,8 +343,11 @@ impl Command {
             0x43 => Some(ToggleCompare),                  // C
             0x2E => Some(Delete),                         // Del
             0x6A | 0x6F => Some(ZoomFit),                 // numpad * and /
-            0x4E | 0x20 | 0x27 | 0x22 | 0x28 => Some(Next), // N, Space, Right, PgDn, Down
-            0x50 | 0x08 | 0x25 | 0x21 | 0x26 => Some(Previous), // P, Backspace, Left, PgUp, Up
+            // Pages of a multi-page file; in other files they page through the files as well.
+            0x27 => Some(NextPage),                      // Right
+            0x25 => Some(PreviousPage),                  // Left
+            0x4E | 0x20 | 0x22 | 0x28 => Some(Next),     // N, Space, PgDn, Down
+            0x50 | 0x08 | 0x21 | 0x26 => Some(Previous), // P, Backspace, PgUp, Up
             _ => None,
         })
     }
@@ -565,6 +572,9 @@ unsafe fn caption(state: &ViewerState) -> String {
         if let Some(zoom) = image_view::zoom_percent(state) {
             title += &format!(" [{}%]", zoom);
         }
+        if state.pages > 1 {
+            title += &format!(" [{} {}/{}]", tr("page"), state.page + 1, state.pages);
+        }
     } else if let Some(media) = &state.media {
         if let Some(tagged) = media.display_title() {
             title = tagged;
@@ -754,6 +764,11 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 refresh(state);
             }
         }
+        Command::NextPage | Command::PreviousPage => {
+            if state.turn_page(command == Command::NextPage) {
+                refresh(state);
+            }
+        }
         Command::Copy => {
             // The picture for editors, plus a file for pasting into a folder: the photo itself,
             // or the frame / album art saved as a temporary PNG.
@@ -848,8 +863,9 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         Command::SaveAs => {
             if state.media.is_none() && state.image.is_some() {
                 let (path, turns) = (state.file_path.clone(), state.quarter_turns);
+                let page = (state.pages > 1).then_some(state.page);
                 let auto_rotate = state.config.auto_rotate_exif;
-                save_as::save_as(dialog::modal_owner(hwnd), &path, turns, auto_rotate);
+                save_as::save_as(dialog::modal_owner(hwnd), &path, page, turns, auto_rotate);
             }
         }
         Command::Slower | Command::Faster | Command::NormalSpeed => {
@@ -1218,6 +1234,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
         state.config.osd.photo()
     };
     let gps = state.photo_gps().is_some();
+    let pages = state.pages > 1;
 
     let Some(mut menu) = ThemedMenu::new(hwnd, state.show_flags & LCP_DARKMODE != 0) else {
         return;
@@ -1227,7 +1244,11 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
         fs.reveal_cursor(hwnd);
     }
     let items = Command::MENU.iter().filter(|item| {
-        item.is_none_or(|(cmd, _)| cmd.available(media, video) && (cmd != Command::OpenMap || gps))
+        item.is_none_or(|(cmd, _)| {
+            cmd.available(media, video)
+                && (cmd != Command::OpenMap || gps)
+                && (!matches!(cmd, Command::NextPage | Command::PreviousPage) || pages)
+        })
     });
     let mut previous_was_separator = true;
     for item in items {
@@ -1599,12 +1620,15 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             {
                 // The wheel over a song text that doesn't fit scrolls it.
             } else if delta != 0 {
+                // Through the pages of a multi-page photo, on to the next file past the last.
+                let photo = state.media.is_none();
                 execute(
                     hwnd,
-                    if delta < 0 {
-                        Command::Next
-                    } else {
-                        Command::Previous
+                    match (delta < 0, photo) {
+                        (true, true) => Command::NextPage,
+                        (false, true) => Command::PreviousPage,
+                        (true, false) => Command::Next,
+                        (false, false) => Command::Previous,
                     },
                 );
             }
@@ -1792,6 +1816,18 @@ mod tests {
             Command::from_key(0x25, false, false, true, true),
             Some(Command::SeekBack)
         );
+    }
+
+    #[test]
+    fn photo_arrows_turn_pages_up_and_down_go_to_files() {
+        let key = |vk| Command::from_key(vk, false, false, false, false);
+        assert_eq!(key(0x27), Some(Command::NextPage)); // Right
+        assert_eq!(key(0x25), Some(Command::PreviousPage)); // Left
+        assert_eq!(key(0x28), Some(Command::Next)); // Down
+        assert_eq!(key(0x26), Some(Command::Previous)); // Up
+        assert_eq!(key(0x22), Some(Command::Next)); // PgDn
+                                                    // Pages are a photo's: on audio/video the arrows seek.
+        assert!(!Command::NextPage.available(true, false));
     }
 
     #[test]

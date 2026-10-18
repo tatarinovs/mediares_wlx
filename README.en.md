@@ -91,7 +91,8 @@ CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — via the embedded JPEG preview; 
 Through Windows codecs (WIC), adding nothing to the plugin size: **HEIC/HEIF/HIF** and **AVIF** — need the
 Microsoft Store extensions "HEIF Image Extensions" plus "HEVC Video Extensions" (for HEIC) or "AV1 Video Extension"
 (for AVIF); **JXL** — "JPEG XL Image Extension"; **JXR/WDP/HDP** (JPEG XR) and **DDS** (BC1–BC3, uncompressed) and
-**TIFF/TIF** (any compression, old-style JPEG included) — built into Windows. The HEIF container's rotation (`irot`/`imir`) is applied and its EXIF (date, camera, GPS) is
+**TIFF/TIF** (any compression, old-style JPEG included; every page of a multi-page one, each with its own
+orientation) — built into Windows. The HEIF container's rotation (`irot`/`imir`) is applied and its EXIF (date, camera, GPS) is
 read. A file the standard decoder fails on (e.g. an unusual BMP variant) gets a second try via WIC.
 
 **SVG/SVGZ** is drawn by the Direct2D engine (Windows 10 1703+): shapes, paths, gradients, clipping, `use`, styles —
@@ -112,7 +113,8 @@ shows without waiting for it.
 
 | Action | Keys / mouse |
 |---|---|
-| Next / previous photo | Space, PgDn, N / PgUp, Backspace, P; mouse wheel (or the other way round — wheel zooms, a setting); mouse side buttons. →↓ / ←↑ do the same, but only in fit mode: zoomed in, they pan instead |
+| Next / previous photo | Space, PgDn, N / PgUp, Backspace, P; mouse wheel (or the other way round — wheel zooms, a setting); mouse side buttons. ↓ / ↑ do the same, but only in fit mode: zoomed in, they pan instead |
+| Pages of a multi-page TIFF | → / ← and the mouse wheel; past the last page — the next file, before the first — the previous one (it opens at its first page). In a file of one page → / ← page through the files, zoomed in they pan |
 | Zoom | + / −, Ctrl+wheel (towards the cursor; steps stop at 100%, or the other way round — wheel zooms, Ctrl+wheel pages, a setting); Ctrl+1 — 100%, Ctrl+2 — 200%, Ctrl+3 — 300%; Ctrl+0, *, / — fit to window |
 | Pan / loupe | arrow keys, or drag, while zoomed in / hold left mouse button in fit mode |
 | Rotate left / right (view only, the file is not changed) | L / R |
@@ -132,7 +134,8 @@ shows without waiting for it.
 
 **Paging through files, for any type and any zoom:** N / PgDn — next file, Backspace / PgUp —
 previous. Space, the arrows and the wheel only page while nothing else claims them (for photos, while
-the photo fits the window; zoomed in, the arrows pan instead); for video/audio Space pauses and the
+the photo fits the window; zoomed in, the arrows pan instead; in a multi-page TIFF → / ← and the wheel go
+through its pages first); for video/audio Space pauses and the
 arrows seek or change the volume / step a frame.
 
 The right-click menu also has: **open in external editor**, **show in folder**, **set as desktop wallpaper**
@@ -245,6 +248,9 @@ field..." button inserts a field from a menu (file, image, EXIF; for video — s
 - `{field}` — a value; an unknown field is shown as is, so a typo is visible.
 - `<...>` — the whole block disappears if it contains an empty field (e.g. ISO for a photo without EXIF).
 - `{{ }} << >>` — the literal characters; a line break in the template is a new OSD line.
+
+In a multi-page TIFF `{page_of}` gives "page 2 / 5", `{page}` and `{pages}` the page number and count; in a file of
+one page they are empty, so their block disappears.
 
 EXIF comes from the same read needed for auto-rotation, so paging isn't slowed down. Video codec, bitrate and
 tags are read once per file, and only if the template uses them. In `mediares.ini` templates are stored in

@@ -217,6 +217,7 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
         full: (width as u32, height as u32),
         bgra: pixels,
         is_preview: false,
+        pages: 1,
         exif: None,
     })
 }
