@@ -17,6 +17,25 @@ A high-performance 64-bit plugin for **Total Commander**, written in **Rust**. R
 2. **`mediares_wdx`** — a lightweight content plugin (WDX), no viewer: EXIF, tag and stream-property fields for columns, search and multi-rename (ready-made sets are [below](#ready-made-column-sets)), plus perceptual hashes (dHash, pHash, CoarseHash, Video/Audio Fingerprint) for duplicate search.
 ---
 
+## System requirements
+
+| | Minimum | Notes |
+|---|---|---|
+| OS | Windows 10 (1607) x64 | Needed for `GetDpiForWindow`; Rust 1.78+ does not target anything older than Windows 10. SVG needs 1703+. 32-bit Windows and Total Commander are not supported |
+| Total Commander | 64-bit (`totalcmd64.exe`), `.wlx64` / `.wdx64` plugins | |
+| CPU | any x86-64 (SSE2) | No AVX or other extensions needed; the `x86_64-v3` `libmpv` build requires Haswell / Excavator or newer |
+| Memory | 2 GB (Windows 10 x64 minimum itself) | The photo cache takes up to 512 MB, a single frame up to 64 Mpx (≈256 MB as RGBA); 4 GB or more for comfortable work with large photos |
+| Graphics | not required | D3D11 is created on the GPU, falling back to software WARP; smooth high-resolution video wants hardware decoding |
+| Disk | ≈4 MB | `mediares.wlx64` ≈3.8 MB, `mediares.wdx64` ≈2.8 MB |
+| Runtime | [Microsoft Visual C++ Redistributable 2015–2022 x64](https://aka.ms/vs/17/release/vc_redist.x64.exe) | The DLLs link to `VCRUNTIME140.dll`; on a clean Windows without it the plugin won't load (most machines already have it) |
+
+Everything else is a Windows 10 system component: Media Foundation (video, WMA/Opus/AC3, WDX fields), WIC (TIFF, JXR,
+DDS; HEIC/AVIF/JXL with the Store extensions), Direct2D (SVG), WASAPI (audio). **Windows N / KN** editions ship without
+Media Foundation (`mfplat.dll`): the plugin won't load there until the "Media Feature Pack" is installed. The optional
+`libmpv-2.dll` and Microsoft Store codec extensions don't change these requirements.
+
+---
+
 ## Workspace layout
 
 ```
