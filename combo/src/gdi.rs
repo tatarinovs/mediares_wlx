@@ -95,6 +95,11 @@ pub fn rect(width: i32, height: i32) -> RECT {
     }
 }
 
+/// Width and height of `r`.
+pub fn size(r: RECT) -> (f32, f32) {
+    ((r.right - r.left) as f32, (r.bottom - r.top) as f32)
+}
+
 pub fn contains(r: &RECT, x: i32, y: i32) -> bool {
     x >= r.left && x < r.right && y >= r.top && y < r.bottom
 }

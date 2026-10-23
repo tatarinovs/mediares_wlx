@@ -214,6 +214,7 @@ repeat-list or repeat-one and shuffle — in the right-click menu and in setting
 | Action | Keys / mouse |
 |---|---|
 | Pause / play | Space, K, click on the video / cover art, media key |
+| Loupe while paused: the frame enlarged, the same spot under the cursor | hold the left mouse button on the video, or drag with it |
 | Seek ±5 s (step in settings) | ← / →, click or drag on the timeline |
 | Next / previous key frame (audio: ±1 s) | ↑ / ↓ |
 | Video speed 0.25×–2× / normal | [ / ] / \ |

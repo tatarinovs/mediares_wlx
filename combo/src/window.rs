@@ -710,6 +710,9 @@ unsafe fn execute(hwnd: HWND, command: Command) {
     if !command.available(state.media.is_some(), video) {
         return;
     }
+    if let Some(media) = state.media.as_mut() {
+        media.end_loupe();
+    }
     match command {
         Command::ToggleFullscreen => {
             state.drag = None;
@@ -1498,11 +1501,13 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         WM_LBUTTONDOWN => {
             let _ = SetFocus(Some(hwnd));
             let pt = point_from_lparam(lparam.0);
+            let loupe_scale = state.config.loupe_scale;
             if let Some(media) = state.media.as_mut() {
                 match media.mouse_down(pt.x, pt.y) {
                     Click::Outside => {
-                        media.toggle_play();
-                        media.invalidate_bar();
+                        if media.picture_down(pt.x, pt.y, loupe_scale) {
+                            let _ = SetCapture(hwnd);
+                        }
                     }
                     Click::Bar if media.is_dragging() => {
                         let _ = SetCapture(hwnd);
@@ -1533,7 +1538,9 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 fs.mouse_moved(hwnd);
             }
             if let Some(media) = state.media.as_mut() {
-                media.mouse_move(pt.x, pt.y);
+                if !media.picture_move(pt.x, pt.y) {
+                    media.mouse_move(pt.x, pt.y);
+                }
                 return LRESULT(0);
             }
             let (Some(img), Some(view)) = (state.image.clone(), view_size(state)) else {
@@ -1558,6 +1565,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 if media.is_dragging() {
                     media.mouse_up(point_from_lparam(lparam.0).x);
                 }
+                media.picture_up();
                 return LRESULT(0);
             }
             state.drag = None;

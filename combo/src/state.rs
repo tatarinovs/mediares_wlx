@@ -37,6 +37,9 @@ pub struct Drag {
 pub struct Loupe {
     pub saved_zoom: ZoomMode,
     pub saved_offset: (f32, f32),
+    /// Where the button went down (view coordinates) and the magnified offset shown there.
+    pub press: (f32, f32),
+    pub press_offset: (f32, f32),
 }
 
 pub struct ViewerState {

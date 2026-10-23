@@ -142,6 +142,7 @@ another. Repeat and shuffle are in the right-click menu and in the
 settings.
 
   Play / pause ............. Space, K, click on the video
+  Loupe while paused ....... hold the left mouse button on the video
   Seek ±5 seconds .......... ← / →, click on the progress bar
   Next / previous key frame  ↑ / ↓ (audio: ±1 second)
   Previous / next frame .... , / .

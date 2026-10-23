@@ -16,7 +16,9 @@ use mediares_core::video_frame::VideoMeta;
 use mediares_core::video_tags::VideoTags;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{GetStockObject, BLACK_BRUSH, HBRUSH};
+use windows::Win32::Graphics::Gdi::{
+    GetStockObject, InvalidateRect, UpdateWindow, BLACK_BRUSH, HBRUSH,
+};
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, MF_MEDIA_ENGINE_EVENT_ENDED, MF_MEDIA_ENGINE_EVENT_ERROR,
     MF_MEDIA_ENGINE_EVENT_FORMATCHANGE, MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA,
@@ -25,12 +27,14 @@ use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, IsWindow, KillTimer, MoveWindow, SetTimer,
-    HTTRANSPARENT, WINDOW_EX_STYLE, WINDOW_STYLE, WM_NCHITTEST, WS_CHILD, WS_CLIPSIBLINGS,
-    WS_VISIBLE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, IsWindow, KillTimer, MoveWindow,
+    SetTimer, ShowWindow, HTTRANSPARENT, SW_HIDE, SW_SHOWNA, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_NCHITTEST, WS_CHILD, WS_CLIPSIBLINGS, WS_VISIBLE,
 };
 
+use crate::gdi;
 use crate::i18n::tr;
+use crate::image_view::FrameLoupe;
 use crate::media_view::EventEffect;
 use crate::module;
 use crate::playback_mpv::{self, MpvPlayer};
@@ -296,6 +300,9 @@ pub struct VideoView {
     /// The time of the key frame on screen while the engine is still elsewhere
     /// ([`SeekProfile::Previewed`]).
     preview: Cell<Option<f64>>,
+    /// The paused frame magnified while the left button is held; the surface is hidden then
+    /// and the viewer draws it.
+    loupe: Option<FrameLoupe>,
 }
 
 /// How seeking behaves on the current file.
@@ -444,6 +451,7 @@ impl VideoView {
             back_target: None,
             key_seek: None,
             preview: Cell::new(None),
+            loupe: None,
         })
     }
 
@@ -453,6 +461,7 @@ impl VideoView {
         // opens it. A file failing it isn't played: the caller drops this view.
         let probe = matches!(self.player, Player::Mf(_)).then(|| Probe::start(path));
         self.remember_position();
+        self.loupe_end();
         // Done: if this view is dropped below, the player is already on the new file.
         self.loaded = false;
         self.finish_step();
@@ -930,6 +939,50 @@ impl VideoView {
             pages: 1,
             exif: None,
         })
+    }
+
+    /// Magnifies the paused frame at `scale` (of its pixels) over `area`, the surface's place,
+    /// keeping the point under `cursor` (viewer client coordinates) in place. False while
+    /// playing, or while the frame on screen isn't the player's ([`SeekProfile::Previewed`]).
+    pub unsafe fn loupe_begin(&mut self, area: RECT, scale: f32, cursor: (i32, i32)) -> bool {
+        if self.is_playing() || self.preview.get().is_some() {
+            return false;
+        }
+        let Some(frame) = self.capture_frame() else {
+            return false;
+        };
+        let view = gdi::size(area);
+        let at = (cursor.0 - area.left, cursor.1 - area.top);
+        self.loupe = Some(FrameLoupe::begin(frame, view, scale, at));
+        let _ = ShowWindow(self.surface.0, SW_HIDE);
+        let _ = InvalidateRect(Some(self.viewer), Some(&area), false);
+        true
+    }
+
+    /// The cursor moved while the loupe is shown.
+    pub unsafe fn loupe_follow(&mut self, area: RECT, cursor: (i32, i32)) {
+        if let Some(loupe) = &mut self.loupe {
+            loupe.follow(gdi::size(area), (cursor.0 - area.left, cursor.1 - area.top));
+            let _ = InvalidateRect(Some(self.viewer), Some(&area), false);
+            let _ = UpdateWindow(self.viewer);
+        }
+    }
+
+    /// Back to the player's picture; false if the loupe wasn't shown.
+    pub unsafe fn loupe_end(&mut self) -> bool {
+        if self.loupe.take().is_none() {
+            return false;
+        }
+        let _ = ShowWindow(self.surface.0, SW_SHOWNA);
+        // The media engine presents its frame again (it may not have kept it while hidden).
+        let mut rc = RECT::default();
+        let _ = GetClientRect(self.surface.0, &mut rc);
+        self.player.resize(rc.right, rc.bottom);
+        true
+    }
+
+    pub fn loupe(&self) -> Option<&FrameLoupe> {
+        self.loupe.as_ref()
     }
 
     /// "1920x1080, 1:23:45"

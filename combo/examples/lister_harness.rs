@@ -5,6 +5,7 @@
 //! cargo run -p mediares_combo --example lister_harness -- <file> <out_dir> [steps...]
 //! steps: wait:<ms>  shot:<name>  key:<vk hex>  click:<x>,<y>  dblclick:<x>,<y>
 //!        resize:<w>,<h>  wheel:<delta>[,<x>,<y>]  next:<file>  rects
+//!        ldown:<x>,<y>  drag:<x>,<y>  lup:<x>,<y>   left button down / moved with it / up
 //!        input:[ctrl+|shift+]<vk hex>   real keyboard input (modifiers are seen by GetKeyState)
 //!        oclick:top|bottom,<x>,<y>   click in the fullscreen panel
 //!        move:<x>,<y>    move the real cursor (screen coordinates)
@@ -372,6 +373,17 @@ fn main() {
                         let _ = PostMessageW(Some(viewer), WM_LBUTTONDBLCLK, WPARAM(1), lp);
                         let _ = PostMessageW(Some(viewer), WM_LBUTTONUP, WPARAM(0), lp);
                     }
+                    pump(50);
+                }
+                "ldown" | "drag" | "lup" => {
+                    let (x, y) = xy(arg);
+                    let lp = LPARAM(((y as isize) << 16) | (x as isize & 0xFFFF));
+                    let (msg, keys) = match cmd {
+                        "ldown" => (WM_LBUTTONDOWN, 1),
+                        "drag" => (WM_MOUSEMOVE, 1),
+                        _ => (WM_LBUTTONUP, 0),
+                    };
+                    let _ = PostMessageW(Some(viewer), msg, WPARAM(keys), lp);
                     pump(50);
                 }
                 "wheel" => {

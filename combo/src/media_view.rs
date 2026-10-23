@@ -11,7 +11,9 @@ use mediares_core::probe::MediaType;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
-use windows::Win32::UI::WindowsAndMessaging::{GetClientRect, KillTimer, SetTimer};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetClientRect, GetSystemMetrics, KillTimer, SetTimer, SM_CXDRAG, SM_CYDRAG,
+};
 
 use crate::audio_view::{AudioView, PROGRESS_TIMER_ID};
 use crate::gdi::{self, Font};
@@ -24,6 +26,9 @@ use crate::video_view::{VideoView, RENDER_TIMER_ID};
 /// Clears a status message from the bar.
 pub const STATUS_TIMER_ID: usize = 0x4D54;
 const STATUS_MS: u32 = 3000;
+/// Holding the left button this long on a paused video shows the loupe; a shorter click plays.
+const LOUPE_TIMER_ID: usize = 0x4D57;
+const LOUPE_HOLD_MS: u32 = 250;
 
 /// What the viewer should do after an engine event or a timer tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,13 @@ impl Content {
     }
 }
 
+/// The left button down on a paused video, not yet told apart from holding it for the loupe.
+#[derive(Clone, Copy)]
+struct Press {
+    at: (i32, i32),
+    loupe_scale: f32,
+}
+
 pub struct MediaView {
     pub content: Content,
     viewer: HWND,
@@ -74,6 +86,7 @@ pub struct MediaView {
     seek_preview_enabled: bool,
     /// A-B loop: its start once set, then its end (playback jumps back to the start there).
     ab_loop: (Option<f64>, Option<f64>),
+    press: Option<Press>,
 }
 
 /// RealMedia, Ogg and the like are often sound only: those play in the audio view (tags, cover,
@@ -164,6 +177,7 @@ impl MediaView {
             seek_preview: None,
             seek_preview_enabled: options.seek_preview,
             ab_loop: (None, None),
+            press: None,
         };
         view.layout();
         Some(view)
@@ -269,14 +283,19 @@ impl MediaView {
     }
 
     /// Paints the part of the client area in `dirty` (a video surface is clipped out by the viewer);
-    /// `smooth`: enlarge album art with bicubic filtering.
+    /// `smooth`: enlarge album art and the loupe's frame with bicubic filtering.
     pub unsafe fn paint(&mut self, hdc: HDC, width: i32, height: i32, dirty: RECT, smooth: bool) {
         let scale = self.dpi_scale();
         let area = self.content_area();
         // Progress updates repaint only the bar: the cover isn't redrawn then (clipped out).
         gdi::with_buffer(hdc, width, height, dirty, |dc| unsafe {
             match &mut self.content {
-                Content::Video(_) => gdi::fill(dc, gdi::rect(width, height), 0),
+                Content::Video(v) => {
+                    gdi::fill(dc, gdi::rect(width, height), 0);
+                    if let Some(loupe) = v.loupe() {
+                        loupe.draw(dc, area, smooth);
+                    }
+                }
                 Content::Audio(a) => a.paint(dc, area, scale, smooth),
             }
             if self.bar_host.is_none() {
@@ -359,6 +378,75 @@ impl MediaView {
             self.invalidate_bar();
         }
         click
+    }
+
+    /// The left button went down on the picture at `x`, `y` (viewer client coordinates): plays or
+    /// pauses, except on a paused video, where holding the button (or moving with it) magnifies
+    /// the frame at `loupe_scale` and a click plays on release. True if the viewer should
+    /// capture the mouse for [`Self::picture_move`] and [`Self::picture_up`].
+    pub unsafe fn picture_down(&mut self, x: i32, y: i32, loupe_scale: f32) -> bool {
+        self.end_loupe();
+        if !self.is_video() || self.transport().is_playing() {
+            self.toggle_play();
+            self.invalidate_bar();
+            return false;
+        }
+        self.press = Some(Press {
+            at: (x, y),
+            loupe_scale,
+        });
+        SetTimer(Some(self.viewer), LOUPE_TIMER_ID, LOUPE_HOLD_MS, None);
+        true
+    }
+
+    /// The cursor moved to `x`, `y`; true if the press or the loupe took it.
+    pub unsafe fn picture_move(&mut self, x: i32, y: i32) -> bool {
+        if let Some(press) = self.press {
+            let moved = (x - press.at.0).abs() > GetSystemMetrics(SM_CXDRAG)
+                || (y - press.at.1).abs() > GetSystemMetrics(SM_CYDRAG);
+            if !moved {
+                return true;
+            }
+            self.start_loupe();
+        }
+        let area = self.content_area();
+        match &mut self.content {
+            Content::Video(v) if v.loupe().is_some() => {
+                v.loupe_follow(area, (x, y));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The left button went up after [`Self::picture_down`].
+    pub unsafe fn picture_up(&mut self) {
+        if self.press.is_some() {
+            self.toggle_play();
+            self.invalidate_bar();
+        }
+        self.end_loupe();
+    }
+
+    unsafe fn start_loupe(&mut self) {
+        let _ = KillTimer(Some(self.viewer), LOUPE_TIMER_ID);
+        let Some(press) = self.press.take() else {
+            return;
+        };
+        let area = self.content_area();
+        if let Content::Video(v) = &mut self.content {
+            v.loupe_begin(area, press.loupe_scale, press.at);
+        }
+    }
+
+    /// Drops the loupe, and a press that could still become one: the picture is about to change.
+    pub unsafe fn end_loupe(&mut self) {
+        if self.press.take().is_some() {
+            let _ = KillTimer(Some(self.viewer), LOUPE_TIMER_ID);
+        }
+        if let Content::Video(v) = &mut self.content {
+            v.loupe_end();
+        }
     }
 
     /// True while a bar slider is being dragged (the caller keeps mouse capture).
@@ -664,6 +752,14 @@ impl MediaView {
         match (&mut self.content, id) {
             (Content::Video(v), RENDER_TIMER_ID) => {
                 v.render();
+                // Played on (the Play key): the frame magnified is gone.
+                if v.loupe().is_some() && v.is_playing() {
+                    v.loupe_end();
+                }
+                Some(EventEffect::None)
+            }
+            (_, LOUPE_TIMER_ID) => {
+                self.start_loupe();
                 Some(EventEffect::None)
             }
             (Content::Audio(a), PROGRESS_TIMER_ID) => Some(a.on_tick()),

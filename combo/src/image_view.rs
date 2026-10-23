@@ -26,6 +26,9 @@ const FIT_SNAP: f32 = 0.04;
 /// fitting a small image into the window is smoothed at any scale.
 const MAX_SMOOTH_ZOOM: f32 = 4.0;
 const OSD_MARGIN: i32 = 10;
+/// The loupe enlarges a video frame at least this much over its fitted size: a frame often has
+/// fewer pixels than the window, and the loupe scale counts them.
+const FRAME_LOUPE_MIN: f32 = 2.0;
 
 pub unsafe fn client_size(hwnd: HWND) -> Option<(f32, f32)> {
     let mut rc = RECT::default();
@@ -218,34 +221,136 @@ pub fn restore_view(state: &mut ViewerState, img: &DecodedImage, view: (f32, f32
     show_at(state, img, view, kept.scale, kept.point, middle);
 }
 
-/// Starts the loupe: magnify at the configured scale and map the cursor proportionally over the image.
+/// Starts the loupe: magnify at the configured scale keeping the point under the cursor in place.
 pub fn loupe_begin(
     state: &mut ViewerState,
     img: &DecodedImage,
     view: (f32, f32),
     cursor: (i32, i32),
 ) {
+    let (saved_zoom, saved_offset) = (state.zoom, state.offset);
+    let press = (cursor.0 as f32, cursor.1 as f32);
+    zoom_to(state, img, view, state.config.loupe_scale, press);
     state.loupe = Some(Loupe {
-        saved_zoom: state.zoom,
-        saved_offset: state.offset,
+        saved_zoom,
+        saved_offset,
+        press,
+        press_offset: state.offset,
     });
-    loupe_follow(state, img, view, cursor);
 }
 
-/// The cursor's place in the window picks the same place in the image, so moving across the
-/// window scans the whole picture.
+/// One axis of [`loupe_follow`]: the offset is `held` with the cursor at `press`, and moves
+/// linearly from there to show the picture's start with the cursor at the window's start and
+/// its end at the window's end.
+fn loupe_axis(cursor: f32, press: f32, held: f32, image_len: f32, window_len: f32) -> f32 {
+    let cursor = cursor.clamp(0.0, window_len);
+    let far = window_len - image_len;
+    if cursor < press {
+        held * cursor / press
+    } else if press < window_len {
+        held + (far - held) * (cursor - press) / (window_len - press)
+    } else {
+        held
+    }
+}
+
+/// Moving the cursor away from where the button went down scans the picture up to its edges
+/// as the cursor reaches the window's edges.
 pub fn loupe_follow(
     state: &mut ViewerState,
     img: &DecodedImage,
     view: (f32, f32),
     cursor: (i32, i32),
 ) {
-    let t = (
-        (cursor.0 as f32 / view.0).clamp(0.0, 1.0),
-        (cursor.1 as f32 / view.1).clamp(0.0, 1.0),
+    let Some(loupe) = state.loupe else {
+        return;
+    };
+    let ZoomMode::Custom(s) = state.zoom else {
+        return;
+    };
+    let (iw, ih) = size(img);
+    state.offset = (
+        loupe_axis(
+            cursor.0 as f32,
+            loupe.press.0,
+            loupe.press_offset.0,
+            iw * s,
+            view.0,
+        ),
+        loupe_axis(
+            cursor.1 as f32,
+            loupe.press.1,
+            loupe.press_offset.1,
+            ih * s,
+            view.1,
+        ),
     );
-    let at = (t.0 * view.0, t.1 * view.1);
-    show_at(state, img, view, state.config.loupe_scale, t, at);
+    clamp_offset(state, img, view);
+}
+
+/// The loupe over a paused video frame, which the player shows fitted (enlarged too) and centered
+/// in a view of its own.
+pub struct FrameLoupe {
+    frame: DecodedImage,
+    scale: f32,
+    press: (f32, f32),
+    press_offset: (f32, f32),
+    offset: (f32, f32),
+}
+
+impl FrameLoupe {
+    /// Magnifies `frame` at `scale` keeping the point under `cursor` in place, as
+    /// [`loupe_begin`] does.
+    pub fn begin(frame: DecodedImage, view: (f32, f32), scale: f32, cursor: (i32, i32)) -> Self {
+        let (iw, ih) = size(&frame);
+        let fit = (view.0 / iw).min(view.1 / ih);
+        let scale = scale.max(FRAME_LOUPE_MIN * fit);
+        let press = (cursor.0 as f32, cursor.1 as f32);
+        let anchored = |at: f32, image_len: f32, window_len: f32| {
+            let origin = ((window_len - image_len * fit) / 2.0).round();
+            let point = (at - origin) / fit;
+            clamp_axis(at - point * scale, image_len * scale, window_len)
+        };
+        let offset = (anchored(press.0, iw, view.0), anchored(press.1, ih, view.1));
+        Self {
+            frame,
+            scale,
+            press,
+            press_offset: offset,
+            offset,
+        }
+    }
+
+    /// As [`loupe_follow`].
+    pub fn follow(&mut self, view: (f32, f32), cursor: (i32, i32)) {
+        let (iw, ih) = size(&self.frame);
+        let axis = |at: i32, press: f32, held: f32, image_len: f32, window_len: f32| {
+            let len = image_len * self.scale;
+            clamp_axis(
+                loupe_axis(at as f32, press, held, len, window_len),
+                len,
+                window_len,
+            )
+        };
+        self.offset = (
+            axis(cursor.0, self.press.0, self.press_offset.0, iw, view.0),
+            axis(cursor.1, self.press.1, self.press_offset.1, ih, view.1),
+        );
+    }
+
+    /// Draws the magnified frame over `area` (its view); `smooth` as the photo setting.
+    pub unsafe fn draw(&self, dc: HDC, area: RECT, smooth: bool) {
+        draw_picture(
+            dc,
+            &self.frame,
+            self.frame.full,
+            self.scale,
+            self.offset,
+            gdi::size(area),
+            (area.left, area.top),
+            smooth && self.scale <= MAX_SMOOTH_ZOOM,
+        );
+    }
 }
 
 pub fn loupe_end(state: &mut ViewerState) -> bool {
@@ -719,6 +824,47 @@ mod tests {
         assert_eq!(clamp_axis(-5000.0, 2000.0, 800.0), -1200.0);
         assert_eq!(clamp_axis(-300.0, 2000.0, 800.0), -300.0);
         assert_eq!(clamp_axis(-300.0, 400.0, 800.0), 200.0);
+    }
+
+    #[test]
+    fn loupe_scans_from_the_pressed_point_to_the_edges() {
+        // 3000px picture in a 1000px window, pressed at 250 with offset -500 shown there.
+        let at = |cursor| loupe_axis(cursor, 250.0, -500.0, 3000.0, 1000.0);
+        assert_eq!(at(250.0), -500.0);
+        assert_eq!(at(0.0), 0.0);
+        assert_eq!(at(1000.0), -2000.0);
+        assert_eq!(at(125.0), -250.0);
+        assert_eq!(at(625.0), -1250.0);
+        assert_eq!(at(-50.0), 0.0);
+        // Pressed at the window's edge.
+        assert_eq!(loupe_axis(1000.0, 1000.0, -2000.0, 3000.0, 1000.0), -2000.0);
+        assert_eq!(loupe_axis(0.0, 0.0, 0.0, 3000.0, 1000.0), 0.0);
+        assert_eq!(loupe_axis(1000.0, 0.0, 0.0, 3000.0, 1000.0), -2000.0);
+    }
+
+    #[test]
+    fn frame_loupe_keeps_the_pressed_point() {
+        let frame = || DecodedImage {
+            width: 2000,
+            height: 1000,
+            full: (2000, 1000),
+            bgra: Vec::new(),
+            is_preview: false,
+            pages: 1,
+            exif: None,
+        };
+        // Fitted at 50% into 1000x1000: 250px bars above and below.
+        let loupe = FrameLoupe::begin(frame(), (1000.0, 1000.0), 2.0, (100, 300));
+        // Frame pixel (200, 100) stays under the cursor; vertically the frame can't move further
+        // down than the window's top.
+        assert_eq!(loupe.offset, (-300.0, 0.0));
+        let mut loupe = FrameLoupe::begin(frame(), (1000.0, 1000.0), 2.0, (500, 500));
+        assert_eq!(loupe.offset, (-1500.0, -500.0));
+        loupe.follow((1000.0, 1000.0), (1000, 0));
+        assert_eq!(loupe.offset, (-3000.0, 0.0));
+        // A frame the window shows enlarged is still magnified twice over that.
+        let loupe = FrameLoupe::begin(frame(), (4000.0, 2000.0), 1.0, (0, 0));
+        assert_eq!(loupe.scale, 4.0);
     }
 
     #[test]
