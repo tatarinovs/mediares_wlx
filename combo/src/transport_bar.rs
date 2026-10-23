@@ -18,7 +18,7 @@ const BAR_HEIGHT: f32 = 40.0;
 pub const BG: u32 = 0x00202020;
 const TRACK: u32 = 0x00505050;
 const FILL: u32 = 0x00FFCC80; // COLORREF is BGR: a light blue
-const ICON: u32 = 0x00E8E8E8;
+pub const ICON: u32 = 0x00E8E8E8;
 const TEXT: u32 = 0x00D0D0D0;
 const ERROR_TEXT: u32 = 0x006060FF;
 /// Slider label over the filled part (the light [`FILL`]).

@@ -179,7 +179,8 @@ ReplayGain tags (a setting).
 Full screen fills the whole monitor; the cursor hides when the mouse
 does not move. Videos get the control bar over the picture, photos get
 ⏮ ⏯ ⏭ buttons at the bottom. The panels can hide and reappear when the
-mouse approaches the bottom edge of the screen (a setting).
+mouse approaches the bottom edge of the screen (a setting). Near the
+top edge a ✕ button shows up in the right corner: it closes the Lister.
 
 The OSD is an info line over the photo or video: file name, size,
 position in the folder, zoom, for videos the time. What it shows is set

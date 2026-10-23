@@ -21,10 +21,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
     IDC_HAND, IDC_SIZEALL, MSG, PM_NOREMOVE, PM_REMOVE, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND,
-    WM_CAPTURECHANGED, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
-    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
-    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
-    WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
+    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
+    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
 use mediares_core::tc_api::{
@@ -128,6 +128,7 @@ commands! {
     PanDown,
     NextPage,
     PreviousPage,
+    Close,
 }
 
 impl Command {
@@ -618,12 +619,41 @@ pub unsafe fn overlay_message(
 ) -> Option<LRESULT> {
     let state = get_live_state(viewer)?;
     let fs = state.overlay.as_mut()?;
-    let kind = fs.panel.as_ref().filter(|p| p.hwnd == window)?.kind;
+    let kind = fs.kind_of(window)?;
     let pt = point_from_lparam(lparam.0);
     if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
-        fs.panel_used(viewer);
+        fs.panel_used(viewer, kind);
     }
     match (msg, kind) {
+        (WM_PAINT, PanelKind::Close) => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(window, &mut ps);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(window, &mut rc);
+            let scale = gdi::dpi_scale(window);
+            let hot = fs.close_hot();
+            gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
+                overlay::paint_close_button(dc, rc, scale, hot)
+            });
+            let _ = EndPaint(window, &ps);
+        }
+        // Mouse moves light it up through `panel_used`. Like a caption button: pressed, it closes
+        // on release over it.
+        (WM_MOUSELEAVE, PanelKind::Close) => fs.set_close_hot(false),
+        (WM_LBUTTONDOWN, PanelKind::Close) => {
+            let _ = SetCapture(window);
+        }
+        (WM_LBUTTONUP, PanelKind::Close) => {
+            let _ = ReleaseCapture();
+            if fs.close_hot() {
+                let _ = PostMessageW(
+                    Some(viewer),
+                    WM_OVERLAY_COMMAND,
+                    WPARAM(Command::Close as usize),
+                    LPARAM(0),
+                );
+            }
+        }
         (WM_PAINT, PanelKind::Video) => state.media.as_mut()?.paint_bar_host(window),
         (WM_PAINT, PanelKind::Photo) => {
             let mut ps = PAINTSTRUCT::default();
@@ -737,6 +767,17 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             image_view::loupe_end(state);
             fullscreen::toggle(state);
             refresh(state);
+        }
+        // TC's Quick View panel can't be closed from here: the button only leaves fullscreen.
+        Command::Close if is_quick_view(state.lister) => {
+            if state.fullscreen.is_some() {
+                execute(hwnd, Command::ToggleFullscreen);
+            }
+        }
+        // The Lister destroys the viewer (`ListCloseWindow`) without first leaving fullscreen,
+        // so its window never shows.
+        Command::Close => {
+            let _ = PostMessageW(Some(state.lister), WM_CLOSE, WPARAM(0), LPARAM(0));
         }
         Command::ToggleCompare => {
             if state.toggle_compare() {

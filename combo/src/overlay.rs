@@ -6,12 +6,19 @@
 //! over) without moving it. It never takes focus: keys keep going to the viewer. With auto-hide
 //! it shows up only when the mouse comes near the bottom edge and hides after a few idle seconds
 //! (not while the cursor is over it or a slider is dragged). Audio keeps its bar pinned instead.
+//!
+//! A close button of the same kind sits in the top right corner for any content: it shows up
+//! when the mouse comes near the top edge and always hides with the idle cursor.
 
 use std::sync::Once;
 
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{CreateRoundRectRgn, SetWindowRgn, HDC};
+use windows::Win32::Graphics::Gdi::{
+    CreatePen, CreateRoundRectRgn, InvalidateRect, LineTo, MoveToEx, SelectObject, SetWindowRgn,
+    HDC, PS_SOLID,
+};
+use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
     GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, SetCursor,
@@ -30,8 +37,12 @@ const CLASS_NAME: PCWSTR = w!("MediaresOverlay");
 pub const OVERLAY_TIMER_ID: usize = 0x4D55;
 const IDLE_MS: u32 = 2500;
 const OPACITY: u8 = 215;
-/// The panel appears when the cursor is this many panel heights from the bottom edge.
+/// The panel appears when the cursor is this many panel heights from the bottom edge (the close
+/// button: from the top edge).
 const APPROACH_HEIGHTS: i32 = 3;
+/// Close button under the cursor, as Windows paints it (#C42B1C; COLORREF is BGR).
+const CLOSE_HOT: u32 = 0x001C2BC4;
+const CLOSE_HOT_ICON: u32 = 0x00FFFFFF;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PanelKind {
@@ -39,6 +50,8 @@ pub enum PanelKind {
     Video,
     /// A small ⏮ ⏯ ⏭ box at the bottom centre.
     Photo,
+    /// The close button in the top right corner.
+    Close,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +97,37 @@ pub struct Panel {
     pub visible: bool,
 }
 
+impl Panel {
+    fn show(&mut self) {
+        if !self.visible {
+            self.visible = true;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_SHOWNOACTIVATE);
+            }
+        }
+    }
+
+    fn hide(&mut self) {
+        if self.visible {
+            self.visible = false;
+            unsafe {
+                let _ = ShowWindow(self.hwnd, SW_HIDE);
+            }
+        }
+    }
+
+    unsafe fn under_cursor(&self) -> bool {
+        if !self.visible {
+            return false;
+        }
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let mut rc = RECT::default();
+        let _ = GetWindowRect(self.hwnd, &mut rc);
+        gdi::contains(&rc, pt.x, pt.y)
+    }
+}
+
 impl Drop for Panel {
     fn drop(&mut self) {
         unsafe {
@@ -92,10 +136,13 @@ impl Drop for Panel {
     }
 }
 
-/// Fullscreen state of the viewer: the optional panel and the cursor.
+/// Fullscreen state of the viewer: the optional panel, the close button and the cursor.
 pub struct Fullscreen {
     monitor: RECT,
     pub panel: Option<Panel>,
+    close: Option<Panel>,
+    /// The cursor is over the close button (painted red).
+    close_hot: bool,
     autohide: bool,
     cursor_hidden: bool,
     last_cursor: POINT,
@@ -156,6 +203,12 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
                 bottom: monitor.bottom - margin,
             }
         }
+        // Flush with the corner, so a flick of the mouse into it hits the button.
+        PanelKind::Close => RECT {
+            left: monitor.right - h * 3 / 2,
+            bottom: monitor.top + h,
+            ..monitor
+        },
     };
     let hwnd = CreateWindowExW(
         WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
@@ -200,6 +253,8 @@ impl Fullscreen {
         let mut fs = Self {
             monitor,
             panel: None,
+            close: create_panel(viewer, monitor, PanelKind::Close),
+            close_hot: false,
             autohide: true,
             cursor_hidden: false,
             last_cursor: POINT::default(),
@@ -233,12 +288,28 @@ impl Fullscreen {
     }
 
     fn show_panel(&mut self) {
-        if let Some(panel) = self.panel.as_mut().filter(|p| !p.visible) {
-            panel.visible = true;
-            unsafe {
-                let _ = ShowWindow(panel.hwnd, SW_SHOWNOACTIVATE);
-            }
+        if let Some(panel) = self.panel.as_mut() {
+            panel.show();
         }
+    }
+
+    unsafe fn show_close(&mut self) {
+        let Some(close) = self.close.as_mut() else {
+            return;
+        };
+        close.show();
+        // A flick into the corner may stop right on it: no mouse move would light it up then.
+        let hot = close.under_cursor();
+        self.set_close_hot(hot);
+    }
+
+    /// Which of the floating windows `window` is.
+    pub fn kind_of(&self, window: HWND) -> Option<PanelKind> {
+        [&self.panel, &self.close]
+            .into_iter()
+            .flatten()
+            .find(|p| p.hwnd == window)
+            .map(|p| p.kind)
     }
 
     /// Viewer mouse move. Only a real movement counts (Windows also sends WM_MOUSEMOVE when
@@ -255,14 +326,44 @@ impl Fullscreen {
         if pt.y >= self.monitor.bottom - zone {
             self.show_panel();
         }
+        if pt.y < self.monitor.top + zone {
+            self.show_close();
+        }
         SetTimer(Some(viewer), OVERLAY_TIMER_ID, IDLE_MS, None);
     }
 
-    /// Use of the panel itself: keep it (and the cursor) on screen.
-    pub unsafe fn panel_used(&mut self, viewer: HWND) {
+    /// Use of the panel or the close button itself: keep it (and the cursor) on screen.
+    pub unsafe fn panel_used(&mut self, viewer: HWND, kind: PanelKind) {
         self.cursor_hidden = false;
-        self.show_panel();
+        if kind == PanelKind::Close {
+            self.show_close();
+        } else {
+            self.show_panel();
+        }
         SetTimer(Some(viewer), OVERLAY_TIMER_ID, IDLE_MS, None);
+    }
+
+    /// The cursor came onto (or left) the close button: it turns red under the cursor.
+    pub unsafe fn set_close_hot(&mut self, hot: bool) {
+        let Some(close) = self.close.as_ref().filter(|_| hot != self.close_hot) else {
+            return;
+        };
+        self.close_hot = hot;
+        let _ = InvalidateRect(Some(close.hwnd), None, false);
+        if hot {
+            // WM_MOUSELEAVE turns it back.
+            let mut track = TRACKMOUSEEVENT {
+                cbSize: size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: close.hwnd,
+                dwHoverTime: 0,
+            };
+            let _ = TrackMouseEvent(&mut track);
+        }
+    }
+
+    pub fn close_hot(&self) -> bool {
+        self.close_hot
     }
 
     /// `OVERLAY_TIMER_ID`: hides the cursor and (with auto-hide) the panel, unless the user is
@@ -275,10 +376,12 @@ impl Fullscreen {
         self.cursor_hidden = true;
         SetCursor(None);
         if self.autohide {
-            if let Some(panel) = self.panel.as_mut().filter(|p| p.visible) {
-                panel.visible = false;
-                let _ = ShowWindow(panel.hwnd, SW_HIDE);
+            if let Some(panel) = self.panel.as_mut() {
+                panel.hide();
             }
+        }
+        if let Some(close) = self.close.as_mut() {
+            close.hide();
         }
     }
 
@@ -297,19 +400,15 @@ impl Fullscreen {
     }
 
     unsafe fn cursor_over_panel(&self) -> bool {
-        let Some(panel) = self.panel.as_ref().filter(|p| p.visible) else {
-            return false;
-        };
-        let mut pt = POINT::default();
-        let _ = GetCursorPos(&mut pt);
-        let mut rc = RECT::default();
-        let _ = GetWindowRect(panel.hwnd, &mut rc);
-        gdi::contains(&rc, pt.x, pt.y)
+        [&self.panel, &self.close]
+            .into_iter()
+            .flatten()
+            .any(|p| p.under_cursor())
     }
 
     pub unsafe fn invalidate_panel(&self) {
         if let Some(panel) = &self.panel {
-            let _ = windows::Win32::Graphics::Gdi::InvalidateRect(Some(panel.hwnd), None, false);
+            let _ = InvalidateRect(Some(panel.hwnd), None, false);
         }
     }
 
@@ -341,6 +440,27 @@ pub unsafe fn paint_photo_panel(dc: HDC, rc: RECT, dpi_scale: f32, playing: bool
             PhotoButton::Next => transport_bar::skip_icon(dc, r, true, dpi_scale),
         }
     }
+}
+
+/// Paints the close button: a thin cross, on red while `hot` (under the cursor).
+pub unsafe fn paint_close_button(dc: HDC, rc: RECT, dpi_scale: f32, hot: bool) {
+    let (bg, icon) = if hot {
+        (CLOSE_HOT, CLOSE_HOT_ICON)
+    } else {
+        (transport_bar::BG, transport_bar::ICON)
+    };
+    gdi::fill(dc, rc, bg);
+    let arm = (6.0 * dpi_scale).round() as i32;
+    let width = dpi_scale.round().max(1.0) as i32;
+    let (cx, cy) = ((rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2);
+    let pen = gdi::GdiObject(CreatePen(PS_SOLID, width, COLORREF(icon)));
+    let old = SelectObject(dc, pen.0.into());
+    // LineTo leaves out the last pixel: one more makes both strokes symmetric.
+    for (from_x, to_x) in [(cx - arm, cx + arm + 1), (cx + arm, cx - arm - 1)] {
+        let _ = MoveToEx(dc, from_x, cy - arm, None);
+        let _ = LineTo(dc, to_x, cy + arm + 1);
+    }
+    SelectObject(dc, old);
 }
 
 #[cfg(test)]

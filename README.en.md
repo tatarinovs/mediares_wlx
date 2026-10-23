@@ -250,6 +250,8 @@ settings.
 - Video: the control panel sits semi-transparent over the frame (or, if disabled, underneath it).
 - Photos: a ⏮ ⏯ ⏭ bar at the bottom center — previous photo, slideshow, next.
 - Audio: the panel is docked at the bottom, as in the window.
+- A ✕ button in the top right corner shows up when the mouse nears the top edge of the screen and closes the
+  Lister (in the Ctrl+Q Quick View panel it only leaves fullscreen).
 
 With "Hide panel when idle", the panel only shows when the mouse nears the bottom edge of the screen, and
 hides again after 2.5 s. All of this is in settings, under "Fullscreen mode".

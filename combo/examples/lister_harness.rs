@@ -137,6 +137,11 @@ unsafe extern "system" fn host_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_CLOSE {
+        // TC would close the Lister here; the scenario goes on and closes it at the end.
+        println!("host: WM_CLOSE");
+        return LRESULT(0);
+    }
     if msg == WM_SIZE {
         // Like TC: keep the plugin window filling the client area.
         if let Ok(child) = GetWindow(hwnd, GW_CHILD) {
