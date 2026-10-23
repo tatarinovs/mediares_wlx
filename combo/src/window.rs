@@ -16,14 +16,15 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, VK_CONTROL, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, PostMessageW, SetCursor, SetTimer,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect, GetCursorPos,
+    GetWindowLongPtrW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW, SetCursor, SetTimer,
     SetWindowLongPtrW, SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
-    IDC_HAND, IDC_SIZEALL, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND, WM_DESTROY, WM_DRAWITEM,
-    WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM,
-    WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW,
-    WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
+    IDC_HAND, IDC_SIZEALL, MSG, PM_NOREMOVE, PM_REMOVE, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND,
+    WM_CAPTURECHANGED, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK,
+    WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY,
+    WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
 use mediares_core::tc_api::{
@@ -672,13 +673,16 @@ pub unsafe fn overlay_message(
             }
         }
         (WM_LBUTTONUP, _) => {
-            let _ = ReleaseCapture();
             if kind == PanelKind::Video {
-                let media = state.media.as_mut()?;
-                if media.is_dragging() {
+                if let Some(media) = state.media.as_mut().filter(|m| m.is_dragging()) {
                     media.mouse_up(pt.x);
                 }
             }
+            let _ = ReleaseCapture();
+        }
+        (WM_CAPTURECHANGED, PanelKind::Video) if HWND(lparam.0 as *mut _) != window => {
+            let x = cursor_in(window).x;
+            state.media.as_mut()?.capture_lost(x);
         }
         (WM_MOUSEMOVE, _) => {}
         // Wheel over the floating bar: volume.
@@ -694,6 +698,20 @@ pub unsafe fn overlay_message(
         _ => return None,
     }
     Some(LRESULT(0))
+}
+
+/// Drops the auto-repeats of `vk` that queued up while a seek step ran: on a long transport
+/// stream a key frame lookup can take longer than the repeat interval, and the backlog went on
+/// seeking after the key was released. A new press (previous key state up) stays.
+unsafe fn drop_key_repeats(hwnd: HWND, vk: u16) {
+    const PREVIOUSLY_DOWN: isize = 1 << 30;
+    let mut msg = MSG::default();
+    while PeekMessageW(&mut msg, Some(hwnd), WM_KEYDOWN, WM_KEYDOWN, PM_NOREMOVE).as_bool()
+        && msg.wParam.0 as u16 == vk
+        && msg.lParam.0 & PREVIOUSLY_DOWN != 0
+    {
+        let _ = PeekMessageW(&mut msg, Some(hwnd), WM_KEYDOWN, WM_KEYDOWN, PM_REMOVE);
+    }
 }
 
 unsafe fn forward_to_lister(state: &ViewerState, wparam: WPARAM, lparam: LPARAM) {
@@ -1025,7 +1043,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 }
                 _ => media.change_volume(command == Command::VolumeUp),
             }
-            media.invalidate_bar();
+            media.repaint_bar();
         }
     }
 }
@@ -1560,26 +1578,44 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
         }
         WM_LBUTTONUP => {
-            let _ = ReleaseCapture();
+            // Released after the button's work is done: losing the capture ends it otherwise
+            // (see WM_CAPTURECHANGED).
             if let Some(media) = state.media.as_mut() {
                 if media.is_dragging() {
                     media.mouse_up(point_from_lparam(lparam.0).x);
                 }
                 media.picture_up();
-                return LRESULT(0);
+            } else {
+                state.drag = None;
+                if image_view::loupe_end(state) {
+                    refresh(state);
+                }
             }
-            state.drag = None;
-            if image_view::loupe_end(state) {
-                refresh(state);
+            let _ = ReleaseCapture();
+        }
+        // Another window took the mouse (a menu, Alt+Tab, a dialog): the button may come up
+        // elsewhere, so whatever it was doing ends here.
+        WM_CAPTURECHANGED if HWND(lparam.0 as *mut _) != hwnd => {
+            let pt = cursor_in(hwnd);
+            if let Some(media) = state.media.as_mut() {
+                media.capture_lost(pt.x);
+            } else {
+                state.drag = None;
+                if image_view::loupe_end(state) {
+                    refresh(state);
+                }
             }
         }
         WM_LBUTTONDBLCLK => {
             let pt = point_from_lparam(lparam.0);
             if let Some(media) = state.media.as_mut() {
                 match media.mouse_down(pt.x, pt.y) {
-                    // The first click of the pair already toggled playback: undo it.
+                    // The first click of the pair played or paused: undo that (not after holding
+                    // the button for the loupe).
                     Click::Outside => {
-                        media.toggle_play();
+                        if media.take_click_toggled() {
+                            media.toggle_play();
+                        }
                         execute(hwnd, Command::ToggleFullscreen);
                     }
                     Click::Bar if media.is_dragging() => {
@@ -1677,6 +1713,15 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 Command::from_key(vk, ctrl_down(), shift_down(), state.media.is_some(), zoomed)
             {
                 execute(hwnd, cmd);
+                if matches!(
+                    cmd,
+                    Command::SeekBack
+                        | Command::SeekForward
+                        | Command::KeyframeBack
+                        | Command::KeyframeForward
+                ) {
+                    drop_key_repeats(hwnd, vk);
+                }
             } else {
                 forward_to_lister(state, wparam, lparam);
             }
@@ -1702,6 +1747,14 @@ fn wheel_notches(rest: &mut i32, delta: i16) -> i32 {
     let notches = *rest / WHEEL_DELTA;
     *rest -= notches * WHEEL_DELTA;
     notches
+}
+
+/// The cursor in `hwnd`'s client coordinates.
+unsafe fn cursor_in(hwnd: HWND) -> POINT {
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    let _ = ScreenToClient(hwnd, &mut pt);
+    pt
 }
 
 unsafe fn ctrl_down() -> bool {

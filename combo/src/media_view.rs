@@ -9,7 +9,9 @@ use std::time::Instant;
 
 use mediares_core::probe::MediaType;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, HDC, PAINTSTRUCT};
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, EndPaint, InvalidateRect, UpdateWindow, HDC, PAINTSTRUCT,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GetClientRect, GetSystemMetrics, KillTimer, SetTimer, SM_CXDRAG, SM_CYDRAG,
@@ -62,6 +64,8 @@ impl Content {
 struct Press {
     at: (i32, i32),
     loupe_scale: f32,
+    /// Held, but the loupe couldn't show the frame: the release still counts as a click.
+    no_loupe: bool,
 }
 
 pub struct MediaView {
@@ -87,6 +91,8 @@ pub struct MediaView {
     /// A-B loop: its start once set, then its end (playback jumps back to the start there).
     ab_loop: (Option<f64>, Option<f64>),
     press: Option<Press>,
+    /// The last click on the picture played or paused (a double click undoes that).
+    click_toggled: bool,
 }
 
 /// RealMedia, Ogg and the like are often sound only: those play in the audio view (tags, cover,
@@ -138,6 +144,8 @@ impl MediaView {
                 _ => false,
             };
             if reused {
+                view.end_loupe();
+                view.click_toggled = false;
                 view.bar.cancel();
                 // "Frame saved..." was about the previous file.
                 view.status = None;
@@ -178,6 +186,7 @@ impl MediaView {
             seek_preview_enabled: options.seek_preview,
             ab_loop: (None, None),
             press: None,
+            click_toggled: false,
         };
         view.layout();
         Some(view)
@@ -280,6 +289,13 @@ impl MediaView {
                 let _ = InvalidateRect(Some(self.viewer), Some(&self.bar_layout().bar), false);
             }
         }
+    }
+
+    /// Repaints the bar at once: while a key is held its repeats keep the message queue busy, and
+    /// `WM_PAINT` only comes when it is empty.
+    pub unsafe fn repaint_bar(&self) {
+        self.invalidate_bar();
+        let _ = UpdateWindow(self.bar_host.unwrap_or(self.viewer));
     }
 
     /// Paints the part of the client area in `dirty` (a video surface is clipped out by the viewer);
@@ -386,7 +402,9 @@ impl MediaView {
     /// capture the mouse for [`Self::picture_move`] and [`Self::picture_up`].
     pub unsafe fn picture_down(&mut self, x: i32, y: i32, loupe_scale: f32) -> bool {
         self.end_loupe();
+        self.click_toggled = false;
         if !self.is_video() || self.transport().is_playing() {
+            self.click_toggled = true;
             self.toggle_play();
             self.invalidate_bar();
             return false;
@@ -394,6 +412,7 @@ impl MediaView {
         self.press = Some(Press {
             at: (x, y),
             loupe_scale,
+            no_loupe: false,
         });
         SetTimer(Some(self.viewer), LOUPE_TIMER_ID, LOUPE_HOLD_MS, None);
         true
@@ -401,7 +420,7 @@ impl MediaView {
 
     /// The cursor moved to `x`, `y`; true if the press or the loupe took it.
     pub unsafe fn picture_move(&mut self, x: i32, y: i32) -> bool {
-        if let Some(press) = self.press {
+        if let Some(press) = self.press.filter(|p| !p.no_loupe) {
             let moved = (x - press.at.0).abs() > GetSystemMetrics(SM_CXDRAG)
                 || (y - press.at.1).abs() > GetSystemMetrics(SM_CYDRAG);
             if !moved {
@@ -422,8 +441,24 @@ impl MediaView {
     /// The left button went up after [`Self::picture_down`].
     pub unsafe fn picture_up(&mut self) {
         if self.press.is_some() {
+            self.click_toggled = true;
             self.toggle_play();
             self.invalidate_bar();
+        }
+        self.end_loupe();
+    }
+
+    /// Whether the last click on the picture played or paused; asked once, by a double click.
+    pub fn take_click_toggled(&mut self) -> bool {
+        std::mem::take(&mut self.click_toggled)
+    }
+
+    /// The viewer lost the mouse capture (another window took it, Alt+Tab): the button may be
+    /// released elsewhere. A slider dragged ends at `x` (in the bar's window), a press or the
+    /// loupe ends without playing.
+    pub unsafe fn capture_lost(&mut self, x: i32) {
+        if self.is_dragging() {
+            self.mouse_up(x);
         }
         self.end_loupe();
     }
@@ -434,8 +469,16 @@ impl MediaView {
             return;
         };
         let area = self.content_area();
-        if let Content::Video(v) = &mut self.content {
-            v.loupe_begin(area, press.loupe_scale, press.at);
+        let shown = match &mut self.content {
+            Content::Video(v) => v.loupe_begin(area, press.loupe_scale, press.at),
+            Content::Audio(_) => false,
+        };
+        if !shown {
+            // No frame to magnify (a key frame previewed, a capture failed): a click after all.
+            self.press = Some(Press {
+                no_loupe: true,
+                ..press
+            });
         }
     }
 

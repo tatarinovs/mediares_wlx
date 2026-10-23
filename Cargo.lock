@@ -182,7 +182,7 @@ checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "mediares_combo"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "mediares_core",
  "windows",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "mediares_core"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "flate2",
  "image",
@@ -203,7 +203,7 @@ dependencies = [
 
 [[package]]
 name = "mediares_wdx"
-version = "0.4.4"
+version = "0.4.5"
 dependencies = [
  "mediares_core",
 ]

@@ -166,7 +166,7 @@ unsafe fn draw_osd(swap_chain: &IDXGISwapChain1, osd: &Osd<'_>) {
     let _ = surface.ReleaseDC(None);
 }
 
-/// Draws `picture` letterboxed (as the engine does its frames), with the OSD.
+/// Draws `picture` letterboxed in its shown shape (as the engine does its frames), with the OSD.
 unsafe fn present_picture(out: &mut Output, picture: &KeyPicture, osd: Option<Osd<'_>>) {
     let Ok(surface) = out.swap_chain.GetBuffer::<IDXGISurface1>(0) else {
         return;
@@ -181,7 +181,7 @@ unsafe fn present_picture(out: &mut Output, picture: &KeyPicture, osd: Option<Os
         bottom: ch,
     };
     FillRect(dc, &all, HBRUSH(GetStockObject(BLACK_BRUSH).0));
-    let (pw, ph) = (picture.width as f64, picture.height as f64);
+    let (pw, ph) = (picture.shown.0 as f64, picture.shown.1 as f64);
     let scale = (cw as f64 / pw).min(ch as f64 / ph);
     let (dw, dh) = ((pw * scale).round() as i32, (ph * scale).round() as i32);
     let bmi = crate::gdi::bitmap_info(picture.width, -(picture.height as i32));

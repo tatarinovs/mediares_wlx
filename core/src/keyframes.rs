@@ -9,27 +9,30 @@
 //! scrubs by key frames).
 
 use std::cell::{OnceCell, RefCell};
+use std::collections::VecDeque;
 use std::mem::ManuallyDrop;
 use std::path::Path;
+use std::sync::Arc;
 
 use windows::core::{Interface, GUID};
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer, IMFActivate, IMFMediaBuffer, IMFSample, IMFSourceReader, IMFTransform,
-    MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample, MFMediaType_Video,
-    MFSampleExtension_CleanPoint, MFTEnumEx, MFVideoFormat_H264, MFVideoFormat_HEVC,
-    MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT,
+    IMF2DBuffer2, IMFActivate, IMFMediaBuffer, IMFSample, IMFSourceReader, IMFTransform,
+    MF2DBuffer_LockFlags_Read, MFCreateMediaType, MFCreateMemoryBuffer, MFCreateSample,
+    MFMediaType_Video, MFSampleExtension_CleanPoint, MFTEnumEx, MFVideoFormat_H264,
+    MFVideoFormat_HEVC, MFVideoFormat_NV12, MFT_CATEGORY_VIDEO_DECODER, MFT_ENUM_FLAG_LOCALMFT,
     MFT_ENUM_FLAG_SORTANDFILTER, MFT_ENUM_FLAG_SYNCMFT, MFT_MESSAGE_COMMAND_DRAIN,
     MFT_MESSAGE_COMMAND_FLUSH, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
     MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_OUTPUT_DATA_BUFFER,
     MFT_OUTPUT_STREAM_CAN_PROVIDE_SAMPLES, MFT_OUTPUT_STREAM_PROVIDES_SAMPLES,
     MFT_REGISTER_TYPE_INFO, MF_E_TRANSFORM_STREAM_CHANGE, MF_LOW_LATENCY, MF_MT_FRAME_SIZE,
-    MF_MT_SUBTYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
 };
 use windows::Win32::System::Com::CoTaskMemFree;
 
 use crate::mf_init::{mf_scope, ComScope};
 use crate::video_frame::{
-    next_sample, open_reader, set_position, video_codec_name, HNS_PER_SEC, STREAM,
+    next_sample, open_reader, pixel_aspect, set_position, shown_size, video_codec_name,
+    HNS_PER_SEC, STREAM,
 };
 
 /// Upper bound of frames scanned for one lookup: a very long group of pictures at a high frame
@@ -37,15 +40,26 @@ use crate::video_frame::{
 const MAX_SCAN_FRAMES: usize = 3000;
 /// Samples without a time read in a row before the stream counts as ended.
 const MAX_UNTIMED_SAMPLES: usize = 64;
+/// Seeks one lookup may make while the source keeps landing past the place wanted; the step
+/// back starts at [`PROBE_BACK_START`] seconds and doubles (about two hours back in all).
+const PROBES: usize = 16;
+const PROBE_BACK_START: f64 = 0.25;
 /// A key frame's access unit larger than this is not gathered (an 8K intra frame is a few MB).
 const MAX_KEY_FRAME_BYTES: usize = 32 << 20;
+/// Transport streams: how far past the stretch already read a lookup reads on instead of seeking
+/// (the source's landing is usually further off).
+const READ_ON_SEC: f64 = 30.0;
+/// Transport streams: key frame data kept from the stretch read (about a minute and a half of an
+/// HD broadcast).
+const RUN_BYTES: usize = 16 << 20;
 
 /// A key frame found by [`KeyframeIndex`].
+#[derive(Clone)]
 pub struct KeyFrame {
     /// Seconds, on the timeline the media engine plays.
     pub time: f64,
     /// The compressed access unit, kept for transport streams ([`KeyframeIndex::picture`]).
-    data: Option<Vec<u8>>,
+    data: Option<Arc<[u8]>>,
 }
 
 /// A decoded key frame, top-down BGRA.
@@ -53,11 +67,13 @@ pub struct KeyPicture {
     pub width: u32,
     pub height: u32,
     pub bgra: Vec<u8>,
+    /// The size it is shown at (its pixel aspect applied): stretched to that shape.
+    pub shown: (u32, u32),
 }
 
 /// Locates key frames of the first video stream by reading compressed samples: nothing is
-/// decoded, so a lookup costs a few milliseconds (transport streams: tens of milliseconds, as
-/// their source lands far before the requested time).
+/// decoded, so a lookup costs a few milliseconds (transport streams: up to seconds, as their
+/// source lands far before the requested time; nearby lookups reuse what was read).
 pub struct KeyframeIndex {
     reader: IMFSourceReader,
     /// Transport streams: key frames are recognised in this bitstream, the source's clean point
@@ -65,9 +81,58 @@ pub struct KeyframeIndex {
     bitstream: Option<KeyCodec>,
     /// A timed sample read past the end of a key frame's data (see [`Self::read`]).
     pending: RefCell<Option<IMFSample>>,
+    /// Transport streams: what was read since the reader was last positioned.
+    run: RefCell<Option<Run>>,
     /// Opened on the first [`Self::picture`]; `None` inside: no decoder for this stream.
     decoder: OnceCell<Option<RefCell<KeyFrameDecoder>>>,
     _com: ComScope,
+}
+
+/// The stretch of a transport stream read since the reader was last positioned.
+struct Run {
+    /// Every key frame after this time (up to `to`) is in `keys`; NaN: nothing read yet.
+    after: f64,
+    /// The latest frame time read.
+    to: f64,
+    keys: VecDeque<KeyFrame>,
+    /// Their data, up to [`RUN_BYTES`]: the earliest are let go beyond.
+    bytes: usize,
+}
+
+impl Run {
+    fn new() -> Self {
+        Self {
+            after: f64::NAN,
+            to: f64::NAN,
+            keys: VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    fn note(&mut self, frame: &Frame) {
+        if self.after.is_nan() {
+            // Key frames follow in time the frames decoded before them.
+            self.after = frame.time - 1e-6;
+            self.to = frame.time;
+        }
+        self.to = self.to.max(frame.time);
+        if !frame.key {
+            return;
+        }
+        let size = |key: &KeyFrame| key.data.as_ref().map_or(0, |d| d.len());
+        let key = KeyFrame {
+            time: frame.time,
+            data: frame.data.clone(),
+        };
+        self.bytes += size(&key);
+        self.keys.push_back(key);
+        while self.bytes > RUN_BYTES && self.keys.len() > 1 {
+            if let Some(old) = self.keys.pop_front() {
+                self.bytes -= size(&old);
+                self.after = old.time;
+            }
+        }
+    }
 }
 
 /// One frame of the compressed stream.
@@ -75,7 +140,7 @@ struct Frame {
     time: f64,
     key: bool,
     /// Key frames of transport streams: the whole access unit.
-    data: Option<Vec<u8>>,
+    data: Option<Arc<[u8]>>,
 }
 
 impl Frame {
@@ -106,6 +171,7 @@ impl KeyframeIndex {
             reader,
             bitstream,
             pending: RefCell::new(None),
+            run: RefCell::new(None),
             decoder: OnceCell::new(),
             _com: com,
         })
@@ -113,23 +179,45 @@ impl KeyframeIndex {
 
     /// First key frame strictly after `seconds`.
     pub fn next_after(&self, seconds: f64) -> Option<KeyFrame> {
+        if let Some(key) = self.in_run(seconds, true) {
+            return Some(key);
+        }
+        // A transport stream's source may land past `seconds`, over key frames before its
+        // landing: then it is asked for an earlier place until it lands at or before `seconds`.
+        let mut probe = seconds;
+        let mut back = PROBE_BACK_START;
+        for _ in 0..PROBES {
+            let mut frames = unsafe { self.frames_from(probe) }?.peekable();
+            let landed = frames.peek().map(|f| f.time);
+            match landed {
+                Some(landed) if landed > seconds && probe > 0.0 => {
+                    probe = (probe.min(landed) - back).max(0.0);
+                    back *= 2.0;
+                }
+                _ => {
+                    return frames
+                        .find(|f| f.key && f.time > seconds)
+                        .map(Frame::into_key)
+                }
+            }
+        }
         unsafe { self.frames_from(seconds) }?
             .find(|f| f.key && f.time > seconds)
             .map(Frame::into_key)
     }
 
-    /// Last key frame strictly before `seconds` (the first frame if there is none).
+    /// Last key frame strictly before `seconds` (the first key frame if there is none).
     pub fn previous_before(&self, seconds: f64) -> Option<KeyFrame> {
+        if let Some(key) = self.in_run(seconds, false) {
+            return Some(key);
+        }
         let mut probe = seconds;
         // Probing just before where the source landed normally yields the preceding key frame;
-        // the step only grows if the source keeps landing at or after `seconds`.
+        // the step only grows if the source keeps landing at or after it. It doubles: a
+        // transport stream's source may land seconds late, and a step growing faster went on
+        // past the start of the file, past the key frame wanted.
         let mut back = 0.001;
-        for _ in 0..16 {
-            if probe <= 0.0 {
-                return unsafe { self.frames_from(0.0) }?
-                    .find(|f| f.key)
-                    .map(Frame::into_key);
-            }
+        for _ in 0..PROBES {
             let (mut landed, mut last_key) = (None, None);
             for frame in unsafe { self.frames_from(probe) }? {
                 landed.get_or_insert(frame.time);
@@ -143,9 +231,15 @@ impl KeyframeIndex {
             if let Some(key) = last_key {
                 return Some(key.into_key());
             }
+            if probe <= 0.0 {
+                // Read from the start of the file: no key frame before `seconds`.
+                return unsafe { self.frames_from(0.0) }?
+                    .find(|f| f.key)
+                    .map(Frame::into_key);
+            }
             // Nothing read (past the end): just probe earlier.
-            probe = landed.map_or(probe, |l: f64| probe.min(l)) - back;
-            back = (back * 4.0).max(0.25);
+            probe = (landed.map_or(probe, |l: f64| probe.min(l)) - back).max(0.0);
+            back = (back * 2.0).max(PROBE_BACK_START);
         }
         None
     }
@@ -160,18 +254,52 @@ impl KeyframeIndex {
         unsafe { decoder.borrow_mut().decode(data, key.time) }
     }
 
+    /// A transport stream's key frame after (`after`) or before `seconds` from the stretch read
+    /// since the last seek, reading on as far as needed; `None`: a seek is needed. Arrow keys held
+    /// step through the same stretch, which a seek would read again: the source lands seconds to
+    /// minutes early (on a 2.5 h broadcast up to 100 s, about 4 s of reading).
+    fn in_run(&self, seconds: f64, after: bool) -> Option<KeyFrame> {
+        for _ in 0..MAX_SCAN_FRAMES {
+            {
+                let run = self.run.borrow();
+                let run = run.as_ref()?;
+                if run.after.is_nan() || seconds <= run.after || seconds - run.to > READ_ON_SEC {
+                    return None;
+                }
+                if after {
+                    if let Some(key) = run.keys.iter().find(|k| k.time > seconds) {
+                        return Some(key.clone());
+                    }
+                } else if run.to >= seconds {
+                    return run.keys.iter().rev().find(|k| k.time < seconds).cloned();
+                }
+            }
+            unsafe { self.read() }?;
+        }
+        None
+    }
+
     /// Frames from `seconds` on: the source positions on or before the requested time (on the
     /// preceding key frame, or wherever a transport stream's estimate lands).
     unsafe fn frames_from(&self, seconds: f64) -> Option<impl Iterator<Item = Frame> + '_> {
         self.pending.borrow_mut().take();
+        *self.run.borrow_mut() = self.bitstream.map(|_| Run::new());
         set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
         Some((0..MAX_SCAN_FRAMES).map_while(|_| self.read()))
     }
 
-    /// Next frame; `None` at the end of the stream. A transport stream splits frames into
-    /// several samples, only the first with a time: the rest are skipped, or for a key frame
-    /// gathered into its data.
+    /// Next frame (noted in the run); `None` at the end of the stream.
     unsafe fn read(&self) -> Option<Frame> {
+        let frame = self.read_frame()?;
+        if let Some(run) = self.run.borrow_mut().as_mut() {
+            run.note(&frame);
+        }
+        Some(frame)
+    }
+
+    /// Next frame. A transport stream splits frames into several samples, only the first with a
+    /// time: the rest are skipped, or for a key frame gathered into its data.
+    unsafe fn read_frame(&self) -> Option<Frame> {
         let first = self.pending.borrow_mut().take();
         let (sample, time) = match first {
             Some(sample) => {
@@ -213,7 +341,7 @@ impl KeyframeIndex {
         Some(Frame {
             time,
             key: true,
-            data: complete.then_some(data),
+            data: complete.then(|| data.into()),
         })
     }
 
@@ -287,6 +415,8 @@ struct KeyFrameDecoder {
     /// Decoded frame as allocated (may be padded, e.g. 1088 lines for 1080); a contiguous
     /// buffer's stride is its width.
     frame: (u32, u32),
+    /// Pixel aspect ratio (16:9 SD broadcasts store 720x576 with wide pixels).
+    pixel_aspect: (u32, u32),
 }
 
 impl KeyFrameDecoder {
@@ -319,6 +449,7 @@ impl KeyFrameDecoder {
                 mft,
                 size,
                 frame: size,
+                pixel_aspect: pixel_aspect(&native),
             };
             if decoder.set_output_type() {
                 let _ = decoder
@@ -340,6 +471,10 @@ impl KeyFrameDecoder {
             return false;
         }
         let frame = unpack_size(nv12.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0));
+        // The decoder reads it from the bitstream, where the source may not have.
+        if nv12.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO).is_ok() {
+            self.pixel_aspect = pixel_aspect(&nv12);
+        }
         if frame.0 >= 2 && frame.1 >= 2 {
             self.frame = frame;
             self.size = if self.size.0 == 0 || self.size.1 == 0 {
@@ -405,8 +540,16 @@ impl KeyFrameDecoder {
         sample.ok_or_else(|| windows::Win32::Foundation::E_UNEXPECTED.into())
     }
 
-    /// The NV12 `sample` as BGRA at the shown size.
+    /// The NV12 `sample` as BGRA at the decoded size, with the size it is shown at.
     unsafe fn to_bgra(&self, sample: &IMFSample) -> Option<KeyPicture> {
+        let picture = self.convert(sample)?;
+        Some(KeyPicture {
+            shown: shown_size((picture.width, picture.height), self.pixel_aspect),
+            ..picture
+        })
+    }
+
+    unsafe fn convert(&self, sample: &IMFSample) -> Option<KeyPicture> {
         let buffer = sample.GetBufferByIndex(0).ok()?;
         let (width, height) = self.size;
         let rows = self.frame.1 as usize;
@@ -416,13 +559,25 @@ impl KeyFrameDecoder {
                 && data.len() >= chroma + pitch * (height as usize).div_ceil(2))
             .then(|| nv12_to_bgra(data, pitch, chroma, width, height))
         };
-        if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer>() {
+        // The 2D lock that also tells the buffer's length: every row read is checked against it.
+        if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
             let (mut scan0, mut pitch) = (std::ptr::null_mut(), 0i32);
-            if buffer2d.Lock2D(&mut scan0, &mut pitch).is_ok() {
-                let picture = (pitch > 0 && !scan0.is_null())
+            let (mut start, mut len) = (std::ptr::null_mut(), 0u32);
+            if buffer2d
+                .Lock2DSize(
+                    MF2DBuffer_LockFlags_Read,
+                    &mut scan0,
+                    &mut pitch,
+                    &mut start,
+                    &mut len,
+                )
+                .is_ok()
+            {
+                let picture = (pitch > 0 && !start.is_null() && scan0 >= start)
                     .then(|| {
-                        let len = pitch as usize * rows.div_ceil(2) * 3;
-                        convert(std::slice::from_raw_parts(scan0, len), pitch as usize)
+                        let data = std::slice::from_raw_parts(start, len as usize);
+                        let top = data.get(scan0.offset_from(start) as usize..)?;
+                        convert(top, pitch as usize)
                     })
                     .flatten();
                 let _ = buffer2d.Unlock2D();
@@ -518,6 +673,7 @@ fn nv12_to_bgra(data: &[u8], pitch: usize, chroma: usize, width: u32, height: u3
         width,
         height,
         bgra,
+        shown: (width, height),
     }
 }
 

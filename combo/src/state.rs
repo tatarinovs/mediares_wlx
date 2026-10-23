@@ -580,8 +580,10 @@ impl ViewerState {
                 MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
             };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
-            if let Some(media) = self.media.as_mut() {
-                media.set_skip(can_skip);
+            match self.media.as_mut() {
+                Some(media) => media.set_skip(can_skip),
+                // Said in the window: moved onto from another file, the viewer stays open.
+                None => self.load_failed = true,
             }
         } else {
             self.media = None;

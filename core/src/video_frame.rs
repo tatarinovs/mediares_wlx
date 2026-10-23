@@ -10,10 +10,11 @@ use windows::Win32::Media::MediaFoundation::{
     MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
     MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_AUDIO_NUM_CHANNELS,
     MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_ROTATION, MF_PD_DURATION,
-    MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
-    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
-    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
+    MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
+    MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
+    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
+    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
+    MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
@@ -337,12 +338,53 @@ pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> 
 
 /// A video kept open to take frames from one after another (previews along the timeline): each
 /// is the key frame at or before the time asked for, so it costs one seek and one decoded frame.
+/// Frames come as the player shows them: pixel aspect applied and turned upright.
 /// COM objects inside: used on the thread that opened it.
 pub struct FrameGrabber {
     reader: IMFSourceReader,
     geo: FrameGeometry,
+    /// Pixel aspect ratio (width : height of a pixel); 1:1 when the stream doesn't say.
+    pixel_aspect: (u32, u32),
+    /// Clockwise quarter turn the player applies: 0, 90, 180 or 270.
+    rotation: u32,
     duration_hns: u64,
     _com: crate::mf_init::ComScope,
+}
+
+/// The size a `size` frame of pixels `pixel_aspect` (width : height) is shown at: one side is
+/// shrunk, never enlarged (a 720x576 frame of 16:9 DVD video becomes 720x405).
+pub(crate) fn shown_size((w, h): (u32, u32), (num, den): (u32, u32)) -> (u32, u32) {
+    let scaled = |len: u32, num: u32, den: u32| {
+        ((u64::from(len) * u64::from(num) + u64::from(den) / 2) / u64::from(den)).max(1) as u32
+    };
+    if num == 0 || den == 0 || num == den {
+        (w, h)
+    } else if num > den {
+        (w, scaled(h, den, num))
+    } else {
+        (scaled(w, num, den), h)
+    }
+}
+
+/// `size` after a turn of `rotation` degrees (sides swap for a quarter turn).
+fn turned_size((w, h): (u32, u32), rotation: u32) -> (u32, u32) {
+    if rotation % 180 == 90 {
+        (h, w)
+    } else {
+        (w, h)
+    }
+}
+
+/// `MF_MT_PIXEL_ASPECT_RATIO` of a media type (numerator << 32 | denominator); 1:1 if absent.
+pub(crate) unsafe fn pixel_aspect(
+    media_type: &windows::Win32::Media::MediaFoundation::IMFMediaType,
+) -> (u32, u32) {
+    match media_type.GetUINT64(&MF_MT_PIXEL_ASPECT_RATIO) {
+        Ok(packed) if packed >> 32 != 0 && packed as u32 != 0 => {
+            ((packed >> 32) as u32, packed as u32)
+        }
+        _ => (1, 1),
+    }
 }
 
 impl FrameGrabber {
@@ -356,10 +398,20 @@ impl FrameGrabber {
             if pixels == 0 || pixels > crate::image_decode::MAX_PIXELS {
                 return None;
             }
+            // The output type carries both over from the stream (the source's own type may
+            // lack the turn, as a transport stream's does).
+            let current = reader.GetCurrentMediaType(STREAM).ok()?;
+            let rotation = current
+                .GetUINT32(&MF_MT_VIDEO_ROTATION)
+                .ok()
+                .filter(|r| matches!(r, 90 | 180 | 270))
+                .unwrap_or(0);
             let duration_hns = duration_hns(&reader);
             Some(Self {
                 reader,
                 geo,
+                pixel_aspect: pixel_aspect(&current),
+                rotation,
                 duration_hns,
                 _com: com,
             })
@@ -399,14 +451,27 @@ impl FrameGrabber {
             })?;
             (frame, time)
         };
-        let Some(fit) = fit else {
-            return Some((frame, time));
+        // Scaled while the pixels still lie as stored, then turned.
+        let upright = turned_size(
+            shown_size((width, height), self.pixel_aspect),
+            self.rotation,
+        );
+        let target = fit.map_or(upright, |fit| {
+            crate::image_decode::fitted_size(upright, fit)
+        });
+        let (w, h) = turned_size(target, self.rotation);
+        let frame = if (w, h) == (width, height) {
+            frame
+        } else {
+            image::imageops::thumbnail(&frame, w, h)
         };
-        let (w, h) = crate::image_decode::fitted_size((width, height), fit);
-        if (w, h) == (width, height) {
-            return Some((frame, time));
-        }
-        Some((image::imageops::thumbnail(&frame, w, h), time))
+        let frame = match self.rotation {
+            90 => image::imageops::rotate90(&frame),
+            180 => image::imageops::rotate180(&frame),
+            270 => image::imageops::rotate270(&frame),
+            _ => frame,
+        };
+        Some((frame, time))
     }
 }
 
@@ -721,6 +786,19 @@ mod tests {
             audio_codec_name(&GUID::from_u128(0x00001234_0000_0010_8000_00aa00389b71)).as_deref(),
             Some("0x1234")
         );
+    }
+
+    #[test]
+    fn frames_are_shown_with_their_pixel_aspect_and_turn() {
+        // 16:9 PAL DVD (64:45), 4:3 PAL (16:15), anamorphic HDV (4:3), tall pixels.
+        assert_eq!(shown_size((720, 576), (64, 45)), (720, 405));
+        assert_eq!(shown_size((720, 576), (16, 15)), (720, 540));
+        assert_eq!(shown_size((1440, 1080), (4, 3)), (1440, 810));
+        assert_eq!(shown_size((720, 480), (8, 9)), (640, 480));
+        assert_eq!(shown_size((1920, 1080), (1, 1)), (1920, 1080));
+        assert_eq!(shown_size((1920, 1080), (0, 1)), (1920, 1080));
+        assert_eq!(turned_size((1280, 720), 270), (720, 1280));
+        assert_eq!(turned_size((1280, 720), 180), (1280, 720));
     }
 
     fn geo(stride: i32) -> FrameGeometry {

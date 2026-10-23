@@ -6,6 +6,9 @@
 //! steps: wait:<ms>  shot:<name>  key:<vk hex>  click:<x>,<y>  dblclick:<x>,<y>
 //!        resize:<w>,<h>  wheel:<delta>[,<x>,<y>]  next:<file>  rects
 //!        ldown:<x>,<y>  drag:<x>,<y>  lup:<x>,<y>   left button down / moved with it / up
+//!        steal           the host takes the mouse capture (as a menu or another program would)
+//!        hold:<vk hex>,<n>  a key held for <n> auto-repeats, all queued at once (a slow handler
+//!                        falling behind), then released; prints how long the queue took
 //!        input:[ctrl+|shift+]<vk hex>   real keyboard input (modifiers are seen by GetKeyState)
 //!        oclick:top|bottom,<x>,<y>   click in the fullscreen panel
 //!        move:<x>,<y>    move the real cursor (screen coordinates)
@@ -364,6 +367,37 @@ fn main() {
                     let _ = PostMessageW(Some(viewer), WM_KEYDOWN, WPARAM(vk), LPARAM(0));
                     pump(50);
                 }
+                "hold" => {
+                    let (vk, n) = arg.split_once(',').expect("vk,n");
+                    let vk = usize::from_str_radix(vk, 16).expect("hex vk");
+                    let n: usize = n.parse().expect("repeats");
+                    let started = Instant::now();
+                    let _ = PostMessageW(Some(viewer), WM_KEYDOWN, WPARAM(vk), LPARAM(1));
+                    for _ in 0..n {
+                        // Bit 30: the key was already down.
+                        let _ =
+                            PostMessageW(Some(viewer), WM_KEYDOWN, WPARAM(vk), LPARAM(1 << 30 | 1));
+                    }
+                    let _ = PostMessageW(Some(viewer), WM_KEYUP, WPARAM(vk), LPARAM(3 << 30 | 1));
+                    let done = WM_APP + 0x3F;
+                    let _ = PostMessageW(Some(host), done, WPARAM(0), LPARAM(0));
+                    let mut msg = MSG::default();
+                    'queue: loop {
+                        while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                            if msg.message == done {
+                                break 'queue;
+                            }
+                            let _ = TranslateMessage(&msg);
+                            DispatchMessageW(&msg);
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    println!(
+                        "hold {n} repeats: queue done in {} ms",
+                        started.elapsed().as_millis()
+                    );
+                    pump(50);
+                }
                 "click" | "dblclick" => {
                     let (x, y) = xy(arg);
                     let lp = LPARAM(((y as isize) << 16) | (x as isize & 0xFFFF));
@@ -373,6 +407,12 @@ fn main() {
                         let _ = PostMessageW(Some(viewer), WM_LBUTTONDBLCLK, WPARAM(1), lp);
                         let _ = PostMessageW(Some(viewer), WM_LBUTTONUP, WPARAM(0), lp);
                     }
+                    pump(50);
+                }
+                "steal" => {
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::SetCapture(host);
+                    pump(50);
+                    let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
                     pump(50);
                 }
                 "ldown" | "drag" | "lup" => {

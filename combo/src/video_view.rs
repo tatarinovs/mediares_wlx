@@ -300,6 +300,8 @@ pub struct VideoView {
     /// The time of the key frame on screen while the engine is still elsewhere
     /// ([`SeekProfile::Previewed`]).
     preview: Cell<Option<f64>>,
+    /// The seek that settled a preview, until its landing is checked.
+    settle_check: Cell<Option<SettleCheck>>,
     /// The paused frame magnified while the left button is held; the surface is hidden then
     /// and the viewer draws it.
     loupe: Option<FrameLoupe>,
@@ -368,6 +370,28 @@ const KEY_SEEK_QUIET: Duration = Duration::from_millis(250);
 /// A finished seek whose frame hasn't shown up by then doesn't hold the next one back any longer
 /// (VLC's limit, too).
 const SEEK_SETTLE: Duration = Duration::from_millis(125);
+
+/// The seek settling a previewed key frame, until the frame it brought is on screen (see
+/// [`VideoView::check_landing`]).
+#[derive(Clone, Copy)]
+struct SettleCheck {
+    /// The key frame previewed.
+    key: f64,
+    /// Where the engine was sent.
+    sent: f64,
+    /// The frame on screen when it was sent.
+    pts_before: Option<i64>,
+    /// When the seek was seen done without a new frame on screen.
+    done: Option<Instant>,
+    /// Already sent again earlier: not corrected twice.
+    corrected: bool,
+}
+
+/// A settled preview landing this much after its key frame is sent again (the next frame a
+/// decoder can start from is at least about half a second further).
+const LATE_LANDING_SEC: f64 = 0.25;
+/// A settled seek showing no other frame this long after it is done landed on the one shown.
+const LANDING_WAIT: Duration = Duration::from_secs(1);
 
 /// Forward frame step: the video plays slowly and muted until the next frame is on screen.
 struct Step {
@@ -451,6 +475,7 @@ impl VideoView {
             back_target: None,
             key_seek: None,
             preview: Cell::new(None),
+            settle_check: Cell::new(None),
             loupe: None,
         })
     }
@@ -474,6 +499,7 @@ impl VideoView {
         self.player.set_frame_rate(info.frame_rate);
         self.seek_profile = SeekProfile::of(&self.player, path);
         self.preview.set(None);
+        self.settle_check.set(None);
         self.back_target = None;
         self.key_seek = None;
         self.resume = resume;
@@ -643,6 +669,8 @@ impl VideoView {
     pub unsafe fn render(&mut self) {
         self.push_osd();
         self.advance_step();
+        // Before a held seek ends and playback resumes from where it landed.
+        self.check_landing();
         self.advance_key_seek();
     }
 
@@ -897,6 +925,7 @@ impl VideoView {
     /// Every engine seek goes through here: it supersedes a preview, and is exact where
     /// approximate ones land far off.
     fn engine_seek(&self, seconds: f64, approximate: bool) {
+        self.settle_check.set(None);
         if self.preview.take().is_some() {
             if let Some(player) = self.player.mf() {
                 player.end_preview();
@@ -923,7 +952,48 @@ impl VideoView {
     /// a timeline drag was cut short, or something else takes over.
     pub fn settle_preview(&self) {
         if let Some(time) = self.preview.get() {
-            self.engine_seek(time, false);
+            self.settle_to(time, time, false);
+        }
+    }
+
+    /// Seeks the engine to `target` for the key frame at `key`, checking where it lands.
+    fn settle_to(&self, key: f64, target: f64, corrected: bool) {
+        let pts_before = self.player.presented_pts();
+        self.engine_seek(target.max(0.0), false);
+        self.settle_check.set(Some(SettleCheck {
+            key,
+            sent: target,
+            pts_before,
+            done: None,
+            corrected,
+        }));
+    }
+
+    /// Render tick after settling a preview. A transport stream's source may land after the
+    /// place asked for (by up to a second on camcorder files), and the frames it passed over
+    /// are lost: an exact seek to the key frame previewed then shows the next one the decoder
+    /// can start from. Once a frame is on screen, a seek that came out late is sent once more,
+    /// that much earlier.
+    fn check_landing(&self) {
+        let Some(mut check) = self.settle_check.get() else {
+            return;
+        };
+        if unsafe { self.player.is_seeking() } {
+            return;
+        }
+        let pts = self.player.presented_pts();
+        if pts == check.pts_before {
+            // It may have landed on the frame already shown.
+            let done = *check.done.get_or_insert_with(Instant::now);
+            self.settle_check
+                .set((done.elapsed() < LANDING_WAIT).then_some(check));
+            return;
+        }
+        self.settle_check.set(None);
+        let Some(pts) = pts else { return };
+        let late = pts as f64 / 1e7 - check.key;
+        if !check.corrected && late > LATE_LANDING_SEC {
+            self.settle_to(check.key, check.sent - late, true);
         }
     }
 
