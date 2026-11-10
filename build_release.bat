@@ -14,6 +14,38 @@ if errorlevel 1 (
     exit /b 1
 )
 
+set "TARGET=x86_64-pc-windows-gnu"
+where rustup >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] rustup not found. Install Rust using rustup.
+    exit /b 1
+)
+
+:: The GNU-host Rust toolchain includes a matching MinGW linker and CRT libraries.
+:: A target added to the MSVC toolchain does not include all of these libraries.
+set "TOOLCHAIN=stable-x86_64-pc-windows-gnu"
+rustup run %TOOLCHAIN% rustc --version >nul 2>nul
+if errorlevel 1 (
+    rustup toolchain install %TOOLCHAIN% --profile minimal
+    if errorlevel 1 exit /b 1
+)
+for /f "delims=" %%S in ('rustup run %TOOLCHAIN% rustc --print sysroot') do set "GNU_SYSROOT=%%S"
+set "GNU_BIN=%GNU_SYSROOT%\lib\rustlib\%TARGET%\bin\self-contained"
+if not exist "%GNU_BIN%\x86_64-w64-mingw32-gcc.exe" (
+    echo [ERROR] Bundled MinGW linker not found in %GNU_BIN%
+    exit /b 1
+)
+where dlltool.exe >nul 2>nul
+if errorlevel 1 (
+    echo [ERROR] Add the w64devkit bin directory to PATH before running this script.
+    exit /b 1
+)
+set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%GNU_BIN%\x86_64-w64-mingw32-gcc.exe"
+
+:: Keep inherited MSVC/static-CRT flags out of this release build.
+set "RUSTFLAGS="
+set "CARGO_ENCODED_RUSTFLAGS="
+
 :: Extract version from combo/Cargo.toml
 set "VERSION=unknown"
 for /f "tokens=3 delims= " %%A in ('findstr /b "version" combo\Cargo.toml') do (
@@ -30,7 +62,7 @@ if /i "%~1"=="notest"     set "RUN_TESTS=0"
 if "!RUN_TESTS!"=="1" (
     echo:
     echo [1/4] Running workspace tests...
-    cargo test --workspace
+    cargo +%TOOLCHAIN% test --locked --workspace --target %TARGET%
     if errorlevel 1 (
         echo [ERROR] Tests failed! Aborting release packaging.
         exit /b 1
@@ -44,17 +76,17 @@ if "!RUN_TESTS!"=="1" (
 :: Build release binaries. The crates are "cdylib" + "rlib" (the rlib serves tests and examples),
 :: and with both types LTO keeps more code: built as a cdylib alone each DLL is ~230 KB smaller.
 echo:
-echo [2/4] Building release binaries as cdylib-only...
+echo [2/4] Building MinGW release binaries as cdylib-only...
 for %%P in (mediares_combo mediares_wdx) do (
-    cargo rustc --release -p %%P --lib --crate-type cdylib
+    cargo +%TOOLCHAIN% rustc --locked --release --target %TARGET% -p %%P --lib --crate-type cdylib
     if errorlevel 1 (
         echo [ERROR] Cargo build of %%P failed!
         exit /b 1
     )
 )
 
-set "COMBO_DLL=target\release\mediares_combo.dll"
-set "WDX_DLL=target\release\mediares_wdx.dll"
+set "COMBO_DLL=target\%TARGET%\release\mediares_combo.dll"
+set "WDX_DLL=target\%TARGET%\release\mediares_wdx.dll"
 
 if not exist "%COMBO_DLL%" (
     echo [ERROR] Expected build artifact not found: %COMBO_DLL%
