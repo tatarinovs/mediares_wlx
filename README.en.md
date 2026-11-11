@@ -1,4 +1,4 @@
-﻿# Mediares for Total Commander
+# Mediares for Total Commander
 
 [Русский](README.md) | **English**
 
@@ -94,7 +94,7 @@ Download it from [shinchiro releases](https://github.com/shinchiro/mpv-winbuild-
 | On-screen information (OSD) | O or I |
 | Settings | S |
 | Copy image, frame or cover art | Ctrl+C |
-| Print | Ctrl+P |
+| Print preview and printing | Ctrl+P |
 | Open in editor / show in folder | F4 / Ctrl+Enter |
 | Move to Recycle Bin | Del |
 

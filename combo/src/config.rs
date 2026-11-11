@@ -396,7 +396,9 @@ impl ViewerConfig {
             .filter(|v| v.is_finite());
 
         Self {
-            language: LangSetting::from_ini(&string("Language", "")),
+            // No Language key (or one no longer in the catalog): use TC's language if it has a
+            // translation here, English otherwise.
+            language: LangSetting::from_ini(&string("Language", "")).or_detected(),
             start_fullscreen: int("StartFullscreen", d.start_fullscreen as i32) != 0,
             // Older configs only had ShowOSD (photos).
             osd: OsdMode::from_index(int("OSDMode", -1)).unwrap_or(if int("ShowOSD", 1) != 0 {

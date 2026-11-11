@@ -108,7 +108,28 @@ pub unsafe fn control(
     id: usize,
     font: HFONT,
 ) -> HWND {
-    let [x, y, w, h] = [x, y, w, h].map(|v| px(parent, v));
+    control_px(
+        parent,
+        class,
+        text,
+        style,
+        (px(parent, x), px(parent, y), px(parent, w), px(parent, h)),
+        id,
+        font,
+    )
+}
+
+/// Like [`control`], for a rectangle already in pixels of `parent`'s monitor.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn control_px(
+    parent: HWND,
+    class: PCWSTR,
+    text: &str,
+    style: u32,
+    (x, y, w, h): (i32, i32, i32, i32),
+    id: usize,
+    font: HFONT,
+) -> HWND {
     let hwnd = CreateWindowExW(
         WINDOW_EX_STYLE(0),
         class,

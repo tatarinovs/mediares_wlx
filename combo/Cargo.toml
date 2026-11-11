@@ -1,6 +1,6 @@
 [package]
 name = "mediares_combo"
-version = "0.4.5"
+version = "0.4.6"
 edition = "2021"
 license = "MIT"
 
@@ -21,6 +21,7 @@ windows = { version = "0.62.2", features = [
     "Win32_Graphics_Dxgi",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Printing",
     "Win32_Globalization",
     "Win32_Media_Audio",
     "Win32_Media_MediaFoundation",

@@ -13,6 +13,8 @@
 //!        oclick:top|bottom,<x>,<y>   click in the fullscreen panel
 //!        move:<x>,<y>    move the real cursor (screen coordinates)
 //!        copy:<name>     ListSendCommand(lc_copy), clipboard DIB saved as <name>.png
+//!        print           open print preview through ListPrintW (pair with dialog to cancel)
+//!        print-check     check preview orientation/margins/copies, capture it, then cancel
 //!        thumb:<w>,<h>,<name>[,<file>]  ListGetPreviewBitmapW saved as <name>.png
 //!        dialog:<name>[,<pages>]  put before the step that opens a modal dialog: waits for it,
 //!                        saves <name>_0.png, then Ctrl+Tab and <name>_<i>.png for each further
@@ -28,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use mediares_combo::{
-    ListCloseWindow, ListGetPreviewBitmapW, ListLoadNextW, ListLoadW, ListSendCommand,
+    ListCloseWindow, ListGetPreviewBitmapW, ListLoadNextW, ListLoadW, ListPrintW, ListSendCommand,
 };
 use mediares_core::image::{ImageBuffer, Rgba};
 use windows::core::w;
@@ -36,15 +38,15 @@ use windows::Win32::Foundation::HGLOBAL;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC, GetDIBits,
-    ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS,
-    SRCCOPY,
+    InvalidateRect, ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT,
+    DIB_RGB_COLORS, SRCCOPY,
 };
 use windows::Win32::Graphics::Gdi::{DeleteObject as DeleteGdi, GetObjectW, BITMAP, HBITMAP};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, VIRTUAL_KEY,
+    IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
@@ -250,7 +252,7 @@ unsafe fn find_dialog(thread: u32) -> Option<HWND> {
 }
 
 /// Runs on its own thread while the main one sits in the dialog's modal loop.
-fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf) {
+fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print_check: bool) {
     unsafe {
         let until = Instant::now() + Duration::from_secs(10);
         let dlg = loop {
@@ -264,6 +266,38 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf) {
             std::thread::sleep(Duration::from_millis(50));
         };
         std::thread::sleep(Duration::from_millis(400));
+        if print_check {
+            let orientation = GetDlgItem(Some(dlg), 101).unwrap();
+            SendMessageW(orientation, CB_SETCURSEL, Some(WPARAM(1)), None);
+            SendMessageW(
+                dlg,
+                WM_COMMAND,
+                Some(WPARAM(101 | ((CBN_SELCHANGE as usize) << 16))),
+                Some(LPARAM(orientation.0 as isize)),
+            );
+            let landscape = SendMessageW(orientation, CB_GETCURSEL, None, None).0 == 1;
+            let print = GetDlgItem(Some(dlg), IDOK.0).unwrap();
+            let set = |id, text: &str| {
+                let text = windows::core::HSTRING::from(text);
+                SendMessageW(
+                    GetDlgItem(Some(dlg), id).unwrap(),
+                    WM_SETTEXT,
+                    None,
+                    Some(LPARAM(text.as_ptr() as isize)),
+                );
+            };
+            set(110, "999");
+            let invalid_margin_blocked = !IsWindowEnabled(print).as_bool();
+            set(110, "12,5");
+            let decimal_margin_accepted = IsWindowEnabled(print).as_bool();
+            set(102, "0");
+            let invalid_copies_blocked = !IsWindowEnabled(print).as_bool();
+            set(102, "2");
+            let valid_copies_accepted = IsWindowEnabled(print).as_bool();
+            println!("print preview: landscape={landscape}, invalid margin blocked={invalid_margin_blocked}, decimal margin accepted={decimal_margin_accepted}, invalid copies blocked={invalid_copies_blocked}, valid copies accepted={valid_copies_accepted}");
+            let _ = InvalidateRect(Some(dlg), None, true);
+            std::thread::sleep(Duration::from_millis(300));
+        }
         for page in 0..pages.max(1) {
             if page > 0 {
                 let _ = SetForegroundWindow(dlg);
@@ -526,6 +560,23 @@ fn main() {
                     pump(100);
                     save_clipboard_dib(host, &out_dir.join(format!("{}.png", arg)));
                 }
+                "print" | "print-check" => {
+                    if cmd == "print-check" {
+                        let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+                        let out = out_dir.clone();
+                        std::thread::spawn(move || {
+                            shoot_dialog(thread, "landscape".into(), 1, out, true)
+                        });
+                    }
+                    let result = ListPrintW(
+                        viewer,
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        0,
+                        std::ptr::null(),
+                    );
+                    println!("ListPrintW -> {result}");
+                }
                 "thumb" => {
                     let parts: Vec<&str> = arg.splitn(4, ',').collect();
                     let (w, h) = (parts[0].parse().expect("w"), parts[1].parse().expect("h"));
@@ -552,7 +603,7 @@ fn main() {
                     let (name, pages) = (name.to_string(), pages.parse().expect("pages"));
                     let thread = windows::Win32::System::Threading::GetCurrentThreadId();
                     let out = out_dir.clone();
-                    std::thread::spawn(move || shoot_dialog(thread, name, pages, out));
+                    std::thread::spawn(move || shoot_dialog(thread, name, pages, out, false));
                 }
                 other => panic!("unknown step {}", other),
             }

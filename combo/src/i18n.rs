@@ -10,9 +10,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::OnceLock;
 
 use windows::core::{w, HSTRING};
-use windows::Win32::Globalization::{
-    GetLocaleInfoW, GetUserDefaultUILanguage, LOCALE_SABBREVLANGNAME,
-};
 use windows::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
 
 const FILE_NAME: &str = "mediares_ui.lng";
@@ -198,7 +195,8 @@ pub fn decimal(formatted: String) -> String {
     }
 }
 
-/// The language setting: follow Total Commander, or a fixed one (by section code).
+/// The language setting: a fixed language by section code. A config that names none (or names a
+/// translation that is no longer there) reads as `Auto`, which resolves from Total Commander.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LangSetting {
     Auto,
@@ -206,15 +204,16 @@ pub enum LangSetting {
 }
 
 impl LangSetting {
-    /// "Same as Total Commander", then every language of the catalog.
+    /// Every language of the catalog, English first.
     pub fn all() -> Vec<LangSetting> {
-        std::iter::once(LangSetting::Auto)
-            .chain(catalog().iter().map(|l| LangSetting::Fixed(l.code)))
+        catalog()
+            .iter()
+            .map(|l| LangSetting::Fixed(l.code))
             .collect()
     }
 
     /// Codes of languages that are no longer available read as `Auto`. Older configs stored
-    /// "en" / "ru".
+    /// "en" / "ru", and "auto" is what [`LangSetting::Auto`] was written as.
     pub fn from_ini(value: &str) -> Self {
         let code = match value.trim().to_ascii_lowercase().as_str() {
             "en" => ENGLISH.to_string(),
@@ -234,23 +233,39 @@ impl LangSetting {
         }
     }
 
-    /// Language names are shown in their own language.
-    pub fn label(self) -> &'static str {
+    /// The configured language, or Total Commander's when the config does not name one; English
+    /// if the catalog has no translation for TC's language.
+    pub fn or_detected(self) -> Self {
         match self {
-            LangSetting::Auto => tr("Same as Total Commander"),
-            LangSetting::Fixed(code) => find(code).map_or(code, |i| catalog()[i].name),
+            LangSetting::Auto => LangSetting::Fixed(detected_code()),
+            fixed => fixed,
         }
     }
 
-    pub fn resolve(self) -> &'static Lang {
-        let index = match self {
-            LangSetting::Fixed(code) => find(code),
-            LangSetting::Auto => tc_language()
-                .or_else(windows_language)
-                .and_then(|code| find(&code)),
+    /// Language names are shown in their own language.
+    pub fn label(self) -> &'static str {
+        let code = match self {
+            LangSetting::Auto => detected_code(),
+            LangSetting::Fixed(code) => code,
         };
-        &catalog()[index.unwrap_or(0)]
+        find(code).map_or(code, |i| catalog()[i].name)
     }
+
+    pub fn resolve(self) -> &'static Lang {
+        let code = match self {
+            LangSetting::Auto => detected_code(),
+            LangSetting::Fixed(code) => code,
+        };
+        &catalog()[find(code).unwrap_or(0)]
+    }
+}
+
+/// The section code of the language Total Commander uses, or English if the catalog has no
+/// translation for it.
+fn detected_code() -> &'static str {
+    tc_language()
+        .and_then(|code| find(&code).map(|i| catalog()[i].code))
+        .unwrap_or(ENGLISH)
 }
 
 /// `LanguageIni` in `wincmd.ini` as a section code: `wcmd_rus.lng` → "rus"; empty means TC's
@@ -287,15 +302,6 @@ fn language_code(language_ini: &str) -> String {
     }
 }
 
-/// Windows' three-letter name of the UI language ("RUS", "DEU", "ENU"), as a section code.
-fn windows_language() -> Option<String> {
-    let lcid = u32::from(unsafe { GetUserDefaultUILanguage() });
-    let mut buf = [0u16; 16];
-    let len = unsafe { GetLocaleInfoW(lcid, LOCALE_SABBREVLANGNAME, Some(&mut buf)) };
-    let name = String::from_utf16_lossy(&buf[..usize::try_from(len).ok()?.saturating_sub(1)]);
-    Some(name.to_ascii_lowercase()).filter(|n| n.len() == 3)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,6 +316,13 @@ mod tests {
         assert_eq!(LangSetting::from_ini(" EN "), LangSetting::Fixed("eng"));
         assert_eq!(LangSetting::from_ini("ru"), LangSetting::Fixed("rus"));
         assert_eq!(LangSetting::from_ini("Rus"), LangSetting::Fixed("rus"));
+    }
+
+    #[test]
+    fn the_language_list_has_no_auto_entry() {
+        let all = LangSetting::all();
+        assert!(all.iter().all(|l| matches!(l, LangSetting::Fixed(_))));
+        assert_eq!(all[0], LangSetting::Fixed(ENGLISH));
     }
 
     #[test]

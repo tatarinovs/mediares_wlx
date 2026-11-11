@@ -504,6 +504,31 @@ pub unsafe fn draw_fitted(dc: HDC, img: &DecodedImage, rect: RECT, smooth: bool)
     );
 }
 
+/// Draws the whole image stretched to exactly `rect`, without keeping its aspect ratio.
+pub unsafe fn draw_stretched(dc: HDC, img: &DecodedImage, rect: RECT) {
+    let (rw, rh) = (
+        (rect.right - rect.left).max(1),
+        (rect.bottom - rect.top).max(1),
+    );
+    if img.width == 0 || img.height == 0 {
+        return;
+    }
+    let (sx, sy) = (rw as f32 / img.width as f32, rh as f32 / img.height as f32);
+    let filter = if sx < 1.0 || sy < 1.0 {
+        Filter::Shrink
+    } else {
+        Filter::Pixels
+    };
+    stretch(
+        dc,
+        img,
+        (0, img.width as i32, rect.left, rw),
+        (0, img.height as i32, rect.top, rh),
+        filter,
+        rect,
+    );
+}
+
 /// The copy to draw at `scale` (of the whole picture): the one fitted to the screen while its
 /// pixels suffice, the whole picture beyond that once it has arrived.
 fn copy_for_scale(

@@ -65,6 +65,11 @@ Rotated 90° clockwise and mirrored=Поворот на 90° по часовой
 Rotated 270° clockwise=Поворот на 270° по часовой
 Unknown=Неизвестно
 
+; file_actions.rs
+Move "{name}" to the Recycle Bin?=Удалить «{name}» в корзину?
+
+; i18n.rs
+
 ; image_view.rs
 Cannot open the image=Не удалось открыть изображение
 Cannot play the file=Не удалось воспроизвести файл
@@ -144,6 +149,36 @@ No repeat=Без повтора
 Repeat list=Повторять список
 Repeat file=Повторять файл
 
+; print.rs
+Print preview=Предварительный просмотр
+Printer=Принтер
+Paper:=Бумага:
+Print settings=Настройка печати
+Margins (mm)=Поля (мм)
+Top=Сверху
+Bottom=Снизу
+Left=Слева
+Right=Справа
+Placement=Размещение
+Size=Размер
+Original size=Исходный размер
+Fit to page=Вписать в страницу
+Stretch to page=Растянуть на страницу
+Specified size=Указанный размер
+Fill and crop=Заполнить с обрезкой
+Copies=Копии
+Copies:=Копии:
+Orientation=Ориентация
+Portrait=Книжная
+Landscape=Альбомная
+Auto rotate=Автоповорот
+Print=Печать
+No default printer is available.=Принтер по умолчанию недоступен.
+Could not change the paper orientation.=Не удалось изменить ориентацию бумаги.
+Could not print the image.=Не удалось напечатать изображение.
+W:=Ш:
+H:=В:
+
 ; save_as.rs
 Cannot save over the open file.=Нельзя сохранить поверх открытого файла.
 Could not save=Не удалось сохранить
@@ -151,60 +186,71 @@ Save as=Сохранить как
 
 ; settings_dialog.rs
 Mediares Settings=Настройки Mediares
-Browse...=Обзор...
-the program assigned in Windows=программа, назначенная в Windows
-Start in full screen=Запускать в полноэкранном режиме
-Auto-rotate by EXIF orientation=Автоповорот по ориентации EXIF
 Photo=Фото
+Video and audio=Видео и звук
 Display=Экран
 General=Общие
-Loupe zoom (left click):=Масштаб лупы (ЛКМ):
-Background:=Цвет фона:
-Choose color...=Выбрать цвет...
+Viewing=Просмотр
+Background, loupe and slideshow=Фон, лупа и слайд-шоу
+Playback=Воспроизведение
+Seeking and snapshots=Перемотка и сохранение кадров
+Full screen=Полноэкранный режим
+Info line (OSD)=Информационная строка (OSD)
+Interface=Интерфейс
+External editors ("Open in editor")=Внешние редакторы («Открыть в редакторе»)
+Content plugin (WDX)=Контентный плагин (WDX)
+Auto-rotate by EXIF orientation=Автоповорот по ориентации EXIF
 Don't enlarge small images=Не растягивать маленькие изображения
 Smooth enlarged images=Сглаживание при увеличении
 Keep the zoom on the next photo (Z)=Сохранять масштаб при переходе к следующему фото (Z)
 Skip RAW files that have a JPEG twin=Пропускать RAW, у которых есть JPEG с тем же именем
-Play audio at its ReplayGain loudness=Учитывать ReplayGain (громкость из тегов)
+Mouse wheel zooms the picture (Ctrl+wheel pages instead)=Колесо мыши масштабирует фото (Ctrl+колесо переключает файлы)
 Confirm moving to Recycle Bin (Del)=Спрашивать перед удалением в корзину (Del)
-Info line (OSD)=Информационная строка (OSD)
-Show OSD:=Показывать OSD:
-Font size:=Размер шрифта:
-Font color:=Цвет шрифта:
-Contents:=Что показывать:
-Photos...=Для фото...
-Videos...=Для видео...
-Full screen=Полноэкранный режим
-⏮ ⏯ ⏭ buttons over photos=Кнопки ⏮ ⏯ ⏭ поверх фото
-Control bar over videos=Панель управления поверх видео
-Hide the bar when idle=Скрывать панель при бездействии
+Background:=Цвет фона:
+Choose color...=Выбрать цвет...
+Loupe zoom (left click):=Масштаб лупы (ЛКМ):
 Slideshow interval (F5):=Интервал слайд-шоу (F5):
+s=с
+min=мин
 Auto-advance to the next file=Автопереход к следующему файлу
 Repeat:=Повтор:
 Shuffle=Случайный порядок
 Resume videos longer than=Продолжать видео длиннее
 where they stopped=с места остановки
+Play audio at its ReplayGain loudness=Учитывать ReplayGain (громкость из тегов)
 Show a frame preview on the timeline=Показывать кадр под курсором на шкале
+Seek step (← →):=Шаг перемотки (← →):
 Frames (Shift+S):=Кадры (Shift+S):
 Contact sheet (Ctrl+Shift+S):=Раскадровка (Ctrl+Shift+S):
-Seek step (← →):=Шаг перемотки (← →):
+Start in full screen=Запускать в полноэкранном режиме
+⏮ ⏯ ⏭ buttons over photos=Кнопки ⏮ ⏯ ⏭ поверх фото
+Control bar over videos=Панель управления поверх видео
+Hide the bar when idle=Скрывать панель при бездействии
+Show OSD:=Показывать OSD:
+Font size:=Размер шрифта:
 Family:=Гарнитура:
-min=мин
-Mouse wheel zooms the picture (Ctrl+wheel pages instead)=Колесо мыши масштабирует фото (Ctrl+колесо переключает файлы)
-External editors ("Open in editor")=Внешние редакторы («Открыть в редакторе»)
+Font color:=Цвет шрифта:
+Contents:=Что показывать:
+Photos...=Для фото...
+Videos...=Для видео...
+Language=Язык
 Photo:=Фото:
 Video:=Видео:
 Audio:=Аудио:
-Content plugin (WDX)=Контентный плагин (WDX)
+Browse...=Обзор...
+the program assigned in Windows=программа, назначенная в Windows
 mediares fields for TC columns, duplicate search and multi-rename=Поля mediares для колонок, поиска дубликатов и группового переименования в TC
 Register WDX=Зарегистрировать WDX
-Video OSD=OSD для видео
-Photo OSD=OSD для фото
 WDX registered=WDX зарегистрирован
 wincmd.ini not found. Add the plugin manually: Configuration → Options → Plugins → Content plugins → Add, select mediares.wlx64.=Не найден wincmd.ini. Подключите плагин вручную: Конфигурация → Настройка → Плагины → Контентные плагины → Добавить, выбрать mediares.wlx64.
 WDX registered, restart Total Commander.=WDX зарегистрирован, перезапустите Total Commander.
 Programs (*.exe)\0*.exe\0All files (*.*)\0*.*\0=Программы (*.exe)\0*.exe\0Все файлы (*.*)\0*.*\0
 Choose an editor=Выберите редактор
+Video OSD=OSD для видео
+Photo OSD=OSD для фото
+Could not save the settings to this file; they apply until Total Commander is closed:=Не удалось сохранить настройки в этот файл; они действуют до закрытия Total Commander:
+OK=ОК
+Cancel=Отмена
 
 ; snapshot.rs
 PNG — lossless=PNG — без потерь
@@ -274,13 +320,3 @@ Lossless rotation can be written to JPEG only.\nFor other formats use Save as (C
 Could not save the rotation=Не удалось записать поворот
 Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it.=Поворот записан. Автоповорот по EXIF выключен в настройках, поэтому здесь фото показано без него.
 Could not set the desktop background.=Не удалось установить обои.
-
-; file_actions.rs
-Move "{name}" to the Recycle Bin?=Удалить «{name}» в корзину?
-
-; i18n.rs
-Same as Total Commander=Как в Total Commander
-
-; settings_dialog.rs
-Language=Язык
-Could not save the settings to this file; they apply until Total Commander is closed:=Не удалось сохранить настройки в этот файл; они действуют до закрытия Total Commander:

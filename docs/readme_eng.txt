@@ -78,7 +78,7 @@ Neighbouring photos are loaded in advance, so paging is instant.
   Where it was taken ....... G (OpenStreetMap; photos with GPS)
   Copy image ............... Ctrl+C
   Save as .................. Ctrl+S
-  Print .................... Ctrl+P
+  Print with preview ....... Ctrl+P
   Open in editor ........... F4
   Show in folder ........... Ctrl+Enter
   Move to Recycle Bin ...... Del
@@ -339,8 +339,9 @@ Music:
 Open any file in the viewer (F3) and press S or choose "Settings..." in
 the right-click menu. You can set:
 
-  * the language (same as Total Commander, English, Russian or one added
-    in mediares_ui.lng, see below);
+  * the language (English, Russian or one added in mediares_ui.lng,
+    see below): until you choose one, Total Commander's language is
+    used, or English if there is no translation for it;
   * starting in full screen;
   * auto-rotating photos by the camera data;
   * the loupe zoom, the background color around photos;
@@ -377,8 +378,9 @@ translation or add a language. A language section is named after the
 Total Commander language file: wcmd_rus.lng -> [Rus], wcmd_deu.lng ->
 [Deu]. The key is the English text, the value is the translation; keep
 {name} placeholders as they are. A new language appears in the
-settings list, and "same as Total Commander" picks it up when TC runs
-in that language. Restart Total Commander after editing the file.
+settings list and is used automatically when Total Commander runs in
+that language; English is used when there is no match. Restart Total
+Commander after editing the file.
 
 mediares.lng holds Russian field names for Total Commander's dialogs;
 it does not affect other languages.
