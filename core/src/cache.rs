@@ -40,9 +40,9 @@ pub struct AudioAnalysis {
 /// Identifies a specific version of a file: edits change size or mtime and miss the cache.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub struct FileKey {
-    path: PathBuf,
-    size: u64,
-    modified: Option<SystemTime>,
+    pub(crate) path: PathBuf,
+    pub(crate) size: u64,
+    pub(crate) modified: Option<SystemTime>,
 }
 
 thread_local! {
@@ -56,7 +56,7 @@ impl FileKey {
         scoped.or_else(|| Self::stat(path))
     }
 
-    fn stat(path: &Path) -> Option<Self> {
+    pub(crate) fn stat(path: &Path) -> Option<Self> {
         let meta = fs::metadata(path).ok()?;
         Some(FileKey {
             path: path.to_path_buf(),
@@ -123,6 +123,11 @@ impl<V: Clone> FileCache<V> {
             }
         }
         let value = compute(path)?;
+        // An editor may have saved the file while a decoder was reading it. Do not attach
+        // the result to either version; the next call must read the file again.
+        if FileKey::stat(path).as_ref() != Some(&key) {
+            return None;
+        }
         let mut lru = self.lock();
         lru.clock += 1;
         let now = lru.clock;
@@ -161,7 +166,9 @@ impl MediaCache {
     /// `Unsupported` but not cached, so the next request recomputes it.
     pub fn get_or_analyze(&self, path: &Path, cancelled: &dyn Fn() -> bool) -> CachedMedia {
         self.0
-            .get_or_compute(path, |path| analyze_file(path, cancelled))
+            .get_or_compute(path, |path| {
+                persistent_result(path, cancelled, || analyze_file(path, cancelled))
+            })
             .unwrap_or(CachedMedia::Unsupported)
     }
 
@@ -172,6 +179,29 @@ impl MediaCache {
     pub fn clear(&self) {
         self.0.clear();
     }
+}
+
+/// Called only on a RAM miss, outside the RAM-cache mutex. SQLite access never holds a lock
+/// while decoding; failures simply miss the disk cache. A fresh stat bypasses SCOPED_KEY
+/// before saving, since it still describes the file at the beginning of the TC call.
+fn persistent_result<T: crate::disk_cache::DiskValue>(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+    compute: impl FnOnce() -> Option<T>,
+) -> Option<T> {
+    if cancelled() {
+        return None;
+    }
+    let key = FileKey::for_path(path)?;
+    if let Some(value) = crate::disk_cache::read(&key) {
+        return (!cancelled()).then_some(value);
+    }
+    let value = compute()?;
+    if cancelled() || FileKey::stat(path).as_ref() != Some(&key) {
+        return None;
+    }
+    crate::disk_cache::write(&key, &value);
+    Some(value)
 }
 
 /// `None` if the host cancelled the analysis.
@@ -300,9 +330,12 @@ fn sharpness_cache() -> &'static MetaCache<u32> {
 pub fn get_sharpness(path: &Path) -> Option<u32> {
     sharpness_cache()
         .get_or_read(path, |p| {
-            let side = crate::hashing::SHARPNESS_SIZE;
-            let (img, _) = crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
-            Some(crate::hashing::sharpness(&img))
+            persistent_result(p, &|| false, || {
+                let side = crate::hashing::SHARPNESS_SIZE;
+                let (img, _) =
+                    crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
+                Some(crate::hashing::sharpness(&img))
+            })
         })
         .map(|s| *s)
 }
@@ -401,6 +434,7 @@ pub fn clear_all() {
     video_meta_cache().clear();
     audio_meta_cache().clear();
     video_tags_cache().clear();
+    crate::disk_cache::close();
 }
 
 pub fn get_cache() -> &'static MediaCache {
@@ -469,5 +503,36 @@ mod tests {
         // A file that doesn't exist has no key, scoped or not.
         let gone = dir.join("no_such_file");
         with_file_key(&gone, || assert_eq!(FileKey::for_path(&gone), None));
+    }
+
+    #[test]
+    fn changes_during_computation_are_not_cached_even_inside_a_scoped_key() {
+        let path =
+            std::env::temp_dir().join(format!("mediares-cache-change-{}", std::process::id()));
+        fs::write(&path, b"old").unwrap();
+        let cache = FileCache::new(2);
+        with_file_key(&path, || {
+            assert_eq!(
+                cache.get_or_compute(&path, |_| {
+                    fs::write(&path, b"changed size").unwrap();
+                    Some(42)
+                }),
+                None
+            );
+        });
+        assert!(!cache.contains(&path));
+        assert_eq!(cache.get_or_compute(&path, |_| Some(43)), Some(43));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn cancelled_analysis_does_not_compute_or_enter_the_ram_cache() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let cache = MediaCache(FileCache::new(2));
+        assert!(matches!(
+            cache.get_or_analyze(&path, &|| true),
+            CachedMedia::Unsupported
+        ));
+        assert!(!cache.is_cached(&path));
     }
 }

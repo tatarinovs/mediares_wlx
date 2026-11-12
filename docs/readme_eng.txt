@@ -202,6 +202,10 @@ search (Alt+F7) and in multi-rename (Ctrl+M). They are in the
 Hashes, sharpness and uncached stream properties are calculated in the
 background. Dimensions and cached metadata remain available immediately.
 
+Image hashes, video/audio fingerprints, PCM hashes and sharpness survive
+Total Commander restarts in a local SQLite database:
+  %LOCALAPPDATA%\mediares\content-cache-v1.sqlite3
+
 
 5.1. Finding duplicates
 

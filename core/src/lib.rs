@@ -8,6 +8,7 @@ pub mod audio_fingerprint;
 #[cfg(feature = "tags")]
 pub mod audio_tags;
 pub mod cache;
+mod disk_cache;
 pub mod exif;
 pub mod ffi;
 pub mod file_write;

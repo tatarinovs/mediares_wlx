@@ -198,6 +198,8 @@ The interface is available in Russian and English; additional translations can b
 
 For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions and the local cache are stored in `%LOCALAPPDATA%\mediares`.
 
+Hashes, fingerprints and sharpness survive restarts in `content-cache-v1.sqlite3` in that folder. Results are recalculated when the file size or modification time changes. To clear the cache, close all TC instances and delete the database; to disable it, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
+
 ## Building
 
 Requires Rust and Windows build tools.
@@ -206,6 +208,7 @@ Requires Rust and Windows build tools.
 cargo test             # tests
 cargo build --release  # build
 .\build_release.bat    # tests, build and installation archives in dist/
+.\test_content_cache.bat # check SQLite caching in the built DLL (requires Python 3)
 ```
 
 ## License
