@@ -202,9 +202,24 @@ search (Alt+F7) and in multi-rename (Ctrl+M). They are in the
 Hashes, sharpness and uncached stream properties are calculated in the
 background. Dimensions and cached metadata remain available immediately.
 
-Image hashes, video/audio fingerprints, PCM hashes and sharpness survive
+Image hashes, video/audio fingerprints, PCM hashes, sharpness and metadata survive
 Total Commander restarts in a local SQLite database:
   %LOCALAPPDATA%\mediares\content-cache-v1.sqlite3
+
+Metadata includes EXIF, audio/video tags, stream properties, image
+dimensions and pixel format, and the TIFF page list. Data is saved on
+demand; cover images and lyrics are excluded. Updating the plugin
+preserves existing cached hashes. A change in file size, modification
+time or algorithm version triggers a fresh read. Renamed files are also
+read again. Content changes preserving both size and time cannot be detected.
+
+Caching is enabled by default, with a 256 MiB limit and about 500,000
+records; old records are removed automatically. Adjacent -wal and -shm
+files may appear. If the database is unavailable, corrupt or busy, the
+plugin reads the source file. To clear it, close all TC instances and
+delete the database. To disable it, set MEDIARES_CONTENT_CACHE=off before
+starting TC; an absolute database path on a local drive can be used
+instead of off. Media files themselves may reside on a network drive.
 
 
 5.1. Finding duplicates

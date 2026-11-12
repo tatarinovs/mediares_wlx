@@ -18,7 +18,7 @@ use symphonia::default::meta::embedded::riff;
 
 use crate::audio_decode::{open_format, track_duration};
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioTags {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -38,16 +38,19 @@ pub struct AudioTags {
     pub track_total: Option<u32>,
     pub disc_total: Option<u32>,
     /// "MP3", "FLAC", "AAC", "ALAC"...
-    pub codec: Option<&'static str>,
+    #[serde(deserialize_with = "crate::disk_cache::audio_codec")]
+    pub codec: Option<crate::disk_cache::StaticName>,
     pub lossless: Option<bool>,
     /// An embedded picture exists (even if `cover` was not kept).
     pub has_cover: bool,
     /// Encoded front cover (JPEG/PNG...), or the first embedded picture.
+    #[serde(skip)]
     pub cover: Option<Vec<u8>>,
     /// ReplayGain of the track: gain in dB and peak amplitude (1.0 = full scale).
     pub replay_gain_db: Option<f32>,
     pub replay_peak: Option<f32>,
     /// Song text (ID3 USLT, Vorbis LYRICS...); read for the viewer only, like `cover`.
+    #[serde(skip)]
     pub lyrics: Option<String>,
 }
 

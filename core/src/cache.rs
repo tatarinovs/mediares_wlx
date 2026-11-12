@@ -229,14 +229,16 @@ fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia
 /// every column separately, and each file is read once. Failed reads are cached too.
 struct MetaCache<T>(FileCache<Option<Arc<T>>>);
 
-impl<T> MetaCache<T> {
+impl<T: crate::disk_cache::DiskValue> MetaCache<T> {
     fn new() -> Self {
         MetaCache(FileCache::new(META_CAPACITY))
     }
 
     fn get_or_read(&self, path: &Path, read: impl FnOnce(&Path) -> Option<T>) -> Option<Arc<T>> {
         self.0
-            .get_or_compute(path, |p| Some(read(p).map(Arc::new)))
+            .get_or_compute(path, |p| {
+                Some(persistent_result(p, &|| false, || read(p)).map(Arc::new))
+            })
             .flatten()
     }
 
@@ -330,12 +332,9 @@ fn sharpness_cache() -> &'static MetaCache<u32> {
 pub fn get_sharpness(path: &Path) -> Option<u32> {
     sharpness_cache()
         .get_or_read(path, |p| {
-            persistent_result(p, &|| false, || {
-                let side = crate::hashing::SHARPNESS_SIZE;
-                let (img, _) =
-                    crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
-                Some(crate::hashing::sharpness(&img))
-            })
+            let side = crate::hashing::SHARPNESS_SIZE;
+            let (img, _) = crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
+            Some(crate::hashing::sharpness(&img))
         })
         .map(|s| *s)
 }

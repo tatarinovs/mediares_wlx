@@ -103,7 +103,7 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// A page of a multi-page TIFF: the frame holding it and the page's own Orientation (1..=8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TiffPage {
     pub frame: u32,
     pub orientation: Option<u16>,

@@ -1,4 +1,4 @@
-//! Disposable local SQLite cache. Only expensive analysis and sharpness use it, on a RAM miss.
+//! Disposable local SQLite cache of analysis and metadata, accessed on a RAM miss.
 //! No worker thread outlives the DLL. Locks are never waited for and decoding runs outside them.
 
 use std::os::windows::ffi::OsStrExt;
@@ -12,11 +12,17 @@ use crate::cache::{AudioAnalysis, CachedMedia, FileKey};
 use crate::hashing::{compute_aspect_ratio, ImageAnalysis};
 use crate::video_frame::VideoAnalysis;
 
-// Bump when either the stored representation or any cached analysis algorithm changes.
+// Schema upgrades preserve existing analysis records; record versions invalidate stale results.
+const SCHEMA_VERSION: i32 = 2;
+// Bump when a cached analysis algorithm or payload representation changes.
 const VERSION: i32 = 1;
-const MAX_BYTES: i64 = 128 * 1024 * 1024;
-const MAX_ENTRIES: i64 = 100_000;
+const MAX_PAYLOAD: usize = 1024 * 1024;
+const MAX_BYTES: i64 = 256 * 1024 * 1024;
+const MAX_ENTRIES: i64 = 500_000;
 const PRUNE_BATCH: i64 = 8192;
+
+// Unlike a borrowed &str, these names are resolved to known literals during deserialization.
+pub(crate) type StaticName = &'static str;
 
 enum State {
     Unopened,
@@ -120,7 +126,7 @@ impl Store {
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::ZERO)?;
         let version: i32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if version != 0 && version != VERSION {
+        if !(0..=SCHEMA_VERSION).contains(&version) {
             return Err(rusqlite::Error::InvalidQuery);
         }
         // Bound the main database and SQLite's RAM. WAL is checkpointed every ~1 MiB and
@@ -141,7 +147,7 @@ impl Store {
              PRAGMA wal_autocheckpoint=256;
              PRAGMA journal_size_limit=1048576;",
         )?;
-        if version == 0 {
+        if version < SCHEMA_VERSION {
             db.execute_batch(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE IF NOT EXISTS entries (
@@ -152,7 +158,8 @@ impl Store {
                     fingerprint TEXT, pcm_hash TEXT, sharpness INTEGER,
                     PRIMARY KEY(path, slot)
                  );
-                 PRAGMA user_version=1;
+                 ALTER TABLE entries ADD COLUMN payload TEXT;
+                 PRAGMA user_version=2;
                  COMMIT;",
             )?;
         }
@@ -164,9 +171,17 @@ impl Store {
     fn read<T: DiskValue>(&self, key: &Key) -> rusqlite::Result<T> {
         self.db.query_row(
             "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
-                    fingerprint, pcm_hash, sharpness FROM entries
-             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5",
-            (&key.path, T::SLOT, key.size, &key.modified[..], VERSION),
+                    fingerprint, pcm_hash, sharpness, payload FROM entries
+             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
+            (
+                &key.path,
+                T::SLOT,
+                key.size,
+                &key.modified[..],
+                VERSION,
+                MAX_PAYLOAD as i64,
+            ),
             T::from_row,
         )
     }
@@ -175,15 +190,16 @@ impl Store {
         self.db.execute(
             "INSERT OR REPLACE INTO entries
              (path, slot, size, modified, version, kind, width, height, duration,
-              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness)
+              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
              VALUES (:path, :slot, :size, :modified, :version, :kind, :width, :height,
-                     :duration, :hash_a, :hash_b, :coarse, :fingerprint, :pcm_hash, :sharpness)",
+                     :duration, :hash_a, :hash_b, :coarse, :fingerprint, :pcm_hash, :sharpness, :payload)",
             named_params! {
                 ":path": &key.path, ":slot": slot, ":size": key.size,
                 ":modified": &key.modified[..], ":version": VERSION, ":kind": c.kind,
                 ":width": c.width, ":height": c.height, ":duration": c.duration,
                 ":hash_a": c.hash_a, ":hash_b": c.hash_b, ":coarse": c.coarse,
                 ":fingerprint": c.fingerprint, ":pcm_hash": c.pcm_hash, ":sharpness": c.sharpness,
+                ":payload": c.payload,
             },
         )?;
         self.writes = self.writes.wrapping_add(1);
@@ -222,6 +238,7 @@ pub(crate) struct Columns<'a> {
     fingerprint: Option<&'a str>,
     pcm_hash: Option<&'a str>,
     sharpness: Option<u32>,
+    payload: Option<String>,
 }
 
 pub(crate) trait DiskValue: Sized {
@@ -313,9 +330,107 @@ impl DiskValue for u32 {
     }
 }
 
+// JSON keeps each metadata family together without growing a mostly-empty SQL schema.
+// Only successful reads are written; a missing tag inside a successful record stays missing.
+macro_rules! metadata {
+    ($ty:ty, $slot:expr) => {
+        impl DiskValue for $ty {
+            const SLOT: i32 = $slot;
+
+            fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
+                let payload: String = row.get("payload")?;
+                serde_json::from_str(&payload).map_err(|e| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        row.as_ref().column_index("payload").unwrap_or(0),
+                        rusqlite::types::Type::Text,
+                        Box::new(e),
+                    )
+                })
+            }
+
+            fn columns(&self) -> Option<Columns<'_>> {
+                let payload = serde_json::to_string(self).ok()?;
+                (payload.len() <= MAX_PAYLOAD).then_some(Columns {
+                    kind: 5,
+                    payload: Some(payload),
+                    ..Columns::default()
+                })
+            }
+        }
+    };
+}
+
+metadata!(crate::exif::ExifInfo, 2);
+#[cfg(feature = "tags")]
+metadata!(crate::audio_tags::AudioTags, 3);
+metadata!(crate::video_frame::VideoMeta, 4);
+metadata!(crate::mf_audio::AudioStreamMeta, 5);
+metadata!(crate::video_tags::VideoTags, 6);
+metadata!((u32, u32), 7);
+metadata!(crate::image_decode::PixelFormat, 8);
+metadata!(Vec<crate::wic_decode::TiffPage>, 9);
+
+// The public models use static names. Resolve only known literals; never leak a string read
+// from disk to manufacture a 'static lifetime. Unknown names cause a normal cache miss.
+fn static_name<'de, D: serde::Deserializer<'de>>(
+    de: D,
+    names: &[&'static str],
+) -> Result<Option<&'static str>, D::Error> {
+    use serde::Deserialize;
+    Option::<String>::deserialize(de)?
+        .map(|value| {
+            names
+                .iter()
+                .copied()
+                .find(|&name| name == value)
+                .ok_or_else(|| serde::de::Error::custom("unknown cached name"))
+        })
+        .transpose()
+}
+
+pub(crate) fn dynamic_range<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<&'static str>, D::Error> {
+    static_name(de, &["SDR", "HDR10", "HLG"])
+}
+
+#[cfg(feature = "tags")]
+pub(crate) fn audio_codec<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<&'static str>, D::Error> {
+    // Names returned by audio_tags::codec_name. New names safely miss until added here.
+    static_name(
+        de,
+        &[
+            "PCM float",
+            "PCM",
+            "ADPCM",
+            "MP1",
+            "MP2",
+            "MP3",
+            "AAC",
+            "Vorbis",
+            "Opus",
+            "Speex",
+            "Musepack",
+            "AC-3",
+            "E-AC-3",
+            "DTS",
+            "WMA",
+            "FLAC",
+            "WavPack",
+            "Monkey's Audio",
+            "ALAC",
+            "TTA",
+            "TrueHD",
+        ],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::video_frame::VideoMeta;
     use std::time::{Instant, SystemTime};
 
     struct Fixture(PathBuf);
@@ -349,6 +464,240 @@ mod tests {
 
     fn put<T: DiskValue>(store: &mut Store, key: &Key, value: &T) {
         store.write(key, T::SLOT, value.columns().unwrap()).unwrap();
+    }
+
+    fn roundtrip<T: DiskValue + PartialEq + std::fmt::Debug>(fixture: &Fixture, value: &T) {
+        let mut store = Store::open(&fixture.path()).unwrap();
+        put(&mut store, &fixture.key(), value);
+        drop(store);
+        let reopened = Store::open(&fixture.path()).unwrap();
+        assert_eq!(&reopened.read::<T>(&fixture.key()).unwrap(), value);
+    }
+
+    #[test]
+    fn metadata_survives_reopening_with_unicode_optional_fields_and_floats() {
+        let fixture = Fixture::new();
+        roundtrip(
+            &fixture,
+            &crate::exif::ExifInfo {
+                make: Some("Камера 🦊".into()),
+                model: Some("Model".into()),
+                date_time: Some("2020:01:02 03:04:05".into()),
+                date_time_original: None,
+                exposure_time: Some("1/250".into()),
+                f_number: Some(2.8),
+                iso: Some(400),
+                focal_length: Some(35.5),
+                focal_length_35mm: Some(50),
+                lens_model: Some("Lens".into()),
+                flash_fired: Some(false),
+                orientation: Some(6),
+                width: Some(6000),
+                height: Some(4000),
+                software: Some("Editor".into()),
+                gps_latitude: Some(-33.865143),
+                gps_longitude: Some(151.209900),
+            },
+        );
+        roundtrip(
+            &fixture,
+            &VideoMeta {
+                width: 3840,
+                height: 2160,
+                duration_sec: 123.45678901234567,
+                frame_rate: 30000.0 / 1001.0,
+                codec: Some("HEVC".into()),
+                bitrate_kbps: Some(50000),
+                audio_codec: Some("AAC".into()),
+                audio_channels: Some(6),
+                audio_sample_rate: Some(48000),
+                rotation: Some(90),
+                dynamic_range: Some("HDR10"),
+            },
+        );
+        roundtrip(
+            &fixture,
+            &crate::mf_audio::AudioStreamMeta {
+                codec: Some("WMA Lossless".into()),
+                lossless: Some(true),
+                duration_sec: 52.125,
+                bitrate_kbps: Some(1500),
+                sample_rate: Some(96000),
+                channels: Some(2),
+                bit_depth: Some(24),
+            },
+        );
+        roundtrip(
+            &fixture,
+            &crate::video_tags::VideoTags {
+                title: Some("Название".into()),
+                artist: Some("Artist".into()),
+                director: Some("Director".into()),
+                date: Some("2026-11-12".into()),
+                genre: None,
+                comment: Some("Text\nline".into()),
+                transfer: Some(u64::MAX),
+                chapters: vec![(0.0, "Старт".into()), (60.125, "".into())],
+            },
+        );
+        roundtrip(&fixture, &(6000u32, 4000u32));
+        roundtrip(
+            &fixture,
+            &crate::image_decode::PixelFormat {
+                bits_per_channel: 16,
+                channels: 4,
+                alpha: true,
+            },
+        );
+        roundtrip(
+            &fixture,
+            &vec![
+                crate::wic_decode::TiffPage {
+                    frame: 0,
+                    orientation: None,
+                },
+                crate::wic_decode::TiffPage {
+                    frame: 3,
+                    orientation: Some(8),
+                },
+            ],
+        );
+        // A successful record whose fields are all absent is different from a failed read.
+        roundtrip(&fixture, &crate::exif::ExifInfo::default());
+        roundtrip(&fixture, &VideoMeta::default());
+    }
+
+    #[cfg(feature = "tags")]
+    #[test]
+    fn audio_metadata_keeps_tags_and_replaygain_but_excludes_cover_and_lyrics() {
+        use crate::audio_tags::AudioTags;
+        let fixture = Fixture::new();
+        let mut tags = AudioTags {
+            title: Some("Песня".into()),
+            artist: Some("Артист".into()),
+            album: Some("Album".into()),
+            album_artist: Some("Group".into()),
+            genre: Some("Rock".into()),
+            comment: Some("Comment".into()),
+            year: Some(2026),
+            track: Some(2),
+            disc: Some(1),
+            duration_sec: 180.125,
+            bitrate_kbps: Some(960),
+            sample_rate: Some(48000),
+            bit_depth: Some(24),
+            channels: Some(2),
+            composer: Some("Composer".into()),
+            track_total: Some(12),
+            disc_total: Some(2),
+            codec: Some("FLAC"),
+            lossless: Some(true),
+            has_cover: true,
+            cover: Some(vec![1, 2, 3]),
+            lyrics: Some("private lyrics".into()),
+            replay_gain_db: Some(-6.54),
+            replay_peak: Some(0.987654),
+        };
+        let mut store = Store::open(&fixture.path()).unwrap();
+        put(&mut store, &fixture.key(), &tags);
+        let payload = tags.columns().unwrap().payload.unwrap();
+        assert!(!payload.contains("\"cover\"") && !payload.contains("lyrics"));
+        // has_cover is deliberately retained, unlike the image bytes.
+        assert!(payload.contains("has_cover"));
+        tags.cover = None;
+        tags.lyrics = None;
+        assert_eq!(store.read::<AudioTags>(&fixture.key()).unwrap(), tags);
+        drop(store);
+        roundtrip(&fixture, &tags);
+        roundtrip(&fixture, &AudioTags::default());
+    }
+
+    #[test]
+    fn schema_upgrade_preserves_existing_analysis_and_sharpness() {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        let analysis = CachedMedia::Image(Arc::new(ImageAnalysis {
+            width: 2,
+            height: 1,
+            aspect_ratio: "2:1".into(),
+            dhash: u64::MAX,
+            phash: 1 << 63,
+            coarse_hash: 123,
+        }));
+        put(&mut store, &fixture.key(), &analysis);
+        put(&mut store, &fixture.key(), &42u32);
+        let rows_before: Vec<i64> = store
+            .db
+            .prepare("SELECT rowid FROM entries ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        // This is exactly the previous schema: metadata payloads did not exist yet.
+        store
+            .db
+            .execute_batch("ALTER TABLE entries DROP COLUMN payload; PRAGMA user_version=1;")
+            .unwrap();
+        drop(store);
+        let store = Store::open(&fixture.path()).unwrap();
+        assert_eq!(store.read::<u32>(&fixture.key()).unwrap(), 42);
+        assert_eq!(
+            format!("{:?}", store.read::<CachedMedia>(&fixture.key()).unwrap()),
+            format!("{analysis:?}")
+        );
+        let rows_after: Vec<i64> = store
+            .db
+            .prepare("SELECT rowid FROM entries ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(rows_before, rows_after);
+        assert_eq!(
+            store
+                .db
+                .pragma_query_value::<i32, _>(None, "user_version", |r| r.get(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn invalid_and_oversized_metadata_misses_without_losing_other_entries() {
+        use crate::exif::ExifInfo;
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        put(&mut store, &fixture.key(), &ExifInfo::default());
+        put(&mut store, &fixture.key(), &42u32);
+        for payload in ["not JSON".to_owned(), "x".repeat(MAX_PAYLOAD + 1)] {
+            store
+                .db
+                .execute(
+                    "UPDATE entries SET payload=?1 WHERE slot=?2",
+                    (&payload, ExifInfo::SLOT),
+                )
+                .unwrap();
+            assert!(store.read::<ExifInfo>(&fixture.key()).is_err());
+            assert_eq!(store.read::<u32>(&fixture.key()).unwrap(), 42);
+        }
+        let huge = ExifInfo {
+            software: Some("x".repeat(MAX_PAYLOAD)),
+            ..ExifInfo::default()
+        };
+        assert!(huge.columns().is_none());
+        put(&mut store, &fixture.key(), &ExifInfo::default());
+        assert_eq!(
+            store.read::<ExifInfo>(&fixture.key()).unwrap(),
+            ExifInfo::default()
+        );
+        let unknown = VideoMeta {
+            dynamic_range: Some("future HDR"),
+            ..VideoMeta::default()
+        };
+        put(&mut store, &fixture.key(), &unknown);
+        assert!(store.read::<VideoMeta>(&fixture.key()).is_err());
     }
 
     #[test]

@@ -122,7 +122,7 @@ unsafe fn float_format(reader: &IMFSourceReader) -> Option<(u32, u16)> {
 }
 
 /// Properties of the first audio stream as the container declares them. No decoding.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct AudioStreamMeta {
     /// "WMA", "AC-3", "WMA Lossless"... or the WAVE format tag.
     pub codec: Option<String>,

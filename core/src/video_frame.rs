@@ -43,7 +43,7 @@ impl VideoAnalysis {
 }
 
 /// Stream properties for WDX columns: codecs, frame rate, bitrate, the audio track. No decoding.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct VideoMeta {
     pub width: u32,
     pub height: u32,
@@ -62,7 +62,8 @@ pub struct VideoMeta {
     pub rotation: Option<u32>,
     /// "HDR10" (PQ) or "HLG" for high dynamic range video, "SDR" otherwise; `None` if the stream
     /// doesn't say.
-    pub dynamic_range: Option<&'static str>,
+    #[serde(deserialize_with = "crate::disk_cache::dynamic_range")]
+    pub dynamic_range: Option<crate::disk_cache::StaticName>,
 }
 
 /// The dynamic range named by a stream's transfer function (`MFVideoTransferFunction`).

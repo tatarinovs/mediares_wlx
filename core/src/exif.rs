@@ -27,7 +27,7 @@ const TYPE_LONG: u16 = 4;
 const TYPE_RATIONAL: u16 = 5;
 const TYPE_UNDEFINED: u16 = 7;
 
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ExifInfo {
     pub make: Option<String>,
     pub model: Option<String>,
