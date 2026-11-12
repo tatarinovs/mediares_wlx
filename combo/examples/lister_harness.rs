@@ -15,6 +15,8 @@
 //!        copy:<name>     ListSendCommand(lc_copy), clipboard DIB saved as <name>.png
 //!        print           open print preview through ListPrintW (pair with dialog to cancel)
 //!        print-check     check preview orientation/margins/copies, capture it, then cancel
+//!        print-pdf-check print through the preview and the PDF driver's Save As dialog
+//!        print-pdf-cancel-check cancel the PDF filename dialog and return to the preview
 //!        thumb:<w>,<h>,<name>[,<file>]  ListGetPreviewBitmapW saved as <name>.png
 //!        dialog:<name>[,<pages>]  put before the step that opens a modal dialog: waits for it,
 //!                        saves <name>_0.png, then Ctrl+Tab and <name>_<i>.png for each further
@@ -44,6 +46,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::Graphics::Gdi::{DeleteObject as DeleteGdi, GetObjectW, BITMAP, HBITMAP};
 use windows::Win32::System::DataExchange::{CloseClipboard, GetClipboardData, OpenClipboard};
 use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::UI::Controls::EM_SETSEL;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     IsWindowEnabled, SendInput, SetFocus, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
     KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VIRTUAL_KEY,
@@ -254,6 +257,7 @@ unsafe fn find_dialog(thread: u32) -> Option<HWND> {
 /// Runs on its own thread while the main one sits in the dialog's modal loop.
 fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print_check: bool) {
     unsafe {
+        let mut checks_passed = true;
         let until = Instant::now() + Duration::from_secs(10);
         let dlg = loop {
             if let Some(dlg) = find_dialog(thread) {
@@ -267,15 +271,21 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print
         };
         std::thread::sleep(Duration::from_millis(400));
         if print_check {
-            let orientation = GetDlgItem(Some(dlg), 101).unwrap();
-            SendMessageW(orientation, CB_SETCURSEL, Some(WPARAM(1)), None);
-            SendMessageW(
-                dlg,
-                WM_COMMAND,
-                Some(WPARAM(101 | ((CBN_SELCHANGE as usize) << 16))),
-                Some(LPARAM(orientation.0 as isize)),
-            );
-            let landscape = SendMessageW(orientation, CB_GETCURSEL, None, None).0 == 1;
+            let checked = |id| {
+                SendMessageW(GetDlgItem(Some(dlg), id).unwrap(), BM_GETCHECK, None, None).0 == 1
+            };
+            let click = |id| {
+                SendMessageW(GetDlgItem(Some(dlg), id).unwrap(), BM_CLICK, None, None);
+            };
+            let get = |id| {
+                let mut buf = [0u16; 256];
+                let len = GetWindowTextW(GetDlgItem(Some(dlg), id).unwrap(), &mut buf) as usize;
+                String::from_utf16_lossy(&buf[..len])
+            };
+            let preferred_printer = get(100) == "Microsoft Print to PDF";
+            let tc_margin = get(110).replace(',', ".") == "12.5";
+            click(103);
+            let landscape = checked(103) && !checked(102) && checked(171);
             let print = GetDlgItem(Some(dlg), IDOK.0).unwrap();
             let set = |id, text: &str| {
                 let text = windows::core::HSTRING::from(text);
@@ -290,11 +300,59 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print
             let invalid_margin_blocked = !IsWindowEnabled(print).as_bool();
             set(110, "12,5");
             let decimal_margin_accepted = IsWindowEnabled(print).as_bool();
-            set(102, "0");
+            set(116, "0");
             let invalid_copies_blocked = !IsWindowEnabled(print).as_bool();
-            set(102, "2");
+            set(116, "2");
             let valid_copies_accepted = IsWindowEnabled(print).as_bool();
-            println!("print preview: landscape={landscape}, invalid margin blocked={invalid_margin_blocked}, decimal margin accepted={decimal_margin_accepted}, invalid copies blocked={invalid_copies_blocked}, valid copies accepted={valid_copies_accepted}");
+            click(173);
+            set(180, "");
+            let empty_size_blocked = !IsWindowEnabled(print).as_bool();
+            set(180, "999999999999");
+            let huge_size_blocked = !IsWindowEnabled(print).as_bool();
+            set(180, "999");
+            let spin = GetDlgItem(Some(dlg), 184).unwrap();
+            let delta = windows::Win32::UI::Controls::NMUPDOWN {
+                hdr: windows::Win32::UI::Controls::NMHDR {
+                    hwndFrom: spin,
+                    idFrom: 184,
+                    code: windows::Win32::UI::Controls::UDN_DELTAPOS,
+                },
+                iPos: 999,
+                iDelta: 1,
+            };
+            SendMessageW(
+                dlg,
+                WM_NOTIFY,
+                Some(WPARAM(184)),
+                Some(LPARAM(&delta as *const _ as isize)),
+            );
+            let thousand_size_accepted = get(180) == "1000" && IsWindowEnabled(print).as_bool();
+            set(180, "12");
+            let width = GetDlgItem(Some(dlg), 180).unwrap();
+            SendMessageW(width, EM_SETSEL, Some(WPARAM(2)), Some(LPARAM(2)));
+            for ch in [',', '5'] {
+                SendMessageW(width, WM_CHAR, Some(WPARAM(ch as usize)), None);
+            }
+            let decimal_typing_accepted = get(180) == "12,5" && IsWindowEnabled(print).as_bool();
+            set(180, "100");
+            set(181, "150");
+            click(176);
+            checks_passed = [
+                preferred_printer,
+                tc_margin,
+                landscape,
+                invalid_margin_blocked,
+                decimal_margin_accepted,
+                invalid_copies_blocked,
+                valid_copies_accepted,
+                empty_size_blocked,
+                huge_size_blocked,
+                thousand_size_accepted,
+                decimal_typing_accepted,
+            ]
+            .into_iter()
+            .all(|ok| ok);
+            println!("print preview: printer={preferred_printer}, TC margins={tc_margin}, landscape={landscape}, invalid margin={invalid_margin_blocked}, decimal margin={decimal_margin_accepted}, invalid copies={invalid_copies_blocked}, valid copies={valid_copies_accepted}, empty size={empty_size_blocked}, huge size={huge_size_blocked}, 1000 mm={thousand_size_accepted}, decimal typing={decimal_typing_accepted}");
             let _ = InvalidateRect(Some(dlg), None, true);
             std::thread::sleep(Duration::from_millis(300));
         }
@@ -309,6 +367,120 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print
             capture(rc, &out_dir.join(format!("{}_{}.png", name, page)));
         }
         let _ = PostMessageW(Some(dlg), WM_CLOSE, WPARAM(0), LPARAM(0));
+        if !checks_passed {
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Exercises the actual preview -> worker -> PDF driver's filename dialog -> completion path.
+fn print_pdf_check(thread: u32, out_dir: PathBuf, cancel: bool) {
+    unsafe extern "system" fn find_save(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut process = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut process));
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class) as usize;
+        if process == std::process::id()
+            && IsWindowVisible(hwnd).as_bool()
+            && String::from_utf16_lossy(&class[..len]) == "#32770"
+        {
+            *(found.0 as *mut isize) = hwnd.0 as isize;
+            return false.into();
+        }
+        true.into()
+    }
+    unsafe extern "system" fn find_edit(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut class = [0u16; 64];
+        let len = GetClassNameW(hwnd, &mut class) as usize;
+        if IsWindowVisible(hwnd).as_bool()
+            && GetDlgCtrlID(hwnd) == 1001
+            && String::from_utf16_lossy(&class[..len]) == "Edit"
+        {
+            *(found.0 as *mut isize) = hwnd.0 as isize;
+            return false.into();
+        }
+        true.into()
+    }
+    unsafe {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let dlg = loop {
+            if let Some(dlg) = find_dialog(thread) {
+                break dlg;
+            }
+            if Instant::now() > deadline {
+                eprintln!("PDF preview not found");
+                std::process::exit(2);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        std::thread::sleep(Duration::from_millis(300));
+        let print = GetDlgItem(Some(dlg), IDOK.0).unwrap();
+        SendMessageW(print, BM_CLICK, None, None);
+        let busy = !IsWindowEnabled(print).as_bool()
+            && IsWindowEnabled(GetDlgItem(Some(dlg), IDCANCEL.0).unwrap()).as_bool();
+        let save = loop {
+            let mut found = 0isize;
+            let _ = EnumWindows(Some(find_save), LPARAM(&mut found as *mut _ as isize));
+            if found != 0 {
+                break HWND(found as *mut _);
+            }
+            if Instant::now() > deadline {
+                eprintln!("PDF filename dialog not found");
+                std::process::exit(2);
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        if cancel {
+            SendMessageW(save, WM_COMMAND, Some(WPARAM(IDCANCEL.0 as usize)), None);
+            while !IsWindowEnabled(print).as_bool() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let ok = busy
+                && IsWindow(Some(dlg)).as_bool()
+                && IsWindowEnabled(print).as_bool()
+                && IsWindowEnabled(dlg).as_bool();
+            println!("PDF cancellation: responsive={busy}, preview restored={ok}");
+            let _ = PostMessageW(Some(dlg), WM_CLOSE, WPARAM(0), LPARAM(0));
+            if !ok {
+                std::process::exit(2);
+            }
+            return;
+        }
+        let mut edit = 0isize;
+        let _ = EnumChildWindows(
+            Some(save),
+            Some(find_edit),
+            LPARAM(&mut edit as *mut _ as isize),
+        );
+        if edit == 0 {
+            eprintln!("PDF filename edit not found");
+            std::process::exit(2);
+        }
+        let output = out_dir.join(format!("preview-{}.pdf", std::process::id()));
+        let absolute: PathBuf = std::env::current_dir()
+            .unwrap()
+            .join(&output)
+            .components()
+            .collect();
+        SetWindowTextW(
+            HWND(edit as *mut _),
+            &windows::core::HSTRING::from(absolute.as_os_str()),
+        )
+        .unwrap();
+        SendMessageW(save, WM_COMMAND, Some(WPARAM(IDOK.0 as usize)), None);
+        while IsWindow(Some(dlg)).as_bool() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ok = busy
+            && !IsWindow(Some(dlg)).as_bool()
+            && std::fs::read(&output).is_ok_and(|b| b.starts_with(b"%PDF-"));
+        println!(
+            "PDF preview: responsive={busy}, completed={ok}, output={}",
+            output.display()
+        );
+        if !ok {
+            std::process::exit(2);
+        }
     }
 }
 
@@ -560,22 +732,49 @@ fn main() {
                     pump(100);
                     save_clipboard_dib(host, &out_dir.join(format!("{}.png", arg)));
                 }
-                "print" | "print-check" => {
-                    if cmd == "print-check" {
+                "print" | "print-check" | "print-pdf-check" | "print-pdf-cancel-check" => {
+                    let print_worker = if cmd == "print-check" {
                         let thread = windows::Win32::System::Threading::GetCurrentThreadId();
                         let out = out_dir.clone();
-                        std::thread::spawn(move || {
+                        Some(std::thread::spawn(move || {
                             shoot_dialog(thread, "landscape".into(), 1, out, true)
-                        });
-                    }
+                        }))
+                    } else if cmd == "print-pdf-check" || cmd == "print-pdf-cancel-check" {
+                        let thread = windows::Win32::System::Threading::GetCurrentThreadId();
+                        let out = out_dir.clone();
+                        let cancel = cmd == "print-pdf-cancel-check";
+                        Some(std::thread::spawn(move || {
+                            print_pdf_check(thread, out, cancel)
+                        }))
+                    } else {
+                        None
+                    };
+                    let printer: Vec<u16> = "Microsoft Print to PDF\0".encode_utf16().collect();
+                    let margins = RECT {
+                        left: 100,
+                        top: 125,
+                        right: 100,
+                        bottom: 100,
+                    };
                     let result = ListPrintW(
                         viewer,
                         std::ptr::null(),
-                        std::ptr::null(),
+                        if cmd != "print" {
+                            printer.as_ptr()
+                        } else {
+                            std::ptr::null()
+                        },
                         0,
-                        std::ptr::null(),
+                        if cmd == "print-check" {
+                            &margins
+                        } else {
+                            std::ptr::null()
+                        },
                     );
                     println!("ListPrintW -> {result}");
+                    if let Some(worker) = print_worker {
+                        worker.join().unwrap();
+                    }
                 }
                 "thumb" => {
                     let parts: Vec<&str> = arg.splitn(4, ',').collect();

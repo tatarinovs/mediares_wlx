@@ -221,12 +221,17 @@ pub unsafe extern "system" fn ListSendCommand(
 pub unsafe extern "system" fn ListPrintW(
     list_win: HWND,
     _file_to_print: *const u16,
-    _def_printer: *const u16,
+    def_printer: *const u16,
     _print_flags: c_int,
     margins: *const RECT,
 ) -> c_int {
     guard(LISTPLUGIN_ERROR, || unsafe {
-        print_result(window::print(list_win, margins.as_ref().copied()))
+        let printer = pwstr_to_path(def_printer).map(|s| s.to_string_lossy().into_owned());
+        print_result(window::print(
+            list_win,
+            printer.as_deref(),
+            margins.as_ref().copied().map(print::tc_margins),
+        ))
     })
 }
 
@@ -234,12 +239,17 @@ pub unsafe extern "system" fn ListPrintW(
 pub unsafe extern "system" fn ListPrint(
     list_win: HWND,
     _file_to_print: *const c_char,
-    _def_printer: *const c_char,
+    def_printer: *const c_char,
     _print_flags: c_int,
     margins: *const RECT,
 ) -> c_int {
     guard(LISTPLUGIN_ERROR, || unsafe {
-        print_result(window::print(list_win, margins.as_ref().copied()))
+        let printer = pstr_to_path(def_printer).map(|s| s.to_string_lossy().into_owned());
+        print_result(window::print(
+            list_win,
+            printer.as_deref(),
+            margins.as_ref().copied().map(print::tc_margins),
+        ))
     })
 }
 

@@ -1,21 +1,23 @@
-//! One-page print preview and GDI printing, using the selected printer's paper geometry.
+//! Print preview and cancellable background GDI printing.
 
-use std::mem::size_of;
-use std::ptr::null_mut;
+mod job;
+mod layout;
+mod printer;
+
+use std::sync::Arc;
 use windows::core::{w, HSTRING, PCWSTR};
-use windows::Win32::Foundation::{COLORREF, HGLOBAL, HWND, LPARAM, LRESULT, RECT, WPARAM};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::Graphics::Printing::*;
-use windows::Win32::Storage::Xps::{AbortDoc, EndDoc, EndPage, StartDocW, StartPage, DOCINFOW};
-use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE};
 use windows::Win32::UI::Controls::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::dialog;
-use crate::i18n::tr;
+use crate::i18n::{decimal, tr, tr_fmt};
 use crate::image_cache::DecodedImage;
-use crate::image_view::{draw_fitted, draw_stretched};
+use job::{Outcome, Task};
+use layout::{intersect, parse_mm, Options, Placement, SizeMode};
+use printer::{PaperChoice, Printer};
 
 const CLASS: PCWSTR = w!("MediaresPrintPreview");
 
@@ -52,115 +54,141 @@ const CUSTOM_H_UNIT: usize = 187;
 const SIDEBAR_WIDTH: i32 = 510;
 const DEFAULT_MARGIN_MM: i32 = 10;
 const MM100_PER_MM: i32 = 100;
-const MM100_PER_INCH: i64 = 2540;
+const STATUS: usize = 190;
+const PRINT_TIMER: usize = 1;
 
-#[link(name = "winspool")]
-unsafe extern "system" {
-    #[link_name = "DeviceCapabilitiesW"]
-    fn printer_device_capabilities(
-        device: PCWSTR,
-        port: PCWSTR,
-        capability: u16,
-        output: *mut u16,
-        devmode: *const DEVMODEW,
-    ) -> i32;
-}
-const DC_PAPERS_ID: u16 = 2;
-const DC_PAPERSIZE_ID: u16 = 3;
-const DC_PAPERNAMES_ID: u16 = 16;
-
-#[derive(Clone)]
-struct PaperChoice {
-    id: u16,
-    label: String,
+/// The Lister SDK passes MM_LOMETRIC (1/10 mm); internally margins use 1/100 mm.
+pub(crate) fn tc_margins(m: RECT) -> RECT {
+    RECT {
+        left: m.left.saturating_mul(10),
+        top: m.top.saturating_mul(10),
+        right: m.right.saturating_mul(10),
+        bottom: m.bottom.saturating_mul(10),
+    }
 }
 
-unsafe fn paper_choices(printer: &PrinterState) -> Vec<PaperChoice> {
-    let name = HSTRING::from(printer.name.as_str());
-    let devmode = if printer.devmode.is_invalid() {
-        std::ptr::null_mut()
-    } else {
-        GlobalLock(printer.devmode).cast::<DEVMODEW>()
+struct Preview {
+    printer: Printer,
+    available: bool,
+    image: Arc<DecodedImage>,
+    preview: Arc<DecodedImage>,
+    name: String,
+    printed: bool,
+    initializing: bool,
+    papers: Vec<PaperChoice>,
+    alignment: usize,
+    rotated: Option<Arc<DecodedImage>>,
+    job: Option<Task>,
+    caption_font: HFONT,
+}
+impl Preview {
+    fn rotated(&mut self) -> &DecodedImage {
+        self.rotated
+            .get_or_insert_with(|| Arc::new(crate::image_cache::rotated(&self.preview, true)))
+    }
+}
+
+/// Keep repainting and preview rotation cheap even when printing a very large original.
+fn preview_copy(image: &Arc<DecodedImage>) -> Arc<DecodedImage> {
+    use mediares_core::image::{imageops, ImageBuffer, Rgba};
+    const MAX_SIDE: u32 = 1600;
+    let longest = image.width.max(image.height);
+    if longest <= MAX_SIDE {
+        return image.clone();
+    }
+    let Some(source) =
+        ImageBuffer::<Rgba<u8>, _>::from_raw(image.width, image.height, image.bgra.as_slice())
+    else {
+        return image.clone();
     };
-    let device = PCWSTR(name.as_ptr());
-    let port = PCWSTR::null();
-    let count = printer_device_capabilities(device, port, DC_PAPERS_ID, null_mut(), devmode);
-    let result = if (1..=1024).contains(&count) {
-        let n = count as usize;
-        let mut ids = vec![0u16; n];
-        let mut names = vec![0u16; n * 64];
-        let mut sizes = vec![0u16; n * 4];
-        let a = printer_device_capabilities(device, port, DC_PAPERS_ID, ids.as_mut_ptr(), devmode);
-        let b = printer_device_capabilities(
-            device,
-            port,
-            DC_PAPERNAMES_ID,
-            names.as_mut_ptr(),
-            devmode,
-        );
-        let c =
-            printer_device_capabilities(device, port, DC_PAPERSIZE_ID, sizes.as_mut_ptr(), devmode);
-        if a != count || b != count {
-            Vec::new()
-        } else {
-            let dimensions = if c == count {
-                Some(std::slice::from_raw_parts(
-                    sizes.as_ptr().cast::<i32>(),
-                    n * 2,
-                ))
-            } else {
-                None
-            };
-            (0..n)
-                .map(|i| {
-                    let raw = &names[i * 64..(i + 1) * 64];
-                    let end = raw.iter().position(|&ch| ch == 0).unwrap_or(64);
-                    let mut label = String::from_utf16_lossy(&raw[..end]).trim().to_string();
-                    if label.is_empty() {
-                        label = format!("Paper {}", ids[i]);
-                    }
-                    if let Some(dim) = dimensions {
-                        let w = dim[i * 2];
-                        let h = dim[i * 2 + 1];
-                        if w > 0 && h > 0 {
-                            label.push_str(&format!(
-                                " ({} × {} mm)",
-                                w as f64 / 10.0,
-                                h as f64 / 10.0
-                            ));
-                        }
-                    }
-                    PaperChoice { id: ids[i], label }
-                })
-                .collect()
+    let width = (image.width as u64 * MAX_SIDE as u64 / longest as u64).max(1) as u32;
+    let height = (image.height as u64 * MAX_SIDE as u64 / longest as u64).max(1) as u32;
+    let pixels = imageops::resize(&source, width, height, imageops::FilterType::Triangle);
+    Arc::new(DecodedImage {
+        width,
+        height,
+        full: image.full,
+        bgra: pixels.into_raw(),
+        is_preview: image.is_preview,
+        exif: None,
+        pages: image.pages,
+    })
+}
+
+fn format_mm(value: f64) -> String {
+    decimal(
+        format!("{value:.2}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string(),
+    )
+}
+
+// Device pixel rounding is useful for layout, but adds misleading hundredths to paper sizes.
+fn format_size(value: f64) -> String {
+    format_mm((value * 10.0).round() / 10.0)
+}
+
+unsafe fn text(dlg: HWND, id: usize, value: &str) {
+    let _ = SetWindowTextW(
+        GetDlgItem(Some(dlg), id as i32).unwrap_or_default(),
+        &HSTRING::from(value),
+    );
+}
+
+unsafe fn selected_mode(dlg: HWND) -> SizeMode {
+    SizeMode::ALL
+        .into_iter()
+        .enumerate()
+        .find_map(|(i, mode)| {
+            (SendDlgItemMessageW(
+                dlg,
+                (MODE_FIRST + i) as i32,
+                BM_GETCHECK,
+                WPARAM(0),
+                LPARAM(0),
+            )
+            .0 == BST_CHECKED.0 as isize)
+                .then_some(mode)
+        })
+        .unwrap_or(SizeMode::Fit)
+}
+
+unsafe fn update_mode_controls_visibility(dlg: HWND) {
+    let mode = selected_mode(dlg);
+    for id in [
+        CUSTOM_W_LABEL,
+        CUSTOM_WIDTH,
+        CUSTOM_W_SPIN,
+        CUSTOM_W_UNIT,
+        CUSTOM_H_LABEL,
+        CUSTOM_HEIGHT,
+        CUSTOM_H_SPIN,
+        CUSTOM_H_UNIT,
+    ] {
+        if let Ok(h) = GetDlgItem(Some(dlg), id as i32) {
+            let _ = ShowWindow(
+                h,
+                if mode == SizeMode::Custom {
+                    SW_SHOW
+                } else {
+                    SW_HIDE
+                },
+            );
         }
-    } else {
-        Vec::new()
-    };
-    if !devmode.is_null() {
-        let _ = GlobalUnlock(printer.devmode);
     }
-    result
+    let _ = EnableWindow(
+        GetDlgItem(Some(dlg), AUTO_CROP as i32).unwrap_or_default(),
+        matches!(mode, SizeMode::Fit | SizeMode::Custom),
+    );
 }
 
-unsafe fn selected_paper_id(printer: &PrinterState) -> Option<u16> {
-    if printer.devmode.is_invalid() {
-        return None;
-    }
-    let mode = GlobalLock(printer.devmode).cast::<DEVMODEW>();
-    if mode.is_null() {
-        return None;
-    }
-    let id = (*mode).Anonymous1.Anonymous1.dmPaperSize as u16;
-    let _ = GlobalUnlock(printer.devmode);
-    Some(id)
-}
-
-unsafe fn refresh_papers(dlg: HWND, data: &mut Preview<'_>) {
-    data.papers = paper_choices(&data.printer);
+unsafe fn refresh_papers(dlg: HWND, data: &mut Preview) {
+    data.papers = data.printer.papers();
     let combo = GetDlgItem(Some(dlg), PAPER_INFO).unwrap_or_default();
     SendMessageW(combo, CB_RESETCONTENT, None, None);
-    let current = selected_paper_id(&data.printer);
+    let current = data.printer.paper_id();
+    let mut selected = None;
     for (i, paper) in data.papers.iter().enumerate() {
         let label = HSTRING::from(paper.label.as_str());
         SendMessageW(
@@ -170,340 +198,99 @@ unsafe fn refresh_papers(dlg: HWND, data: &mut Preview<'_>) {
             Some(LPARAM(label.as_ptr() as isize)),
         );
         if Some(paper.id) == current {
-            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(i)), None);
+            selected = Some(i);
         }
     }
-    if !data.papers.is_empty() {
-        let selection = SendMessageW(combo, CB_GETCURSEL, None, None).0;
-        if selection < 0 {
-            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
-        }
-    } else {
-        let pw = GetDeviceCaps(Some(data.printer.dc), PHYSICALWIDTH);
-        let ph = GetDeviceCaps(Some(data.printer.dc), PHYSICALHEIGHT);
-        let dx = GetDeviceCaps(Some(data.printer.dc), LOGPIXELSX).max(1);
-        let dy = GetDeviceCaps(Some(data.printer.dc), LOGPIXELSY).max(1);
-        let label = format!(
-            "{:.0} × {:.0} mm",
-            pw as f64 * 25.4 / dx as f64,
-            ph as f64 * 25.4 / dy as f64
-        );
-        let text = HSTRING::from(label);
+    // Custom driver forms may not occur in DC_PAPERS: display their real geometry.
+    if selected.is_none() {
+        let (w, h) = data
+            .printer
+            .geometry()
+            .map(|g| g.paper_mm())
+            .unwrap_or((0.0, 0.0));
+        let label = HSTRING::from(format!("{} × {} {}", format_mm(w), format_mm(h), tr("mm")));
         SendMessageW(
             combo,
             CB_ADDSTRING,
             None,
-            Some(LPARAM(text.as_ptr() as isize)),
+            Some(LPARAM(label.as_ptr() as isize)),
         );
-        SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(0)), None);
+        selected = Some(data.papers.len());
     }
-    let _ = EnableWindow(combo, !data.papers.is_empty());
+    SendMessageW(
+        combo,
+        CB_SETCURSEL,
+        Some(WPARAM(selected.unwrap_or(0))),
+        None,
+    );
+    let _ = EnableWindow(combo, data.available && !data.papers.is_empty());
 }
 
-struct PrinterState {
-    name: String,
-    dc: HDC,
-    devmode: HGLOBAL,
-}
-
-impl Drop for PrinterState {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.dc.is_invalid() {
-                let _ = DeleteDC(self.dc);
-            }
-            if !self.devmode.is_invalid() {
-                let _ = windows::Win32::Foundation::GlobalFree(Some(self.devmode));
-            }
-        }
+unsafe fn fill_printers(dlg: HWND, data: &Preview, mut names: Vec<String>) {
+    if data.available && !names.contains(&data.printer.name) {
+        names.push(data.printer.name.clone());
     }
-}
-
-impl PrinterState {
-    unsafe fn create(name: &str) -> Option<Self> {
-        let name_h = HSTRING::from(name);
-        let mut handle = PRINTER_HANDLE::default();
-        if OpenPrinterW(PCWSTR(name_h.as_ptr()), &mut handle, None).is_err() {
-            return None;
-        }
-
-        let needed = DocumentPropertiesW(None, handle, PCWSTR(name_h.as_ptr()), None, None, 0);
-
-        let devmode = if needed > 0 {
-            let mem = GlobalAlloc(GMEM_MOVEABLE, needed as usize).ok()?;
-            let ptr = GlobalLock(mem).cast::<DEVMODEW>();
-            if !ptr.is_null() {
-                DocumentPropertiesW(
-                    None,
-                    handle,
-                    PCWSTR(name_h.as_ptr()),
-                    Some(ptr),
-                    None,
-                    DM_OUT_BUFFER.0,
-                );
-                let _ = GlobalUnlock(mem);
-            }
-            mem
-        } else {
-            HGLOBAL::default()
-        };
-        let _ = ClosePrinter(handle);
-
-        let dev_ptr = if !devmode.is_invalid() {
-            GlobalLock(devmode).cast::<DEVMODEW>()
-        } else {
-            null_mut()
-        };
-
-        let dc = CreateDCW(
-            w!("WINSPOOL"),
-            PCWSTR(name_h.as_ptr()),
-            PCWSTR::null(),
-            if dev_ptr.is_null() {
-                None
-            } else {
-                Some(dev_ptr)
-            },
+    let combo = GetDlgItem(Some(dlg), PRINTER_COMBO as i32).unwrap_or_default();
+    SendMessageW(combo, CB_RESETCONTENT, None, None);
+    for (i, name) in names.iter().enumerate() {
+        let label = HSTRING::from(name.as_str());
+        SendMessageW(
+            combo,
+            CB_ADDSTRING,
+            None,
+            Some(LPARAM(label.as_ptr() as isize)),
         );
-
-        if !dev_ptr.is_null() {
-            let _ = GlobalUnlock(devmode);
-        }
-
-        if dc.is_invalid() {
-            if !devmode.is_invalid() {
-                let _ = windows::Win32::Foundation::GlobalFree(Some(devmode));
-            }
-            None
-        } else {
-            Some(Self {
-                name: name.to_string(),
-                dc,
-                devmode,
-            })
+        if *name == data.printer.name {
+            SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(i)), None);
         }
     }
-
-    unsafe fn configure(&mut self, landscape: Option<bool>) -> bool {
-        if self.devmode.is_invalid() {
-            return false;
-        }
-        let mode = GlobalLock(self.devmode).cast::<DEVMODEW>();
-        if mode.is_null() {
-            return false;
-        }
-        let old = *mode;
-        (*mode).dmFields |= DM_COPIES;
-        (*mode).Anonymous1.Anonymous1.dmCopies = 1;
-        if let Some(landscape) = landscape {
-            (*mode).dmFields |= DM_ORIENTATION;
-            (*mode).Anonymous1.Anonymous1.dmOrientation = if landscape {
-                DMORIENT_LANDSCAPE as i16
-            } else {
-                DMORIENT_PORTRAIT as i16
-            };
-        }
-        let new_dc = ResetDCW(self.dc, mode);
-        if new_dc.is_invalid() {
-            *mode = old;
-        } else {
-            self.dc = new_dc;
-        }
-        let _ = GlobalUnlock(self.devmode);
-        !new_dc.is_invalid()
-    }
-
-    unsafe fn set_paper(&mut self, paper_id: u16) -> bool {
-        if self.devmode.is_invalid() {
-            return false;
-        }
-        let mode = GlobalLock(self.devmode).cast::<DEVMODEW>();
-        if mode.is_null() {
-            return false;
-        }
-        let old = *mode;
-        (*mode).dmFields |= DM_PAPERSIZE;
-        (*mode).dmFields &= !(DM_PAPERWIDTH | DM_PAPERLENGTH);
-        (*mode).Anonymous1.Anonymous1.dmPaperSize = paper_id as i16;
-        let new_dc = ResetDCW(self.dc, mode);
-        if new_dc.is_invalid() {
-            *mode = old;
-        } else {
-            self.dc = new_dc;
-        }
-        let _ = GlobalUnlock(self.devmode);
-        !new_dc.is_invalid()
-    }
-
-    unsafe fn open_properties(&mut self, owner: HWND) -> bool {
-        let name_h = HSTRING::from(self.name.as_str());
-        let mut handle = PRINTER_HANDLE::default();
-        if OpenPrinterW(PCWSTR(name_h.as_ptr()), &mut handle, None).is_err() {
-            return false;
-        }
-        let mode = GlobalLock(self.devmode).cast::<DEVMODEW>();
-        let ok = if !mode.is_null() {
-            let res = DocumentPropertiesW(
-                Some(owner),
-                handle,
-                PCWSTR(name_h.as_ptr()),
-                Some(mode),
-                Some(mode),
-                (DM_IN_PROMPT | DM_IN_BUFFER | DM_OUT_BUFFER).0,
-            );
-            let _ = GlobalUnlock(self.devmode);
-            res == 1
-        } else {
-            false
-        };
-        let _ = ClosePrinter(handle);
-        if ok {
-            let mode = GlobalLock(self.devmode).cast::<DEVMODEW>();
-            let new_dc = ResetDCW(self.dc, mode);
-            if !new_dc.is_invalid() {
-                self.dc = new_dc;
-            }
-            let _ = GlobalUnlock(self.devmode);
-        }
-        ok
-    }
+    let _ = EnableWindow(combo, !names.is_empty());
 }
 
-unsafe fn enumerate_printers() -> Vec<String> {
-    let mut needed = 0u32;
-    let mut returned = 0u32;
-    let flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
-    let _ = EnumPrintersW(flags, PCWSTR::null(), 4, None, &mut needed, &mut returned);
-    if needed == 0 {
-        return Vec::new();
-    }
-    let mut buffer = vec![0u8; needed as usize];
-    if EnumPrintersW(
-        flags,
-        PCWSTR::null(),
-        4,
-        Some(buffer.as_mut_slice()),
-        &mut needed,
-        &mut returned,
-    )
-    .is_err()
-    {
-        return Vec::new();
-    }
-    let entries =
-        std::slice::from_raw_parts(buffer.as_ptr().cast::<PRINTER_INFO_4W>(), returned as usize);
-    entries
-        .iter()
-        .filter_map(|info| {
-            if info.pPrinterName.is_null() {
-                None
-            } else {
-                Some(info.pPrinterName.to_string().unwrap_or_default())
-            }
-        })
-        .collect()
-}
-
-unsafe fn default_printer_name() -> Option<String> {
-    let mut len = 0u32;
-    let _ = GetDefaultPrinterW(None, &mut len);
-    if len == 0 {
-        return None;
-    }
-    let mut buf = vec![0u16; len as usize];
-    if GetDefaultPrinterW(Some(windows::core::PWSTR(buf.as_mut_ptr())), &mut len).as_bool() {
-        Some(String::from_utf16_lossy(
-            &buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())],
-        ))
-    } else {
-        None
-    }
-}
-
-struct Preview<'a> {
-    printer: PrinterState,
-    image: &'a DecodedImage,
-    name: &'a str,
-    printed: bool,
-    papers: Vec<PaperChoice>,
-    alignment: usize,
-    /// The picture turned a quarter clockwise, made the first time "Auto rotate" needs it.
-    rotated: Option<DecodedImage>,
-}
-
-impl Preview<'_> {
-    /// The picture turned a quarter clockwise, for "Auto rotate".
-    fn rotated(&mut self) -> &DecodedImage {
-        let image = self.image;
-        self.rotated
-            .get_or_insert_with(|| crate::image_cache::rotated(image, true))
-    }
-}
-
-/// The checked "Size" radio button (1 = "Fit to page", as the dialog starts).
-unsafe fn selected_mode(dlg: HWND) -> usize {
-    for i in 0..4 {
-        let checked = SendDlgItemMessageW(
-            dlg,
-            (MODE_FIRST + i) as i32,
-            BM_GETCHECK,
-            WPARAM(0),
-            LPARAM(0),
-        )
-        .0 == BST_CHECKED.0 as isize;
-        if checked {
-            return i;
+unsafe fn refresh_printers(dlg: HWND, data: &mut Preview) {
+    let names = printer::enumerate();
+    let next = Printer::create(&data.printer.name)
+        .or_else(|| names.iter().find_map(|name| Printer::create(name)));
+    data.available = next.is_some();
+    if let Some(mut next) = next {
+        if let Some(g) = data.printer.geometry() {
+            next.orient(g.paper_mm().0 > g.paper_mm().1);
         }
+        data.printer = next;
     }
-    1
-}
-
-unsafe fn update_mode_controls_visibility(dlg: HWND) {
-    let mode = selected_mode(dlg);
-    let show = if mode == 3 { SW_SHOW } else { SW_HIDE };
-    let controls = [
-        CUSTOM_W_LABEL,
-        CUSTOM_WIDTH,
-        CUSTOM_W_SPIN,
-        CUSTOM_W_UNIT,
-        CUSTOM_H_LABEL,
-        CUSTOM_HEIGHT,
-        CUSTOM_H_SPIN,
-        CUSTOM_H_UNIT,
-    ];
-    for id in controls {
-        if let Ok(h) = GetDlgItem(Some(dlg), id as i32) {
-            let _ = ShowWindow(h, show);
-        }
-    }
-    // "Fill and crop" only changes how a picture is fitted into a frame; "Original size"
-    // and "Stretch to page" have nothing to crop.
-    if let Ok(crop) = GetDlgItem(Some(dlg), AUTO_CROP as i32) {
-        let _ = EnableWindow(crop, mode == 1 || mode == 3);
-    }
+    fill_printers(dlg, data, names);
+    sync_orientation(dlg, data.printer.dc);
+    refresh_papers(dlg, data);
+    validate(dlg, data);
 }
 
 pub unsafe fn print(
     owner: HWND,
-    img: &DecodedImage,
+    img: Arc<DecodedImage>,
     doc_name: &str,
+    preferred_printer: Option<&str>,
     margins: Option<RECT>,
 ) -> bool {
-    let printers = enumerate_printers();
-    let Some(mut printer) = default_printer_name()
-        .as_deref()
-        .or_else(|| printers.first().map(|s| s.as_str()))
-        .and_then(|name| PrinterState::create(name))
-        .or_else(|| printers.first().and_then(|p| PrinterState::create(p)))
+    let printers = printer::enumerate();
+    let default = printer::default_name();
+    let Some(mut printer) = preferred_printer
+        .and_then(|name| Printer::create(name))
+        .or_else(|| default.as_deref().and_then(|name| Printer::create(name)))
+        .or_else(|| printers.iter().find_map(|name| Printer::create(name)))
     else {
         crate::file_actions::show_error(owner, tr("No default printer is available."));
         return false;
     };
-
-    printer.configure(Some(img.width > img.height));
+    printer.orient(img.width > img.height);
 
     dialog::register_class(CLASS, Some(wnd_proc));
-    let Some(dlg) = dialog::create_frame(owner, CLASS, tr("Print preview"), 1040, 560) else {
+    let Some(dlg) = dialog::create_frame(
+        owner,
+        CLASS,
+        &format!("{} — {}", tr("Print preview"), doc_name),
+        1120,
+        640,
+    ) else {
         return false;
     };
 
@@ -513,8 +300,13 @@ pub unsafe fn print(
     let font = dialog::font(dlg, "Segoe UI", -14);
     let mut data = Preview {
         printer,
+        available: true,
+        initializing: true,
+        job: None,
+        caption_font: HFONT::default(),
+        preview: preview_copy(&img),
         image: img,
-        name: doc_name,
+        name: doc_name.to_string(),
         printed: false,
         papers: Vec::new(),
         alignment: 4,
@@ -533,7 +325,8 @@ pub unsafe fn print(
     let control = |class, text: &str, style, bounds, id| {
         dialog::control_px(dlg, class, text, style, bounds, id, font.0)
     };
-    let small_font = dialog::font(dlg, "Segoe UI", -12);
+    let small_font = dialog::font(dlg, "Segoe UI", -13);
+    data.caption_font = small_font.0;
     let label = |text: &str, bounds, id| {
         dialog::control_px(
             dlg,
@@ -562,7 +355,7 @@ pub unsafe fn print(
 
     // Принтер и бумага
     group(tr("Printer"), right_x, px(6), ctrl_w, px(88));
-    let printer_combo = control(
+    control(
         w!("COMBOBOX"),
         "",
         WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32,
@@ -591,17 +384,7 @@ pub unsafe fn print(
         (right_x + px(63), px(54), ctrl_w - px(72), px(220)),
         PAPER_INFO as usize,
     );
-    for (i, printer) in printers.iter().enumerate() {
-        SendMessageW(
-            printer_combo,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(HSTRING::from(printer.as_str()).as_ptr() as isize)),
-        );
-        if *printer == data.printer.name {
-            SendMessageW(printer_combo, CB_SETCURSEL, Some(WPARAM(i)), None);
-        }
-    }
+    fill_printers(dlg, &data, printers);
 
     let left_x = right_x;
     let left_w = (ctrl_w - px(8)) / 2;
@@ -621,28 +404,28 @@ pub unsafe fn print(
         | WS_CHILD.0
         | UDS_ALIGNRIGHT
         | UDS_ARROWKEYS
-        | UDS_AUTOBUDDY
+        | UDS_NOTHOUSANDS
         | UDS_SETBUDDYINT;
 
     // Крестовина полей: сверху и снизу по центру, слева и справа у краёв группы.
-    let field_w = px(58);
+    let field_w = px(78);
     let field_h = px(24);
     let label_w = px(78);
     let label_h = px(17);
     let top_x = left_x + (left_w - field_w) / 2;
-    let mid_y = px(158);
+    let mid_y = px(162);
 
     let positions = [
-        (top_x, px(114)),                            // Сверху
+        (top_x, px(122)),                            // Сверху
         (left_x + px(12), mid_y),                    // Слева
         (left_x + left_w - px(12) - field_w, mid_y), // Справа
         (top_x, px(202)),                            // Снизу
     ];
     let values = [
-        m.top / MM100_PER_MM,
-        m.left / MM100_PER_MM,
-        m.right / MM100_PER_MM,
-        m.bottom / MM100_PER_MM,
+        m.top as f64 / MM100_PER_MM as f64,
+        m.left as f64 / MM100_PER_MM as f64,
+        m.right as f64 / MM100_PER_MM as f64,
+        m.bottom as f64 / MM100_PER_MM as f64,
     ];
     let ids = [
         MARGIN_FIRST,
@@ -656,8 +439,8 @@ pub unsafe fn print(
         let (x, y) = positions[i];
         let edit_h = control(
             w!("EDIT"),
-            &values[i].to_string(),
-            WS_TABSTOP.0 | WS_BORDER.0 | ES_NUMBER as u32 | dialog::ES_AUTOHSCROLL,
+            &format_mm(values[i]),
+            WS_TABSTOP.0 | WS_BORDER.0 | dialog::ES_AUTOHSCROLL,
             (x, y, field_w, field_h),
             ids[i],
         );
@@ -669,6 +452,8 @@ pub unsafe fn print(
         SendMessageW(spin_h, UDM_SETRANGE32, Some(WPARAM(0)), Some(LPARAM(300)));
         SendMessageW(spin_h, UDM_SETPOS32, None, Some(LPARAM(values[i] as isize)));
 
+        let _ = SetWindowTextW(edit_h, &HSTRING::from(format_mm(values[i])));
+
         // Подпись шире поля и центрируется относительно него.
         let lx = x + (field_w - label_w) / 2;
         label(labels[i], (lx, y + field_h, label_w, label_h), 0);
@@ -677,15 +462,26 @@ pub unsafe fn print(
     // Расположение (сетка 3x3)
     group(tr("Placement"), right_col, px(100), right_w, px(150));
     let button_w = px(42);
-    let button_h = px(38);
-    let gap = px(6);
+    let button_h = px(36);
+    let gap = px(4);
     let grid_x = right_col + (right_w - (button_w * 3 + gap * 2)) / 2;
     for i in 0..9 {
         let x = grid_x + (i % 3) as i32 * (button_w + gap);
-        let y = px(114) + (i / 3) as i32 * (button_h + gap);
+        let y = px(122) + (i / 3) as i32 * (button_h + gap);
+        let rows = [tr("Top"), tr("Center"), tr("Bottom")];
+        let cols = [tr("Left"), tr("Center"), tr("Right")];
+        let name = if i == 4 {
+            tr("Center").to_string()
+        } else if i / 3 == 1 {
+            cols[i % 3].to_string()
+        } else if i % 3 == 1 {
+            rows[i / 3].to_string()
+        } else {
+            format!("{} {}", rows[i / 3], cols[i % 3])
+        };
         control(
             w!("BUTTON"),
-            "",
+            &name,
             WS_TABSTOP.0 | BS_OWNERDRAW as u32,
             (x, y, button_w, button_h),
             ALIGN_FIRST + i,
@@ -744,7 +540,7 @@ pub unsafe fn print(
         let edit = control(
             w!("EDIT"),
             &value.to_string(),
-            WS_TABSTOP.0 | WS_BORDER.0 | ES_NUMBER as u32 | dialog::ES_AUTOHSCROLL,
+            WS_TABSTOP.0 | WS_BORDER.0 | dialog::ES_AUTOHSCROLL,
             (left_x + px(38), y, edit_cw, px(24)),
             edit_id,
         );
@@ -836,23 +632,32 @@ pub unsafe fn print(
         AUTO_ROTATE,
     );
 
+    control(
+        w!("STATIC"),
+        "",
+        dialog::SS_LEFT,
+        (right_x + px(12), px(480), ctrl_w - px(24), px(52)),
+        STATUS,
+    );
+
     // Футер
     let footer_y = rc.bottom - px(46);
     control(
         w!("BUTTON"),
         tr("Cancel"),
         WS_TABSTOP.0,
-        (right_x + ctrl_w - px(104), footer_y, px(94), px(30)),
+        (right_x + ctrl_w - px(144), footer_y, px(134), px(30)),
         IDCANCEL.0 as usize,
     );
     let print_button = control(
         w!("BUTTON"),
         tr("Print"),
         WS_TABSTOP.0 | BS_DEFPUSHBUTTON as u32,
-        (right_x + ctrl_w - px(210), footer_y, px(98), px(30)),
+        (right_x + ctrl_w - px(260), footer_y, px(108), px(30)),
         IDOK.0 as usize,
     );
 
+    data.initializing = false;
     sync_orientation(dlg, data.printer.dc);
     refresh_papers(dlg, &mut data);
     validate(dlg, &data);
@@ -882,197 +687,179 @@ unsafe fn sync_orientation(dlg: HWND, dc: HDC) {
     }
 }
 
-fn parse_margin(text: &str) -> Option<i32> {
-    let mm = text.trim().replace(',', ".").parse::<f64>().ok()?;
-    (mm.is_finite() && (0.0..=300.0).contains(&mm))
-        .then(|| (mm * MM100_PER_MM as f64).round() as i32)
-}
-
-struct PrintOptions {
-    margins: RECT,
-    copies: u32,
-    mode: usize,
-    custom_size_mm: (f64, f64),
-    auto_crop: bool,
-    auto_rotate: bool,
-}
-
-unsafe fn options(dlg: HWND) -> Option<PrintOptions> {
-    let top = parse_margin(&dialog::item_text(dlg, MARGIN_FIRST as i32))?;
-    let left = parse_margin(&dialog::item_text(dlg, (MARGIN_FIRST + 1) as i32))?;
-    let right = parse_margin(&dialog::item_text(dlg, (MARGIN_FIRST + 2) as i32))?;
-    let bottom = parse_margin(&dialog::item_text(dlg, (MARGIN_FIRST + 3) as i32))?;
-
+unsafe fn options(dlg: HWND, alignment: usize) -> Result<Options, &'static str> {
+    let margin = |id| {
+        parse_mm(&dialog::item_text(dlg, id), 0.0, 300.0)
+            .map(|mm| (mm * 100.0).round() as i32)
+            .ok_or(tr("Enter margins from 0 to 300 mm."))
+    };
+    let margins = RECT {
+        top: margin(MARGIN_FIRST as i32)?,
+        left: margin((MARGIN_FIRST + 1) as i32)?,
+        right: margin((MARGIN_FIRST + 2) as i32)?,
+        bottom: margin((MARGIN_FIRST + 3) as i32)?,
+    };
     let copies = dialog::item_text(dlg, COPIES as i32)
         .trim()
         .parse::<u32>()
-        .ok()?;
-
+        .ok()
+        .filter(|n| (1..=99).contains(n))
+        .ok_or(tr("Enter 1 to 99 copies."))?;
     let mode = selected_mode(dlg);
-
-    let custom_w = dialog::item_text(dlg, CUSTOM_WIDTH as i32)
-        .trim()
-        .replace(',', ".")
-        .parse::<f64>()
-        .unwrap_or(100.0)
-        .max(1.0);
-    let custom_h = dialog::item_text(dlg, CUSTOM_HEIGHT as i32)
-        .trim()
-        .replace(',', ".")
-        .parse::<f64>()
-        .unwrap_or(150.0)
-        .max(1.0);
-
-    let auto_crop = SendDlgItemMessageW(dlg, AUTO_CROP as i32, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-        == BST_CHECKED.0 as isize;
-    let auto_rotate =
-        SendDlgItemMessageW(dlg, AUTO_ROTATE as i32, BM_GETCHECK, WPARAM(0), LPARAM(0)).0
-            == BST_CHECKED.0 as isize;
-
-    (1..=99).contains(&copies).then_some(PrintOptions {
-        margins: RECT {
-            left,
-            top,
-            right,
-            bottom,
-        },
+    let size_mm = if mode == SizeMode::Custom {
+        let dimension = |id| {
+            parse_mm(&dialog::item_text(dlg, id), 1.0, 1000.0)
+                .ok_or(tr("Enter width and height from 1 to 1000 mm."))
+        };
+        (
+            dimension(CUSTOM_WIDTH as i32)?,
+            dimension(CUSTOM_HEIGHT as i32)?,
+        )
+    } else {
+        (100.0, 150.0)
+    };
+    let checked = |id| {
+        SendDlgItemMessageW(dlg, id, BM_GETCHECK, WPARAM(0), LPARAM(0)).0 == BST_CHECKED.0 as isize
+    };
+    Ok(Options {
+        margins,
         copies,
         mode,
-        custom_size_mm: (custom_w, custom_h),
-        auto_crop,
-        auto_rotate,
+        size_mm,
+        crop: checked(AUTO_CROP as i32),
+        auto_rotate: checked(AUTO_ROTATE as i32),
+        alignment,
     })
 }
 
-unsafe fn validate(dlg: HWND, data: &Preview<'_>) {
-    let valid = options(dlg).is_some_and(|opt| {
-        let r = printable_rect(data.printer.dc, opt.margins);
-        r.right > r.left && r.bottom > r.top
-    });
-    let _ = EnableWindow(GetDlgItem(Some(dlg), IDOK.0).unwrap_or_default(), valid);
-    let _ = InvalidateRect(Some(dlg), None, false);
+unsafe fn preview_rect(dlg: HWND) -> RECT {
+    let mut rc = RECT::default();
+    let _ = GetClientRect(dlg, &mut rc);
+    rc.right -= dialog::px(dlg, SIDEBAR_WIDTH);
+    rc.bottom -= dialog::px(dlg, 45);
+    rc
 }
 
-/// Whether "Auto rotate" should turn the picture a quarter to match the printable area.
-fn should_rotate(img: &DecodedImage, area: RECT, auto_rotate: bool) -> bool {
-    if !auto_rotate || img.width == img.height {
-        return false;
+unsafe fn validate(dlg: HWND, data: &Preview) {
+    validate_options(dlg, data, true);
+}
+
+unsafe fn validate_options(dlg: HWND, data: &Preview, repaint: bool) {
+    if data.initializing || data.job.is_some() {
+        return;
     }
-    let area_is_landscape = area.right - area.left > area.bottom - area.top;
-    (img.width > img.height) != area_is_landscape
-}
-
-/// Where to draw the picture, and the rectangle to clip it to.
-struct Placement {
-    image: RECT,
-    clip: RECT,
-}
-
-fn intersect(a: RECT, b: RECT) -> RECT {
-    RECT {
-        left: a.left.max(b.left),
-        top: a.top.max(b.top),
-        right: a.right.min(b.right),
-        bottom: a.bottom.min(b.bottom),
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn compute_placement(
-    area: RECT,
-    img_w: u32,
-    img_h: u32,
-    mode: usize,
-    custom_size_mm: (f64, f64),
-    dpi: (i32, i32),
-    printer_dpi: (i32, i32),
-    auto_crop: bool,
-    alignment: usize,
-) -> Placement {
-    let target_w = (area.right - area.left) as f64;
-    let target_h = (area.bottom - area.top) as f64;
-    if img_w == 0 || img_h == 0 || target_w <= 0.0 || target_h <= 0.0 {
-        return Placement {
-            image: area,
-            clip: area,
-        };
-    }
-
-    // Scale the image into a `req_w` x `req_h` box, cropping or letterboxing as asked.
-    let fit = |req_w: f64, req_h: f64, cover: bool| {
-        let (sx, sy) = (req_w / img_w as f64, req_h / img_h as f64);
-        let scale = if cover { sx.max(sy) } else { sx.min(sy) };
-        (
-            (img_w as f64 * scale).round() as i32,
-            (img_h as f64 * scale).round() as i32,
-        )
+    let result = if !data.available {
+        Err(tr("No default printer is available."))
+    } else {
+        options(dlg, data.alignment).and_then(|opt| {
+            data.printer
+                .geometry()
+                .and_then(|g| {
+                    g.layout((data.image.width, data.image.height), opt)
+                        .map(|p| (g, p))
+                })
+                .ok_or(tr("The image does not fit within these margins."))
+        })
     };
-    let place = |dw: i32, dh: i32| {
-        let left = area.left + (target_w as i32 - dw) * (alignment % 3) as i32 / 2;
-        let top = area.top + (target_h as i32 - dh) * (alignment / 3) as i32 / 2;
-        RECT {
-            left,
-            top,
-            right: left + dw,
-            bottom: top + dh,
-        }
-    };
-
-    if mode == 3 && auto_crop {
-        // "Specified size" + "Fill and crop": the W x H box is placed on the page by the
-        // alignment, the picture covers it, and the overflow is clipped to the box (not just
-        // to the printable area), so the printed size stays the one that was asked for.
-        let box_w = ((custom_size_mm.0 / 25.4 * dpi.0 as f64).round() as i32).max(1);
-        let box_h = ((custom_size_mm.1 / 25.4 * dpi.1 as f64).round() as i32).max(1);
-        let frame = place(box_w, box_h);
-        let (dw, dh) = fit(box_w as f64, box_h as f64, true);
-        let left = frame.left + (box_w - dw) / 2;
-        let top = frame.top + (box_h - dh) / 2;
-        return Placement {
-            image: RECT {
-                left,
-                top,
-                right: left + dw,
-                bottom: top + dh,
-            },
-            clip: intersect(frame, area),
-        };
-    }
-
-    let (dw, dh) = match mode {
-        0 => {
-            // Исходный размер: один пиксель изображения на пиксель устройства печати. В
-            // предпросмотре разрешение принтера проецируется на экран.
-            (
-                (img_w as f64 * dpi.0 as f64 / printer_dpi.0.max(1) as f64).round() as i32,
-                (img_h as f64 * dpi.1 as f64 / printer_dpi.1.max(1) as f64).round() as i32,
+    let _ = EnableWindow(
+        GetDlgItem(Some(dlg), IDOK.0).unwrap_or_default(),
+        result.is_ok(),
+    );
+    let status = match result {
+        Ok((g, p)) => {
+            let r = intersect(p.image, p.clip);
+            tr_fmt(
+                "Image: {width} × {height} mm",
+                &[
+                    (
+                        "width",
+                        &format_size((r.right - r.left) as f64 * 25.4 / g.dpi.0 as f64),
+                    ),
+                    (
+                        "height",
+                        &format_size((r.bottom - r.top) as f64 * 25.4 / g.dpi.1 as f64),
+                    ),
+                ],
             )
         }
-        2 => (target_w as i32, target_h as i32),
-        3 => fit(
-            custom_size_mm.0 / 25.4 * dpi.0 as f64,
-            custom_size_mm.1 / 25.4 * dpi.1 as f64,
-            false,
-        ),
-        _ => fit(target_w, target_h, auto_crop),
+        Err(error) => error.to_string(),
     };
+    text(dlg, STATUS, &status);
+    if repaint {
+        let mut canvas = preview_rect(dlg);
+        canvas.bottom += dialog::px(dlg, 45);
+        let _ = InvalidateRect(Some(dlg), Some(&canvas), false);
+    }
+}
 
-    Placement {
-        image: place(dw, dh),
-        clip: area,
+unsafe fn set_busy(dlg: HWND, busy: bool) {
+    let mut child = GetWindow(dlg, GW_CHILD).unwrap_or_default();
+    while !child.is_invalid() {
+        let id = GetDlgCtrlID(child) as usize;
+        if id != IDCANCEL.0 as usize && id != STATUS {
+            let _ = EnableWindow(child, !busy);
+        }
+        child = GetWindow(child, GW_HWNDNEXT).unwrap_or_default();
+    }
+    text(
+        dlg,
+        IDCANCEL.0 as usize,
+        if busy {
+            tr("Cancel printing")
+        } else {
+            tr("Cancel")
+        },
+    );
+}
+
+unsafe fn start_print(dlg: HWND, data: &mut Preview) {
+    if data.job.is_some() || !data.available {
+        return;
+    }
+    let Ok(opt) = options(dlg, data.alignment) else {
+        validate(dlg, data);
+        return;
+    };
+    if data
+        .printer
+        .geometry()
+        .and_then(|g| g.layout((data.image.width, data.image.height), opt))
+        .is_none()
+    {
+        return;
+    }
+    let request = job::Request {
+        settings: data.printer.settings(),
+        image: data.image.clone(),
+        name: data.name.clone(),
+        options: opt,
+    };
+    match Task::start(request) {
+        Ok(task) => {
+            data.job = Some(task);
+            set_busy(dlg, true);
+            text(dlg, STATUS, tr("Sending to printer…"));
+            if SetTimer(Some(dlg), PRINT_TIMER, 100, None) == 0 {
+                data.job = None;
+                set_busy(dlg, false);
+                validate(dlg, data);
+                crate::file_actions::show_error(dlg, tr("Could not print the image."));
+            }
+        }
+        Err(_) => crate::file_actions::show_error(dlg, tr("Could not print the image.")),
     }
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Preview<'_>;
+    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Preview;
     if ptr.is_null() {
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     match msg {
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let hdc = HDC(wp.0 as _);
-            SetBkMode(hdc, TRANSPARENT);
-            SetTextColor(hdc, COLORREF(GetSysColor(COLOR_BTNTEXT)));
+            let dc = HDC(wp.0 as _);
+            SetBkMode(dc, TRANSPARENT);
+            SetTextColor(dc, COLORREF(GetSysColor(COLOR_BTNTEXT)));
             LRESULT(GetStockObject(WHITE_BRUSH).0 as isize)
         }
         WM_ERASEBKGND => LRESULT(1),
@@ -1160,96 +947,109 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             DefWindowProcW(hwnd, msg, wp, lp)
         }
         WM_NOTIFY if lp.0 != 0 => {
-            let notice = &*(lp.0 as *const NMUPDOWN);
-            let id = notice.hdr.idFrom;
-            if notice.hdr.code == UDN_DELTAPOS
-                && ((SPIN_FIRST..SPIN_FIRST + 5).contains(&id)
-                    || id == CUSTOM_W_SPIN
-                    || id == CUSTOM_H_SPIN)
-            {
-                validate(hwnd, &*ptr);
-                LRESULT(0)
-            } else {
-                LRESULT(0)
+            let header = &*(lp.0 as *const NMHDR);
+            if header.code == UDN_DELTAPOS {
+                let notice = &*(lp.0 as *const NMUPDOWN);
+                let field = match header.idFrom {
+                    id if (SPIN_FIRST..SPIN_FIRST + 4).contains(&id) => {
+                        Some((MARGIN_FIRST + id - SPIN_FIRST, 0.0, 300.0))
+                    }
+                    id if id == SPIN_FIRST + 4 => Some((COPIES, 1.0, 99.0)),
+                    CUSTOM_W_SPIN => Some((CUSTOM_WIDTH, 1.0, 1000.0)),
+                    CUSTOM_H_SPIN => Some((CUSTOM_HEIGHT, 1.0, 1000.0)),
+                    _ => None,
+                };
+                if let Some((id, min, max)) = field {
+                    if (*ptr).job.is_none() {
+                        let current =
+                            parse_mm(&dialog::item_text(hwnd, id as i32), min, max).unwrap_or(min);
+                        text(
+                            hwnd,
+                            id,
+                            &format_mm((current + notice.iDelta as f64).clamp(min, max)),
+                        );
+                    }
+                    return LRESULT(1); // Keep decimal fractions; prevent the integer buddy rewrite.
+                }
             }
+            LRESULT(0)
         }
         WM_COMMAND => {
             let id = dialog::loword(wp);
             let code = (wp.0 >> 16) as u32;
+            if id == IDCANCEL.0 as usize {
+                dialog::close(hwnd);
+                return LRESULT(0);
+            }
+            if (*ptr).initializing || (*ptr).job.is_some() {
+                return LRESULT(0);
+            }
             match id {
-                id if id == IDCANCEL.0 as usize => dialog::close(hwnd),
-                id if id == IDOK.0 as usize => {
-                    if let Some(opt) = options(hwnd) {
-                        let area = printable_rect((*ptr).printer.dc, opt.margins);
-                        if area.right > area.left && area.bottom > area.top {
-                            let configured = (*ptr).printer.configure(None);
-                            let dc = (*ptr).printer.dc;
-                            let rotate = should_rotate((*ptr).image, area, opt.auto_rotate);
-                            let alignment = (*ptr).alignment;
-                            let name = (*ptr).name;
-                            let image = (*ptr).image;
-                            let image = if rotate { (*ptr).rotated() } else { image };
-                            let printed = configured
-                                && print_page(
-                                    dc,
-                                    image,
-                                    name,
-                                    opt.margins,
-                                    opt.copies,
-                                    opt.mode,
-                                    opt.custom_size_mm,
-                                    opt.auto_crop,
-                                    alignment,
-                                );
-                            (*ptr).printed = printed;
-                            if printed {
-                                dialog::close(hwnd);
-                            } else {
-                                crate::file_actions::show_error(
-                                    hwnd,
-                                    tr("Could not print the image."),
-                                );
-                            }
-                        }
-                    }
-                }
+                id if id == IDOK.0 as usize => start_print(hwnd, &mut *ptr),
                 PRINTER_COMBO if code == CBN_SELCHANGE => {
                     let name = dialog::item_text(hwnd, PRINTER_COMBO as i32);
-                    if let Some(new_p) = PrinterState::create(&name) {
-                        (*ptr).printer = new_p;
+                    if let Some(mut next) = Printer::create(&name) {
+                        if let Some(g) = (*ptr).printer.geometry() {
+                            next.orient(g.paper_mm().0 > g.paper_mm().1);
+                        }
+                        (*ptr).printer = next;
+                        (*ptr).available = true;
                         sync_orientation(hwnd, (*ptr).printer.dc);
                         refresh_papers(hwnd, &mut *ptr);
                         validate(hwnd, &*ptr);
+                    } else {
+                        fill_printers(hwnd, &*ptr, printer::enumerate());
+                        crate::file_actions::show_error(
+                            hwnd,
+                            tr("Could not open the selected printer."),
+                        );
                     }
                 }
                 PRINTER_PROPS => {
-                    if (*ptr).printer.open_properties(hwnd) {
-                        sync_orientation(hwnd, (*ptr).printer.dc);
-                        refresh_papers(hwnd, &mut *ptr);
-                        validate(hwnd, &*ptr);
-                    }
-                }
-                id if id == ORIENTATION || id == ORIENTATION + 1 => {
-                    if code == BN_CLICKED {
-                        let landscape = id == ORIENTATION + 1;
-                        if !(*ptr).printer.configure(Some(landscape)) {
-                            crate::file_actions::show_error(
-                                hwnd,
-                                tr("Could not change the paper orientation."),
-                            );
+                    // The driver runs a nested modal loop. Keep the active printer untouched
+                    // while that loop can paint the preview or close it on host shutdown.
+                    let candidate = Printer::from_settings((*ptr).printer.settings());
+                    if let Some(mut candidate) = candidate {
+                        let accepted = candidate.properties(hwnd);
+                        if !IsWindow(Some(hwnd)).as_bool() {
+                            return LRESULT(0);
                         }
-                        sync_orientation(hwnd, (*ptr).printer.dc);
-                        validate(hwnd, &*ptr);
+                        match accepted {
+                            Ok(true) => {
+                                (*ptr).printer = candidate;
+                                sync_orientation(hwnd, (*ptr).printer.dc);
+                                refresh_papers(hwnd, &mut *ptr);
+                                validate(hwnd, &*ptr);
+                            }
+                            Ok(false) => {}
+                            Err(()) => crate::file_actions::show_error(
+                                hwnd,
+                                tr("Could not apply the printer settings."),
+                            ),
+                        }
+                    } else {
+                        crate::file_actions::show_error(
+                            hwnd,
+                            tr("Could not apply the printer settings."),
+                        );
                     }
                 }
-                id if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&id) => {
-                    let old_align = (*ptr).alignment;
-                    (*ptr).alignment = id - ALIGN_FIRST;
-                    if let Ok(old_btn) = GetDlgItem(Some(hwnd), (ALIGN_FIRST + old_align) as i32) {
-                        let _ = InvalidateRect(Some(old_btn), None, true);
+                id if (ORIENTATION..ORIENTATION + 2).contains(&id) && code == BN_CLICKED => {
+                    if !(*ptr).printer.orient(id == ORIENTATION + 1) {
+                        crate::file_actions::show_error(
+                            hwnd,
+                            tr("Could not change the paper orientation."),
+                        );
                     }
-                    if let Ok(new_btn) = GetDlgItem(Some(hwnd), id as i32) {
-                        let _ = InvalidateRect(Some(new_btn), None, true);
+                    sync_orientation(hwnd, (*ptr).printer.dc);
+                    refresh_papers(hwnd, &mut *ptr);
+                    validate(hwnd, &*ptr);
+                }
+                id if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&id) && code == BN_CLICKED => {
+                    let old = (*ptr).alignment;
+                    (*ptr).alignment = id - ALIGN_FIRST;
+                    for id in [ALIGN_FIRST + old, id] {
+                        let _ = InvalidateRect(GetDlgItem(Some(hwnd), id as i32).ok(), None, true);
                     }
                     validate(hwnd, &*ptr);
                 }
@@ -1257,31 +1057,54 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     update_mode_controls_visibility(hwnd);
                     validate(hwnd, &*ptr);
                 }
-                id if id == AUTO_CROP || id == AUTO_ROTATE => {
-                    validate(hwnd, &*ptr);
-                }
-                PRINTER_REFRESH => {
-                    refresh_papers(hwnd, &mut *ptr);
-                    validate(hwnd, &*ptr);
-                }
+                AUTO_CROP | AUTO_ROTATE => validate(hwnd, &*ptr),
+                PRINTER_REFRESH => refresh_printers(hwnd, &mut *ptr),
                 id if id == PAPER_INFO as usize && code == CBN_SELCHANGE => {
                     let sel =
                         SendDlgItemMessageW(hwnd, PAPER_INFO, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
                     if sel >= 0 {
-                        // An explicit reference: rustc's `dangerous_implicit_autorefs` lint rejects
-                        // the automatic borrow of a field behind this raw pointer.
                         let papers = &(*ptr).papers;
                         if let Some(paper) = papers.get(sel as usize).cloned() {
                             if !(*ptr).printer.set_paper(paper.id) {
-                                refresh_papers(hwnd, &mut *ptr);
+                                crate::file_actions::show_error(
+                                    hwnd,
+                                    tr("Could not change the paper size."),
+                                );
                             }
                             sync_orientation(hwnd, (*ptr).printer.dc);
+                            refresh_papers(hwnd, &mut *ptr);
                             validate(hwnd, &*ptr);
                         }
                     }
                 }
+                COPIES if code == EN_CHANGE => {
+                    validate_options(hwnd, &*ptr, false);
+                }
                 _ if code == EN_CHANGE => validate(hwnd, &*ptr),
                 _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TIMER if wp.0 == PRINT_TIMER => {
+            let outcome = (*ptr).job.as_ref().and_then(Task::poll);
+            if let Some(outcome) = outcome {
+                let _ = KillTimer(Some(hwnd), PRINT_TIMER);
+                (*ptr).job = None;
+                match outcome {
+                    Outcome::Printed => {
+                        (*ptr).printed = true;
+                        dialog::close(hwnd);
+                    }
+                    _ => {
+                        set_busy(hwnd, false);
+                        update_mode_controls_visibility(hwnd);
+                        refresh_papers(hwnd, &mut *ptr);
+                        validate(hwnd, &*ptr);
+                        if outcome == Outcome::Failed {
+                            crate::file_actions::show_error(hwnd, tr("Could not print the image."));
+                        }
+                    }
+                }
             }
             LRESULT(0)
         }
@@ -1296,217 +1119,154 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
             dialog::close(hwnd);
             LRESULT(0)
         }
+        WM_NCDESTROY => {
+            // The modal loop keeps Preview alive through destruction; workers never reference it.
+            (*ptr).job = None;
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        }
         _ => DefWindowProcW(hwnd, msg, wp, lp),
     }
 }
 
-fn project_rect(area: RECT, paper: RECT, physical: (i32, i32), offset: (i32, i32)) -> RECT {
-    let map =
-        |v, off, orig, span, phys| orig + ((v + off) as i64 * span as i64 / phys as i64) as i32;
-    let span_x = paper.right - paper.left;
-    let span_y = paper.bottom - paper.top;
-    RECT {
-        left: map(area.left, offset.0, paper.left, span_x, physical.0),
-        top: map(area.top, offset.1, paper.top, span_y, physical.1),
-        right: map(area.right, offset.0, paper.left, span_x, physical.0),
-        bottom: map(area.bottom, offset.1, paper.top, span_y, physical.1),
-    }
-}
-
-unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview<'_>) {
+unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {
     let px = |v| dialog::px(hwnd, v);
     let mut bounds = RECT::default();
     let _ = GetClientRect(hwnd, &mut bounds);
-
-    let sidebar_w = px(SIDEBAR_WIDTH);
-    let separator_x = bounds.right - sidebar_w;
-
-    let preview_area = RECT {
+    let separator = bounds.right - px(SIDEBAR_WIDTH);
+    FillRect(dc, &bounds, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+    let canvas = RECT {
         left: 0,
         top: 0,
-        right: separator_x,
+        right: separator,
         bottom: bounds.bottom,
     };
-    FillRect(dc, &preview_area, crate::gdi::solid_brush(0x00D5D5D5).0);
-
-    let sidebar = RECT {
-        left: separator_x,
-        top: 0,
-        right: bounds.right,
-        bottom: bounds.bottom,
-    };
-    FillRect(dc, &sidebar, HBRUSH(GetStockObject(WHITE_BRUSH).0));
-
-    let separator = RECT {
-        left: separator_x,
-        top: 0,
-        right: separator_x + px(1),
-        bottom: bounds.bottom,
-    };
-    FillRect(dc, &separator, crate::gdi::solid_brush(0x00D0D0D0).0);
-
-    let printer = data.printer.dc;
-    let caps = |index| GetDeviceCaps(Some(printer), index);
-    let (pw, ph) = (caps(PHYSICALWIDTH), caps(PHYSICALHEIGHT));
-    let (dx, dy) = (caps(LOGPIXELSX), caps(LOGPIXELSY));
-    if pw <= 0 || ph <= 0 || dx <= 0 || dy <= 0 {
+    FillRect(dc, &canvas, crate::gdi::solid_brush(0x00F0EEEC).0);
+    FrameRect(
+        dc,
+        &RECT {
+            left: separator,
+            top: 0,
+            right: separator + 1,
+            bottom: bounds.bottom,
+        },
+        crate::gdi::solid_brush(NEUTRAL).0,
+    );
+    let Some(g) = data.printer.geometry() else {
         return;
-    }
-    let (w, h) = (pw as f64 / dx as f64, ph as f64 / dy as f64);
-    let pad = px(25);
-    let avail_w = (preview_area.right - preview_area.left - pad * 2).max(1);
-    let avail_h = (preview_area.bottom - preview_area.top - pad * 2 - px(25)).max(1);
-    let scale = (avail_w as f64 / w).min(avail_h as f64 / h);
+    };
+    let available = preview_rect(hwnd);
+    let (mm_w, mm_h) = g.paper_mm();
+    crate::gdi::text(
+        dc,
+        RECT {
+            left: px(20),
+            top: available.bottom,
+            right: separator - px(20),
+            bottom: bounds.bottom,
+        },
+        &format!(
+            "{} × {} {}  ·  {} × {} dpi",
+            format_size(mm_w),
+            format_size(mm_h),
+            tr("mm"),
+            g.dpi.0,
+            g.dpi.1
+        ),
+        Some(data.caption_font),
+        0x006A6460,
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE,
+    );
+    let scale =
+        ((available.right - px(52)) as f64 / mm_w).min((available.bottom - px(48)) as f64 / mm_h);
     if scale <= 0.0 {
         return;
     }
-
-    let (w, h) = ((w * scale).round() as i32, (h * scale).round() as i32);
-    let left = (preview_area.left + preview_area.right - w) / 2;
-    let top = (preview_area.top + preview_area.bottom - h - px(22)) / 2;
-
-    let shadow_offset = px(4);
-    let shadow = RECT {
-        left: left + px(2),
-        top: top + shadow_offset,
-        right: left + w + shadow_offset,
-        bottom: top + h + shadow_offset,
-    };
-    FillRect(dc, &shadow, crate::gdi::solid_brush(0x00B9B6B3).0);
-
+    let (w, h) = ((mm_w * scale).round() as i32, (mm_h * scale).round() as i32);
+    let left = (available.right - w) / 2;
+    let top = (available.bottom - h) / 2;
     let paper = RECT {
         left,
         top,
         right: left + w,
         bottom: top + h,
     };
+    let shadow = RECT {
+        left: left + px(3),
+        top: top + px(4),
+        right: paper.right + px(4),
+        bottom: paper.bottom + px(4),
+    };
+    FillRect(dc, &shadow, crate::gdi::solid_brush(0x00D8D5D2).0);
     FillRect(dc, &paper, HBRUSH(GetStockObject(WHITE_BRUSH).0));
     FrameRect(dc, &paper, crate::gdi::solid_brush(0x00C8C6C3).0);
-
-    if let Some(opt) = options(hwnd) {
-        let device_area = printable_rect(printer, opt.margins);
-        let rotate = should_rotate(data.image, device_area, opt.auto_rotate);
-        let area = project_rect(
-            device_area,
-            paper,
-            (pw, ph),
-            (caps(PHYSICALOFFSETX), caps(PHYSICALOFFSETY)),
-        );
-
-        // Разрешение превью: сколько экранных пикселей приходится на дюйм бумаги.
-        let preview_dpi = (
-            (((paper.right - paper.left) as f64 * dx as f64 / pw as f64).round() as i32).max(1),
-            (((paper.bottom - paper.top) as f64 * dy as f64 / ph as f64).round() as i32).max(1),
-        );
-
-        let alignment = data.alignment;
-        let image = data.image;
-        let image = if rotate { data.rotated() } else { image };
-        let placement = compute_placement(
-            area,
-            image.width,
-            image.height,
-            opt.mode,
-            opt.custom_size_mm,
-            preview_dpi,
-            (dx, dy),
-            opt.auto_crop,
-            alignment,
-        );
+    let Ok(opt) = options(hwnd, data.alignment) else {
+        return;
+    };
+    let Some(p) = g.layout((data.image.width, data.image.height), opt) else {
+        return;
+    };
+    let placement = Placement {
+        image: g.project(p.image, paper),
+        clip: g.project(p.clip, paper),
+        rotate: p.rotate,
+    };
+    let image = data.preview.clone();
+    let image = if p.rotate { data.rotated() } else { &image };
+    job::draw_image(dc, image, placement);
+    // Subtle margin guides make clipping visible without being sent to the printer.
+    if let Some(area) = g.area(opt.margins) {
+        let r = g.project(area, paper);
         let saved = SaveDC(dc);
-        let clip = placement.clip;
-        if clip.right > clip.left && clip.bottom > clip.top {
-            let _ = IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
-            if opt.mode == 2 {
-                draw_stretched(dc, image, placement.image);
-            } else {
-                draw_fitted(dc, image, placement.image, false);
-            }
-        }
         if saved != 0 {
+            let pen = crate::gdi::GdiObject(CreatePen(PS_DOT, 1, COLORREF(0x00D6D3D0)));
+            SelectObject(dc, pen.0.into());
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            let _ = Rectangle(dc, r.left, r.top, r.right, r.bottom);
             let _ = RestoreDC(dc, saved);
         }
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-unsafe fn print_page(
-    dc: HDC,
-    img: &DecodedImage,
-    doc_name: &str,
-    margins: RECT,
-    copies: u32,
-    mode: usize,
-    custom_size_mm: (f64, f64),
-    auto_crop: bool,
-    alignment: usize,
-) -> bool {
-    let name = HSTRING::from(doc_name);
-    let doc = DOCINFOW {
-        cbSize: size_of::<DOCINFOW>() as i32,
-        lpszDocName: PCWSTR(name.as_ptr()),
-        ..Default::default()
-    };
-    if StartDocW(dc, &doc) <= 0 {
-        return false;
-    }
-    let area = printable_rect(dc, margins);
-    for _ in 0..copies {
-        if StartPage(dc) <= 0 {
-            AbortDoc(dc);
-            return false;
-        }
-        let saved = SaveDC(dc);
-        if saved == 0 {
-            AbortDoc(dc);
-            return false;
-        }
-        let dpi = (
-            GetDeviceCaps(Some(dc), LOGPIXELSX).max(1),
-            GetDeviceCaps(Some(dc), LOGPIXELSY).max(1),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn preview_cache_keeps_the_original_and_bounds_its_own_memory() {
+        let image = Arc::new(DecodedImage {
+            width: 3200,
+            height: 2,
+            full: (3200, 2),
+            bgra: [0, 128, 255, 255].repeat(6400),
+            is_preview: false,
+            exif: None,
+            pages: 1,
+        });
+        let preview = preview_copy(&image);
+        assert_eq!(
+            (preview.width, preview.height, preview.full),
+            (1600, 1, (3200, 2))
         );
-
-        let placement = compute_placement(
-            area,
-            img.width,
-            img.height,
-            mode,
-            custom_size_mm,
-            dpi,
-            dpi,
-            auto_crop,
-            alignment,
-        );
-        let clip = placement.clip;
-        if clip.right > clip.left && clip.bottom > clip.top {
-            let _ = IntersectClipRect(dc, clip.left, clip.top, clip.right, clip.bottom);
-            if mode == 2 {
-                draw_stretched(dc, img, placement.image);
-            } else {
-                draw_fitted(dc, img, placement.image, false);
-            }
-        }
-
-        let _ = RestoreDC(dc, saved);
-        if EndPage(dc) <= 0 {
-            AbortDoc(dc);
-            return false;
-        }
+        assert_eq!(preview.bgra.len(), 6400);
+        assert_eq!((image.width, image.height), (3200, 2));
+        assert!(Arc::ptr_eq(&preview_copy(&preview), &preview));
     }
-    EndDoc(dc) > 0
-}
-
-unsafe fn printable_rect(dc: HDC, margins: RECT) -> RECT {
-    let caps = |index| GetDeviceCaps(Some(dc), index);
-    let (dpi_x, dpi_y) = (caps(LOGPIXELSX), caps(LOGPIXELSY));
-    let (off_x, off_y) = (caps(PHYSICALOFFSETX), caps(PHYSICALOFFSETY));
-    let (paper_w, paper_h) = (caps(PHYSICALWIDTH), caps(PHYSICALHEIGHT));
-    let (page_w, page_h) = (caps(HORZRES).max(0), caps(VERTRES).max(0));
-    let px = |mm100: i32, dpi: i32| (mm100.max(0) as i64 * dpi as i64 / MM100_PER_INCH) as i32;
-    RECT {
-        left: (px(margins.left, dpi_x) - off_x).clamp(0, page_w),
-        top: (px(margins.top, dpi_y) - off_y).clamp(0, page_h),
-        right: (paper_w - px(margins.right, dpi_x) - off_x).clamp(0, page_w),
-        bottom: (paper_h - px(margins.bottom, dpi_y) - off_y).clamp(0, page_h),
+    #[test]
+    fn lister_margins_keep_tenths_of_a_millimeter() {
+        let r = tc_margins(RECT {
+            left: 100,
+            top: 125,
+            right: 200,
+            bottom: 0,
+        });
+        assert_eq!((r.left, r.top, r.right, r.bottom), (1000, 1250, 2000, 0));
+        assert_eq!(
+            tc_margins(RECT {
+                left: i32::MAX,
+                ..Default::default()
+            })
+            .left,
+            i32::MAX
+        );
     }
 }

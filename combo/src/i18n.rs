@@ -362,8 +362,20 @@ mod tests {
     fn source_keys() -> Vec<(String, String, bool)> {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src");
         let mut keys = Vec::new();
-        for entry in std::fs::read_dir(dir).unwrap().flatten() {
-            let path = entry.path();
+        let mut pending = vec![std::path::PathBuf::from(dir)];
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .flatten()
+                        .map(|entry| entry.path()),
+                );
+                continue;
+            }
+            if path.extension().is_none_or(|ext| ext != "rs") {
+                continue;
+            }
             // Code only: no comments, no unit tests.
             let full = std::fs::read_to_string(&path).unwrap();
             let code = full.split("#[cfg(test)]").next().unwrap_or_default();

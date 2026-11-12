@@ -939,7 +939,7 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         Command::SetWallpaper => set_wallpaper(hwnd),
         Command::SaveRotation => save_rotation(hwnd),
         Command::Print => {
-            print(hwnd, None);
+            print(hwnd, None, None);
         }
         Command::SaveAs => {
             if state.media.is_none() && state.image.is_some() {
@@ -1215,7 +1215,7 @@ unsafe fn set_wallpaper(hwnd: HWND) {
 }
 
 /// Prints the photo, or the video frame / album art. `margins` in 1/100 mm.
-pub unsafe fn print(hwnd: HWND, margins: Option<RECT>) -> bool {
+pub unsafe fn print(hwnd: HWND, printer: Option<&str>, margins: Option<RECT>) -> bool {
     let Some(state) = get_state(hwnd) else {
         return false;
     };
@@ -1229,7 +1229,7 @@ pub unsafe fn print(hwnd: HWND, margins: Option<RECT>) -> bool {
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    crate::print::print(dialog::modal_owner(hwnd), &picture, &name, margins)
+    crate::print::print(dialog::modal_owner(hwnd), picture, &name, printer, margins)
 }
 
 /// Viewer timer of the slideshow.
