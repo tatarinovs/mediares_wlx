@@ -5,8 +5,7 @@
 //! camera's own JPEG would have it). Otherwise the file is decoded again at full resolution,
 //! turned like on screen and encoded with the main EXIF fields.
 
-use std::fs::File;
-use std::io::BufWriter;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -83,38 +82,52 @@ fn write(
     quarter_turns: u8,
     auto_rotate: bool,
 ) -> bool {
-    let mut temp = target.as_os_str().to_owned();
-    temp.push(".mediares-tmp");
-    let temp = PathBuf::from(temp);
-    let ok = write_to(source, page, &temp, format, quarter_turns, auto_rotate)
-        && std::fs::rename(&temp, target).is_ok();
-    if !ok {
-        let _ = std::fs::remove_file(&temp);
-    }
-    ok
+    mediares_core::file_write::replace(target, |out| {
+        write_to(source, page, out, format, quarter_turns, auto_rotate)
+    })
+    .is_ok()
 }
 
 fn write_to(
     source: &Path,
     page: u32,
-    target: &Path,
+    out: &mut dyn Write,
     format: Format,
     quarter_turns: u8,
     auto_rotate: bool,
-) -> bool {
+) -> io::Result<()> {
     let kind = probe_file(source);
     if quarter_turns == 0 {
+        if kind == MediaType::StandardImage && copy_matching(source, format, out)? {
+            return Ok(());
+        }
         if let Some(bytes) = lossless(source, kind, format) {
-            return std::fs::write(target, bytes).is_ok();
+            return out.write_all(&bytes);
         }
     }
     let Some((mut img, exif)) = decode_oriented(source, kind, auto_rotate, page) else {
-        return false;
+        return Err(io::Error::other("could not decode the source image"));
     };
     for _ in 0..quarter_turns {
         img = img.rotate90();
     }
-    encode(img, exif.as_ref(), target, format)
+    encode(img, exif.as_ref(), out, format)
+}
+
+/// Preserve metadata and appended data without loading the whole source into memory.
+fn copy_matching(source: &Path, format: Format, out: &mut dyn Write) -> io::Result<bool> {
+    let mut file = std::fs::File::open(source)?;
+    let mut head = [0u8; 8];
+    let read = file.read(&mut head)?;
+    let same = match format {
+        Format::Jpeg => head[..read].starts_with(&[0xFF, 0xD8, 0xFF]),
+        Format::Png => head[..read].starts_with(b"\x89PNG\r\n\x1a\n"),
+    };
+    if same {
+        file.seek(SeekFrom::Start(0))?;
+        io::copy(&mut file, out)?;
+    }
+    Ok(same)
 }
 
 /// The file's own bytes, or a RAW's embedded JPEG with the RAW's metadata, when they already are
@@ -125,14 +138,6 @@ fn lossless(source: &Path, kind: MediaType, format: Format) -> Option<Vec<u8>> {
             let preview = extract_raw_preview(source)?;
             let exif = without_size(read_exif(source).unwrap_or_default());
             with_exif(&preview, &build_exif(&exif, exif.orientation.unwrap_or(1)))
-        }
-        (MediaType::StandardImage, _) => {
-            let bytes = std::fs::read(source).ok()?;
-            let same = match format {
-                Format::Jpeg => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
-                Format::Png => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-            };
-            same.then_some(bytes)
         }
         _ => None,
     }
@@ -148,11 +153,12 @@ fn without_size(exif: ExifInfo) -> ExifInfo {
 }
 
 /// Pixels are already upright, so the orientation written is 1.
-fn encode(img: DynamicImage, exif: Option<&ExifInfo>, target: &Path, format: Format) -> bool {
-    let Ok(file) = File::create(target) else {
-        return false;
-    };
-    let out = BufWriter::new(file);
+fn encode(
+    img: DynamicImage,
+    exif: Option<&ExifInfo>,
+    out: &mut dyn Write,
+    format: Format,
+) -> io::Result<()> {
     let exif = exif.map(|e| build_exif(&without_size(e.clone()), 1));
     match format {
         Format::Png => {
@@ -160,7 +166,7 @@ fn encode(img: DynamicImage, exif: Option<&ExifInfo>, target: &Path, format: For
             if let Some(exif) = exif {
                 let _ = encoder.set_exif_metadata(exif);
             }
-            img.write_with_encoder(encoder).is_ok()
+            img.write_with_encoder(encoder).map_err(io::Error::other)
         }
         Format::Jpeg => {
             let rgb = on_white(img);
@@ -175,7 +181,7 @@ fn encode(img: DynamicImage, exif: Option<&ExifInfo>, target: &Path, format: For
                     rgb.height(),
                     ExtendedColorType::Rgb8,
                 )
-                .is_ok()
+                .map_err(io::Error::other)
         }
     }
 }
@@ -288,10 +294,9 @@ mod tests {
             .save(&png)
             .unwrap();
         let original = std::fs::read(&png).unwrap();
-        assert_eq!(
-            lossless(&png, MediaType::StandardImage, Format::Png),
-            Some(original)
-        );
+        let mut copied = Vec::new();
+        assert!(copy_matching(&png, Format::Png, &mut copied).unwrap());
+        assert_eq!(copied, original);
         assert_eq!(lossless(&png, MediaType::StandardImage, Format::Jpeg), None);
         assert_eq!(
             free_name(&png, None, Format::Png).file_name().unwrap(),

@@ -279,8 +279,7 @@ impl ViewerState {
         arrived
     }
 
-    /// Shows `img` (just decoded, so not turned yet) and, when it is a fitted copy, has the
-    /// whole picture decoded in the background.
+    /// Shows `img` (just decoded, so not turned yet). A fitted copy suffices until zoom needs more.
     fn set_image(&mut self, img: Arc<DecodedImage>) {
         self.image = Some(img.clone());
         self.apply_kept_view(&img);
@@ -290,7 +289,6 @@ impl ViewerState {
             self.pages = img.pages;
             image_cache::prefetch(self.prefetch_candidates());
         }
-        self.request_whole();
     }
 
     /// Zooms the photo just shown in as the previous one was (see [`Self::kept_view`]).
@@ -321,8 +319,7 @@ impl ViewerState {
         true
     }
 
-    /// Queues the whole picture of a fitted photo on screen. Called after the neighbours are
-    /// queued: it runs once they are done.
+    /// Queues the whole picture when zoom needs more pixels than the fitted copy provides.
     fn request_whole(&mut self) {
         let fitted = self.image.as_ref().is_some_and(|img| !img.is_whole());
         if fitted && self.whole_upright.is_none() && self.whole_pending.is_none() {
@@ -356,6 +353,8 @@ impl ViewerState {
     /// The whole picture turned like the one on screen, if it has arrived; drawn when zoomed in
     /// beyond the fitted copy's own pixels.
     pub fn whole_turned(&mut self) -> Option<Arc<DecodedImage>> {
+        // Called only when the requested zoom needs more pixels than the screen-sized copy.
+        self.request_whole();
         if self.whole.is_none() {
             let upright = self.whole_upright.clone()?;
             self.whole = Some(turned(upright, self.quarter_turns));
@@ -615,7 +614,6 @@ impl ViewerState {
         }
 
         image_cache::prefetch(self.prefetch_candidates());
-        self.request_whole();
     }
 
     /// Pictures to warm up, most likely next first: the page that turning on in the direction

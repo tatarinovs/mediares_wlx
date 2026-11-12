@@ -7,7 +7,7 @@
 use std::cell::{Cell, OnceCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 
 use mediares_core::cache::{get_video_meta, get_video_tags, is_video_meta_cached};
@@ -115,6 +115,18 @@ enum Player {
 }
 
 impl Player {
+    fn take_events(&self, token: usize) -> Vec<crate::media_events::Event> {
+        match self {
+            Self::Mf(p) => p.take_events(token),
+            Self::Mpv(p) => p.take_events(token),
+        }
+    }
+    fn is_ended(&self) -> bool {
+        match self {
+            Self::Mf(p) => p.is_ended(),
+            Self::Mpv(p) => p.is_ended(),
+        }
+    }
     /// The media engine, if that is the player.
     fn mf(&self) -> Option<&VideoPlayer> {
         match self {
@@ -136,6 +148,20 @@ impl Player {
         match self {
             Self::Mf(p) => p.open(path).is_ok(),
             Self::Mpv(p) => p.open(path),
+        }
+    }
+
+    /// MF must reject unreadable sources before returning from ListLoad(W)/ListLoadNext(W),
+    /// so Total Commander can try the next plugin. mpv supplies uncached metadata itself.
+    fn file_meta(&self, path: &Path) -> Option<VideoMeta> {
+        match self {
+            Self::Mf(_) => get_video_meta(path).map(|m| (*m).clone()),
+            Self::Mpv(_) if is_video_meta_cached(path) => Some(
+                get_video_meta(path)
+                    .map(|m| (*m).clone())
+                    .unwrap_or_default(),
+            ),
+            Self::Mpv(_) => Some(VideoMeta::default()),
         }
     }
 
@@ -266,6 +292,7 @@ pub struct VideoView {
     surface: Surface,
     viewer: HWND,
     path: PathBuf,
+    chapter_probe: Option<ChapterProbe>,
     /// Opened on first use (holding `None`: the file has none to offer); reset when the file
     /// changes.
     keyframes: OnceCell<Option<KeyframeIndex>>,
@@ -432,24 +459,26 @@ pub struct OsdText {
 }
 
 impl VideoView {
-    /// Creates the surface inside `viewer` and starts playing `path`. `None` if Media Foundation
-    /// cannot open the file (so TC can fall back to another plugin).
+    pub fn take_events(&self, token: usize) -> Vec<crate::media_events::Event> {
+        self.player.take_events(token)
+    }
+    /// Creates the surface inside `viewer` and opens `path`. MF metadata validation finishes
+    /// before accepting the file, allowing Total Commander to fall back to another plugin.
     pub unsafe fn new(
         viewer: HWND,
         path: &Path,
         resume: bool,
         resume_threshold: f64,
     ) -> Option<Self> {
-        // The check that Media Foundation can open the file runs while the player starts up.
-        let probe = (!playback_mpv::available()).then(|| Probe::start(path));
         let surface = Surface::new(viewer, true)?;
         let player = Player::new(surface.0, viewer)?;
+        let info = player.file_meta(path)?;
         transport_bar::restore_audio_level(&*player);
         if !player.open(path) {
             return None;
         }
-        let info = Probe::finish(probe, &player, path)?;
         player.set_frame_rate(info.frame_rate);
+        let chapter_probe = ChapterProbe::start(path);
 
         SetTimer(Some(viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
         let seek_profile = SeekProfile::of(&player, path);
@@ -458,8 +487,9 @@ impl VideoView {
             surface,
             viewer,
             path: path.to_path_buf(),
+            chapter_probe,
             keyframes: OnceCell::new(),
-            chapters: file_chapters(path),
+            chapters: Vec::new(),
             info,
             error: None,
             osd: None,
@@ -480,23 +510,34 @@ impl VideoView {
         })
     }
 
-    /// Switches to another file, reusing the engine (and its speed).
+    /// Switches to another file, preserving the speed and audio level.
     pub unsafe fn open(&mut self, path: &Path, resume: bool, resume_threshold: f64) -> bool {
-        // As in `new`, the check that Media Foundation can open the file runs while the player
-        // opens it. A file failing it isn't played: the caller drops this view.
-        let probe = matches!(self.player, Player::Mf(_)).then(|| Probe::start(path));
-        self.remember_position();
-        self.loupe_end();
-        // Done: if this view is dropped below, the player is already on the new file.
-        self.loaded = false;
-        self.finish_step();
-        if !self.player.open(path) {
-            return false;
-        }
-        let Some(info) = Probe::finish(probe, &self.player, path) else {
+        // Neither engine identifies the source of every callback. Give each file its own
+        // engine/mailbox, so even a callback delivered late cannot acquire the next file's token.
+        // A flip-model swap chain is exclusive to its HWND while the old engine shuts down.
+        let Some(surface) = Surface::new(self.viewer, true) else {
             return false;
         };
-        self.player.set_frame_rate(info.frame_rate);
+        let Some(player) = Player::new(surface.0, self.viewer) else {
+            return false;
+        };
+        let Some(info) = player.file_meta(path) else {
+            return false;
+        };
+        self.remember_position();
+        self.loupe_end();
+        self.loaded = false;
+        self.finish_step();
+        self.player.pause();
+        player.set_volume(self.player.volume());
+        player.set_muted(self.player.is_muted());
+        player.set_rate(self.rate);
+        if !player.open(path) {
+            return false;
+        }
+        player.set_frame_rate(info.frame_rate);
+        self.player = player;
+        self.surface = surface;
         self.seek_profile = SeekProfile::of(&self.player, path);
         self.preview.set(None);
         self.settle_check.set(None);
@@ -507,9 +548,10 @@ impl VideoView {
         self.resume_pending = resume;
         self.resumed_to = None;
         self.info = info;
+        self.chapter_probe = ChapterProbe::start(path);
         self.path = path.to_path_buf();
         self.keyframes = OnceCell::new();
-        self.chapters = file_chapters(path);
+        self.chapters.clear();
         self.step_paused.set(false);
         self.error = None;
         true
@@ -666,12 +708,21 @@ impl VideoView {
     }
 
     /// `WM_TIMER` with [`RENDER_TIMER_ID`].
-    pub unsafe fn render(&mut self) {
+    pub unsafe fn render(&mut self) -> bool {
+        let result = self.chapter_probe.as_ref().and_then(ChapterProbe::take);
+        let changed = result.is_some();
+        if let Some(result) = result {
+            self.chapter_probe = None;
+            if self.chapters.is_empty() {
+                self.chapters = result;
+            }
+        }
         self.push_osd();
         self.advance_step();
         // Before a held seek ends and playback resumes from where it landed.
         self.check_landing();
         self.advance_key_seek();
+        changed
     }
 
     /// Hands the OSD, with the text for the current position, to the player.
@@ -1065,7 +1116,7 @@ impl VideoView {
         )
     }
 
-    pub unsafe fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
+    pub unsafe fn on_event(&mut self, event: i32, _param1: isize) -> EventEffect {
         if event == MF_MEDIA_ENGINE_EVENT_SEEKED.0 {
             // Checked before the next step goes out; a stale event (another seek already under
             // way) doesn't tell where this one landed.
@@ -1094,6 +1145,7 @@ impl VideoView {
                     self.info.height = h;
                 }
                 if loaded {
+                    self.error = None;
                     self.loaded = true;
                     if self.chapters.is_empty() {
                         self.chapters = self.player.chapters();
@@ -1108,11 +1160,12 @@ impl VideoView {
                 }
                 EventEffect::Relayout
             }
-            e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => EventEffect::Ended,
+            e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 && self.player.is_ended() => EventEffect::Ended,
             e if e == MF_MEDIA_ENGINE_EVENT_ERROR.0 => {
-                self.error = Some(engine_error_text(
-                    self.player.error_code().unwrap_or(param1 as u16),
-                ));
+                let Some(code) = self.player.error_code() else {
+                    return EventEffect::None;
+                };
+                self.error = Some(engine_error_text(code));
                 EventEffect::RepaintBar
             }
             e if is_progress_event(e) => EventEffect::RepaintBar,
@@ -1121,36 +1174,33 @@ impl VideoView {
     }
 }
 
-/// Stream properties of the file being opened. With the media engine they come from Media
-/// Foundation, read on another thread while the player starts up; failing to read them means
-/// the engine can't play the file either (and TC tries another plugin). mpv plays what Media
-/// Foundation can't read and reports the streams itself once the file is loaded: opening the
-/// file once more just to read them would only delay the start.
-struct Probe(Option<std::thread::JoinHandle<Option<VideoMeta>>>);
+/// Optional chapters do not decide whether the file can be played. Read them in the background;
+/// the UI polls an owned mailbox and never joins the worker.
+type Chapters = Vec<(f64, String)>;
+struct ChapterProbe(Arc<Mutex<Option<Chapters>>>);
 
-impl Probe {
-    fn start(path: &Path) -> Self {
+impl ChapterProbe {
+    fn start(path: &Path) -> Option<Self> {
         let path = path.to_path_buf();
-        Self(
-            std::thread::Builder::new()
-                .name("mediares-video-probe".into())
-                .spawn(move || get_video_meta(&path).map(|m| (*m).clone()))
-                .ok(),
-        )
+        let result = Arc::new(Mutex::new(None));
+        let weak = Arc::downgrade(&result);
+        std::thread::Builder::new()
+            .name("mediares-video-chapters".into())
+            .spawn(move || {
+                if weak.strong_count() == 0 {
+                    return;
+                }
+                let chapters = file_chapters(&path);
+                if let Some(result) = weak.upgrade() {
+                    *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(chapters);
+                }
+            })
+            .ok()?;
+        Some(Self(result))
     }
 
-    /// The properties for `player`: a probe started for the media engine, or read now.
-    fn finish(probe: Option<Self>, player: &Player, path: &Path) -> Option<VideoMeta> {
-        let read = || get_video_meta(path).map(|m| (*m).clone());
-        match player {
-            // Known already if the WDX columns read them; else they follow `LOADEDMETADATA`.
-            Player::Mpv(_) if is_video_meta_cached(path) => Some(read().unwrap_or_default()),
-            Player::Mpv(_) => Some(VideoMeta::default()),
-            Player::Mf(_) => match probe.and_then(|p| p.0) {
-                Some(thread) => thread.join().ok().flatten(),
-                None => read(),
-            },
-        }
+    fn take(&self) -> Option<Chapters> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 

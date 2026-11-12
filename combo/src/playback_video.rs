@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use mediares_core::keyframes::KeyPicture;
 use mediares_core::mf_init::{mf_scope, ComScope, PropVariant};
 use windows::core::{implement, Interface, BSTR};
-use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, LPARAM, RECT, WPARAM};
+use windows::Win32::Foundation::{E_FAIL, HMODULE, HWND, RECT};
 use windows::Win32::Graphics::Direct3D::{
     D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP,
 };
@@ -53,28 +53,21 @@ use windows::Win32::Media::MediaFoundation::{
     MF_SD_LANGUAGE,
 };
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
-use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 use crate::transport_bar::{clamp_to_duration, Transport};
 
-pub const WM_MEDIA_EVENT: u32 = WM_APP + 0x10;
+use crate::media_events::{Event, Events};
 
 #[implement(IMFMediaEngineNotify)]
 struct EngineNotify {
-    /// Viewer window, stored as an integer: HWND is not `Send`, the callback runs on MF threads.
-    target: isize,
+    /// A mailbox belonging to one engine/file, including callbacks delivered during shutdown.
+    events: Events,
 }
 
 impl IMFMediaEngineNotify_Impl for EngineNotify_Impl {
     fn EventNotify(&self, event: u32, param1: usize, _param2: u32) -> windows::core::Result<()> {
-        unsafe {
-            let _ = PostMessageW(
-                Some(HWND(self.target as *mut _)),
-                WM_MEDIA_EVENT,
-                WPARAM(event as usize),
-                LPARAM(param1 as isize),
-            );
-        }
+        let token = self.events.token();
+        self.events.post(token, event as i32, param1 as isize);
         Ok(())
     }
 }
@@ -434,6 +427,7 @@ unsafe fn present_frame(
 
 /// Field order matters: the engine is released before the device manager and COM.
 pub struct VideoPlayer {
+    events: Events,
     engine: IMFMediaEngine,
     engine_ex: Option<IMFMediaEngineEx>,
     /// Frame length of the current file (see [`Self::set_frame_rate`]).
@@ -458,8 +452,9 @@ impl VideoPlayer {
 
         let factory: IMFMediaEngineClassFactory =
             CoCreateInstance(&CLSID_MFMediaEngineClassFactory, None, CLSCTX_INPROC_SERVER)?;
+        let events = Events::new(events_to);
         let notify: IMFMediaEngineNotify = EngineNotify {
-            target: events_to.0 as isize,
+            events: events.clone(),
         }
         .into();
 
@@ -493,6 +488,7 @@ impl VideoPlayer {
                 .map_err(|_| windows::core::Error::from(E_FAIL))?
         };
         Ok(Self {
+            events,
             engine,
             engine_ex,
             frame: Cell::new(FALLBACK_FRAME_SEC),
@@ -509,6 +505,7 @@ impl VideoPlayer {
 
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
     pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
+        self.events.begin_file();
         {
             let mut screen = self.screen();
             screen.out.last_pts = None;
@@ -518,6 +515,13 @@ impl VideoPlayer {
         self.engine
             .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
         self.engine.Play()
+    }
+
+    pub fn take_events(&self, token: usize) -> Vec<Event> {
+        self.events.take(token)
+    }
+    pub fn is_ended(&self) -> bool {
+        unsafe { self.engine.IsEnded().as_bool() }
     }
 
     /// Shows `picture` instead of the engine's frames until [`Self::end_preview`]: the viewer
@@ -649,7 +653,11 @@ impl VideoPlayer {
         }
         context.Unmap(&staging, 0);
         // The alpha channel is undefined for video: make it opaque.
-        pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+        pixels
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .for_each(|px| px[3] = 255);
         Some((width, height, pixels))
     }
 
@@ -796,6 +804,7 @@ impl Transport for VideoPlayer {
 
 impl Drop for VideoPlayer {
     fn drop(&mut self) {
+        self.events.close();
         // The render thread stops within a composition tick, before the engine shuts down.
         self.shared.stop.store(true, Ordering::Relaxed);
         if let Some(renderer) = self.renderer.take() {

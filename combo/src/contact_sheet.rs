@@ -17,7 +17,7 @@ use crate::gdi;
 use crate::i18n::tr;
 use crate::image_cache::{to_bgra, DecodedImage};
 use crate::image_view::draw_fitted;
-use crate::snapshot::{save_picture, unique_path, PictureFormat};
+use crate::snapshot::{save_unique_picture, PictureFormat};
 use crate::transport_bar::format_time;
 
 /// Posted to the viewer when the sheet is saved (or failed); `lparam` owns a `Box<String>` with
@@ -93,8 +93,7 @@ fn make(video: &Path, info: &SheetInfo, format: PictureFormat) -> Option<PathBuf
     let frames = frames(video, info.duration, &times)?;
     let sheet = unsafe { compose(video, info, &frames)? };
     let stem = video.file_stem()?.to_string_lossy().into_owned();
-    let target = unique_path(video, &format!("{stem}_sheet"), format);
-    save_picture(&sheet, &target, format).then_some(target)
+    save_unique_picture(&sheet, video, &format!("{stem}_sheet"), format)
 }
 
 /// A frame of the sheet and the time it shows.
@@ -119,7 +118,7 @@ fn frames(video: &Path, duration: f64, times: &[f64]) -> Option<Vec<Option<Shot>
     let frames: Vec<Option<Shot>> = times
         .iter()
         .map(|&t| {
-            crate::playback_mpv::video_frame(video, t / duration).map(|f| {
+            crate::playback_mpv::video_frame(video, t / duration, fit).map(|f| {
                 let (w, h) = mediares_core::image_decode::fitted_size(f.dimensions(), fit);
                 shot(mediares_core::image::imageops::thumbnail(&f, w, h), t)
             })
@@ -207,7 +206,11 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
 
     let len = width as usize * height as usize * 4;
     let mut pixels = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
-    pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+    pixels
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .for_each(|px| px[3] = 255);
     SelectObject(dc, old);
     let _ = DeleteObject(bitmap.into());
     let _ = DeleteDC(dc);

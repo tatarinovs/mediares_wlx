@@ -330,9 +330,17 @@ pub fn analyze_video(
 /// Decodes the frame at `fraction` (0..1) of the duration as RGBA — for thumbnails. The source
 /// reader lands on the key frame before that position, which is fine for a preview.
 pub fn video_frame_rgba(path: &Path, fraction: f64) -> Option<image::RgbaImage> {
+    video_frame_rgba_fitted(path, fraction, None)
+}
+
+pub fn video_frame_rgba_fitted(
+    path: &Path,
+    fraction: f64,
+    fit: Option<(u32, u32)>,
+) -> Option<image::RgbaImage> {
     let grabber = FrameGrabber::open(path)?;
     grabber
-        .frame_at(grabber.duration_sec() * fraction.clamp(0.0, 1.0), None)
+        .frame_at(grabber.duration_sec() * fraction.clamp(0.0, 1.0), fit)
         .map(|(frame, _)| frame)
 }
 
@@ -430,28 +438,6 @@ impl FrameGrabber {
         fit: Option<(u32, u32)>,
     ) -> Option<(image::RgbaImage, f64)> {
         let (width, height) = (self.geo.width, self.geo.height);
-        let (frame, time) = unsafe {
-            set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
-            let sample = next_sample(&self.reader)?;
-            let time = sample
-                .GetSampleTime()
-                .map_or(seconds, |t| t as f64 / HNS_PER_SEC);
-            let buffer = sample.ConvertToContiguousBuffer().ok()?;
-            let frame = with_linear_frame(&buffer, &self.geo, |frame| {
-                let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
-                for y in 0..height {
-                    rgba.extend(
-                        frame
-                            .row(y)?
-                            .chunks_exact(4)
-                            .flat_map(|px| [px[2], px[1], px[0], 255]),
-                    );
-                }
-                image::RgbaImage::from_raw(width, height, rgba)
-            })?;
-            (frame, time)
-        };
-        // Scaled while the pixels still lie as stored, then turned.
         let upright = turned_size(
             shown_size((width, height), self.pixel_aspect),
             self.rotation,
@@ -460,10 +446,33 @@ impl FrameGrabber {
             crate::image_decode::fitted_size(upright, fit)
         });
         let (w, h) = turned_size(target, self.rotation);
-        let frame = if (w, h) == (width, height) {
-            frame
-        } else {
-            image::imageops::thumbnail(&frame, w, h)
+        let (frame, time) = unsafe {
+            set_position(&self.reader, (seconds.max(0.0) * HNS_PER_SEC) as i64).ok()?;
+            let sample = next_sample(&self.reader)?;
+            let time = sample
+                .GetSampleTime()
+                .map_or(seconds, |t| t as f64 / HNS_PER_SEC);
+            let buffer = sample.ConvertToContiguousBuffer().ok()?;
+            let frame = with_linear_frame(&buffer, &self.geo, |frame| {
+                frame.row(0)?;
+                frame.row(height - 1)?;
+                if (w, h) != (width, height) {
+                    return Some(image::imageops::thumbnail(&BgraView(frame), w, h));
+                }
+                let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
+                for y in 0..height {
+                    rgba.extend(
+                        frame
+                            .row(y)?
+                            .as_chunks::<4>()
+                            .0
+                            .iter()
+                            .flat_map(|px| [px[2], px[1], px[0], 255]),
+                    );
+                }
+                image::RgbaImage::from_raw(width, height, rgba)
+            })?;
+            (frame, time)
         };
         let frame = match self.rotation {
             90 => image::imageops::rotate90(&frame),
@@ -631,6 +640,23 @@ struct FrameView<'a> {
     top: usize,
     pitch: isize,
     geo: &'a FrameGeometry,
+}
+
+/// Borrow the decoder's rows while reducing a thumbnail: no full-resolution RGBA copy.
+struct BgraView<'a, 'b>(&'a FrameView<'b>);
+impl image::GenericImageView for BgraView<'_, '_> {
+    type Pixel = image::Rgba<u8>;
+    fn dimensions(&self) -> (u32, u32) {
+        (self.0.geo.width, self.0.geo.height)
+    }
+    fn get_pixel(&self, x: u32, y: u32) -> Self::Pixel {
+        let row = self
+            .0
+            .row(y)
+            .expect("frame extent was checked before thumbnailing");
+        let at = x as usize * 4;
+        image::Rgba([row[at + 2], row[at + 1], row[at], 255])
+    }
 }
 
 impl FrameView<'_> {

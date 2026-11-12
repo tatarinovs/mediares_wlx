@@ -70,11 +70,13 @@ fn gradient_hash(gray: &GrayImage, cols: u32, rows: u32) -> u64 {
 fn compute_phash(gray: &GrayImage) -> u64 {
     const N: usize = 32;
     let thumb = imageops::resize(gray, N as u32, N as u32, FilterType::Triangle);
-
-    let mut cos = [[0.0f64; N]; 8];
-    for (k, row) in cos.iter_mut().enumerate() {
-        for (n, c) in row.iter_mut().enumerate() {
-            *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / (2 * N) as f64).cos();
+    let cos = phash_cosines();
+    let mut horizontal = [[0.0; 8]; N];
+    for (y, row) in thumb.rows().enumerate() {
+        for (x, px) in row.enumerate() {
+            for v in 0..8 {
+                horizontal[y][v] += px[0] as f64 * cos[v][x];
+            }
         }
     }
     let alpha = |k: usize| {
@@ -89,10 +91,8 @@ fn compute_phash(gray: &GrayImage) -> u64 {
     for u in 0..8 {
         for v in 0..8 {
             let mut sum = 0.0;
-            for (y, row) in thumb.rows().enumerate() {
-                for (x, px) in row.enumerate() {
-                    sum += px[0] as f64 * cos[u][y] * cos[v][x];
-                }
+            for y in 0..N {
+                sum += horizontal[y][v] * cos[u][y];
             }
             dct[u * 8 + v] = sum * alpha(u) * alpha(v);
         }
@@ -102,8 +102,55 @@ fn compute_phash(gray: &GrayImage) -> u64 {
     ac.sort_by(f64::total_cmp);
     let median = ac[ac.len() / 2];
 
+    // Flat art and symmetric patterns put coefficients at the rounding noise floor. Preserve
+    // the established bit pattern there by using the original accumulation order.
+    let mid = ac.len() / 2;
+    if median - ac[mid - 1] <= 1e-7 || ac[mid + 1] - median <= 1e-7 {
+        return legacy_phash(&thumb, cos);
+    }
+
     dct.iter()
         .fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
+}
+
+fn phash_cosines() -> &'static [[f64; 32]; 8] {
+    static COS: std::sync::OnceLock<[[f64; 32]; 8]> = std::sync::OnceLock::new();
+    COS.get_or_init(|| {
+        let mut cos = [[0.0; 32]; 8];
+        for (k, row) in cos.iter_mut().enumerate() {
+            for (n, c) in row.iter_mut().enumerate() {
+                *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / 64.0).cos();
+            }
+        }
+        cos
+    })
+}
+
+fn legacy_phash(thumb: &GrayImage, cos: &[[f64; 32]; 8]) -> u64 {
+    let alpha = |k| {
+        if k == 0 {
+            (1.0f64 / 32.0).sqrt()
+        } else {
+            (2.0f64 / 32.0).sqrt()
+        }
+    };
+    let mut dct = [0.0; 64];
+    for u in 0..8 {
+        for v in 0..8 {
+            let mut sum = 0.0;
+            for (y, row) in thumb.rows().enumerate() {
+                for (x, px) in row.enumerate() {
+                    sum += px[0] as f64 * cos[u][y] * cos[v][x];
+                }
+            }
+            dct[u * 8 + v] = sum * alpha(u) * alpha(v);
+        }
+    }
+    let mut ac = dct[1..].to_vec();
+    ac.sort_by(f64::total_cmp);
+    let median = ac[ac.len() / 2];
+    dct.iter()
+        .fold(0, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
 /// Longest side the sharpness is measured at: values compare between photos of any size.
@@ -188,6 +235,33 @@ fn gcd(mut a: u32, mut b: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimized_phash_preserves_existing_fingerprints() {
+        let mut seed = 0x1234_5678u32;
+        for case in 0..384 {
+            let gray = GrayImage::from_fn(32, 32, |x, y| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                image::Luma([match case {
+                    0..=255 => case as u8,
+                    256..=287 => (x * (case - 255) + y * 3) as u8,
+                    288..=319 => {
+                        if (x / 4 + y / 4) % 2 == 0 {
+                            0
+                        } else {
+                            255
+                        }
+                    }
+                    _ => (seed >> 24) as u8,
+                }])
+            });
+            assert_eq!(
+                compute_phash(&gray),
+                legacy_phash(&gray, phash_cosines()),
+                "case {case}"
+            );
+        }
+    }
 
     #[test]
     fn aspect_ratios() {

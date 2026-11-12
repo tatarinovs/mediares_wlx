@@ -10,6 +10,7 @@ pub mod audio_tags;
 pub mod cache;
 pub mod exif;
 pub mod ffi;
+pub mod file_write;
 pub mod hashing;
 pub mod heif;
 pub mod image_decode;

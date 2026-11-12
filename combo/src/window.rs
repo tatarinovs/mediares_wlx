@@ -33,14 +33,13 @@ use mediares_core::tc_api::{
 
 use crate::config::ViewerConfig;
 use crate::contact_sheet::WM_CONTACT_SHEET;
-use crate::i18n::{n, tr};
+use crate::i18n::tr;
 use crate::image_cache::WM_IMAGE_READY;
 use crate::image_view::{self, point_from_lparam, view_size};
+use crate::media_events::WM_MEDIA_EVENT;
 use crate::media_view::EventEffect;
 use crate::menu_theme::{self, ThemedMenu};
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
-use crate::playback_video::WM_MEDIA_EVENT;
-use crate::playlist::Repeat;
 use crate::seek_preview::WM_SEEK_PREVIEW;
 use crate::state::{Arrived, Drag, ViewerState, ZoomMode, WM_DIR_SCANNED};
 use crate::transport_bar::Click;
@@ -55,308 +54,11 @@ const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 /// `TrackMouseEvent` reports the cursor leaving (in `windows` only with the Controls feature).
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-/// The commands, numbered from 1 in this order (menu ids, posted messages); `ALL` lists them.
-macro_rules! commands {
-    ($first:ident, $($rest:ident),* $(,)?) => {
-        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-        enum Command {
-            $first = 1,
-            $($rest),*
-        }
-
-        impl Command {
-            const ALL: &[Command] = &[Command::$first, $(Command::$rest),*];
-        }
-    };
-}
-
-commands! {
-    ToggleFullscreen,
-    ToggleOsd,
-    ShowExif,
-    ShowSettings,
-    Next,
-    Previous,
-    ZoomIn,
-    ZoomOut,
-    ZoomActualSize,
-    ZoomFit,
-    TogglePlay,
-    ToggleMute,
-    SeekBack,
-    SeekForward,
-    KeyframeBack,
-    KeyframeForward,
-    VolumeUp,
-    VolumeDown,
-    PreviousTrack,
-    NextTrack,
-    ToggleAutoAdvance,
-    RepeatOff,
-    RepeatAll,
-    RepeatOne,
-    ToggleShuffle,
-    Copy,
-    SaveFrame,
-    ToggleSlideshow,
-    RotateLeft,
-    RotateRight,
-    Delete,
-    OpenInEditor,
-    ShowInFolder,
-    SetWallpaper,
-    Print,
-    Slower,
-    Faster,
-    NormalSpeed,
-    FrameBack,
-    FrameForward,
-    SaveAs,
-    SaveRotation,
-    OpenMap,
-    Zoom200,
-    Zoom300,
-    ToggleKeepZoom,
-    ToggleCompare,
-    AbLoop,
-    NextAudioTrack,
-    SaveContactSheet,
-    ShowLyrics,
-    PanLeft,
-    PanRight,
-    PanUp,
-    PanDown,
-    NextPage,
-    PreviousPage,
-    Close,
-}
-
-impl Command {
-    /// Menu items with their (English) labels; shown through [`tr`].
-    const MENU: &[Option<(Command, &'static str)>] = &[
-        Some((Command::TogglePlay, n("Play / pause\tSpace"))),
-        Some((Command::ToggleMute, n("Mute\tM"))),
-        Some((Command::ToggleFullscreen, n("Full screen\tEnter / F"))),
-        Some((Command::Copy, n("Copy image\tCtrl+C"))),
-        Some((Command::SaveAs, n("Save as...\tCtrl+S"))),
-        Some((
-            Command::SaveFrame,
-            n("Save frame next to the video\tShift+S"),
-        )),
-        Some((
-            Command::SaveContactSheet,
-            n("Save contact sheet next to the video\tCtrl+Shift+S"),
-        )),
-        Some((Command::ToggleOsd, n("Show OSD\tO"))),
-        Some((Command::ToggleSlideshow, n("Slideshow\tF5"))),
-        Some((Command::RotateLeft, n("Rotate left\tL"))),
-        Some((Command::RotateRight, n("Rotate right\tR"))),
-        Some((
-            Command::SaveRotation,
-            n("Save rotation to file (JPEG, lossless)\tCtrl+R"),
-        )),
-        Some((
-            Command::ToggleKeepZoom,
-            n("Keep the zoom on the next photo\tZ"),
-        )),
-        Some((Command::ToggleCompare, n("Compare with this photo\tC"))),
-        None,
-        Some((Command::Slower, n("Slower\t["))),
-        Some((Command::Faster, n("Faster\t]"))),
-        Some((Command::NormalSpeed, n("Normal speed\t\\"))),
-        Some((Command::FrameBack, n("Previous frame\t,"))),
-        Some((Command::FrameForward, n("Next frame\t."))),
-        Some((Command::AbLoop, n("A-B loop\tA"))),
-        Some((Command::NextAudioTrack, n("Next audio track\tB"))),
-        None,
-        Some((
-            Command::ToggleAutoAdvance,
-            n("Auto-advance to the next file"),
-        )),
-        Some((Command::RepeatOff, n("No repeat"))),
-        Some((Command::RepeatAll, n("Repeat list"))),
-        Some((Command::RepeatOne, n("Repeat file"))),
-        Some((Command::ToggleShuffle, n("Shuffle"))),
-        None,
-        Some((Command::ShowExif, n("EXIF info...\tE"))),
-        Some((Command::ShowLyrics, n("Lyrics\tY"))),
-        Some((Command::OpenMap, n("Open on map\tG"))),
-        Some((Command::OpenInEditor, n("Open in editor\tF4"))),
-        Some((Command::ShowInFolder, n("Show in folder\tCtrl+Enter"))),
-        Some((Command::SetWallpaper, n("Set as desktop background"))),
-        Some((Command::Print, n("Print...\tCtrl+P"))),
-        Some((Command::Delete, n("Move to Recycle Bin\tDel"))),
-        None,
-        Some((Command::ShowSettings, n("Settings...\tS"))),
-        None,
-        Some((Command::NextPage, n("Next page\tRight / Ctrl+PgDn"))),
-        Some((Command::PreviousPage, n("Previous page\tLeft / Ctrl+PgUp"))),
-        Some((Command::Next, n("Next file\tSpace / Down"))),
-        Some((Command::Previous, n("Previous file\tBackspace / Up"))),
-    ];
-
-    /// Whether the item applies to the current content (photo, or audio/video).
-    fn available(self, media: bool, video: bool) -> bool {
-        use Command::*;
-        match self {
-            SaveFrame | Slower | Faster | NormalSpeed | FrameBack | FrameForward
-            | NextAudioTrack | SaveContactSheet => video,
-            TogglePlay | ToggleMute | ToggleAutoAdvance | RepeatOff | RepeatAll | RepeatOne
-            | ToggleShuffle | AbLoop => media,
-            ShowLyrics => media && !video,
-            ShowExif | ToggleSlideshow | RotateLeft | RotateRight | SaveRotation | SetWallpaper
-            | SaveAs | OpenMap | ToggleKeepZoom | ToggleCompare | NextPage | PreviousPage => !media,
-            ToggleOsd | Print => !media || video,
-            _ => true,
-        }
-    }
-
-    /// For audio/video, where Space plays / pauses and Left / Right seek (see [`Self::from_key`]).
-    fn media_label(self, media: bool) -> Option<&'static str> {
-        match self {
-            Command::Next if media => Some(n("Next file\tN / PgDn")),
-            Command::Previous if media => Some(n("Previous file\tBackspace / PgUp")),
-            _ => None,
-        }
-    }
-
-    fn repeat_mode(self) -> Option<Repeat> {
-        match self {
-            Command::RepeatOff => Some(Repeat::Off),
-            Command::RepeatAll => Some(Repeat::All),
-            Command::RepeatOne => Some(Repeat::One),
-            _ => None,
-        }
-    }
-
-    /// Any command by its numeric value (posted messages, menu ids).
-    fn from_raw(value: usize) -> Option<Command> {
-        Self::ALL.get(value.checked_sub(1)?).copied()
-    }
-
-    /// Previous / next file in the play queue.
-    fn track(forward: bool) -> Command {
-        if forward {
-            Command::NextTrack
-        } else {
-            Command::PreviousTrack
-        }
-    }
-
-    /// Hotkeys. With Ctrl held only zoom keys are ours; everything else goes to the Lister
-    /// (Ctrl+P print, Ctrl+C copy, ...). For audio/video, player keys take precedence; for a
-    /// zoomed-in photo (`zoomed`, never set together with `media`), the arrows pan it instead of
-    /// paging to another file.
-    fn from_key(vk: u16, ctrl: bool, shift: bool, media: bool, zoomed: bool) -> Option<Command> {
-        use Command::*;
-        if ctrl && !shift && vk == 0x43 {
-            return Some(Copy); // Ctrl+C: the picture, not the file (TC copies files in its panels)
-        }
-        if !ctrl && !shift && vk == 0x73 {
-            return Some(OpenInEditor); // F4, like Edit in TC
-        }
-        if ctrl && !shift && vk == 0x0D {
-            return Some(ShowInFolder); // Ctrl+Enter
-        }
-        if !media && ctrl && !shift && vk == 0x53 {
-            return Some(SaveAs); // Ctrl+S
-        }
-        if !media && ctrl && !shift && vk == 0x52 {
-            return Some(SaveRotation); // Ctrl+R
-        }
-        if media && shift && !ctrl && vk == 0x53 {
-            return Some(SaveFrame); // Shift+S, as in VLC
-        }
-        if media && ctrl && shift && vk == 0x53 {
-            return Some(SaveContactSheet); // Ctrl+Shift+S
-        }
-        if media {
-            let keyboard_media = match vk {
-                0xB0 => Some(NextTrack),     // VK_MEDIA_NEXT_TRACK
-                0xB1 => Some(PreviousTrack), // VK_MEDIA_PREV_TRACK
-                0xB3 => Some(TogglePlay),    // VK_MEDIA_PLAY_PAUSE
-                _ => None,
-            };
-            if keyboard_media.is_some() {
-                return keyboard_media;
-            }
-        }
-        if media && !ctrl {
-            let player = match vk {
-                0x20 | 0x4B => Some(TogglePlay), // Space, K
-                0x25 => Some(SeekBack),          // Left: -step (5 s by default)
-                0x27 => Some(SeekForward),       // Right: +step
-                0x26 => Some(KeyframeForward),   // Up: next key frame (audio: +1 s)
-                0x28 => Some(KeyframeBack),      // Down: previous key frame (audio: -1 s)
-                0xBB | 0x6B => Some(VolumeUp),   // '+' / numpad +
-                0xBD | 0x6D => Some(VolumeDown), // '-' / numpad -
-                0x4D => Some(ToggleMute),        // M
-                0xDB => Some(Slower),            // [
-                0xDD => Some(Faster),            // ]
-                0xDC => Some(NormalSpeed),       // \
-                0xBC => Some(FrameBack),         // ,
-                0xBE => Some(FrameForward),      // .
-                0x41 => Some(AbLoop),            // A
-                0x59 => Some(ShowLyrics),        // Y
-                0x42 => Some(NextAudioTrack),    // B
-                _ => None,
-            };
-            if player.is_some() {
-                return player;
-            }
-        }
-        if zoomed && !ctrl {
-            let pan = match vk {
-                0x25 => Some(PanLeft),  // Left: reveal more of the left edge
-                0x27 => Some(PanRight), // Right
-                0x26 => Some(PanUp),    // Up
-                0x28 => Some(PanDown),  // Down
-                _ => None,
-            };
-            if pan.is_some() {
-                return pan;
-            }
-        }
-        let zoom = match vk {
-            0xBB | 0x6B => Some(ZoomIn),  // '+' / numpad +
-            0xBD | 0x6D => Some(ZoomOut), // '-' / numpad -
-            _ => None,
-        };
-        if ctrl {
-            // Only with Ctrl: bare digits switch the Lister's view mode.
-            return zoom.or(match vk {
-                0x30 | 0x60 => Some(ZoomFit),        // Ctrl+0
-                0x31 | 0x61 => Some(ZoomActualSize), // Ctrl+1
-                0x32 | 0x62 => Some(Zoom200),        // Ctrl+2
-                0x33 | 0x63 => Some(Zoom300),        // Ctrl+3
-                // Pages also while zoomed in, when the arrows pan.
-                0x22 if !media => Some(NextPage),     // Ctrl+PgDn
-                0x21 if !media => Some(PreviousPage), // Ctrl+PgUp
-                _ => None,
-            });
-        }
-        zoom.or(match vk {
-            0x0D | 0x46 | 0x7A => Some(ToggleFullscreen), // Enter, F, F11
-            0x4F | 0x49 => Some(ToggleOsd),               // O, I
-            0x74 => Some(ToggleSlideshow),                // F5
-            0x45 => Some(ShowExif),                       // E
-            0x47 => Some(OpenMap),                        // G
-            0x53 => Some(ShowSettings),                   // S
-            0x4C => Some(RotateLeft),                     // L
-            0x52 => Some(RotateRight),                    // R
-            0x5A => Some(ToggleKeepZoom),                 // Z
-            0x43 => Some(ToggleCompare),                  // C
-            0x2E => Some(Delete),                         // Del
-            0x6A | 0x6F => Some(ZoomFit),                 // numpad * and /
-            // Pages of a multi-page file; in other files they page through the files as well.
-            0x27 => Some(NextPage),                      // Right
-            0x25 => Some(PreviousPage),                  // Left
-            0x4E | 0x20 | 0x22 | 0x28 => Some(Next),     // N, Space, PgDn, Down
-            0x50 | 0x08 | 0x21 | 0x26 => Some(Previous), // P, Backspace, PgUp, Up
-            _ => None,
-        })
-    }
-}
+mod file_commands;
+pub(crate) use file_commands::print;
+use file_commands::{delete_current, leave_fullscreen, save_rotation, set_wallpaper};
+mod commands;
+use commands::Command;
 
 const VK_ESCAPE: u16 = 0x1B;
 
@@ -500,8 +202,8 @@ unsafe fn redraw(hwnd: HWND) {
 unsafe fn refresh(state: &mut ViewerState) {
     fullscreen::sync_overlay(state);
     sync_video_osd(state);
-    redraw(state.hwnd);
     update_title(state);
+    redraw(state.hwnd);
 }
 
 unsafe fn update_title(state: &ViewerState) {
@@ -884,8 +586,9 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 return;
             };
             let saved = media.current_picture().and_then(|frame| {
-                let target = snapshot::frame_file_name(&path, media.position(), format);
-                snapshot::save_picture(&frame, &target, format).then_some(target)
+                let stem = path.file_stem()?.to_string_lossy();
+                let stem = format!("{stem}_{}", snapshot::time_label(media.position()));
+                snapshot::save_unique_picture(&frame, &path, &stem, format)
             });
             let text = match saved {
                 Some(target) => format!(
@@ -1090,148 +793,6 @@ unsafe fn execute(hwnd: HWND, command: Command) {
 }
 
 /// Another program is about to open: the user goes to it from the normal Lister.
-unsafe fn leave_fullscreen(hwnd: HWND) {
-    if get_state(hwnd).is_some_and(|s| s.fullscreen.is_some()) {
-        execute(hwnd, Command::ToggleFullscreen);
-    }
-}
-
-/// Del: the file goes to the Recycle Bin and the next one is shown (the Lister closes when none
-/// is left). State is re-fetched after each call that may show a dialog.
-unsafe fn delete_current(hwnd: HWND) {
-    let Some(state) = get_state(hwnd) else { return };
-    let (path, confirm) = (state.file_path.clone(), state.config.confirm_delete);
-    if !path.is_file() {
-        return;
-    }
-    let owner = dialog::modal_owner(hwnd);
-    if confirm && !file_actions::confirm_delete(owner, &path) {
-        return;
-    }
-    let Some(state) = get_live_state(hwnd) else {
-        return;
-    };
-    // A player keeps its file open: close it first.
-    let had_player = state.media.take().is_some();
-    let deleted = file_actions::recycle(owner, &path);
-    let Some(state) = get_live_state(hwnd) else {
-        return;
-    };
-    if !deleted {
-        if had_player {
-            state.reload();
-            refresh(state);
-        }
-        return;
-    }
-    if state.remove_current() {
-        refresh(state);
-    } else if !state.lister.is_invalid() {
-        let _ = PostMessageW(
-            Some(state.lister),
-            WM_KEYDOWN,
-            WPARAM(VK_ESCAPE as usize),
-            LPARAM(0),
-        );
-    }
-}
-
-/// Writes the turn made with L / R into the JPEG as its EXIF orientation: lossless, the image data
-/// stays byte for byte. Other formats are pointed to "Save as".
-unsafe fn save_rotation(hwnd: HWND) {
-    let Some(state) = get_state(hwnd) else { return };
-    if state.media.is_some() || state.image.is_none() {
-        return;
-    }
-    let owner = dialog::modal_owner(hwnd);
-    let path = state.file_path.clone();
-    if state.quarter_turns == 0 {
-        file_actions::show_error(owner, tr("Turn the photo with L / R first."));
-        return;
-    }
-    if !is_jpeg(&path) {
-        file_actions::show_error(
-            owner,
-            tr("Lossless rotation can be written to JPEG only.\nFor other formats use Save as (Ctrl+S)."),
-        );
-        return;
-    }
-    // With auto-rotation off the screen shows the stored pixels, so the turn counts from them.
-    let auto_rotate = state.config.auto_rotate_exif;
-    let current = if auto_rotate {
-        read_orientation(&path).unwrap_or(1)
-    } else {
-        1
-    };
-    let orientation = mediares_core::orientation::turned(current, state.quarter_turns);
-    if let Err(e) = mediares_core::orientation::set_jpeg_orientation(&path, orientation) {
-        file_actions::show_error(
-            owner,
-            &format!(
-                "{}:\n{}\n\n{}",
-                tr("Could not save the rotation"),
-                path.display(),
-                e
-            ),
-        );
-        return;
-    }
-    if auto_rotate {
-        // The file now shows upright by itself; the turned picture stays until it is re-read.
-        state.reload();
-        refresh(state);
-    } else {
-        file_actions::show_error(
-            owner,
-            tr("Rotation saved. Auto-rotation by EXIF is off in Settings, so the photo is shown here without it."),
-        );
-    }
-}
-
-/// The photo as the desktop wallpaper: the file itself when Windows can show it as is, otherwise
-/// (RAW, PSD, turned with R / L, EXIF-rotated) the picture on screen saved as PNG.
-unsafe fn set_wallpaper(hwnd: HWND) {
-    let Some(state) = get_state(hwnd) else { return };
-    let path = state.file_path.clone();
-    let as_is = state.image.is_some()
-        && state.quarter_turns == 0
-        && mediares_core::probe::has_extension(&path, &["jpg", "jpeg", "png", "bmp"])
-        && read_orientation(&path).is_none_or(|o| o == 1);
-    let source = if as_is {
-        Some(path)
-    } else {
-        let Some(img) = state.whole_image() else {
-            return;
-        };
-        let target = config::local_path("mediares_wallpaper.png");
-        snapshot::save_png(&img, &target).then_some(target)
-    };
-    if !source.is_some_and(|s| file_actions::set_wallpaper(&s)) {
-        file_actions::show_error(
-            dialog::modal_owner(hwnd),
-            tr("Could not set the desktop background."),
-        );
-    }
-}
-
-/// Prints the photo, or the video frame / album art. `margins` in 1/100 mm.
-pub unsafe fn print(hwnd: HWND, printer: Option<&str>, margins: Option<RECT>) -> bool {
-    let Some(state) = get_state(hwnd) else {
-        return false;
-    };
-    let picture = match &state.media {
-        Some(media) => media.current_picture(),
-        None => state.whole_image(),
-    };
-    let Some(picture) = picture else { return false };
-    let name = state
-        .file_path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    crate::print::print(dialog::modal_owner(hwnd), picture, &name, printer, margins)
-}
-
 /// Viewer timer of the slideshow.
 const SLIDESHOW_TIMER_ID: usize = 0x4D56;
 
@@ -1430,8 +991,12 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
         }
         WM_MEDIA_EVENT => {
-            if let Some(media) = state.media.as_mut() {
-                let effect = media.on_event(wparam.0 as i32, lparam.0);
+            let effects = state
+                .media
+                .as_mut()
+                .map(|media| media.on_events(wparam.0))
+                .unwrap_or_default();
+            for effect in effects {
                 apply_effect(hwnd, effect);
             }
         }
@@ -1453,7 +1018,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
         }
         WM_SEEK_PREVIEW => {
             if let Some(media) = &state.media {
-                media.preview_ready();
+                media.preview_ready(wparam.0);
             }
         }
         // The folder's files arrived: the position in the caption, the neighbours to prefetch.

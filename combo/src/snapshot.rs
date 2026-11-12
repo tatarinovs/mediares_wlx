@@ -1,6 +1,7 @@
 //! Pictures out of the viewer: Ctrl+C (clipboard), Shift+S (the video frame saved next to the
 //! video) and TC's thumbnail view (`ListGetPreviewBitmap`).
 
+use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
@@ -10,7 +11,7 @@ use mediares_core::image::codecs::png::PngEncoder;
 use mediares_core::image::{DynamicImage, ExtendedColorType, ImageEncoder};
 use mediares_core::image_decode::{decode_bytes, decode_oriented_fitted};
 use mediares_core::probe::{probe_file, MediaType};
-use mediares_core::video_frame::video_frame_rgba;
+use mediares_core::video_frame::video_frame_rgba_fitted;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, DeleteObject, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
@@ -106,8 +107,12 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, suffix: &str) -> Option<
     }
     std::fs::create_dir_all(&dir).ok()?;
     let stem = source.file_stem()?.to_string_lossy();
-    let path = dir.join(format!("{stem}_{suffix}.png"));
-    save_png(img, &path).then_some(path)
+    save_unique_picture(
+        img,
+        &dir.join("clipboard.png"),
+        &format!("{stem}_{suffix}"),
+        PictureFormat::Png,
+    )
 }
 
 /// Puts the picture on the clipboard as `CF_DIB` (bottom-up: top-down DIBs confuse many apps),
@@ -145,15 +150,6 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
     }
     let _ = CloseClipboard();
     ok
-}
-
-/// "clip_1-23.456.png" next to the video; " (2)", " (3)"... if taken.
-pub fn frame_file_name(video: &Path, position: f64, format: PictureFormat) -> PathBuf {
-    let stem = video
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    unique_path(video, &format!("{}_{}", stem, time_label(position)), format)
 }
 
 /// A video position for a file name: "1-23.456" (no colons), rounded to the millisecond.
@@ -221,27 +217,52 @@ pub fn save_png(img: &DecodedImage, path: &Path) -> bool {
 }
 
 pub fn save_picture(img: &DecodedImage, path: &Path, format: PictureFormat) -> bool {
+    mediares_core::file_write::replace(path, |out| encode_picture(img, out, format)).is_ok()
+}
+
+/// Reserve the name while creating it: concurrent snapshots never overwrite one another.
+pub fn save_unique_picture(
+    img: &DecodedImage,
+    neighbour: &Path,
+    stem: &str,
+    format: PictureFormat,
+) -> Option<PathBuf> {
+    for n in 1..=10000 {
+        let name = if n == 1 {
+            stem.to_string()
+        } else {
+            format!("{stem} ({n})")
+        };
+        let path = neighbour.with_file_name(format!("{name}.{}", format.extension()));
+        match mediares_core::file_write::write_new(&path, |out| encode_picture(img, out, format)) {
+            Ok(()) => return Some(path),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+fn encode_picture(
+    img: &DecodedImage,
+    out: &mut dyn Write,
+    format: PictureFormat,
+) -> io::Result<()> {
     let rgb: Vec<u8> = img
         .bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[2], px[1], px[0]])
         .collect();
-    let Ok(file) = std::fs::File::create(path) else {
-        return false;
-    };
-    let out = std::io::BufWriter::new(file);
     let (w, h, color) = (img.width, img.height, ExtendedColorType::Rgb8);
-    let ok = match format {
+    match format {
         PictureFormat::Png => PngEncoder::new(out).write_image(&rgb, w, h, color),
         PictureFormat::Jpeg => {
             JpegEncoder::new_with_quality(out, JPEG_QUALITY).write_image(&rgb, w, h, color)
         }
     }
-    .is_ok();
-    if !ok {
-        let _ = std::fs::remove_file(path);
-    }
-    ok
+    .map_err(io::Error::other)
 }
 
 /// Picture representing the file: the photo (decoded no larger than needed for a square of
@@ -252,8 +273,8 @@ fn source_picture(path: &Path, side: u32) -> Option<DynamicImage> {
             decode_oriented_fitted(path, kind, true, Some((side, side))).map(|(img, ..)| img)
         }
         // libmpv first when installed, like playback: it decodes more, and faster.
-        MediaType::Video => playback_mpv::video_frame(path, THUMBNAIL_AT)
-            .or_else(|| video_frame_rgba(path, THUMBNAIL_AT))
+        MediaType::Video => playback_mpv::video_frame(path, THUMBNAIL_AT, (side, side))
+            .or_else(|| video_frame_rgba_fitted(path, THUMBNAIL_AT, Some((side, side))))
             .map(DynamicImage::ImageRgba8),
         MediaType::Audio => {
             let embedded = read_tags(path, true)
@@ -300,21 +321,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn concurrent_snapshots_reserve_distinct_names_and_keep_existing_files() {
+        let dir = std::env::temp_dir().join(format!("mediares-snap-race-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("frame.png");
+        std::fs::write(&existing, b"keep this file").unwrap();
+        let image = std::sync::Arc::new(image_cache::to_bgra(
+            mediares_core::image::RgbImage::from_pixel(
+                2,
+                2,
+                mediares_core::image::Rgb([20, 30, 40]),
+            )
+            .into(),
+            0,
+            false,
+        ));
+        let jobs: Vec<_> = (0..4)
+            .map(|_| {
+                let (image, dir) = (image.clone(), dir.clone());
+                std::thread::spawn(move || {
+                    save_unique_picture(&image, &dir.join("video.mp4"), "frame", PictureFormat::Png)
+                        .unwrap()
+                })
+            })
+            .collect();
+        let paths: std::collections::HashSet<_> =
+            jobs.into_iter().map(|job| job.join().unwrap()).collect();
+        assert_eq!(paths.len(), 4);
+        assert_eq!(std::fs::read(&existing).unwrap(), b"keep this file");
+        for path in paths {
+            assert_eq!(mediares_core::image::open(&path).unwrap().width(), 2);
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_file(existing).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
     fn frame_names_are_unique_and_file_system_safe() {
         let dir = std::env::temp_dir().join(format!("mediares_snap_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let video = dir.join("clip.mp4");
-        let first = frame_file_name(&video, 83.4567, PictureFormat::Png);
+        let stem = format!("clip_{}", time_label(83.4567));
+        let first = unique_path(&video, &stem, PictureFormat::Png);
         assert_eq!(first.file_name().unwrap(), "clip_1-23.457.png");
         std::fs::write(&first, b"x").unwrap();
         assert_eq!(
-            frame_file_name(&video, 83.4567, PictureFormat::Png)
+            unique_path(&video, &stem, PictureFormat::Png)
                 .file_name()
                 .unwrap(),
             "clip_1-23.457 (2).png"
         );
         assert_eq!(
-            frame_file_name(&video, 83.4567, PictureFormat::Jpeg)
+            unique_path(&video, &stem, PictureFormat::Jpeg)
                 .file_name()
                 .unwrap(),
             "clip_1-23.457.jpg"

@@ -107,12 +107,7 @@ fn prepare_unicode(ini: &Path) {
         .chain(text.encode_utf16())
         .flat_map(u16::to_le_bytes)
         .collect();
-    // Replaced only once written whole.
-    let mut temp = ini.as_os_str().to_owned();
-    temp.push(".tmp");
-    if std::fs::write(&temp, wide).is_err() || std::fs::rename(&temp, ini).is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
+    let _ = mediares_core::file_write::replace(ini, |out| out.write_all(&wide));
 }
 
 /// Directory of TC's default plugin INI — normally the one holding `wincmd.ini` too.

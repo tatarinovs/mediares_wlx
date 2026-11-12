@@ -585,9 +585,9 @@ impl MediaView {
     }
 
     /// `WM_SEEK_PREVIEW`: a frame for the timeline preview arrived.
-    pub unsafe fn preview_ready(&self) {
+    pub unsafe fn preview_ready(&self, token: usize) {
         if let Some(preview) = &self.seek_preview {
-            preview.frame_ready();
+            preview.frame_ready(token);
         }
     }
 
@@ -724,6 +724,22 @@ impl MediaView {
     }
 
     /// `WM_MEDIA_EVENT` from a Media Foundation engine.
+    pub unsafe fn on_events(&mut self, token: usize) -> Vec<EventEffect> {
+        let events = match &self.content {
+            Content::Video(v) => v.take_events(token),
+            Content::Audio(a) => a.take_events(token),
+        };
+        let mut effects = Vec::new();
+        for event in events {
+            let effect = self.on_event(event.kind, event.parameter);
+            effects.push(effect);
+            if effect == EventEffect::Ended {
+                break;
+            }
+        }
+        effects
+    }
+
     pub unsafe fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
         match &mut self.content {
             Content::Video(v) => {
@@ -794,12 +810,16 @@ impl MediaView {
         }
         match (&mut self.content, id) {
             (Content::Video(v), RENDER_TIMER_ID) => {
-                v.render();
+                let changed = v.render();
                 // Played on (the Play key): the frame magnified is gone.
                 if v.loupe().is_some() && v.is_playing() {
                     v.loupe_end();
                 }
-                Some(EventEffect::None)
+                Some(if changed {
+                    EventEffect::Relayout
+                } else {
+                    EventEffect::None
+                })
             }
             (_, LOUPE_TIMER_ID) => {
                 self.start_loupe();

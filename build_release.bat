@@ -77,8 +77,10 @@ if "!RUN_TESTS!"=="1" (
 :: and with both types LTO keeps more code: built as a cdylib alone each DLL is ~230 KB smaller.
 echo:
 echo [2/4] Building MinGW release binaries as cdylib-only...
+:: Cargo still sees the manifest's rlib and can reduce profile.strip to debuginfo.
+:: Force symbol stripping for these cdylib-only artifacts as well.
 for %%P in (mediares_combo mediares_wdx) do (
-    cargo +%TOOLCHAIN% rustc --locked --release --target %TARGET% -p %%P --lib --crate-type cdylib
+    cargo +%TOOLCHAIN% rustc --locked --release --target %TARGET% -p %%P --lib --crate-type cdylib -- -C strip=symbols
     if errorlevel 1 (
         echo [ERROR] Cargo build of %%P failed!
         exit /b 1
@@ -97,71 +99,13 @@ if not exist "%WDX_DLL%" (
     exit /b 1
 )
 
-:: Prepare dist and temporary staging directories
 echo:
-echo [3/4] Preparing output directories...
-set "DIST_DIR=%~dp0dist"
-set "STAGING_DIR=%~dp0target\staging"
-
-if not exist "%DIST_DIR%" mkdir "%DIST_DIR%"
-if exist "%STAGING_DIR%" rd /s /q "%STAGING_DIR%"
-mkdir "%STAGING_DIR%"
-
-:: Copy standalone binaries to dist/
-echo [INFO] Copying standalone binaries to dist...
-copy /y "%COMBO_DLL%" "%DIST_DIR%\mediares.wlx64" >nul
-copy /y "%WDX_DLL%" "%DIST_DIR%\mediares_wdx_only.wdx64" >nul
-
-copy /y "pluginst\pluginst-wlx.inf" "%DIST_DIR%\pluginst.inf" >nul
-
-:: No mediares.ini in the archives: next to the DLL it would force portable mode (settings written into
-:: the plugin folder, often read-only); without it the plugin uses TC's plugin settings folder and its defaults.
-if exist "%DIST_DIR%\mediares.ini" del "%DIST_DIR%\mediares.ini"
-
-:: Packaging Archives
+echo [3/4] Staging and verifying plugin archives...
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -Root "%~dp0." -Version "%VERSION%" -ComboDll "%COMBO_DLL%" -WdxDll "%WDX_DLL%"
+if errorlevel 1 (
+    echo [ERROR] Packaging failed. Previous artifacts were not reported as a new release.
+    exit /b 1
+)
 echo:
-echo [4/4] Packaging Total Commander plugin zip archives...
-
-:: Package 1: Mediares WDX (fields only, no viewer)
-echo   - Packaging mediares-wdx-v!VERSION!.zip ...
-set "STAGE_WDX=%STAGING_DIR%\wdx"
-mkdir "%STAGE_WDX%"
-copy /y "%WDX_DLL%" "%STAGE_WDX%\mediares.wdx64" >nul
-copy /y "pluginst\pluginst-wdx.inf" "%STAGE_WDX%\pluginst.inf" >nul
-copy /y "pluginst\mediares.lng" "%STAGE_WDX%\mediares.lng" >nul
-copy /y "docs\readme_rus.txt" "%STAGE_WDX%\readme_rus.txt" >nul
-copy /y "docs\readme_eng.txt" "%STAGE_WDX%\readme_eng.txt" >nul
-
-pushd "%STAGE_WDX%"
-tar -a -c -f "%DIST_DIR%\mediares-wdx-v!VERSION!.zip" *
-popd
-
-:: Package 2: Mediares WLX: the viewer, installed as the Lister plugin; the same file also
-:: carries the content-plugin fields, connected from its settings ("Register WDX")
-echo   - Packaging mediares-wlx-v!VERSION!.zip ...
-set "STAGE_WLX=%STAGING_DIR%\wlx"
-mkdir "%STAGE_WLX%"
-copy /y "%COMBO_DLL%" "%STAGE_WLX%\mediares.wlx64" >nul
-copy /y "pluginst\pluginst-wlx.inf" "%STAGE_WLX%\pluginst.inf" >nul
-:: Russian field names for TC's dialogs; must sit next to the plugin under the same name.
-copy /y "pluginst\mediares.lng" "%STAGE_WLX%\mediares.lng" >nul
-:: Sample of the built-in UI translations; a copy next to the plugin overrides them.
-copy /y "pluginst\mediares_ui.lng" "%STAGE_WLX%\mediares_ui.lng" >nul
-copy /y "docs\readme_rus.txt" "%STAGE_WLX%\readme_rus.txt" >nul
-copy /y "docs\readme_eng.txt" "%STAGE_WLX%\readme_eng.txt" >nul
-
-pushd "%STAGE_WLX%"
-tar -a -c -f "%DIST_DIR%\mediares-wlx-v!VERSION!.zip" *
-popd
-
-:: Cleanup staging
-rd /s /q "%STAGING_DIR%"
-
-echo:
-echo =======================================================
-echo   Build and packaging completed successfully!
-echo =======================================================
-echo Output directory: %DIST_DIR%
-echo:
-dir "%DIST_DIR%\*.zip" "%DIST_DIR%\*.w?x64" | findstr /v "Directory Volume"
-echo:
+echo [4/4] Build and packaging completed successfully.
+exit /b 0

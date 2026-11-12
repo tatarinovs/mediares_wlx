@@ -6,7 +6,7 @@
 //!
 //! Photos are first decoded fitted to the screen, which is what the window shows unless zoomed
 //! in: a 36 MP photo then takes about 8 MB instead of 146 MB and HEIC decodes about three times
-//! faster. The whole picture of the photo on screen follows in the background, after the
+//! faster. The whole picture is requested only when zooming needs its pixels, after the
 //! neighbours, and is kept by its window only (never cached).
 
 use std::collections::VecDeque;
@@ -191,6 +191,10 @@ pub fn request(
     }
     let pool = pool();
     let mut q = pool.lock();
+    if q.workers == 0 {
+        drop(q);
+        return load(path, kind, options).map(Request::Ready);
+    }
     // Re-checked under the queue lock: a worker caches its result before leaving `in_flight`.
     if let Some(img) = cache().get(&key) {
         return Some(Request::Ready(img));
@@ -232,6 +236,9 @@ pub fn request_whole(
     };
     let pool = pool();
     let mut q = pool.lock();
+    if q.workers == 0 {
+        return None;
+    }
     let hwnd = notify.0 as isize;
     let job = Job::new(key, path.to_path_buf(), kind, q.generation);
     job.lock_notify().push(hwnd);
@@ -569,7 +576,7 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
         (background >> 8) & 0xFF,
         (background >> 16) & 0xFF,
     ];
-    for px in bgra.chunks_exact_mut(4) {
+    for px in bgra.as_chunks_mut::<4>().0 {
         let a = px[3] as u32;
         let blend = |c: u8, bg: u32| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
         let (r, g, b) = if a == 255 {
@@ -666,7 +673,9 @@ fn rotated_bytes(img: &DecodedImage, clockwise: bool) -> DecodedImage {
 pub fn to_dynamic(img: &DecodedImage) -> Option<DynamicImage> {
     let rgba: Vec<u8> = img
         .bgra
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .flat_map(|px| [px[2], px[1], px[0], px[3]])
         .collect();
     mediares_core::image::RgbaImage::from_raw(img.width, img.height, rgba)

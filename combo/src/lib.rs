@@ -14,6 +14,7 @@ mod gdi;
 mod i18n;
 mod image_cache;
 mod image_view;
+mod media_events;
 mod media_view;
 mod menu_theme;
 mod osd_template;

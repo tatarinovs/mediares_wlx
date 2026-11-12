@@ -27,7 +27,7 @@ fn field(name: &str) -> i32 {
 #[test]
 fn test_supported_fields_enumeration() {
     let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
-    assert_eq!(fields.len(), 73);
+    assert_eq!(fields.len(), 75);
     let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     // Hashes for duplicate search come first.
     assert_eq!(
@@ -45,7 +45,7 @@ fn test_supported_fields_enumeration() {
     assert_eq!(names.last(), Some(&"Plugin_Version"));
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 73, "names are unique");
+    assert_eq!(names.len(), 75, "names are unique");
 
     for (name, kind) in [
         ("Image_dHash", FT_STRINGW),
@@ -189,10 +189,10 @@ fn test_image_hashes_and_duplicate_matching() {
 #[test]
 fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
     use std::os::windows::ffi::OsStrExt;
-    for filename in &[
-        "target/test_dummy.mp4",
-        "target/test_dummy.cr2",
-        "target/test_dummy.psd",
+    for (filename, field_name) in [
+        ("target/test_dummy.mp4", "Video_Fingerprint"),
+        ("target/test_dummy.cr2", "Image_dHash"),
+        ("target/test_dummy.psd", "Image_dHash"),
     ] {
         let path = PathBuf::from(filename);
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
@@ -201,7 +201,7 @@ fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
         let res = unsafe {
             ContentGetValueW(
                 wide.as_ptr(),
-                field("Image_dHash"),
+                field(field_name),
                 0,
                 buf.as_mut_ptr() as *mut c_void,
                 256,
@@ -882,4 +882,89 @@ fn test_every_field_has_a_russian_name() {
     assert!(names
         .iter()
         .all(|n| !n.is_empty() && !n.iter().any(|b| b".|:[]".contains(b))));
+}
+
+#[test]
+fn fields_are_scoped_before_any_analysis_and_full_image_hashes_are_delayed() {
+    use std::os::windows::ffi::OsStrExt;
+    let path = std::env::temp_dir().join(format!("mediares-wdx-scope-{}.png", std::process::id()));
+    mediares_core::image::RgbImage::from_pixel(240, 160, mediares_core::image::Rgb([30, 60, 90]))
+        .save(&path)
+        .unwrap();
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+    let read = |name: &str, flags| {
+        let mut bytes = [0u64; 64];
+        let code = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field(name),
+                0,
+                bytes.as_mut_ptr().cast(),
+                512,
+                flags,
+            )
+        };
+        (code, bytes)
+    };
+    for name in [
+        "Audio_PCM_Hash",
+        "Audio_Duration_Sec",
+        "Video_Fingerprint",
+        "Video_Dimensions",
+    ] {
+        assert_eq!(read(name, CONTENT_DELAYIFSLOW).0, FT_FIELDEMPTY, "{name}");
+        assert_eq!(read(name, 0).0, FT_FIELDEMPTY, "{name}");
+        assert!(!mediares_core::cache::get_cache().is_cached(&path));
+    }
+    let (code, bytes) = read("Image_Megapixels", CONTENT_DELAYIFSLOW);
+    assert_eq!(code, FT_NUMERIC_FLOATING);
+    assert_eq!(f64::from_bits(bytes[0]), 0.0384);
+    assert!(!mediares_core::cache::get_cache().is_cached(&path));
+    assert_eq!(read("Image_pHash", CONTENT_DELAYIFSLOW).0, FT_DELAYED);
+    assert_eq!(read("Image_pHash", 0).0, FT_STRINGW);
+    assert_eq!(read("Image_pHash", CONTENT_DELAYIFSLOW).0, FT_STRINGW);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn replay_gain_is_a_numeric_tag_and_absent_tags_are_empty() {
+    use std::os::windows::ffi::OsStrExt;
+    let path = std::env::temp_dir().join(format!("mediares-wdx-gain-{}.wav", std::process::id()));
+    write_wav(&path, 8000, 1, 0, 1.0);
+    let read = || {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut bytes = [0u64; 16];
+        let code = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field("Audio_ReplayGain_dB"),
+                0,
+                bytes.as_mut_ptr().cast(),
+                128,
+                0,
+            )
+        };
+        (code, f64::from_bits(bytes[0]))
+    };
+    assert_eq!(read().0, FT_FIELDEMPTY);
+    let wave = std::fs::read(&path).unwrap();
+    let value = b"\0REPLAYGAIN_TRACK_GAIN\0-6.25 dB";
+    let mut frame = b"TXXX".to_vec();
+    frame.extend_from_slice(&(value.len() as u32).to_be_bytes());
+    frame.extend_from_slice(&[0, 0]);
+    frame.extend_from_slice(value);
+    let mut tagged = b"ID3\x03\0\0".to_vec();
+    let n = frame.len() as u32;
+    tagged.extend_from_slice(&[
+        ((n >> 21) & 127) as u8,
+        ((n >> 14) & 127) as u8,
+        ((n >> 7) & 127) as u8,
+        (n & 127) as u8,
+    ]);
+    tagged.extend(frame);
+    tagged.extend(wave);
+    std::fs::write(&path, tagged).unwrap();
+    assert_eq!(read(), (FT_NUMERIC_FLOATING, -6.25));
+    assert!(!mediares_core::cache::get_cache().is_cached(&path));
+    std::fs::remove_file(path).unwrap();
 }

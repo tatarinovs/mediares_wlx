@@ -199,9 +199,8 @@ The plugin's fields can be shown in panel columns and used in file
 search (Alt+F7) and in multi-rename (Ctrl+M). They are in the
 "mediares" group.
 
-Some fields (everything about video, music, RAW and PSD) need the whole
-file to be read. Total Commander fills them in the background, so they
-appear in the columns with a short delay.
+Hashes, sharpness and uncached stream properties are calculated in the
+background. Dimensions and cached metadata remain available immediately.
 
 
 5.1. Finding duplicates
@@ -272,6 +271,7 @@ General:
 
 Photos:
   Image_Width, Image_Height      Width and height in pixels
+  Image_Megapixels               Pixel count in millions (width x height / 1000000)
   Image_Dimensions               Size as text: 6000x4000
   Image_AspectRatio              Aspect ratio: 3:2, 16:9, 4:3...
   Image_Bit_Depth                Bits per channel: 8, 16 for 16-bit PNG/TIFF, 10-12 for HDR HEIC/AVIF
@@ -325,6 +325,7 @@ Music:
   Audio_Disc, Audio_Disc_Total   Disc number and total discs
   Audio_Comment                  Comment
   Audio_Has_Cover                Whether there is album art
+  Audio_ReplayGain_dB            Track ReplayGain, dB; empty when absent
   Audio_Codec                    Format: MP3, FLAC, AAC...
   Audio_Lossless                 Lossless (FLAC, WAV, ALAC...)
   Audio_Bitrate_kbps             Bitrate, kbps

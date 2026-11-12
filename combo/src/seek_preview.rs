@@ -7,7 +7,6 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once};
-use std::thread::JoinHandle;
 
 use mediares_core::image::DynamicImage;
 use mediares_core::video_frame::FrameGrabber;
@@ -75,7 +74,7 @@ struct Popup {
 pub struct SeekPreview {
     path: PathBuf,
     shared: Arc<Shared>,
-    worker: Option<JoinHandle<()>>,
+    token: usize,
     popup: HWND,
     /// Picture box size in pixels (DPI applied).
     picture: (i32, i32),
@@ -115,18 +114,22 @@ impl SeekPreview {
             exchange: Mutex::new(Exchange::default()),
             wake: Condvar::new(),
         });
+        let token = crate::media_events::next_token();
         let worker = {
             let (shared, path, viewer) = (shared.clone(), path.to_path_buf(), viewer.0 as isize);
             let fit = (px(PICTURE.0) as u32, px(PICTURE.1) as u32);
             std::thread::Builder::new()
                 .name("mediares-seek-preview".into())
-                .spawn(move || grab_loop(&path, fit, &shared, viewer))
-                .ok()
+                .spawn(move || grab_loop(&path, fit, &shared, viewer, token))
         };
+        if worker.is_err() {
+            let _ = DestroyWindow(popup);
+            return None;
+        }
         Some(Self {
             path: path.to_path_buf(),
             shared,
-            worker,
+            token,
             popup,
             picture: (px(PICTURE.0), px(PICTURE.1)),
             text_height: px(TEXT_HEIGHT),
@@ -191,7 +194,10 @@ impl SeekPreview {
     }
 
     /// [`WM_SEEK_PREVIEW`]: puts the frame that arrived on the popup.
-    pub unsafe fn frame_ready(&self) {
+    pub unsafe fn frame_ready(&self, token: usize) {
+        if token != self.token {
+            return;
+        }
         let Some(picture) = self.shared.lock().done.take() else {
             return;
         };
@@ -209,10 +215,7 @@ impl Drop for SeekPreview {
             exchange.stop = true;
             self.shared.wake.notify_one();
         }
-        // A frame being decoded finishes first (a fraction of a second at most).
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
-        }
+        // The detached worker owns its decoder and mailbox. A blocked codec never holds up UI.
         unsafe {
             let _ = DestroyWindow(self.popup);
         }
@@ -220,7 +223,7 @@ impl Drop for SeekPreview {
 }
 
 /// The frame thread: opens the file, then decodes whatever time was asked for last.
-fn grab_loop(path: &Path, fit: (u32, u32), shared: &Shared, viewer: isize) {
+fn grab_loop(path: &Path, fit: (u32, u32), shared: &Shared, viewer: isize, token: usize) {
     let grabber = FrameGrabber::open(path);
     loop {
         let seconds = {
@@ -246,12 +249,18 @@ fn grab_loop(path: &Path, fit: (u32, u32), shared: &Shared, viewer: isize) {
         else {
             continue;
         };
-        shared.lock().done = Some(to_bgra(DynamicImage::ImageRgba8(frame), BACKGROUND, false));
+        let picture = to_bgra(DynamicImage::ImageRgba8(frame), BACKGROUND, false);
+        let mut exchange = shared.lock();
+        if exchange.stop {
+            return;
+        }
+        // Holding the lock through notification prevents posting after Drop has set stop.
+        exchange.done = Some(picture);
         unsafe {
             let _ = PostMessageW(
                 Some(HWND(viewer as *mut _)),
                 WM_SEEK_PREVIEW,
-                WPARAM(0),
+                WPARAM(token),
                 LPARAM(0),
             );
         }

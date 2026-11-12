@@ -9,7 +9,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use image::metadata::Orientation;
-use image::{DynamicImage, ImageFormat, ImageReader, Limits};
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, Limits};
 
 use crate::probe::MediaType;
 
@@ -17,6 +17,23 @@ use crate::probe::MediaType;
 pub const MAX_PIXELS: u64 = 64_000_000;
 pub const MAX_DIMENSION: u32 = 16_384;
 const MAX_DECODER_ALLOC: u64 = 512 * 1024 * 1024;
+/// Encoded previews are bounded independently from their decoded dimensions.
+pub const MAX_ENCODED_BYTES: usize = 256 * 1024 * 1024;
+
+pub fn valid_dimensions(w: u32, h: u32) -> bool {
+    w > 0
+        && h > 0
+        && w <= MAX_DIMENSION
+        && h <= MAX_DIMENSION
+        && u64::from(w) * u64::from(h) <= MAX_PIXELS
+}
+
+pub(crate) fn zeroed_bytes(len: usize) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).ok()?;
+    bytes.resize(len, 0);
+    Some(bytes)
+}
 
 /// Files and in-memory pictures (RAW/PSD previews, album art) behind one reader type, so `image`
 /// compiles each of its decoders once instead of once per source type.
@@ -81,10 +98,21 @@ fn open(path: &Path) -> Option<ImageReader<Source<'static>>> {
 }
 
 fn decode(reader: ImageReader<Source<'_>>) -> Option<DynamicImage> {
-    reader
-        .decode()
+    let mut decoder = reader.into_decoder().ok()?;
+    let (w, h) = decoder.dimensions();
+    if !valid_dimensions(w, h) {
+        return None;
+    }
+    let len = usize::try_from(decoder.total_bytes()).ok()?;
+    if len as u64 > MAX_DECODER_ALLOC {
+        return None;
+    }
+    // Account for the output before permitting any further decoder allocations.
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(MAX_DECODER_ALLOC - len as u64);
+    decoder.set_limits(limits).ok()?;
+    DynamicImage::from_decoder(decoder)
         .ok()
-        .filter(|img| (img.width() as u64) * (img.height() as u64) <= MAX_PIXELS)
         .map(to_display_range)
 }
 
@@ -159,6 +187,9 @@ fn decode_standard(path: &Path) -> Option<DynamicImage> {
 
 /// Decodes an in-memory image (format detected from content) under the shared limits.
 pub fn decode_bytes(bytes: &[u8]) -> Option<DynamicImage> {
+    if bytes.len() > MAX_ENCODED_BYTES {
+        return None;
+    }
     decode(reader(Source::Memory(Cursor::new(bytes)), None)?)
 }
 

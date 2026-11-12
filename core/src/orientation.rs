@@ -61,7 +61,9 @@ fn tiff_with_orientation(tiff: &[u8], orientation: u16) -> Option<Vec<u8>> {
     let mut out = tiff.to_vec();
     let tag_of = |e: &[u8]| rd.u16(&e[..2]);
     if let Some(i) = entries
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .position(|e| tag_of(e) == TAG_ORIENTATION)
     {
         let at = ifd0 + 2 + i * 12;
@@ -85,7 +87,9 @@ fn tiff_with_orientation(tiff: &[u8], orientation: u16) -> Option<Vec<u8>> {
     entry.extend_from_slice(&[0, 0]);
     // Entries stay sorted by tag, as TIFF requires.
     let insert_at = entries
-        .chunks_exact(12)
+        .as_chunks::<12>()
+        .0
+        .iter()
         .position(|e| tag_of(e) > TAG_ORIENTATION)
         .unwrap_or(count);
 

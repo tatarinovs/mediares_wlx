@@ -278,7 +278,9 @@ fn threegpp_text(kind: &[u8; 4], payload: &[u8]) -> Option<String> {
     let text = payload.get(6..)?;
     if let Some(utf16) = text.strip_prefix(&[0xFE, 0xFF]) {
         let units: Vec<u16> = utf16
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| u16::from_be_bytes([c[0], c[1]]))
             .collect();
         return clean(&String::from_utf16_lossy(&units));

@@ -6,7 +6,7 @@ use std::path::Path;
 
 use image::{DynamicImage, RgbaImage};
 
-use crate::image_decode::{decode_bytes, MAX_PIXELS};
+use crate::image_decode::{decode_bytes, valid_dimensions, zeroed_bytes};
 use crate::jpeg;
 
 const PALETTE_LEN: usize = 768;
@@ -123,13 +123,10 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     ) {
         return None;
     }
-    if width == 0 || height == 0 || channels == 0 || channels > MAX_CHANNELS {
+    if !valid_dimensions(width, height) || channels == 0 || channels > MAX_CHANNELS {
         return None;
     }
     let num_pixels = (width as u64) * (height as u64);
-    if num_pixels > MAX_PIXELS {
-        return None;
-    }
     let num_pixels = num_pixels as usize;
     let (w, h) = (width as usize, height as usize);
 
@@ -195,7 +192,15 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
     };
     let active = channels.min(color_channels + usize::from(transparent));
     // Reserved only once the file is known to hold that much data.
-    let new_planes = || -> Vec<Vec<u8>> { vec![Vec::with_capacity(num_pixels); active] };
+    let new_planes = || -> Option<Vec<Vec<u8>>> {
+        (0..active)
+            .map(|_| {
+                let mut p = Vec::new();
+                p.try_reserve_exact(num_pixels).ok()?;
+                Some(p)
+            })
+            .collect()
+    };
 
     let planes = match compression {
         0 => {
@@ -203,7 +208,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
             if (channels as u64) * plane_bytes > remaining {
                 return None;
             }
-            let mut planes = new_planes();
+            let mut planes = new_planes()?;
             let mut row = vec![0u8; row_bytes];
             for plane in planes.iter_mut() {
                 for _ in 0..h {
@@ -220,7 +225,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
             if table_len > remaining {
                 return None;
             }
-            let mut table = vec![0u8; table_len as usize];
+            let mut table = zeroed_bytes(table_len as usize)?;
             reader.read_exact(&mut table).ok()?;
             let line_lens: Vec<usize> = table
                 .chunks_exact(entry_size)
@@ -231,7 +236,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
                 return None;
             }
 
-            let mut planes = new_planes();
+            let mut planes = new_planes()?;
             let mut packed = Vec::new();
             let mut unpacked = Vec::with_capacity(row_bytes);
             for (c, lens) in line_lens.chunks_exact(h).enumerate() {
@@ -241,6 +246,12 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
                     continue;
                 };
                 for &len in lens {
+                    // A useful PackBits row needs at most two encoded bytes per sample.
+                    // Allow padding, but never allocate a PSB's arbitrary 32-bit length.
+                    if len > row_bytes.saturating_mul(2).saturating_add(1024) {
+                        return None;
+                    }
+                    packed.try_reserve(len.saturating_sub(packed.len())).ok()?;
                     packed.resize(len, 0);
                     reader.read_exact(&mut packed).ok()?;
                     decode_packbits(&packed, row_bytes, &mut unpacked);
@@ -253,7 +264,7 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
         _ => return None,
     };
 
-    let rgba = compose_rgba(color_mode, &planes, &palette, num_pixels);
+    let rgba = compose_rgba(color_mode, &planes, &palette, num_pixels)?;
     RgbaImage::from_raw(width, height, rgba).map(DynamicImage::ImageRgba8)
 }
 
@@ -262,17 +273,22 @@ fn push_row(plane: &mut Vec<u8>, row: &[u8], bytes_per_sample: usize) {
     if bytes_per_sample == 1 {
         plane.extend_from_slice(row);
     } else {
-        plane.extend(row.chunks_exact(2).map(|s| s[0]));
+        plane.extend(row.as_chunks::<2>().0.iter().map(|s| s[0]));
     }
 }
 
-fn compose_rgba(color_mode: u16, planes: &[Vec<u8>], palette: &[u8], num_pixels: usize) -> Vec<u8> {
+fn compose_rgba(
+    color_mode: u16,
+    planes: &[Vec<u8>],
+    palette: &[u8],
+    num_pixels: usize,
+) -> Option<Vec<u8>> {
     let plane = |i: usize| planes.get(i).unwrap_or(&planes[0]).as_slice();
     let alpha = |i: usize| planes.get(i).map(Vec::as_slice);
-    let mut rgba = vec![0u8; num_pixels * 4];
+    let mut rgba = zeroed_bytes(num_pixels.checked_mul(4)?)?;
 
     let fill = |rgba: &mut [u8], a: Option<&[u8]>, f: &dyn Fn(usize) -> [u8; 3]| {
-        for (i, px) in rgba.chunks_exact_mut(4).enumerate() {
+        for (i, px) in rgba.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             px[..3].copy_from_slice(&f(i));
             px[3] = a.map_or(255, |a| a[i]);
         }
@@ -304,7 +320,7 @@ fn compose_rgba(color_mode: u16, planes: &[Vec<u8>], palette: &[u8], num_pixels:
         }
         _ => {}
     }
-    rgba
+    Some(rgba)
 }
 
 /// Decode one PackBits-compressed row into `out`, padded/truncated to exactly `expected_len` bytes.
@@ -333,6 +349,26 @@ fn decode_packbits(input: &[u8], expected_len: usize, out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn psb_cannot_allocate_an_arbitrary_rle_row_from_its_length_table() {
+        use std::io::Write;
+        let path =
+            std::env::temp_dir().join(format!("mediares_psb_row_{}.psb", std::process::id()));
+        let mut header = b"8BPS\0\x02\0\0\0\0\0\0\0\x01".to_vec();
+        header.extend_from_slice(&1u32.to_be_bytes()); // height
+        header.extend_from_slice(&1u32.to_be_bytes()); // width
+        header.extend_from_slice(&[0, 8, 0, 1]); // 8-bit grayscale
+        header.extend_from_slice(&[0; 16]); // color data, resources, PSB layers
+        header.extend_from_slice(&[0, 1]); // RLE
+        header.extend_from_slice(&(8u32 << 20).to_be_bytes());
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&header).unwrap();
+        file.set_len(header.len() as u64 + (8 << 20)).unwrap();
+        drop(file);
+        assert!(decode_psd_composite(&path).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 
     const TEST_PSD_2X2: &[u8] = &[
         56, 66, 80, 83, 0, 1, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0, 2, 0, 0, 0, 2, 0, 8, 0, 3, 0, 0, 0,

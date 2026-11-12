@@ -104,18 +104,22 @@ fn read_candidate(
     len: usize,
     accept: Option<&dyn Fn((u32, u32)) -> bool>,
 ) -> Option<Vec<u8>> {
+    if len > crate::image_decode::MAX_ENCODED_BYTES {
+        return None;
+    }
     file.seek(SeekFrom::Start(offset)).ok()?;
     let mut buf = vec![0u8; len.min(HEADER_PROBE_LEN)];
     file.read_exact(&mut buf).ok()?;
     if !jpeg::is_decodable(&buf) {
         return None;
     }
-    if let Some(accept) = accept {
-        let size = jpeg::read_dimensions(&mut std::io::Cursor::new(&buf[..]))?;
-        if !accept(size) {
-            return None;
-        }
+    let size = jpeg::read_dimensions(&mut std::io::Cursor::new(&buf[..]))?;
+    if !crate::image_decode::valid_dimensions(size.0, size.1)
+        || accept.is_some_and(|accept| !accept(size))
+    {
+        return None;
     }
+    buf.try_reserve_exact(len.saturating_sub(buf.len())).ok()?;
     buf.resize(len, 0);
     file.read_exact(&mut buf[HEADER_PROBE_LEN.min(len)..])
         .ok()?;
@@ -169,7 +173,7 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
     };
     let mut sub_ifd_array = None;
 
-    for e in entries[..count * 12].chunks_exact(12) {
+    for e in entries[..count * 12].as_chunks::<12>().0 {
         let tag = rd.u16(&e[0..2]);
         let typ = rd.u16(&e[2..4]);
         let n = rd.u32(&e[4..8]);
@@ -200,8 +204,28 @@ fn read_ifd(file: &mut File, offset: u64, rd: Endian) -> Option<Ifd> {
         let mut buf = vec![0u8; n * 4];
         if file.seek(SeekFrom::Start(array_offset)).is_ok() && file.read_exact(&mut buf).is_ok() {
             ifd.sub_ifds
-                .extend(buf.chunks_exact(4).map(|c| rd.u32(c) as u64));
+                .extend(buf.as_chunks::<4>().0.iter().map(|c| rd.u32(c) as u64));
         }
     }
     Some(ifd)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn oversized_preview_is_rejected_before_reading_or_allocating_it() {
+        let path = std::env::temp_dir().join(format!("mediares_raw_limit_{}", std::process::id()));
+        std::fs::write(&path, []).unwrap();
+        let mut file = File::open(&path).unwrap();
+        assert!(read_candidate(
+            &mut file,
+            0,
+            crate::image_decode::MAX_ENCODED_BYTES + 1,
+            None
+        )
+        .is_none());
+        drop(file);
+        std::fs::remove_file(path).unwrap();
+    }
 }

@@ -18,7 +18,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use windows::core::{s, HSTRING};
-use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::LOGFONTW;
 use windows::Win32::Media::MediaFoundation::{
     MF_MEDIA_ENGINE_EVENT, MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE, MF_MEDIA_ENGINE_EVENT_ENDED,
@@ -30,14 +30,14 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LoadLibraryExW, LOAD_WITH_ALTERED_SEARCH_PATH,
 };
-use windows::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use mediares_core::audio_tags::AudioTags;
 use mediares_core::image::{DynamicImage, RgbaImage};
 use mediares_core::mf_audio::AudioStreamMeta;
 use mediares_core::video_frame::VideoMeta;
 
-use crate::playback_video::{Osd, WM_MEDIA_EVENT};
+use crate::media_events::{Event as MediaEvent, Events};
+use crate::playback_video::Osd;
 use crate::transport_bar::Transport;
 
 const DLL_NAME: &str = "libmpv-2.dll";
@@ -256,40 +256,57 @@ const PICTURE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PICTURE_EXTS: &[&str] = &["heic", "heif", "hif", "avif", "jxl"];
 
 /// The frame at `fraction` (0..1) of the duration (the key frame before it), for thumbnails.
-pub fn video_frame(path: &Path, fraction: f64) -> Option<RgbaImage> {
+pub fn video_frame(path: &Path, fraction: f64, fit: (u32, u32)) -> Option<RgbaImage> {
     let start = format!("{:.3}%", fraction.clamp(0.0, 1.0) * 100.0);
-    grab_frame(path, &start, VIDEO_FRAME_TIMEOUT)
+    grab_frame(path, &start, VIDEO_FRAME_TIMEOUT, Some(fit))
 }
 
 /// A photo WIC can't decode, upright (mpv applies the HEIF `irot` / `imir` transforms like WIC).
 pub fn picture(path: &Path) -> Option<DynamicImage> {
-    grab_frame(path, "0", PICTURE_TIMEOUT).map(DynamicImage::ImageRgba8)
+    grab_frame(path, "0", PICTURE_TIMEOUT, None).map(DynamicImage::ImageRgba8)
 }
 
 /// The first frame from `start`, decoded without a window or sound.
-fn grab_frame(path: &Path, start: &str, timeout: Duration) -> Option<RgbaImage> {
+fn grab_frame(
+    path: &Path,
+    start: &str,
+    timeout: Duration,
+    fit: Option<(u32, u32)>,
+) -> Option<RgbaImage> {
     let api = api()?;
     let (w, h, mut pixels) = unsafe {
-        let handle = create_handle(
-            api,
-            &[
-                ("vo", "null"),
-                ("ao", "null"),
-                ("aid", "no"),
-                ("sid", "no"),
-                ("pause", "yes"),
-                ("hwdec", "no"),
-                ("hr-seek", "no"),
-                ("start", start),
-                ("idle", "yes"),
-                ("keep-open", "yes"),
-            ],
-        )?;
+        let filter = fit.map(|(w, h)| {
+            format!(
+                "lavfi=[scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease]",
+                w.max(1),
+                h.max(1)
+            )
+        });
+        let mut options = vec![
+            ("vo", "null"),
+            ("ao", "null"),
+            ("aid", "no"),
+            ("sid", "no"),
+            ("pause", "yes"),
+            ("hwdec", "no"),
+            ("hr-seek", "no"),
+            ("start", start),
+            ("idle", "yes"),
+            ("keep-open", "yes"),
+        ];
+        if let Some(filter) = &filter {
+            options.push(("vf", filter));
+        }
+        let handle = create_handle(api, &options)?;
         let frame = first_frame(api, handle, path, timeout);
         (api.terminate_destroy)(handle);
         frame?
     };
-    pixels.chunks_exact_mut(4).for_each(|px| px.swap(0, 2));
+    pixels
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .for_each(|px| px.swap(0, 2));
     RgbaImage::from_raw(w, h, pixels)
 }
 
@@ -586,6 +603,7 @@ const TIME_UPDATE_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What the viewer thread and the event thread share.
 struct Shared {
+    events: Events,
     stop: AtomicBool,
     /// A seek was sent and mpv hasn't finished it yet.
     seeking: AtomicBool,
@@ -662,6 +680,7 @@ impl MpvPlayer {
             (api.observe_property)(handle, id, cstr(name).as_ptr(), format);
         }
         let shared = Arc::new(Shared {
+            events: Events::new(events_to),
             stop: AtomicBool::new(false),
             seeking: AtomicBool::new(false),
             error: AtomicU16::new(0),
@@ -670,12 +689,11 @@ impl MpvPlayer {
         let events = {
             let shared = shared.clone();
             let h = SendHandle(handle);
-            let target = events_to.0 as isize;
             std::thread::Builder::new()
                 .name("mpv events".into())
                 .spawn(move || {
                     let h = h;
-                    event_loop(api, h.0, &shared, target)
+                    event_loop(api, h.0, &shared)
                 })
         };
         let Ok(events) = events else {
@@ -722,10 +740,18 @@ impl MpvPlayer {
 
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
     pub fn open(&self, path: &Path) -> bool {
+        self.shared.events.begin_file();
         self.shared.error.store(0, Ordering::SeqCst);
         self.shared.seeking.store(false, Ordering::SeqCst);
         self.set("pause", "no");
         self.command(&["loadfile", &path.to_string_lossy()])
+    }
+
+    pub fn take_events(&self, token: usize) -> Vec<MediaEvent> {
+        self.shared.events.take(token)
+    }
+    pub fn is_ended(&self) -> bool {
+        self.get_flag("eof-reached")
     }
 
     /// mpv presents frames itself; this only keeps the OSD text up to date.
@@ -993,6 +1019,10 @@ unsafe fn read_screenshot(node: &Node) -> Option<(u32, u32, Vec<u8>)> {
         return None;
     }
     let data = data?;
+    let (width, height) = (u32::try_from(w).ok()?, u32::try_from(h).ok()?);
+    if !mediares_core::image_decode::valid_dimensions(width, height) {
+        return None;
+    }
     let (w, h, stride) = (w as usize, h as usize, stride as usize);
     if data.size < stride * (h - 1) + w * 4 {
         return None;
@@ -1002,31 +1032,33 @@ unsafe fn read_screenshot(node: &Node) -> Option<(u32, u32, Vec<u8>)> {
     for y in 0..h {
         pixels.extend_from_slice(&bytes[y * stride..y * stride + w * 4]);
     }
-    pixels.chunks_exact_mut(4).for_each(|px| px[3] = 255);
+    pixels
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .for_each(|px| px[3] = 255);
     Some((w as u32, h as u32, pixels))
 }
 
 /// Reads mpv's events until the player is dropped, posting them to the viewer as media engine
 /// events.
-fn event_loop(api: &'static Api, handle: Handle, shared: &Shared, target: isize) {
-    let post = |event: MF_MEDIA_ENGINE_EVENT| unsafe {
-        let _ = PostMessageW(
-            Some(HWND(target as *mut _)),
-            WM_MEDIA_EVENT,
-            WPARAM(event.0 as usize),
-            LPARAM(0),
-        );
-    };
+fn event_loop(api: &'static Api, handle: Handle, shared: &Shared) {
     let mut last_time_update: Option<Instant> = None;
     while !shared.stop.load(Ordering::SeqCst) {
         let event = unsafe { &*(api.wait_event)(handle, -1.0) };
         if shared.stop.load(Ordering::SeqCst) {
             break;
         }
+        // A player is opened for one file only; callbacks cannot belong to a previous source.
+        let token = shared.events.token();
+        let post = |event: MF_MEDIA_ENGINE_EVENT| shared.events.post(token, event.0, 0);
         match event.event_id {
             EVENT_NONE => {}
             EVENT_SHUTDOWN => break,
-            EVENT_FILE_LOADED => post(MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA),
+            EVENT_FILE_LOADED => {
+                shared.error.store(0, Ordering::SeqCst);
+                post(MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA);
+            }
             EVENT_VIDEO_RECONFIG => post(MF_MEDIA_ENGINE_EVENT_FORMATCHANGE),
             EVENT_PLAYBACK_RESTART => {
                 shared.seeking.store(false, Ordering::SeqCst);
@@ -1072,6 +1104,7 @@ fn event_loop(api: &'static Api, handle: Handle, shared: &Shared, target: isize)
 
 impl Drop for MpvPlayer {
     fn drop(&mut self) {
+        self.shared.events.close();
         self.shared.stop.store(true, Ordering::SeqCst);
         unsafe { (self.api.wakeup)(self.handle) };
         if let Some(events) = self.events.take() {

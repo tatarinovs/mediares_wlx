@@ -64,7 +64,9 @@ fn save_bgra(path: &Path, width: u32, height: u32, bgra: &[u8], bottom_up: bool)
         };
         rgba.extend(
             bgra[src * row..(src + 1) * row]
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .flat_map(|p| [p[2], p[1], p[0], 255]),
         );
     }
@@ -216,7 +218,7 @@ unsafe fn capture(rc: RECT, out: &Path) {
     let _ = DeleteDC(dc);
     ReleaseDC(None, screen);
 
-    for px in buf.chunks_exact_mut(4) {
+    for px in buf.as_chunks_mut::<4>().0 {
         px.swap(0, 2);
         px[3] = 255;
     }

@@ -659,7 +659,7 @@ fn nv12_to_bgra(data: &[u8], pitch: usize, chroma: usize, width: u32, height: u3
         let luma = &data[y * pitch..y * pitch + w];
         let uv_row = chroma + y / 2 * pitch;
         let uv = &data[uv_row..uv_row + w.div_ceil(2) * 2];
-        for (x, px) in out.chunks_exact_mut(4).enumerate() {
+        for (x, px) in out.as_chunks_mut::<4>().0.iter_mut().enumerate() {
             let c = 298 * (luma[x] as i32 - 16) + 128;
             let u = uv[x / 2 * 2] as i32 - 128;
             let v = uv[x / 2 * 2 + 1] as i32 - 128;

@@ -24,274 +24,133 @@ pub fn reset_stop_flag() {
     STOP_REQUESTED.store(false, Ordering::Relaxed);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Field {
-    ImageDHash,
-    ImagePHash,
-    ImageCoarseHash,
-    ImageDimensions,
-    ImageAspectRatio,
-    VideoFingerprint,
-    VideoDHashMid,
-    VideoDurationSec,
-    VideoDimensions,
-    MediaTypeName,
-    PluginVersion,
-    AudioFingerprint,
-    AudioPcmHash,
-    AudioDurationSec,
-    AudioArtistTitle,
-    AudioArtist,
-    AudioTitle,
-    AudioAlbum,
-    AudioAlbumArtist,
-    AudioYear,
-    AudioTrack,
-    AudioDisc,
-    AudioGenre,
-    AudioComment,
-    AudioLength,
-    AudioBitrate,
-    AudioSampleRate,
-    AudioChannels,
-    AudioBitDepth,
-    AudioHasCover,
-    ImageWidth,
-    ImageHeight,
-    PhotoMake,
-    PhotoModel,
-    PhotoLens,
-    PhotoDateTaken,
-    PhotoExposure,
-    PhotoFNumber,
-    PhotoIso,
-    PhotoFocalLength,
-    PhotoFocalLength35,
-    PhotoFlash,
-    PhotoOrientation,
-    PhotoSoftware,
-    PhotoGpsLatitude,
-    PhotoGpsLongitude,
-    PhotoHasGps,
-    VideoWidth,
-    VideoHeight,
-    VideoLength,
-    VideoFrameRate,
-    VideoCodec,
-    VideoBitrate,
-    VideoAudioCodec,
-    VideoAudioChannels,
-    VideoAudioSampleRate,
-    AudioCodec,
-    AudioLossless,
-    AudioComposer,
-    AudioTrackTotal,
-    AudioDiscTotal,
-    VideoTitle,
-    VideoArtist,
-    VideoDirector,
-    VideoDate,
-    VideoYear,
-    VideoGenre,
-    VideoComment,
-    ImageSharpness,
-    ImageBitDepth,
-    ImageHasAlpha,
-    VideoRotation,
-    VideoDynamicRange,
-}
-
-/// Where a field's value comes from; decides whether it is worth delaying.
+/// The work needed to obtain a field, used to keep slow reads off TC's UI thread.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Source {
     Constant,
-    /// The file extension.
     Probe,
-    /// Audio tags: headers only, but trailing tags (ID3v1, APE) mean a seek to the end, which costs
-    /// a disk head move per file. Stream properties of files symphonia can't parse come from
-    /// Media Foundation.
     Tags,
-    /// EXIF block: a small read, never delayed.
     Exif,
-    /// Image header for standard formats, EXIF for RAW, the full analysis as a fallback.
     ImageSize,
-    /// How a standard image stores its pixels: its header.
     PixelFormat,
-    /// Decoding at a reduced size.
     Sharpness,
-    /// Media Foundation stream properties: no decoding, but slow to open.
     VideoMeta,
-    /// Video container tags: headers only, but MP4 keeps them in `moov`, often at the end of the file.
     VideoTags,
-    /// Decoding and hashing.
     Analysis,
 }
 
-impl Field {
-    fn source(self) -> Source {
-        use Field::*;
+#[derive(Clone, Copy)]
+enum Scope {
+    Any,
+    Media,
+    Image,
+    StandardImage,
+    Video,
+    Audio,
+}
+impl Scope {
+    fn accepts(self, kind: MediaType) -> bool {
         match self {
-            PluginVersion => Source::Constant,
-            MediaTypeName => Source::Probe,
-            ImageWidth | ImageHeight | ImageDimensions | ImageAspectRatio => Source::ImageSize,
-            ImageBitDepth | ImageHasAlpha => Source::PixelFormat,
-            ImageSharpness => Source::Sharpness,
-            PhotoMake | PhotoModel | PhotoLens | PhotoDateTaken | PhotoExposure | PhotoFNumber
-            | PhotoIso | PhotoFocalLength | PhotoFocalLength35 | PhotoFlash | PhotoOrientation
-            | PhotoSoftware | PhotoGpsLatitude | PhotoGpsLongitude | PhotoHasGps => Source::Exif,
-            VideoWidth | VideoHeight | VideoLength | VideoFrameRate | VideoCodec | VideoBitrate
-            | VideoAudioCodec | VideoAudioChannels | VideoAudioSampleRate | VideoRotation
-            | VideoDynamicRange => Source::VideoMeta,
-            VideoTitle | VideoArtist | VideoDirector | VideoDate | VideoYear | VideoGenre
-            | VideoComment => Source::VideoTags,
-            _ if self.is_tag() => Source::Tags,
-            _ => Source::Analysis,
+            Self::Any => true,
+            Self::Media => kind.is_image_kind() || kind.is_playable(),
+            Self::Image => kind.is_image_kind(),
+            Self::StandardImage => kind == MediaType::StandardImage,
+            Self::Video => kind == MediaType::Video,
+            Self::Audio => kind == MediaType::Audio,
         }
-    }
-
-    fn is_tag(self) -> bool {
-        use Field::*;
-        matches!(
-            self,
-            AudioArtistTitle
-                | AudioArtist
-                | AudioTitle
-                | AudioAlbum
-                | AudioAlbumArtist
-                | AudioYear
-                | AudioTrack
-                | AudioDisc
-                | AudioGenre
-                | AudioComment
-                | AudioLength
-                | AudioBitrate
-                | AudioSampleRate
-                | AudioChannels
-                | AudioBitDepth
-                | AudioHasCover
-                | AudioCodec
-                | AudioLossless
-                | AudioComposer
-                | AudioTrackTotal
-                | AudioDiscTotal
-        )
     }
 }
 
-/// The order TC lists the fields in. TC refers to fields by name (columns, search templates), so
-/// the order can change freely.
-const FIELDS: &[(Field, &str, c_int)] = &[
-    // Hashes for duplicate search first, then the fields of each content type.
-    (Field::ImageDHash, "Image_dHash", FT_STRINGW),
-    (Field::ImagePHash, "Image_pHash", FT_STRINGW),
-    (Field::ImageCoarseHash, "Image_CoarseHash", FT_STRINGW),
-    (Field::VideoFingerprint, "Video_Fingerprint", FT_STRINGW),
-    (Field::VideoDHashMid, "Video_dHash_Mid", FT_STRINGW),
-    (Field::AudioFingerprint, "Audio_Fingerprint", FT_STRINGW),
-    (Field::AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW),
-    // Any file.
-    (Field::MediaTypeName, "Media_Type", FT_STRINGW),
-    // Photos.
-    (Field::ImageWidth, "Image_Width", FT_NUMERIC_32),
-    (Field::ImageHeight, "Image_Height", FT_NUMERIC_32),
-    (Field::ImageDimensions, "Image_Dimensions", FT_STRINGW),
-    (Field::ImageAspectRatio, "Image_AspectRatio", FT_STRINGW),
-    (Field::ImageBitDepth, "Image_Bit_Depth", FT_NUMERIC_32),
-    (Field::ImageHasAlpha, "Image_Has_Alpha", FT_BOOLEAN),
-    (Field::ImageSharpness, "Image_Sharpness", FT_NUMERIC_32),
-    (Field::PhotoMake, "Photo_Make", FT_STRINGW),
-    (Field::PhotoModel, "Photo_Model", FT_STRINGW),
-    (Field::PhotoLens, "Photo_Lens", FT_STRINGW),
-    (Field::PhotoDateTaken, "Photo_Date_Taken", FT_DATETIME),
-    (Field::PhotoExposure, "Photo_Exposure", FT_STRINGW),
-    (Field::PhotoFNumber, "Photo_FNumber", FT_NUMERIC_FLOATING),
-    (Field::PhotoIso, "Photo_ISO", FT_NUMERIC_32),
-    (
-        Field::PhotoFocalLength,
-        "Photo_Focal_Length_mm",
-        FT_NUMERIC_FLOATING,
-    ),
-    (
-        Field::PhotoFocalLength35,
-        "Photo_Focal_Length_35mm",
-        FT_NUMERIC_32,
-    ),
-    (Field::PhotoFlash, "Photo_Flash", FT_BOOLEAN),
-    (Field::PhotoOrientation, "Photo_Orientation", FT_NUMERIC_32),
-    (Field::PhotoSoftware, "Photo_Software", FT_STRINGW),
-    (
-        Field::PhotoGpsLatitude,
-        "Photo_GPS_Latitude",
-        FT_NUMERIC_FLOATING,
-    ),
-    (
-        Field::PhotoGpsLongitude,
-        "Photo_GPS_Longitude",
-        FT_NUMERIC_FLOATING,
-    ),
-    (Field::PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN),
-    // Video.
-    (Field::VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32),
-    (Field::VideoLength, "Video_Length", FT_TIME),
-    (Field::VideoWidth, "Video_Width", FT_NUMERIC_32),
-    (Field::VideoHeight, "Video_Height", FT_NUMERIC_32),
-    (Field::VideoDimensions, "Video_Dimensions", FT_STRINGW),
-    (
-        Field::VideoFrameRate,
-        "Video_Frame_Rate",
-        FT_NUMERIC_FLOATING,
-    ),
-    (Field::VideoCodec, "Video_Codec", FT_STRINGW),
-    (Field::VideoDynamicRange, "Video_HDR", FT_STRINGW),
-    (Field::VideoRotation, "Video_Rotation", FT_NUMERIC_32),
-    (Field::VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32),
-    (Field::VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW),
-    (
-        Field::VideoAudioChannels,
-        "Video_Audio_Channels",
-        FT_NUMERIC_32,
-    ),
-    (
-        Field::VideoAudioSampleRate,
-        "Video_Audio_Sample_Rate_Hz",
-        FT_NUMERIC_32,
-    ),
-    (Field::VideoTitle, "Video_Title", FT_STRINGW),
-    (Field::VideoArtist, "Video_Artist", FT_STRINGW),
-    (Field::VideoDirector, "Video_Director", FT_STRINGW),
-    (Field::VideoDate, "Video_Date", FT_STRINGW),
-    (Field::VideoYear, "Video_Year", FT_NUMERIC_32),
-    (Field::VideoGenre, "Video_Genre", FT_STRINGW),
-    (Field::VideoComment, "Video_Comment", FT_STRINGW),
-    // Audio.
-    (Field::AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32),
-    (Field::AudioLength, "Audio_Length", FT_TIME),
-    (Field::AudioArtistTitle, "Audio_Artist_Title", FT_STRINGW),
-    (Field::AudioArtist, "Audio_Artist", FT_STRINGW),
-    (Field::AudioTitle, "Audio_Title", FT_STRINGW),
-    (Field::AudioAlbum, "Audio_Album", FT_STRINGW),
-    (Field::AudioAlbumArtist, "Audio_Album_Artist", FT_STRINGW),
-    (Field::AudioComposer, "Audio_Composer", FT_STRINGW),
-    (Field::AudioGenre, "Audio_Genre", FT_STRINGW),
-    (Field::AudioYear, "Audio_Year", FT_NUMERIC_32),
-    (Field::AudioTrack, "Audio_Track", FT_NUMERIC_32),
-    (Field::AudioTrackTotal, "Audio_Track_Total", FT_NUMERIC_32),
-    (Field::AudioDisc, "Audio_Disc", FT_NUMERIC_32),
-    (Field::AudioDiscTotal, "Audio_Disc_Total", FT_NUMERIC_32),
-    (Field::AudioComment, "Audio_Comment", FT_STRINGW),
-    (Field::AudioHasCover, "Audio_Has_Cover", FT_BOOLEAN),
-    (Field::AudioCodec, "Audio_Codec", FT_STRINGW),
-    (Field::AudioLossless, "Audio_Lossless", FT_BOOLEAN),
-    (Field::AudioBitrate, "Audio_Bitrate_kbps", FT_NUMERIC_32),
-    (
-        Field::AudioSampleRate,
-        "Audio_Sample_Rate_Hz",
-        FT_NUMERIC_32,
-    ),
-    (Field::AudioChannels, "Audio_Channels", FT_NUMERIC_32),
-    (Field::AudioBitDepth, "Audio_Bit_Depth", FT_NUMERIC_32),
-    (Field::PluginVersion, "Plugin_Version", FT_STRINGW),
-];
+// Name, ABI type, data source and applicable media kinds have one definition.
+macro_rules! fields {
+    ($( $field:ident, $name:literal, $kind:ident, $source:ident, $scope:ident; )*) => {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Field { $($field,)* }
+        const FIELDS: &[(Field, &str, c_int)] = &[$((Field::$field, $name, $kind),)*];
+        impl Field {
+            fn source(self) -> Source { match self { $(Self::$field => Source::$source,)* } }
+            fn applies_to(self, kind: MediaType) -> bool { match self { $(Self::$field => Scope::$scope.accepts(kind),)* } }
+        }
+    };
+}
+
+fields! {
+    ImageDHash, "Image_dHash", FT_STRINGW, Analysis, Image;
+    ImagePHash, "Image_pHash", FT_STRINGW, Analysis, Image;
+    ImageCoarseHash, "Image_CoarseHash", FT_STRINGW, Analysis, Image;
+    VideoFingerprint, "Video_Fingerprint", FT_STRINGW, Analysis, Video;
+    VideoDHashMid, "Video_dHash_Mid", FT_STRINGW, Analysis, Video;
+    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, Analysis, Audio;
+    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, Analysis, Audio;
+    MediaTypeName, "Media_Type", FT_STRINGW, Probe, Media;
+    ImageWidth, "Image_Width", FT_NUMERIC_32, ImageSize, Image;
+    ImageHeight, "Image_Height", FT_NUMERIC_32, ImageSize, Image;
+    ImageMegapixels, "Image_Megapixels", FT_NUMERIC_FLOATING, ImageSize, Image;
+    ImageDimensions, "Image_Dimensions", FT_STRINGW, ImageSize, Image;
+    ImageAspectRatio, "Image_AspectRatio", FT_STRINGW, ImageSize, Image;
+    ImageBitDepth, "Image_Bit_Depth", FT_NUMERIC_32, PixelFormat, StandardImage;
+    ImageHasAlpha, "Image_Has_Alpha", FT_BOOLEAN, PixelFormat, StandardImage;
+    ImageSharpness, "Image_Sharpness", FT_NUMERIC_32, Sharpness, Image;
+    PhotoMake, "Photo_Make", FT_STRINGW, Exif, Image;
+    PhotoModel, "Photo_Model", FT_STRINGW, Exif, Image;
+    PhotoLens, "Photo_Lens", FT_STRINGW, Exif, Image;
+    PhotoDateTaken, "Photo_Date_Taken", FT_DATETIME, Exif, Image;
+    PhotoExposure, "Photo_Exposure", FT_STRINGW, Exif, Image;
+    PhotoFNumber, "Photo_FNumber", FT_NUMERIC_FLOATING, Exif, Image;
+    PhotoIso, "Photo_ISO", FT_NUMERIC_32, Exif, Image;
+    PhotoFocalLength, "Photo_Focal_Length_mm", FT_NUMERIC_FLOATING, Exif, Image;
+    PhotoFocalLength35, "Photo_Focal_Length_35mm", FT_NUMERIC_32, Exif, Image;
+    PhotoFlash, "Photo_Flash", FT_BOOLEAN, Exif, Image;
+    PhotoOrientation, "Photo_Orientation", FT_NUMERIC_32, Exif, Image;
+    PhotoSoftware, "Photo_Software", FT_STRINGW, Exif, Image;
+    PhotoGpsLatitude, "Photo_GPS_Latitude", FT_NUMERIC_FLOATING, Exif, Image;
+    PhotoGpsLongitude, "Photo_GPS_Longitude", FT_NUMERIC_FLOATING, Exif, Image;
+    PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN, Exif, Image;
+    VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32, Analysis, Video;
+    VideoLength, "Video_Length", FT_TIME, VideoMeta, Video;
+    VideoWidth, "Video_Width", FT_NUMERIC_32, VideoMeta, Video;
+    VideoHeight, "Video_Height", FT_NUMERIC_32, VideoMeta, Video;
+    VideoDimensions, "Video_Dimensions", FT_STRINGW, Analysis, Video;
+    VideoFrameRate, "Video_Frame_Rate", FT_NUMERIC_FLOATING, VideoMeta, Video;
+    VideoCodec, "Video_Codec", FT_STRINGW, VideoMeta, Video;
+    VideoDynamicRange, "Video_HDR", FT_STRINGW, VideoMeta, Video;
+    VideoRotation, "Video_Rotation", FT_NUMERIC_32, VideoMeta, Video;
+    VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32, VideoMeta, Video;
+    VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW, VideoMeta, Video;
+    VideoAudioChannels, "Video_Audio_Channels", FT_NUMERIC_32, VideoMeta, Video;
+    VideoAudioSampleRate, "Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32, VideoMeta, Video;
+    VideoTitle, "Video_Title", FT_STRINGW, VideoTags, Video;
+    VideoArtist, "Video_Artist", FT_STRINGW, VideoTags, Video;
+    VideoDirector, "Video_Director", FT_STRINGW, VideoTags, Video;
+    VideoDate, "Video_Date", FT_STRINGW, VideoTags, Video;
+    VideoYear, "Video_Year", FT_NUMERIC_32, VideoTags, Video;
+    VideoGenre, "Video_Genre", FT_STRINGW, VideoTags, Video;
+    VideoComment, "Video_Comment", FT_STRINGW, VideoTags, Video;
+    AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32, Analysis, Audio;
+    AudioLength, "Audio_Length", FT_TIME, Tags, Audio;
+    AudioArtistTitle, "Audio_Artist_Title", FT_STRINGW, Tags, Audio;
+    AudioArtist, "Audio_Artist", FT_STRINGW, Tags, Audio;
+    AudioTitle, "Audio_Title", FT_STRINGW, Tags, Audio;
+    AudioAlbum, "Audio_Album", FT_STRINGW, Tags, Audio;
+    AudioAlbumArtist, "Audio_Album_Artist", FT_STRINGW, Tags, Audio;
+    AudioComposer, "Audio_Composer", FT_STRINGW, Tags, Audio;
+    AudioGenre, "Audio_Genre", FT_STRINGW, Tags, Audio;
+    AudioYear, "Audio_Year", FT_NUMERIC_32, Tags, Audio;
+    AudioTrack, "Audio_Track", FT_NUMERIC_32, Tags, Audio;
+    AudioTrackTotal, "Audio_Track_Total", FT_NUMERIC_32, Tags, Audio;
+    AudioDisc, "Audio_Disc", FT_NUMERIC_32, Tags, Audio;
+    AudioDiscTotal, "Audio_Disc_Total", FT_NUMERIC_32, Tags, Audio;
+    AudioComment, "Audio_Comment", FT_STRINGW, Tags, Audio;
+    AudioHasCover, "Audio_Has_Cover", FT_BOOLEAN, Tags, Audio;
+    AudioCodec, "Audio_Codec", FT_STRINGW, Tags, Audio;
+    AudioLossless, "Audio_Lossless", FT_BOOLEAN, Tags, Audio;
+    AudioReplayGain, "Audio_ReplayGain_dB", FT_NUMERIC_FLOATING, Tags, Audio;
+    AudioBitrate, "Audio_Bitrate_kbps", FT_NUMERIC_32, Tags, Audio;
+    AudioSampleRate, "Audio_Sample_Rate_Hz", FT_NUMERIC_32, Tags, Audio;
+    AudioChannels, "Audio_Channels", FT_NUMERIC_32, Tags, Audio;
+    AudioBitDepth, "Audio_Bit_Depth", FT_NUMERIC_32, Tags, Audio;
+    PluginVersion, "Plugin_Version", FT_STRINGW, Constant, Any;
+}
 
 fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int)> {
     FIELDS.get(usize::try_from(index).ok()?)
@@ -408,7 +267,7 @@ unsafe fn get_value(
     }
 
     let kind = probe_file(&path);
-    if kind == MediaType::Unsupported && field.source() != Source::Constant {
+    if !field.applies_to(kind) {
         return FT_FIELDEMPTY;
     }
     crate::cache::with_file_key(&path, || {
@@ -443,8 +302,7 @@ impl Output {
 fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let needs_codec =
         || kind == MediaType::StandardImage && crate::image_decode::header_needs_codec(path);
-    let analysis_pending =
-        || (kind.is_slow_kind() || needs_codec()) && !get_cache().is_cached(path);
+    let analysis_pending = || !get_cache().is_cached(path);
     match field.source() {
         Source::Constant | Source::Probe | Source::Exif => false,
         Source::Tags => {
@@ -529,6 +387,7 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
                 return match field {
                     ImageWidth => Some(int(w)),
                     ImageHeight => Some(int(h)),
+                    ImageMegapixels => Some(Value::Float(w as f64 * h as f64 / 1_000_000.0)),
                     ImageDimensions => text(format!("{w}x{h}")),
                     _ => text(crate::hashing::compute_aspect_ratio(w, h)),
                 };
@@ -542,6 +401,9 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
     match (field, get_cache().get_or_analyze(path, &is_stop_requested)) {
         (ImageWidth, CachedMedia::Image(img)) => Some(int(img.width)),
         (ImageHeight, CachedMedia::Image(img)) => Some(int(img.height)),
+        (ImageMegapixels, CachedMedia::Image(img)) => Some(Value::Float(
+            img.width as f64 * img.height as f64 / 1_000_000.0,
+        )),
         (ImageDHash, CachedMedia::Image(img)) => text(img.dhash_hex()),
         (ImagePHash, CachedMedia::Image(img)) => text(img.phash_hex()),
         (ImageCoarseHash, CachedMedia::Image(img)) => text(img.coarse_hash_hex()),
@@ -762,6 +624,10 @@ fn tags_value(path: &Path, field: Field) -> Option<Value> {
     let num = |n: Option<u32>| n.filter(|&n| n > 0).map(int);
     match field {
         AudioArtistTitle => tags.normalized_artist_title().map(Value::Text),
+        AudioReplayGain => tags
+            .replay_gain_db
+            .filter(|v| v.is_finite())
+            .map(|v| Value::Float(f64::from(v))),
         AudioArtist => text(&tags.artist),
         AudioTitle => text(&tags.title),
         AudioAlbum => text(&tags.album),

@@ -209,7 +209,7 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
     }
     .ok()?;
     // Premultiplied BGRA → straight RGBA.
-    for px in pixels.chunks_exact_mut(4) {
+    for px in pixels.as_chunks_mut::<4>().0 {
         let a = px[3];
         px.swap(0, 2);
         if a != 0 && a != 255 {

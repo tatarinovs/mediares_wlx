@@ -149,6 +149,13 @@ pub struct AudioView {
 }
 
 impl AudioView {
+    pub fn take_events(&self, token: usize) -> Vec<crate::media_events::Event> {
+        match &self.backend {
+            Backend::Native(_) => Vec::new(),
+            Backend::Mpv(p) => p.take_events(token),
+            Backend::Engine { player, .. } => player.take_events(token),
+        }
+    }
     /// Starts playing `path`; `None` if neither decoder can play it.
     pub unsafe fn new(viewer: HWND, path: &Path, replay_gain: bool) -> Option<Self> {
         let backend = Backend::create(viewer, path)?;
@@ -316,20 +323,35 @@ impl AudioView {
     }
 
     /// Media Foundation events (engine and libmpv backends).
-    pub fn on_event(&mut self, event: i32, param1: isize) -> EventEffect {
+    pub fn on_event(&mut self, event: i32, _param1: isize) -> EventEffect {
         let error_code = match &self.backend {
             Backend::Native(_) => return EventEffect::None,
             Backend::Mpv(player) => player.error_code(),
             Backend::Engine { player, .. } => unsafe { player.error_code() },
         };
         match event {
-            e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => EventEffect::Ended,
+            e if e == MF_MEDIA_ENGINE_EVENT_ENDED.0 => {
+                let ended = match &self.backend {
+                    Backend::Native(p) => p.is_ended(),
+                    Backend::Mpv(p) => p.is_ended(),
+                    Backend::Engine { player, .. } => player.is_ended(),
+                };
+                if ended {
+                    EventEffect::Ended
+                } else {
+                    EventEffect::None
+                }
+            }
             e if e == MF_MEDIA_ENGINE_EVENT_ERROR.0 => {
-                self.error = Some(engine_error_text(error_code.unwrap_or(param1 as u16)));
+                let Some(code) = error_code else {
+                    return EventEffect::None;
+                };
+                self.error = Some(engine_error_text(code));
                 EventEffect::RepaintBar
             }
             // The caption shows the duration.
             e if e == MF_MEDIA_ENGINE_EVENT_LOADEDMETADATA.0 => {
+                self.error = None;
                 if let Backend::Mpv(player) = &self.backend {
                     player.fill_tags(&mut self.tags);
                 }

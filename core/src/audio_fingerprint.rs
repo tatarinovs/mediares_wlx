@@ -160,21 +160,27 @@ impl PcmHash {
         }
     }
 
+    fn flush_pending(&mut self) {
+        for &s in &self.pending {
+            let v = (s.clamp(-1.0, 1.0) * 8_388_608.0).round() as i64;
+            self.hash = (self.hash ^ v as u64).wrapping_mul(Self::PRIME);
+        }
+        self.pending.clear();
+    }
+
     fn update(&mut self, samples: &[f32]) {
         for frame in samples.chunks_exact(self.channels) {
             let audible = frame.iter().any(|s| s.abs() >= PCM_SILENCE);
             if audible {
                 self.started = true;
                 if !self.pending.is_empty() {
-                    let pending = std::mem::take(&mut self.pending);
-                    self.mix_samples(&pending);
+                    self.flush_pending();
                 }
                 self.mix_samples(frame);
             } else if self.started {
                 self.pending.extend_from_slice(frame);
                 if self.pending.len() > Self::MAX_PENDING {
-                    let pending = std::mem::take(&mut self.pending);
-                    self.mix_samples(&pending);
+                    self.flush_pending();
                 }
             }
         }
@@ -197,6 +203,8 @@ struct BandAnalyzer {
     filled: usize,
     since_frame: usize,
     fft: Fft,
+    re: [f32; FFT_SIZE],
+    im: [f32; FFT_SIZE],
     window: Vec<f32>,
     sub_band_bins: Vec<(usize, usize)>,
     frames: Vec<Frame>,
@@ -233,6 +241,8 @@ impl BandAnalyzer {
             filled: 0,
             since_frame: 0,
             fft: Fft::new(FFT_SIZE),
+            re: [0.0; FFT_SIZE],
+            im: [0.0; FFT_SIZE],
             window,
             sub_band_bins,
             frames: Vec::new(),
@@ -276,11 +286,12 @@ impl BandAnalyzer {
         let sample = |i: usize| self.ring[(start + i) % FFT_SIZE];
         let rms =
             ((0..FFT_SIZE).map(|i| sample(i) * sample(i)).sum::<f32>() / FFT_SIZE as f32).sqrt();
-        let (mut re, mut im) = (vec![0.0f32; FFT_SIZE], vec![0.0f32; FFT_SIZE]);
+        let (re, im) = (&mut self.re, &mut self.im);
+        im.fill(0.0);
         for (i, v) in re.iter_mut().enumerate() {
             *v = sample(i) * self.window[i];
         }
-        self.fft.run(&mut re, &mut im);
+        self.fft.run(re, im);
         let mut bands = [0.0f32; BANDS];
         let per_band = SUB_BANDS / BANDS;
         for (s, &(lo, hi)) in self.sub_band_bins.iter().enumerate() {
@@ -307,8 +318,8 @@ impl Fft {
     }
 
     /// In place; `re.len()` must be the size given to `new`.
-    fn run(&self, re: &mut [f32], im: &mut [f32]) {
-        let n = re.len();
+    fn run<const N: usize>(&self, re: &mut [f32; N], im: &mut [f32; N]) {
+        let n = N;
         let mut j = 0;
         for i in 1..n {
             let mut bit = n >> 1;
@@ -405,10 +416,9 @@ mod tests {
     #[test]
     fn fft_finds_a_tone() {
         let n = 64;
-        let mut re: Vec<f32> = (0..n)
-            .map(|i| (2.0 * PI * 5.0 * i as f32 / n as f32).cos())
-            .collect();
-        let mut im = vec![0.0; n];
+        let mut re: [f32; 64] =
+            std::array::from_fn(|i| (2.0 * PI * 5.0 * i as f32 / n as f32).cos());
+        let mut im = [0.0; 64];
         Fft::new(n).run(&mut re, &mut im);
         let peak = (0..n / 2)
             .max_by(|&a, &b| re[a].hypot(im[a]).total_cmp(&re[b].hypot(im[b])))

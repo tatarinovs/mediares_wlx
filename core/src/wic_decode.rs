@@ -212,7 +212,7 @@ pub fn decode_turned(
         (tw, th)
     };
     let stride = ow * 4;
-    let mut rgba = vec![0u8; stride as usize * oh as usize];
+    let mut rgba = crate::image_decode::zeroed_bytes(stride as usize * oh as usize)?;
     unsafe {
         let mut source: IWICBitmapSource = frame.cast().ok()?;
         if (tw, th) != (w, h) {
@@ -270,7 +270,7 @@ pub fn decode_whole_cancellable(
         return None;
     }
     let stride = w as usize * 4;
-    let mut rgba = vec![0u8; stride * h as usize];
+    let mut rgba = crate::image_decode::zeroed_bytes(stride * h as usize)?;
     unsafe {
         let converter = factory.CreateFormatConverter().ok()?;
         converter
