@@ -75,18 +75,18 @@ pub fn has_tag_reader(path: &Path) -> bool {
 
 /// Tags of `path`; empty if the container has none or isn't supported.
 pub fn read_video_tags(path: &Path) -> VideoTags {
-    let Some(container) = container(path) else {
-        return VideoTags::default();
-    };
-    let Ok(file) = File::open(path) else {
-        return VideoTags::default();
-    };
+    try_read_video_tags(path).unwrap_or_default()
+}
+
+/// Some(empty) means the supported container was read successfully without tags.
+pub(crate) fn try_read_video_tags(path: &Path) -> Option<VideoTags> {
+    let container = container(path)?;
+    let file = File::open(path).ok()?;
     let mut r = BufReader::new(file);
-    let tags = match container {
+    match container {
         Container::Matroska => read_matroska(&mut r),
         Container::Mp4 => read_mp4(&mut r),
-    };
-    tags.unwrap_or_default()
+    }
 }
 
 fn clean(s: &str) -> Option<String> {
@@ -112,33 +112,30 @@ const MAX_UDTA: u64 = 4 << 20;
 const MAX_BOXES: usize = 4096;
 
 /// Boxes `(type, payload start, payload end)` between `start` and `end` of the file.
-fn mp4_boxes<R: Read + Seek>(r: &mut R, start: u64, end: u64) -> Vec<([u8; 4], u64, u64)> {
+fn mp4_boxes<R: Read + Seek>(r: &mut R, start: u64, end: u64) -> Option<Vec<([u8; 4], u64, u64)>> {
     let mut out = Vec::new();
     let mut pos = start;
     while pos + 8 <= end && out.len() < MAX_BOXES {
         let mut hdr = [0u8; 8];
-        if r.seek(SeekFrom::Start(pos)).is_err() || r.read_exact(&mut hdr).is_err() {
-            break;
-        }
+        r.seek(SeekFrom::Start(pos)).ok()?;
+        r.read_exact(&mut hdr).ok()?;
         let kind = [hdr[4], hdr[5], hdr[6], hdr[7]];
         let (size, header) = match u32::from_be_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]) {
             0 => (end - pos, 8),
             1 => {
                 let mut big = [0u8; 8];
-                if r.read_exact(&mut big).is_err() {
-                    break;
-                }
+                r.read_exact(&mut big).ok()?;
                 (u64::from_be_bytes(big), 16)
             }
             n => (n as u64, 8),
         };
         if size < header || pos.saturating_add(size) > end {
-            break;
+            return None;
         }
         out.push((kind, pos + header, pos + size));
         pos += size;
     }
-    out
+    (pos == end).then_some(out)
 }
 
 /// Boxes of an in-memory payload.
@@ -155,7 +152,7 @@ fn mp4_children(mut data: &[u8]) -> impl Iterator<Item = ([u8; 4], &[u8])> {
 
 fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     let len = r.seek(SeekFrom::End(0)).ok()?;
-    let top = mp4_boxes(r, 0, len);
+    let top = mp4_boxes(r, 0, len)?;
     if !top
         .first()
         .is_some_and(|(kind, _, _)| matches!(kind, b"ftyp" | b"moov" | b"wide" | b"free" | b"mdat"))
@@ -165,12 +162,12 @@ fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     let (_, moov_start, moov_end) = *top.iter().find(|(kind, _, _)| kind == b"moov")?;
     let mut tags = VideoTags::default();
     // Only the movie's own udta; tracks may have theirs, about the track.
-    for (_, start, end) in mp4_boxes(r, moov_start, moov_end)
+    for (_, start, end) in mp4_boxes(r, moov_start, moov_end)?
         .into_iter()
         .filter(|(kind, _, _)| kind == b"udta")
     {
         if end - start > MAX_UDTA {
-            continue;
+            return None; // Not read, so do not cache this as an absence of tags.
         }
         let mut udta = vec![0u8; (end - start) as usize];
         r.seek(SeekFrom::Start(start)).ok()?;
@@ -400,7 +397,15 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     }
     let segment_size = read_size(r)?;
     let segment_start = r.stream_position().ok()?;
-    let segment_end = segment_start.saturating_add(segment_size);
+    let file_end = r.seek(SeekFrom::End(0)).ok()?;
+    let segment_end = if segment_size == UNKNOWN_SIZE {
+        file_end
+    } else {
+        segment_start
+            .checked_add(segment_size)
+            .filter(|&end| end <= file_end)?
+    };
+    r.seek(SeekFrom::Start(segment_start)).ok()?;
 
     let mut tags = VideoTags::default();
     // Read in place or found through the SeekHead, for Info, Tags, Tracks and Chapters.
@@ -411,22 +416,25 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
 
     // Top-level elements in order, up to the first cluster (the frames); Info and Tags usually
     // come before it, and SeekHead says where they are if not.
-    while let Ok(pos) = r.stream_position() {
+    loop {
+        let pos = r.stream_position().ok()?;
         if pos >= segment_end {
             break;
         }
-        let (Some(id), Some(size)) = (read_id(r), read_size(r)) else {
-            break;
-        };
+        let (id, size) = (read_id(r)?, read_size(r)?);
         if id == CLUSTER || size == UNKNOWN_SIZE {
             break;
+        }
+        if r.stream_position().ok()?.checked_add(size)? > segment_end {
+            return None;
+        }
+        if WANTED.contains(&id) && size > MAX_ELEMENT {
+            return None;
         }
         match id {
             SEEK_HEAD | INFO | TAGS | TRACKS | CHAPTERS if size <= MAX_ELEMENT => {
                 let mut data = vec![0u8; size as usize];
-                if r.read_exact(&mut data).is_err() {
-                    break;
-                }
+                r.read_exact(&mut data).ok()?;
                 if id == SEEK_HEAD {
                     for (seek_id, seek_pos) in seek_entries(&data) {
                         if let Some(i) = slot(seek_id) {
@@ -439,10 +447,7 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
                 }
             }
             _ => {
-                let Ok(skip) = i64::try_from(size) else { break };
-                if r.seek(SeekFrom::Current(skip)).is_err() {
-                    break;
-                }
+                r.seek(SeekFrom::Current(i64::try_from(size).ok()?)).ok()?;
             }
         }
     }
@@ -451,7 +456,8 @@ fn read_matroska<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         if seen[i] {
             continue;
         }
-        if let Some(data) = at[i].and_then(|at| read_element_at(r, at, want)) {
+        if let Some(at) = at[i] {
+            let data = read_element_at(r, at, want)?;
             parse_element(want, &data, &mut tags);
         }
     }
@@ -833,6 +839,28 @@ mod tests {
         assert_eq!(year("2022:12:31 03:00:00"), Some(2022));
         assert_eq!(year("20190710"), None);
         assert_eq!(year("весна"), None);
+    }
+
+    #[test]
+    fn empty_containers_are_distinct_from_truncated_metadata() {
+        let plain = cat(&[mp4_box(b"ftyp", b"isom"), mp4_box(b"moov", &[])]);
+        assert_eq!(
+            read_mp4(&mut Cursor::new(&plain)),
+            Some(VideoTags::default())
+        );
+        let mut broken = cat(&[
+            mp4_box(b"ftyp", b"isom"),
+            mp4_box(b"moov", &mp4_box(b"udta", &[1, 2, 3, 4])),
+        ]);
+        broken.pop();
+        assert_eq!(read_mp4(&mut Cursor::new(broken)), None);
+        assert_eq!(
+            read_matroska(&mut Cursor::new(file(&[]))),
+            Some(VideoTags::default())
+        );
+        let mut broken = file(&el(INFO, &el(TITLE, b"title")));
+        broken.pop();
+        assert_eq!(read_matroska(&mut Cursor::new(broken)), None);
     }
 
     #[test]

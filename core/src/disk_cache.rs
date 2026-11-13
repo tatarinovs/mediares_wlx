@@ -1,6 +1,7 @@
 //! Disposable local SQLite cache of analysis and metadata, accessed on a RAM miss.
 //! No worker thread outlives the DLL. Locks are never waited for and decoding runs outside them.
 
+use std::cell::Cell;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -20,6 +21,7 @@ const MAX_PAYLOAD: usize = 1024 * 1024;
 const MAX_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 500_000;
 const PRUNE_BATCH: i64 = 8192;
+const MAINTENANCE_INTERVAL: u32 = 4096;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 // Unlike a borrowed &str, these names are resolved to known literals during deserialization.
@@ -50,6 +52,32 @@ impl State {
 }
 
 static CACHE: Mutex<State> = Mutex::new(State::Unopened);
+
+thread_local! {
+    // Only the host's background requests may scan/evict records. Viewer reads and quick
+    // column calls have no maintenance work or SQLITE_FULL recovery on their critical path.
+    static MAINTENANCE_ALLOWED: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn with_maintenance<R>(allowed: bool, f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            MAINTENANCE_ALLOWED.set(self.0);
+        }
+    }
+    let _restore = Restore(MAINTENANCE_ALLOWED.replace(allowed));
+    let result = f();
+    if allowed {
+        // Never open a database just to service a constant field or an unsupported file.
+        if let Ok(mut state) = CACHE.try_lock() {
+            if let State::Open(store) = &mut *state {
+                let _ = store.maintain();
+            }
+        }
+    }
+    result
+}
 
 fn cache_path() -> Option<PathBuf> {
     if let Some(value) = std::env::var_os("MEDIARES_CONTENT_CACHE") {
@@ -86,7 +114,7 @@ pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) {
         return;
     };
     let Some(key) = Key::new(key) else { return };
-    with_store(|store| store.write(&key, T::SLOT, columns));
+    with_store(|store| store.write(&key, T::SLOT, columns, MAINTENANCE_ALLOWED.get()));
 }
 
 pub(crate) fn close() {
@@ -178,9 +206,11 @@ impl Store {
                  COMMIT;",
             )?;
         }
-        let store = Self { db, writes: 0 };
-        store.prune(MAX_ENTRIES)?;
-        Ok(store)
+        // First maintenance is due, but opening for a quick read must not scan the database.
+        Ok(Self {
+            db,
+            writes: MAINTENANCE_INTERVAL,
+        })
     }
 
     fn read<T: DiskValue>(&self, key: &Key) -> rusqlite::Result<T> {
@@ -201,7 +231,13 @@ impl Store {
         )
     }
 
-    fn write(&mut self, key: &Key, slot: i32, c: Columns<'_>) -> rusqlite::Result<()> {
+    fn write(
+        &mut self,
+        key: &Key,
+        slot: i32,
+        c: Columns<'_>,
+        allow_eviction: bool,
+    ) -> rusqlite::Result<()> {
         // Reject unbounded records before eviction (normal analysis strings are tiny).
         if c.payload.as_ref().map_or(0, String::len)
             + c.fingerprint.map_or(0, str::len)
@@ -210,8 +246,21 @@ impl Store {
         {
             return Err(rusqlite::Error::InvalidQuery);
         }
+        if !allow_eviction && self.writes >= MAINTENANCE_INTERVAL {
+            // max(rowid) is an indexed endpoint lookup, not a count scan. Once this
+            // conservative bound is reached, leave new writes to a background request.
+            let newest: i64 =
+                self.db
+                    .query_row("SELECT coalesce(max(rowid), 0) FROM entries", [], |r| {
+                        r.get(0)
+                    })?;
+            if newest >= MAX_ENTRIES {
+                return Ok(());
+            }
+        }
         if let Err(error) = self.insert(key, slot, &c) {
-            if !matches!(&error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull)
+            if !allow_eviction
+                || !matches!(&error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull)
             {
                 return Err(error);
             }
@@ -219,10 +268,15 @@ impl Store {
             self.make_room()?;
             self.insert(key, slot, &c)?;
         }
-        self.writes = self.writes.wrapping_add(1);
-        if self.writes.is_multiple_of(256) {
+        self.writes = self.writes.saturating_add(1);
+        Ok(())
+    }
+
+    fn maintain(&mut self) -> rusqlite::Result<()> {
+        if self.writes >= MAINTENANCE_INTERVAL {
             self.prune(MAX_ENTRIES)?;
             self.make_room()?;
+            self.writes = 0;
         }
         Ok(())
     }
@@ -535,7 +589,9 @@ mod tests {
     }
 
     fn put<T: DiskValue>(store: &mut Store, key: &Key, value: &T) {
-        store.write(key, T::SLOT, value.columns().unwrap()).unwrap();
+        store
+            .write(key, T::SLOT, value.columns().unwrap(), true)
+            .unwrap();
     }
 
     fn roundtrip<T: DiskValue + PartialEq + std::fmt::Debug>(fixture: &Fixture, value: &T) {
@@ -861,7 +917,7 @@ mod tests {
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         let start = Instant::now();
         assert!(store
-            .write(&key, u32::SLOT, 43u32.columns().unwrap())
+            .write(&key, u32::SLOT, 43u32.columns().unwrap(), true)
             .is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(store.read::<u32>(&key).unwrap(), 42);
@@ -889,6 +945,65 @@ mod tests {
     }
 
     #[test]
+    fn quick_writes_do_not_evict_and_background_writes_can_recover() {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        store.db.pragma_update(None, "max_page_count", 512).unwrap();
+        let mut key = fixture.key();
+        let tags = crate::exif::ExifInfo {
+            make: Some("x".repeat(32 * 1024)),
+            ..Default::default()
+        };
+        let mut failed = false;
+        for i in 0u32..150 {
+            key.path = i.to_le_bytes().to_vec();
+            if store
+                .write(
+                    &key,
+                    <crate::exif::ExifInfo as DiskValue>::SLOT,
+                    tags.columns().unwrap(),
+                    false,
+                )
+                .is_err()
+            {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed);
+        let mut oldest = fixture.key();
+        oldest.path = 0u32.to_le_bytes().to_vec();
+        assert_eq!(store.read::<crate::exif::ExifInfo>(&oldest).unwrap(), tags);
+        // A background call can evict and retain the result that did not fit on the UI path.
+        put(&mut store, &key, &tags);
+        assert_eq!(store.read::<crate::exif::ExifInfo>(&key).unwrap(), tags);
+    }
+
+    #[test]
+    fn quick_writes_defer_at_the_conservative_row_bound_without_scanning() {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        let key = fixture.key();
+        put(&mut store, &key, &42u32);
+        // Sparse rowids can overestimate the count: defer rather than scan from a quick call.
+        store
+            .db
+            .execute("UPDATE entries SET rowid=?1", [MAX_ENTRIES])
+            .unwrap();
+        let mut next = fixture.key();
+        next.path.push(1);
+        store
+            .write(&next, u32::SLOT, 43u32.columns().unwrap(), false)
+            .unwrap();
+        assert!(store.read::<u32>(&next).is_err());
+        assert_eq!(store.read::<u32>(&key).unwrap(), 42);
+        put(&mut store, &next, &43u32);
+        store.maintain().unwrap();
+        assert_eq!(store.read::<u32>(&next).unwrap(), 43);
+        assert_eq!(store.writes, 0);
+    }
+
+    #[test]
     fn byte_limit_evicts_records_before_the_row_limit_and_keeps_accepting_writes() {
         let fixture = Fixture::new();
         let mut store = Store::open(&fixture.path()).unwrap();
@@ -898,7 +1013,7 @@ mod tests {
             make: Some("x".repeat(32 * 1024)),
             ..Default::default()
         };
-        // Fewer than 256 writes: this exercises SQLITE_FULL recovery before periodic pruning.
+        // SQLITE_FULL recovery must work even before the next scheduled maintenance.
         for i in 0u32..150 {
             key.path = i.to_le_bytes().to_vec();
             put(&mut store, &key, &tags);
@@ -972,7 +1087,7 @@ mod tests {
             fingerprint: None,
         }));
         assert!(store
-            .write(&key, CachedMedia::SLOT, value.columns().unwrap())
+            .write(&key, CachedMedia::SLOT, value.columns().unwrap(), true)
             .is_err());
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
     }

@@ -3,10 +3,12 @@
 import argparse
 from contextlib import closing
 import ctypes
+from ctypes import wintypes
 import json
 import math
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import struct
 import subprocess
@@ -16,7 +18,7 @@ import uuid
 import wave
 
 
-def worker(dll_path, paths):
+def content_plugin(dll_path):
     dll = ctypes.WinDLL(str(dll_path))
     dll.ContentGetSupportedField.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
     dll.ContentGetSupportedField.restype = ctypes.c_int
@@ -32,6 +34,11 @@ def worker(dll_path, paths):
         if kind == 0:
             break
         fields[name.value.decode("ascii")] = (index, kind)
+    return dll, fields
+
+
+def worker(dll_path, paths):
+    dll, fields = content_plugin(dll_path)
 
     groups = {
         ".bmp": ["Image_dHash", "Image_pHash", "Image_CoarseHash", "Image_Sharpness",
@@ -56,9 +63,8 @@ def worker(dll_path, paths):
                     # A disk hit must still run off TC's UI thread; is_cached checks RAM only.
                     assert dll.ContentGetValueW(str(path), index, 0, buf, len(buf), 1) == 0, name
                 result = dll.ContentGetValueW(str(path), index, 0, buf, len(buf), 0)
-                if result == -3 and name == "Video_Codec":
-                    # Media Foundation may not name the uncompressed AVI codec. Keep the
-                    # absent field inside the successful stream record across restarts too.
+                if result == -3 and (name == "Video_Codec" or path.name in {"no-exif.jpg", "no-tags.mp4"}):
+                    # Successful empty metadata must survive a restart as well.
                     values[path.name + ":" + name] = None
                     assert dll.ContentGetValueW(str(path), index, 0, buf, len(buf), 1) == -3
                     continue
@@ -75,6 +81,70 @@ def worker(dll_path, paths):
     finally:
         dll.ContentPluginUnloading()
     print(json.dumps({"values": values, "ms": (time.perf_counter() - start) * 1000}))
+
+
+def quick_worker(dll_path, path):
+    dll, fields = content_plugin(dll_path)
+    buf = ctypes.create_string_buffer(128)
+    start = time.perf_counter()
+    try:
+        code = dll.ContentGetValueW(str(path), fields["Image_Width"][0], 0, buf, len(buf), 1)
+        assert code == 1 and ctypes.c_int.from_buffer(buf).value == 1600
+        print(json.dumps({"first_width_ms": (time.perf_counter() - start) * 1000}))
+    finally:
+        dll.ContentPluginUnloading()
+
+
+def viewer_worker(dll_path, image, media):
+    # The caller stages the DLL without libmpv: this regression belongs to the MF backend.
+    dll = ctypes.WinDLL(str(dll_path))
+    ole = ctypes.WinDLL("ole32")
+    assert ole.CoInitializeEx(None, 2) in (0, 1)
+    user = ctypes.WinDLL("user32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    user.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                   wintypes.DWORD, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                                   ctypes.c_int, wintypes.HWND, wintypes.HMENU,
+                                   wintypes.HINSTANCE, wintypes.LPVOID]
+    user.CreateWindowExW.restype = wintypes.HWND
+    user.DestroyWindow.argtypes = [wintypes.HWND]
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    kernel.GetModuleHandleW.restype = wintypes.HMODULE
+    dll.ListLoadW.argtypes = [wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int]
+    dll.ListLoadW.restype = wintypes.HWND
+    dll.ListLoadNextW.argtypes = [wintypes.HWND, wintypes.HWND, wintypes.LPCWSTR, ctypes.c_int]
+    dll.ListLoadNextW.restype = ctypes.c_int
+    dll.ListCloseWindow.argtypes = [wintypes.HWND]
+    host = user.CreateWindowExW(0, "STATIC", "Hidden Mediares cache test", 0x00CF0000,
+                               0, 0, 640, 480, None, None, None, None)
+    assert host
+    viewer, lock = None, None
+    try:
+        lock = kernel.CreateFileW(str(media), 0x80000000, 0, None, 3, 0x80, None)
+        assert lock != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+        assert media.stat().st_size > 0  # Identity is still available while opening is denied.
+        rejected = dll.ListLoadW(host, str(media), 0)
+        if rejected:
+            dll.ListCloseWindow(rejected)
+        assert not rejected, "Cached metadata accepted unreadable media in ListLoadW"
+        viewer = dll.ListLoadW(host, str(image), 0)
+        assert viewer
+        assert dll.ListLoadNextW(host, viewer, str(media), 0) == 1, "ListLoadNextW accepted locked media"
+        assert dll.ListLoadNextW(host, viewer, str(image), 0) == 0
+        assert not kernel.GetModuleHandleW("libmpv-2.dll"), "Expected Media Foundation"
+    finally:
+        if viewer:
+            dll.ListCloseWindow(viewer)
+        if lock and lock != ctypes.c_void_p(-1).value:
+            kernel.CloseHandle(lock)
+        user.DestroyWindow(host)
+        dll.ContentPluginUnloading()
+        ole.CoUninitialize()
+    print(json.dumps({"cached_locked_load_rejected": True, "cached_locked_next_rejected": True}))
 
 
 def make_bmp(path, alternate=False):
@@ -164,17 +234,19 @@ def make_avi(path):
     path.write_bytes(chunk(b"RIFF", b"AVI " + hdrl + listing(b"movi", movi) + chunk(b"idx1", idx)))
 
 
-def run_check(dll, baseline):
+def run_check(dll, baseline, viewer_dll, stress):
     root = Path(__file__).resolve().parent.parent
     work = root / "target" / ("cache-check-" + uuid.uuid4().hex)
     work.mkdir(parents=True)
     paths = [work / "фото 🦊.bmp", work / "audio.wav", work / "video.avi",
-             work / "camera.jpg", work / "tags.mp4"]
+             work / "camera.jpg", work / "tags.mp4", work / "no-exif.jpg", work / "no-tags.mp4"]
     make_bmp(paths[0])
     make_wav(paths[1])
     make_avi(paths[2])
     make_exif(paths[3])
     make_video_tags(paths[4])
+    paths[5].write_bytes(b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff\xd9")
+    paths[6].write_bytes(struct.pack(">I4s4sI4s", 12, b"ftyp", b"isom", 8, b"moov"))
     db = work / "cache.sqlite3"
 
     def run(cache, library=dll):
@@ -194,7 +266,7 @@ def run_check(dll, baseline):
 
     cold = run(db)
     original = rows()
-    assert len(original) == 10, original  # Analysis plus EXIF, tags, dimensions, pixels and streams.
+    assert len(original) == 12, original  # Includes successful empty JPEG EXIF and video tags.
     with closing(sqlite3.connect(db)) as conn:
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
         assert slots == {0, 1, 2, 3, 4, 6, 7, 8}, slots
@@ -212,7 +284,8 @@ def run_check(dll, baseline):
     assert [row for row in original if row[1] < 2] == analysis_rows, "Upgrading recomputed hashes"
     # A malformed individual metadata record must fall back and repair only that record.
     with sqlite3.connect(db) as conn:
-        conn.execute("UPDATE entries SET payload='broken JSON' WHERE slot=2")
+        conn.execute("UPDATE entries SET payload='broken JSON' WHERE slot=2 AND path=?",
+                     (str(paths[3]).encode("utf-16-le"),))
     conn.close()
     assert run(db)["values"] == warm["values"]
     repaired = rows()
@@ -272,7 +345,69 @@ def run_check(dll, baseline):
               "dll_bytes": dll.stat().st_size,
               "checks": ["fresh-process hits", "metadata hits", "metadata edit", "schema upgrade",
                          "malformed metadata", "default path", "RAM/UI delay", "Unicode paths", "file edit",
-                         "algorithm version", "disabled", "unavailable", "corrupt", "locked"]}
+                         "algorithm version", "disabled", "unavailable", "corrupt", "locked",
+                         "empty EXIF", "empty video tags"]}
+    if viewer_dll:
+        viewer_dir = work / "viewer-mf"
+        viewer_dir.mkdir()
+        staged = viewer_dir / "mediares.wlx64"
+        shutil.copy2(viewer_dll, staged)
+        (viewer_dir / "mediares.ini").write_text("[Settings]\nResumeVideo=0\nVolume=0\n", encoding="utf-8")
+        env = dict(os.environ, MEDIARES_CONTENT_CACHE=str(db), LOCALAPPDATA=str(work / "local"))
+        completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--viewer-worker",
+                                    "--dll", str(staged), str(paths[0]), str(paths[2])],
+                                   env=env, capture_output=True, text=True, timeout=30, check=True)
+        report["viewer"] = json.loads(completed.stdout)
+        report["checks"].extend(["MF cached ListLoadW rejection", "MF cached ListLoadNextW rejection"])
+        with closing(sqlite3.connect(db)) as conn:
+            # The actual AudioTags JSON includes every AudioStreamMeta field. Seed its stream
+            # slot so neither the Rust decoder nor the MF fallback can trust a cached record.
+            conn.execute("""INSERT INTO entries(path,slot,size,modified,version,kind,payload)
+                            SELECT path,5,size,modified,version,5,payload FROM entries
+                            WHERE slot=3 AND path=?""", (str(paths[1]).encode("utf-16-le"),))
+            conn.commit()
+        completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--viewer-worker",
+                                    "--dll", str(staged), str(paths[0]), str(paths[1])],
+                                   env=env, capture_output=True, text=True, timeout=30, check=True)
+        report["audio_viewer"] = json.loads(completed.stdout)
+        report["checks"].append("MF cached audio rejection")
+    if stress:
+        large = work / "large.sqlite3"
+        run(large)
+        with closing(sqlite3.connect(large)) as conn:
+            count = conn.execute("SELECT count(*) FROM entries").fetchone()[0]
+            conn.execute("""WITH RECURSIVE n(i) AS
+                            (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<?)
+                            INSERT INTO entries(path,slot,size,modified,version,kind,sharpness)
+                            SELECT CAST(printf('%0199d',i) AS BLOB),1,1,zeroblob(16),1,4,42 FROM n""",
+                         (500001 - count,))
+            conn.commit()
+        large_bytes = large.stat().st_size
+        env = dict(os.environ, MEDIARES_CONTENT_CACHE=str(large), LOCALAPPDATA=str(work / "local"))
+        command = [sys.executable, str(Path(__file__).resolve()), "--quick-worker", "--dll", str(dll), str(paths[0])]
+        fast = subprocess.run(command, env=env, capture_output=True, text=True, timeout=30, check=True)
+        with closing(sqlite3.connect(large)) as conn:
+            assert conn.execute("SELECT count(*) FROM entries").fetchone()[0] == 500001, "A quick read pruned the database"
+        command = [sys.executable, str(Path(__file__).resolve()), "--worker", "--dll", str(dll), *map(str, paths)]
+        workers = [subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                   for _ in range(2)]
+        for process in workers:
+            stdout, stderr = process.communicate(timeout=30)
+            assert process.returncode == 0, (stdout, stderr)
+            assert json.loads(stdout)["values"] == modified["values"]
+        assert run(large)["values"] == modified["values"]
+        with closing(sqlite3.connect(large)) as conn:
+            remaining = conn.execute("SELECT count(*) FROM entries").fetchone()[0]
+            assert remaining <= 500000
+            assert conn.execute("PRAGMA quick_check").fetchone()[0] == "ok"
+            assert conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0] <= 256 * 1024 * 1024
+            # Retain timings, not hundreds of MiB of synthetic records.
+            conn.execute("DELETE FROM entries")
+            conn.commit()
+            conn.execute("VACUUM")
+        report["large_cache"] = dict(json.loads(fast.stdout), bytes=large_bytes, rows_before=500001,
+                                     rows_after=remaining)
+        report["checks"].extend(["large cache quick read", "concurrent writers", "background pruning", "database integrity"])
     if baseline:
         previous = run("off", baseline)
         assert previous["values"] == modified["values"], "Field values changed from the baseline DLL"
@@ -287,10 +422,19 @@ if __name__ == "__main__":
     parser.add_argument("--dll", type=Path,
                         default=Path(__file__).resolve().parent.parent / "target/x86_64-pc-windows-gnu/release/mediares_wdx.dll")
     parser.add_argument("--baseline-dll", type=Path)
+    parser.add_argument("--viewer-dll", type=Path, help="Also test MF rejection through the WLX API")
+    parser.add_argument("--stress", action="store_true", help="Test 500k rows and concurrent processes")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--quick-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--viewer-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("files", nargs="*", type=Path)
     args = parser.parse_args()
     if args.worker:
         worker(args.dll.resolve(), args.files)
+    elif args.quick_worker:
+        quick_worker(args.dll.resolve(), args.files[0])
+    elif args.viewer_worker:
+        viewer_worker(args.dll.resolve(), *args.files)
     else:
-        run_check(args.dll.resolve(), args.baseline_dll.resolve() if args.baseline_dll else None)
+        run_check(args.dll.resolve(), args.baseline_dll.resolve() if args.baseline_dll else None,
+                  args.viewer_dll.resolve() if args.viewer_dll else None, args.stress)

@@ -104,6 +104,15 @@ pub fn parse_exif_datetime(s: &str) -> Option<ExifDateTime> {
 }
 
 pub fn read_exif(path: &Path) -> Option<ExifInfo> {
+    read(path, false)
+}
+
+/// Retain a successful JPEG scan without EXIF; failed reads remain cache misses.
+pub(crate) fn read_exif_for_cache(path: &Path) -> Option<ExifInfo> {
+    read(path, true)
+}
+
+fn read(path: &Path, cache_absent: bool) -> Option<ExifInfo> {
     let mut file = File::open(path).ok()?;
     let mut head = [0u8; 12];
     let head_len = file.read(&mut head).ok()?;
@@ -118,7 +127,10 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
         return Some(info);
     }
     if magic.starts_with(&[0xFF, 0xD8]) {
-        parse_tiff(&read_jpeg_app1(file)?)
+        match read_jpeg_app1(file)? {
+            Some(payload) => parse_tiff(&payload),
+            None => cache_absent.then(ExifInfo::default),
+        }
     } else if magic == b"II*\0" || magic == b"MM\0*" {
         read_tiff_exif(&mut file)
     } else {
@@ -168,7 +180,8 @@ pub fn read_orientation(path: &Path) -> Option<u16> {
 /// Returns the TIFF payload of the first `Exif\0\0` APP1 segment of a JPEG file. The header
 /// segments are read through one buffer: a read per marker byte would be a round trip each on a
 /// network drive.
-fn read_jpeg_app1(file: File) -> Option<Vec<u8>> {
+// Outer None is a failed/malformed read; Some(None) is a completed scan with no EXIF.
+fn read_jpeg_app1(file: File) -> Option<Option<Vec<u8>>> {
     let mut file = BufReader::with_capacity(64 * 1024, file);
     file.seek(SeekFrom::Start(2)).ok()?;
     let mut byte = [0u8; 1];
@@ -183,7 +196,7 @@ fn read_jpeg_app1(file: File) -> Option<Vec<u8>> {
         }
         let marker = byte[0];
         match marker {
-            0xDA | 0xD9 => return None,
+            0xDA | 0xD9 => return Some(None),
             0x01 | 0xD0..=0xD7 => continue,
             _ => {}
         }
@@ -198,7 +211,7 @@ fn read_jpeg_app1(file: File) -> Option<Vec<u8>> {
             file.read_exact(&mut payload).ok()?;
             if payload.starts_with(header) {
                 payload.drain(..header.len());
-                return Some(payload);
+                return Some(Some(payload));
             }
         } else {
             file.seek_relative(payload_len as i64).ok()?;
@@ -687,6 +700,19 @@ fn dms(v: f64) -> [(u32, u32); 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jpeg_without_exif_is_cacheable_but_a_failed_scan_is_not() {
+        let path =
+            std::env::temp_dir().join(format!("mediares-no-exif-{}.jpg", std::process::id()));
+        image::RgbImage::new(8, 8).save(&path).unwrap();
+        assert_eq!(read_exif(&path), None);
+        assert_eq!(read_exif_for_cache(&path), Some(ExifInfo::default()));
+        // An APP1 length extending beyond EOF must not become a persistent empty result.
+        std::fs::write(&path, [0xFF, 0xD8, 0xFF, 0xE1, 0xFF, 0xFF, 0, 0]).unwrap();
+        assert_eq!(read_exif_for_cache(&path), None);
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// Big-endian TIFF with IFD0 {Orientation SHORT=6, ExifIFD} and Exif IFD
     /// {ExposureTime 0/1, FNumber 28/10, ISO SHORT=400}.

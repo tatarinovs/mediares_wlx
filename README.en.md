@@ -208,6 +208,8 @@ Checks require Rust and build tools for the selected toolchain. Release script `
 cargo test --workspace --locked  # tests for the entire workspace
 .\build_release.bat              # release DLLs and installation archives in dist/
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite cache (Python 3)
+# WLX checks, large database and concurrent processes:
+python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
 ```
 
 ## License

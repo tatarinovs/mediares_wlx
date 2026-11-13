@@ -210,6 +210,8 @@ Total Commander сравнивает значения точно, поэтому
 cargo test --workspace --locked  # тесты всего workspace
 .\build_release.bat              # релизные DLL и установочные архивы в dist/
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite-кэш (Python 3)
+# Проверка WLX, большой базы и одновременных процессов:
+python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
 ```
 
 ## Лицензия

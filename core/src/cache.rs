@@ -277,7 +277,7 @@ fn exif_cache() -> &'static MetaCache<crate::exif::ExifInfo> {
 }
 
 pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
-    exif_cache().get_or_read(path, crate::exif::read_exif)
+    exif_cache().get_or_read(path, crate::exif::read_exif_for_cache)
 }
 
 pub fn is_exif_cached(path: &Path) -> bool {
@@ -418,9 +418,7 @@ fn video_tags_cache() -> &'static MetaCache<crate::video_tags::VideoTags> {
 
 /// Title, artist... of MKV/WebM and MP4/MOV: header reads only.
 pub fn get_video_tags(path: &Path) -> Option<Arc<crate::video_tags::VideoTags>> {
-    video_tags_cache().get_or_read(path, |p| {
-        Some(crate::video_tags::read_video_tags(p)).filter(|t| !t.is_empty())
-    })
+    video_tags_cache().get_or_read(path, crate::video_tags::try_read_video_tags)
 }
 
 pub fn is_video_tags_cached(path: &Path) -> bool {

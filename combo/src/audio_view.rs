@@ -78,7 +78,8 @@ impl Backend {
             transport_bar::restore_audio_level(&player);
             return player.open(path).then_some(Backend::Mpv(player));
         }
-        let duration = mediares_core::cache::get_audio_meta(path)?.duration_sec;
+        // Validate the current source; a disk-cache hit can outlive access or codec changes.
+        let duration = mediares_core::mf_audio::probe_audio_meta(path)?.duration_sec;
         let surface = Surface::new(viewer, false)?;
         let player = VideoPlayer::new(surface.0, viewer).ok()?;
         transport_bar::restore_audio_level(&player);

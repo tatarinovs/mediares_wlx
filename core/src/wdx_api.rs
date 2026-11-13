@@ -270,16 +270,18 @@ unsafe fn get_value(
     if !field.applies_to(kind) {
         return FT_FIELDEMPTY;
     }
-    crate::cache::with_file_key(&path, || {
-        if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
-            return FT_DELAYED;
-        }
-        let out = Output {
-            dest: field_value,
-            max_bytes: max_len.max(0) as usize,
-            unicode,
-        };
-        out.value(compute(&path, field, kind))
+    crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
+        crate::cache::with_file_key(&path, || {
+            if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
+                return FT_DELAYED;
+            }
+            let out = Output {
+                dest: field_value,
+                max_bytes: max_len.max(0) as usize,
+                unicode,
+            };
+            out.value(compute(&path, field, kind))
+        })
     })
 }
 

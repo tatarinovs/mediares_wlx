@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use mediares_core::cache::{get_video_meta, get_video_tags, is_video_meta_cached};
 use mediares_core::keyframes::{KeyFrame, KeyframeIndex};
-use mediares_core::video_frame::VideoMeta;
+use mediares_core::video_frame::{probe_video_meta, VideoMeta};
 use mediares_core::video_tags::VideoTags;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -155,7 +155,8 @@ impl Player {
     /// so Total Commander can try the next plugin. mpv supplies uncached metadata itself.
     fn file_meta(&self, path: &Path) -> Option<VideoMeta> {
         match self {
-            Self::Mf(_) => get_video_meta(path).map(|m| (*m).clone()),
+            // Cached properties do not prove that MF can open the source now.
+            Self::Mf(_) => probe_video_meta(path),
             Self::Mpv(_) if is_video_meta_cached(path) => Some(
                 get_video_meta(path)
                     .map(|m| (*m).clone())
