@@ -4,7 +4,7 @@
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{named_params, Connection, Row};
 
@@ -20,6 +20,7 @@ const MAX_PAYLOAD: usize = 1024 * 1024;
 const MAX_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 500_000;
 const PRUNE_BATCH: i64 = 8192;
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 // Unlike a borrowed &str, these names are resolved to known literals during deserialization.
 pub(crate) type StaticName = &'static str;
@@ -28,6 +29,24 @@ enum State {
     Unopened,
     Open(Store),
     Disabled,
+    Retry(Instant),
+}
+
+impl State {
+    fn open_if_needed(&mut self, path: impl FnOnce() -> Option<PathBuf>, now: Instant) {
+        match self {
+            Self::Unopened => {}
+            Self::Retry(after) if now >= *after => {}
+            _ => return,
+        }
+        *self = match path() {
+            None => Self::Disabled,
+            Some(path) => match Store::open(&path) {
+                Ok(store) => Self::Open(store),
+                Err(_) => Self::Retry(now + RETRY_DELAY),
+            },
+        };
+    }
 }
 
 static CACHE: Mutex<State> = Mutex::new(State::Unopened);
@@ -49,11 +68,7 @@ fn cache_path() -> Option<PathBuf> {
 fn with_store<R>(f: impl FnOnce(&mut Store) -> rusqlite::Result<R>) -> Option<R> {
     // A busy SQLite connection is a cache miss, including another call in this DLL.
     let mut state = CACHE.try_lock().ok()?;
-    if matches!(*state, State::Unopened) {
-        *state = cache_path()
-            .and_then(|path| Store::open(&path).ok())
-            .map_or(State::Disabled, State::Open);
-    }
+    state.open_if_needed(cache_path, Instant::now());
     match &mut *state {
         State::Open(store) => f(store).ok(),
         _ => None,
@@ -187,6 +202,32 @@ impl Store {
     }
 
     fn write(&mut self, key: &Key, slot: i32, c: Columns<'_>) -> rusqlite::Result<()> {
+        // Reject unbounded records before eviction (normal analysis strings are tiny).
+        if c.payload.as_ref().map_or(0, String::len)
+            + c.fingerprint.map_or(0, str::len)
+            + c.pcm_hash.map_or(0, str::len)
+            > MAX_PAYLOAD
+        {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        if let Err(error) = self.insert(key, slot, &c) {
+            if !matches!(&error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull)
+            {
+                return Err(error);
+            }
+            // Also handles a larger replacement or another process filling our reserved room.
+            self.make_room()?;
+            self.insert(key, slot, &c)?;
+        }
+        self.writes = self.writes.wrapping_add(1);
+        if self.writes.is_multiple_of(256) {
+            self.prune(MAX_ENTRIES)?;
+            self.make_room()?;
+        }
+        Ok(())
+    }
+
+    fn insert(&self, key: &Key, slot: i32, c: &Columns<'_>) -> rusqlite::Result<()> {
         self.db.execute(
             "INSERT OR REPLACE INTO entries
              (path, slot, size, modified, version, kind, width, height, duration,
@@ -199,12 +240,38 @@ impl Store {
                 ":width": c.width, ":height": c.height, ":duration": c.duration,
                 ":hash_a": c.hash_a, ":hash_b": c.hash_b, ":coarse": c.coarse,
                 ":fingerprint": c.fingerprint, ":pcm_hash": c.pcm_hash, ":sharpness": c.sharpness,
-                ":payload": c.payload,
+                ":payload": &c.payload,
             },
         )?;
-        self.writes = self.writes.wrapping_add(1);
-        if self.writes.is_multiple_of(256) {
-            self.prune(MAX_ENTRIES)?;
+        Ok(())
+    }
+
+    fn make_room(&self) -> rusqlite::Result<()> {
+        let page_size: i64 = self
+            .db
+            .pragma_query_value(None, "page_size", |r| r.get(0))?;
+        let limit: i64 = self
+            .db
+            .pragma_query_value(None, "max_page_count", |r| r.get(0))?;
+        let reserve = (2 * MAX_PAYLOAD as i64).min(limit * page_size / 4);
+        loop {
+            let pages: i64 = self
+                .db
+                .pragma_query_value(None, "page_count", |r| r.get(0))?;
+            let free: i64 = self
+                .db
+                .pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+            if (limit - pages + free) * page_size >= reserve {
+                break;
+            }
+            let removed = self.db.execute(
+                "DELETE FROM entries WHERE rowid IN
+                 (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
+                [PRUNE_BATCH],
+            )?;
+            if removed == 0 {
+                break;
+            }
         }
         Ok(())
     }
@@ -215,12 +282,17 @@ impl Store {
             .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
         if count > limit {
             // FIFO, without a disk write on every hit. Deleted pages are reused, not VACUUMed.
-            self.db.execute(
-                "DELETE FROM entries WHERE rowid IN
-                 (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
-                [count.saturating_sub(limit).max(PRUNE_BATCH)],
-            )?;
+            self.prune_oldest(count.saturating_sub(limit).max(PRUNE_BATCH))?;
         }
+        Ok(())
+    }
+
+    fn prune_oldest(&self, count: i64) -> rusqlite::Result<()> {
+        self.db.execute(
+            "DELETE FROM entries WHERE rowid IN
+             (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
+            [count],
+        )?;
         Ok(())
     }
 }
@@ -796,6 +868,53 @@ mod tests {
         other.execute_batch("ROLLBACK").unwrap();
         put(&mut store, &key, &43u32);
         assert_eq!(store.read::<u32>(&key).unwrap(), 43);
+    }
+
+    #[test]
+    fn a_busy_first_open_retries_after_backoff() {
+        let fixture = Fixture::new();
+        let blocker = Connection::open(fixture.path()).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE").unwrap();
+        let now = Instant::now();
+        let mut state = State::Unopened;
+        state.open_if_needed(|| Some(fixture.path()), now);
+        assert!(matches!(state, State::Retry(_)));
+        blocker.execute_batch("ROLLBACK").unwrap();
+        state.open_if_needed(|| panic!("must respect backoff"), now);
+        state.open_if_needed(|| Some(fixture.path()), now + RETRY_DELAY);
+        assert!(matches!(state, State::Open(_)));
+        let mut disabled = State::Unopened;
+        disabled.open_if_needed(|| None, now);
+        disabled.open_if_needed(|| panic!("explicitly disabled"), now + RETRY_DELAY);
+    }
+
+    #[test]
+    fn byte_limit_evicts_records_before_the_row_limit_and_keeps_accepting_writes() {
+        let fixture = Fixture::new();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        store.db.pragma_update(None, "max_page_count", 512).unwrap(); // 2 MiB test limit.
+        let mut key = fixture.key();
+        let tags = crate::exif::ExifInfo {
+            make: Some("x".repeat(32 * 1024)),
+            ..Default::default()
+        };
+        // Fewer than 256 writes: this exercises SQLITE_FULL recovery before periodic pruning.
+        for i in 0u32..150 {
+            key.path = i.to_le_bytes().to_vec();
+            put(&mut store, &key, &tags);
+        }
+        assert_eq!(store.read::<crate::exif::ExifInfo>(&key).unwrap(), tags);
+        let count: i64 = store
+            .db
+            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .unwrap();
+        assert!(count < 150);
+        let pages: i64 = store
+            .db
+            .pragma_query_value(None, "page_count", |r| r.get(0))
+            .unwrap();
+        assert!(pages <= 512);
+        assert!(store.db.is_autocommit()); // Recovery must leave the connection usable.
     }
 
     #[test]

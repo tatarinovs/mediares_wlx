@@ -106,11 +106,11 @@ fields! {
     PhotoGpsLatitude, "Photo_GPS_Latitude", FT_NUMERIC_FLOATING, Exif, Image;
     PhotoGpsLongitude, "Photo_GPS_Longitude", FT_NUMERIC_FLOATING, Exif, Image;
     PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN, Exif, Image;
-    VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32, Analysis, Video;
+    VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32, VideoMeta, Video;
     VideoLength, "Video_Length", FT_TIME, VideoMeta, Video;
     VideoWidth, "Video_Width", FT_NUMERIC_32, VideoMeta, Video;
     VideoHeight, "Video_Height", FT_NUMERIC_32, VideoMeta, Video;
-    VideoDimensions, "Video_Dimensions", FT_STRINGW, Analysis, Video;
+    VideoDimensions, "Video_Dimensions", FT_STRINGW, VideoMeta, Video;
     VideoFrameRate, "Video_Frame_Rate", FT_NUMERIC_FLOATING, VideoMeta, Video;
     VideoCodec, "Video_Codec", FT_STRINGW, VideoMeta, Video;
     VideoDynamicRange, "Video_HDR", FT_STRINGW, VideoMeta, Video;
@@ -304,7 +304,11 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
         || kind == MediaType::StandardImage && crate::image_decode::header_needs_codec(path);
     let analysis_pending = || !get_cache().is_cached(path);
     match field.source() {
-        Source::Constant | Source::Probe | Source::Exif => false,
+        Source::Constant | Source::Probe => false,
+        Source::Exif => {
+            matches!(kind, MediaType::StandardImage | MediaType::RawImage)
+                && !crate::cache::is_exif_cached(path)
+        }
         Source::Tags => {
             kind == MediaType::Audio
                 && (!tags_cached(path)
@@ -323,6 +327,9 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
         }
         Source::Sharpness => kind.is_image_kind() && !crate::cache::is_sharpness_cached(path),
         Source::ImageSize if needs_codec() => !crate::cache::is_image_size_cached(path),
+        Source::ImageSize if kind == MediaType::RawImage && !crate::cache::is_exif_cached(path) => {
+            true
+        }
         Source::ImageSize => {
             kind != MediaType::StandardImage
                 && analysis_pending()
@@ -411,8 +418,6 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio.clone()),
         (VideoFingerprint, CachedMedia::Video(vid)) => vid.fingerprint.clone().map(Value::Text),
         (VideoDHashMid, CachedMedia::Video(vid)) => vid.dhash_mid_hex().map(Value::Text),
-        (VideoDurationSec, CachedMedia::Video(vid)) => Some(int(vid.duration_sec)),
-        (VideoDimensions, CachedMedia::Video(vid)) => text(vid.dimensions_str()),
         (AudioFingerprint, CachedMedia::Audio(a)) => a.fingerprint.clone().map(Value::Text),
         (AudioPcmHash, CachedMedia::Audio(a)) => text(a.pcm_hash.clone()),
         (AudioDurationSec, CachedMedia::Audio(a)) => Some(int(a.duration_sec)),
@@ -479,6 +484,11 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
     let meta = crate::cache::get_video_meta(path)?;
     let positive = |n: u32| (n > 0).then(|| int(n));
     match field {
+        VideoDimensions => (meta.width > 0 && meta.height > 0)
+            .then(|| Value::Text(format!("{}x{}", meta.width, meta.height))),
+        VideoDurationSec => {
+            (meta.duration_sec > 0.0).then(|| int(meta.duration_sec.round() as u32))
+        }
         VideoWidth => positive(meta.width),
         VideoHeight => positive(meta.height),
         VideoLength => {

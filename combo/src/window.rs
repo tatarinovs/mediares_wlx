@@ -680,6 +680,9 @@ unsafe fn execute(hwnd: HWND, command: Command) {
             let Some(media) = state.media.as_mut() else {
                 return;
             };
+            if media.contact_sheet.is_some() {
+                return;
+            }
             let Some(video) = media.video_mut() else {
                 return;
             };
@@ -695,8 +698,15 @@ unsafe fn execute(hwnd: HWND, command: Command) {
                 columns: state.config.contact_sheet_columns,
                 rows: state.config.contact_sheet_rows,
             };
-            crate::contact_sheet::start(hwnd, &path, sheet, format);
-            media.show_status(tr("Making the contact sheet...").to_string());
+            media.contact_sheet = crate::contact_sheet::start(hwnd, &path, sheet, format);
+            media.show_status(
+                if media.contact_sheet.is_some() {
+                    tr("Making the contact sheet...")
+                } else {
+                    tr("Could not make the contact sheet")
+                }
+                .to_string(),
+            );
         }
         Command::AbLoop => {
             if let Some(media) = state.media.as_mut() {
@@ -1011,9 +1021,15 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             }
         }
         WM_CONTACT_SHEET => {
-            let text = crate::contact_sheet::take_message(lparam);
             if let Some(media) = state.media.as_mut() {
-                media.show_status(text);
+                if let Some(text) = media
+                    .contact_sheet
+                    .as_ref()
+                    .and_then(|task| task.take_message(wparam.0))
+                {
+                    media.contact_sheet = None;
+                    media.show_status(text);
+                }
             }
         }
         WM_SEEK_PREVIEW => {

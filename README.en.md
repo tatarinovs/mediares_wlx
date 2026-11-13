@@ -186,7 +186,7 @@ In Total Commander's duplicate search, choose comparison by plugin fields and se
 | `Audio_PCM_Hash` | Identical decoded audio, such as WAV and FLAC |
 | `Audio_Artist_Title` | Match artist and title tags |
 
-Total Commander compares values exactly, so some modified copies may not be found. Photo rotation, cropping, video edits or different audio mastering can change the result. Audio analysis reads the entire file.
+Total Commander compares values exactly, so some modified copies may not be found. Photo rotation, cropping, video edits or different audio mastering can change the result. Audio analysis reads the entire file. Audio hashes and fingerprints are withheld on a decoding error or detected truncation. `Audio_Duration_Sec` measures the decoded stream; use `Audio_Length` for a normal duration column. Video dimensions and duration come from metadata without analyzing frames.
 
 **Check matches before deleting files.**
 
@@ -196,19 +196,18 @@ Press **S** in the viewer or choose **“Settings...”** from the context menu.
 
 The interface is available in Russian and English; additional translations can be added through `mediares_ui.lng`.
 
-For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions and the local cache are stored in `%LOCALAPPDATA%\mediares`.
+For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions are stored in `%LOCALAPPDATA%\mediares\mediares.sqlite3` (up to 200 videos), separately from the local cache. The old `mediares_resume.txt` is no longer used and may be deleted.
 
-Hashes, fingerprints, sharpness and metadata (EXIF, tags, stream properties, dimensions and pixel format) survive restarts in `content-cache-v1.sqlite3` in that folder. Results are reread when the file size or modification time changes. To clear the cache, close all TC instances and delete the database; to disable it, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
+Hashes, fingerprints, sharpness and metadata (EXIF, tags, stream properties, dimensions and pixel format) survive restarts in `%LOCALAPPDATA%\mediares\content-cache-v1.sqlite3`. Results are reread when the file size, modification time or algorithm version changes. The limits are 256 MiB for the main database and about 500,000 records; old records are evicted when full. To clear it, close all TC instances and delete the cache database. There is no need to disable caching during normal use; for diagnostics, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
 
 ## Building
 
-Requires Rust and Windows build tools.
+Checks require Rust and build tools for the selected toolchain. Release script `build_release.bat` uses `stable-x86_64-pc-windows-gnu` (installed through rustup if missing); first add the `bin` directory from w64devkit, containing `dlltool.exe`, to `PATH`.
 
 ```powershell
-cargo test             # tests
-cargo build --release  # build
-.\build_release.bat    # tests, build and installation archives in dist/
-python scripts/test_content_cache.py # check SQLite caching in the built DLL (Python 3)
+cargo test --workspace --locked  # tests for the entire workspace
+.\build_release.bat              # release DLLs and installation archives in dist/
+python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite cache (Python 3)
 ```
 
 ## License

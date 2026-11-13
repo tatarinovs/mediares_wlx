@@ -199,8 +199,11 @@ The plugin's fields can be shown in panel columns and used in file
 search (Alt+F7) and in multi-rename (Ctrl+M). They are in the
 "mediares" group.
 
-Hashes, sharpness and uncached stream properties are calculated in the
-background. Dimensions and cached metadata remain available immediately.
+Hashes, sharpness, uncached EXIF and stream properties are read in the
+background. Header-only image dimensions and RAM-cached metadata remain
+available immediately. Video dimensions and duration need no frame analysis.
+Audio_Duration_Sec measures the decoded stream; Audio_Length uses metadata.
+Audio hashes are withheld on decoding errors or detected truncation.
 
 Image hashes, video/audio fingerprints, PCM hashes, sharpness and metadata survive
 Total Commander restarts in a local SQLite database:
@@ -208,8 +211,7 @@ Total Commander restarts in a local SQLite database:
 
 Metadata includes EXIF, audio/video tags, stream properties, image
 dimensions and pixel format, and the TIFF page list. Data is saved on
-demand; cover images and lyrics are excluded. Updating the plugin
-preserves existing cached hashes. A change in file size, modification
+demand; cover images and lyrics are excluded. A change in file size, modification
 time or algorithm version triggers a fresh read. Renamed files are also
 read again. Content changes preserving both size and time cannot be detected.
 
@@ -387,9 +389,12 @@ the right-click menu. You can set:
 
 The settings are stored in mediares.ini next to Total Commander's
 settings. If you put mediares.ini next to the plugin file itself, it is
-used from there (handy for a portable installation). Video resume
-positions, the wallpaper image and the libmpv shader cache belong to
-the particular computer and are kept in %LOCALAPPDATA%\mediares.
+used from there (handy for a portable installation).
+Video resume positions are stored in mediares.sqlite3 (up to 200 videos),
+separately from the disposable content cache. The old mediares_resume.txt
+is no longer used and may be deleted.
+The history database, wallpaper image and libmpv shader cache belong
+to the particular computer and are kept in %LOCALAPPDATA%\mediares.
 
 The interface translations are built into the plugin; a sample comes
 in the archive as mediares_ui.lng (UTF-8). Put this file next to the

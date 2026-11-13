@@ -38,13 +38,13 @@ def worker(dll_path, paths):
                  "Image_Width", "Image_Height", "Image_Bit_Depth", "Image_Has_Alpha"],
         ".wav": ["Audio_Fingerprint", "Audio_PCM_Hash", "Audio_Duration_Sec", "Audio_Title",
                  "Audio_Artist", "Audio_Sample_Rate_Hz", "Audio_Codec", "Audio_Channels"],
-        ".avi": ["Video_Fingerprint", "Video_dHash_Mid", "Video_Duration_Sec",
-                 "Video_Width", "Video_Height", "Video_Frame_Rate", "Video_Codec"],
+        ".avi": ["Video_Width", "Video_Height", "Video_Dimensions", "Video_Duration_Sec",
+                 "Video_Frame_Rate", "Video_Codec", "Video_Fingerprint", "Video_dHash_Mid"],
         ".jpg": ["Photo_Make", "Photo_Model", "Photo_Orientation", "Photo_ISO", "Photo_FNumber"],
         ".mp4": ["Video_Title", "Video_Artist", "Video_Year"],
     }
     delayed = {"Image_dHash", "Image_Sharpness", "Audio_Fingerprint", "Audio_Title",
-               "Video_Fingerprint", "Video_Width", "Video_Title"}
+               "Video_Fingerprint", "Video_Width", "Video_Title", "Photo_Make"}
     values = {}
     start = time.perf_counter()
     try:

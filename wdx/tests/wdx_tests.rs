@@ -677,10 +677,10 @@ fn test_photo_exif_fields() {
         (res, f64::from_le_bytes(buf[..8].try_into().unwrap()))
     };
 
-    // EXIF and header sizes are cheap: never delayed.
+    // Uncached EXIF can require seeks on a NAS; header-only JPEG size stays immediate.
     assert_eq!(
         raw(&jpg, field("Photo_Make"), CONTENT_DELAYIFSLOW).0,
-        FT_STRINGW
+        FT_DELAYED
     );
     assert_eq!(
         raw(&jpg, field("Image_Width"), CONTENT_DELAYIFSLOW).0,
@@ -691,6 +691,10 @@ fn test_photo_exif_fields() {
     assert_eq!(int(&jpg, field("Image_Height")), (FT_NUMERIC_32, 48));
     assert_eq!(int(&png, field("Image_Width")), (FT_NUMERIC_32, 64));
     assert_eq!(text(field("Photo_Make")), (FT_STRINGW, "Canon".to_string()));
+    assert_eq!(
+        raw(&jpg, field("Photo_Make"), CONTENT_DELAYIFSLOW).0,
+        FT_STRINGW
+    );
     assert_eq!(
         text(field("Photo_Model")),
         (FT_STRINGW, "EOS R5".to_string())

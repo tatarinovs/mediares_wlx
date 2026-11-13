@@ -219,7 +219,10 @@ fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia
         MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
             Ok(a) => CachedMedia::Audio(Arc::new(a)),
             Err(crate::audio_fingerprint::AudioError::Cancelled) => return None,
-            Err(crate::audio_fingerprint::AudioError::Unsupported) => CachedMedia::Unsupported,
+            Err(
+                crate::audio_fingerprint::AudioError::Unsupported
+                | crate::audio_fingerprint::AudioError::Invalid,
+            ) => CachedMedia::Unsupported,
         },
         _ => CachedMedia::Unsupported,
     })
@@ -275,6 +278,10 @@ fn exif_cache() -> &'static MetaCache<crate::exif::ExifInfo> {
 
 pub fn get_exif(path: &Path) -> Option<Arc<crate::exif::ExifInfo>> {
     exif_cache().get_or_read(path, crate::exif::read_exif)
+}
+
+pub fn is_exif_cached(path: &Path) -> bool {
+    exif_cache().contains(path)
 }
 
 fn tiff_pages_cache() -> &'static MetaCache<Vec<crate::wic_decode::TiffPage>> {

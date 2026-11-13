@@ -3,6 +3,7 @@
 //! detection fields, and stream properties for WDX columns. The output depends on the installed
 //! decoders, so the pure-Rust path stays the first choice.
 
+use std::io;
 use std::path::Path;
 
 use windows::Win32::Media::MediaFoundation::{
@@ -26,6 +27,8 @@ pub struct MfAudioReader {
     reader: IMFSourceReader,
     pub sample_rate: u32,
     pub channels: u16,
+    pub duration: Option<f64>,
+    ended: bool,
     out: Vec<f32>,
     /// Declared after `reader`, so COM is released after it.
     _com: ComScope,
@@ -42,42 +45,52 @@ impl MfAudioReader {
             wanted.SetGUID(&MF_MT_SUBTYPE, &MFAudioFormat_Float).ok()?;
             reader.SetCurrentMediaType(STREAM, None, &wanted).ok()?;
             let (sample_rate, channels) = float_format(&reader)?;
+            let duration = duration_sec(&reader);
             Some(Self {
                 reader,
                 sample_rate,
                 channels,
+                duration: (duration > 0.0).then_some(duration),
+                ended: false,
                 out: Vec::new(),
                 _com: com,
             })
         }
     }
 
-    /// Decodes the next run of interleaved samples; `None` at the end of the stream, on an error
-    /// or when the format changes mid-stream.
-    pub fn next_chunk(&mut self) -> Option<&[f32]> {
+    /// Clean EOF is `Ok(None)`; decoder errors and format changes must not hash as success.
+    pub fn next_chunk(&mut self) -> io::Result<Option<&[f32]>> {
+        if self.ended {
+            return Ok(None);
+        }
         unsafe {
             for _ in 0..MAX_EMPTY_READS {
                 let (mut flags, mut sample) = (0u32, None);
                 self.reader
                     .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
-                    .ok()?;
+                    .map_err(io::Error::other)?;
                 if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
-                    return None;
+                    return Err(io::Error::other("audio source reader failed"));
                 }
                 if flags & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED.0 as u32 != 0
                     && float_format(&self.reader) != Some((self.sample_rate, self.channels))
                 {
-                    return None;
+                    return Err(io::Error::other("audio format changed during analysis"));
                 }
+                self.ended = flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0;
                 let Some(sample) = sample else {
-                    if flags & MF_SOURCE_READERF_ENDOFSTREAM.0 as u32 != 0 {
-                        return None;
+                    if self.ended {
+                        return Ok(None);
                     }
                     continue;
                 };
-                let buffer = sample.ConvertToContiguousBuffer().ok()?;
+                let buffer = sample
+                    .ConvertToContiguousBuffer()
+                    .map_err(io::Error::other)?;
                 let (mut ptr, mut len) = (std::ptr::null_mut(), 0u32);
-                buffer.Lock(&mut ptr, None, Some(&mut len)).ok()?;
+                buffer
+                    .Lock(&mut ptr, None, Some(&mut len))
+                    .map_err(io::Error::other)?;
                 self.out.clear();
                 if !ptr.is_null() {
                     let bytes = std::slice::from_raw_parts(ptr, len as usize);
@@ -94,10 +107,13 @@ impl MfAudioReader {
                 }
                 let _ = buffer.Unlock();
                 if !self.out.is_empty() {
-                    return Some(&self.out);
+                    return Ok(Some(&self.out));
+                }
+                if self.ended {
+                    return Ok(None);
                 }
             }
-            None
+            Err(io::Error::other("too many empty audio reads"))
         }
     }
 }
@@ -198,7 +214,7 @@ mod tests {
         let mut reader = MfAudioReader::open(&path).expect("open");
         assert_eq!((reader.sample_rate, reader.channels), (rate, 1));
         let mut samples = Vec::new();
-        while let Some(chunk) = reader.next_chunk() {
+        while let Some(chunk) = reader.next_chunk().expect("decode") {
             samples.extend_from_slice(chunk);
         }
         assert_eq!(samples.len(), frames as usize);

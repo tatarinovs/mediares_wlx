@@ -86,6 +86,8 @@ pub struct MediaView {
     last_seek_step: Option<Instant>,
     /// The frame under the cursor on the timeline (video only), made on first hover.
     seek_preview: Option<SeekPreview>,
+    /// Owned result mailbox; dropped on file switches or window close.
+    pub contact_sheet: Option<crate::contact_sheet::Task>,
     /// Whether to show it at all (a setting).
     seek_preview_enabled: bool,
     /// A-B loop: its start once set, then its end (playback jumps back to the start there).
@@ -151,6 +153,7 @@ impl MediaView {
                 view.status = None;
                 let _ = KillTimer(Some(viewer), STATUS_TIMER_ID);
                 view.seek_preview = None;
+                view.contact_sheet = None;
                 view.seek_preview_enabled = options.seek_preview;
                 view.ab_loop = (None, None);
                 view.file_name = file_name(path);
@@ -183,6 +186,7 @@ impl MediaView {
             bar_host: None,
             last_seek_step: None,
             seek_preview: None,
+            contact_sheet: None,
             seek_preview_enabled: options.seek_preview,
             ab_loop: (None, None),
             press: None,

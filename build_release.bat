@@ -46,9 +46,9 @@ set "CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=%GNU_BIN%\x86_64-w64-mingw32-gcc.
 set "RUSTFLAGS="
 set "CARGO_ENCODED_RUSTFLAGS="
 
-:: Extract version from combo/Cargo.toml
+:: Extract the shared workspace version.
 set "VERSION=unknown"
-for /f "tokens=3 delims= " %%A in ('findstr /b "version" combo\Cargo.toml') do (
+for /f "tokens=3 delims= " %%A in ('findstr /b "version " Cargo.toml') do (
     set "VERSION=%%~A"
 )
 echo [INFO] Target release version: v!VERSION!

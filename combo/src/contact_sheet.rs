@@ -3,6 +3,7 @@
 //! decoded frame per picture) and saved next to the video in the format chosen for frames.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use mediares_core::image::{DynamicImage, RgbaImage};
 use mediares_core::video_frame::FrameGrabber;
@@ -20,8 +21,7 @@ use crate::image_view::draw_fitted;
 use crate::snapshot::{save_unique_picture, PictureFormat};
 use crate::transport_bar::format_time;
 
-/// Posted to the viewer when the sheet is saved (or failed); `lparam` owns a `Box<String>` with
-/// the message for the bar.
+/// Notification only: `wparam` carries a task token; the task owns the text, not the message.
 pub const WM_CONTACT_SHEET: u32 = WM_APP + 0x15;
 
 const CELL_WIDTH: u32 = 480;
@@ -42,14 +42,33 @@ pub struct SheetInfo {
     pub rows: u32,
 }
 
-/// Makes the sheet of `video` in the background; `viewer` gets [`WM_CONTACT_SHEET`].
-pub fn start(viewer: HWND, video: &Path, info: SheetInfo, format: PictureFormat) {
+pub struct Task {
+    result: Arc<Mutex<Option<String>>>,
+    token: usize,
+}
+
+impl Task {
+    /// A result belongs to this media view only, even if Windows reuses its HWND later.
+    pub fn take_message(&self, token: usize) -> Option<String> {
+        (self.token == token)
+            .then(|| self.result.lock().unwrap_or_else(|e| e.into_inner()).take())
+            .flatten()
+    }
+}
+
+/// At most one task per media view. Dropping it cancels work and frees any undelivered text.
+pub fn start(viewer: HWND, video: &Path, info: SheetInfo, format: PictureFormat) -> Option<Task> {
     let (video, viewer) = (video.to_path_buf(), viewer.0 as isize);
-    // Without a thread the viewer gets no answer; nothing was started either.
-    let _ = std::thread::Builder::new()
+    let task = Task {
+        result: Arc::new(Mutex::new(None)),
+        token: crate::media_events::next_token(),
+    };
+    let (result, token) = (Arc::downgrade(&task.result), task.token);
+    std::thread::Builder::new()
         .name("mediares-contact-sheet".into())
         .spawn(move || {
-            let text = match make(&video, &info, format) {
+            let cancelled = || result.strong_count() == 0;
+            let text = match make(&video, &info, format, &cancelled) {
                 Some(saved) => format!(
                     "{}: {}",
                     tr("Contact sheet saved"),
@@ -57,32 +76,30 @@ pub fn start(viewer: HWND, video: &Path, info: SheetInfo, format: PictureFormat)
                 ),
                 None => tr("Could not make the contact sheet").to_string(),
             };
-            let message = Box::into_raw(Box::new(text));
-            let posted = unsafe {
-                PostMessageW(
+            let Some(result) = result.upgrade() else {
+                return;
+            };
+            *result.lock().unwrap_or_else(|e| e.into_inner()) = Some(text);
+            unsafe {
+                let _ = PostMessageW(
                     Some(HWND(viewer as *mut _)),
                     WM_CONTACT_SHEET,
-                    WPARAM(0),
-                    LPARAM(message as isize),
-                )
-            };
-            if posted.is_err() {
-                // The viewer is gone: nobody takes the message.
-                drop(unsafe { Box::from_raw(message) });
+                    WPARAM(token),
+                    LPARAM(0),
+                );
             }
-        });
-}
-
-/// The message posted with [`WM_CONTACT_SHEET`].
-///
-/// # Safety
-/// `lparam` must come from that message, taken once.
-pub unsafe fn take_message(lparam: LPARAM) -> String {
-    *Box::from_raw(lparam.0 as *mut String)
+        })
+        .ok()?;
+    Some(task)
 }
 
 /// The saved file.
-fn make(video: &Path, info: &SheetInfo, format: PictureFormat) -> Option<PathBuf> {
+fn make(
+    video: &Path,
+    info: &SheetInfo,
+    format: PictureFormat,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<PathBuf> {
     if info.columns == 0 || info.rows == 0 {
         return None;
     }
@@ -90,8 +107,14 @@ fn make(video: &Path, info: &SheetInfo, format: PictureFormat) -> Option<PathBuf
     let times: Vec<f64> = (0..count)
         .map(|i| info.duration * (f64::from(i) + 0.5) / f64::from(count))
         .collect();
-    let frames = frames(video, info.duration, &times)?;
+    let frames = frames(video, info.duration, &times, cancelled)?;
+    if cancelled() {
+        return None;
+    }
     let sheet = unsafe { compose(video, info, &frames)? };
+    if cancelled() {
+        return None;
+    }
     let stem = video.file_stem()?.to_string_lossy().into_owned();
     save_unique_picture(&sheet, video, &format!("{stem}_sheet"), format)
 }
@@ -101,22 +124,31 @@ type Shot = (DecodedImage, f64);
 
 /// One frame per time, with the time it shows (a key frame: at or before the one asked for):
 /// from Media Foundation, else from libmpv (formats only it plays).
-fn frames(video: &Path, duration: f64, times: &[f64]) -> Option<Vec<Option<Shot>>> {
+fn frames(
+    video: &Path,
+    duration: f64,
+    times: &[f64],
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Vec<Option<Shot>>> {
     let fit = (CELL_WIDTH, CELL_WIDTH);
     let shot = |frame: RgbaImage, time| (to_bgra(DynamicImage::ImageRgba8(frame), 0, false), time);
     if let Some(grabber) = FrameGrabber::open(video) {
-        return Some(
-            times
-                .iter()
-                .map(|&t| grabber.frame_at(t, Some(fit)).map(|(f, t)| shot(f, t)))
-                .collect(),
-        );
+        return times
+            .iter()
+            .map(|&t| {
+                if cancelled() {
+                    return None;
+                }
+                Some(grabber.frame_at(t, Some(fit)).map(|(f, t)| shot(f, t)))
+            })
+            .collect::<Option<Vec<_>>>();
     }
     if !crate::playback_mpv::available() || duration <= 0.0 {
         return None;
     }
     let frames: Vec<Option<Shot>> = times
         .iter()
+        .take_while(|_| !cancelled())
         .map(|&t| {
             crate::playback_mpv::video_frame(video, t / duration, fit).map(|f| {
                 let (w, h) = mediares_core::image_decode::fitted_size(f.dimensions(), fit);
@@ -223,4 +255,21 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
         pages: 1,
         exif: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn old_notifications_cannot_consume_a_new_tasks_result() {
+        let result = Arc::new(Mutex::new(Some("saved".to_owned())));
+        let weak = Arc::downgrade(&result);
+        let task = Task { result, token: 5 };
+        assert_eq!(task.take_message(4), None);
+        assert_eq!(task.take_message(5).as_deref(), Some("saved"));
+        assert_eq!(task.take_message(5), None);
+        drop(task);
+        assert!(weak.upgrade().is_none());
+    }
 }

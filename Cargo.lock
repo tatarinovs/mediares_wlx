@@ -230,6 +230,7 @@ name = "mediares_combo"
 version = "0.4.6"
 dependencies = [
  "mediares_core",
+ "rusqlite",
  "windows",
  "windows-core",
 ]

@@ -1,6 +1,6 @@
 [package]
 name = "mediares_combo"
-version = "0.4.6"
+version.workspace = true
 edition = "2021"
 license = "MIT"
 
@@ -9,6 +9,7 @@ name = "mediares_combo"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+rusqlite.workspace = true
 mediares_core = { path = "../core", features = ["raw-preview", "psd-preview", "audio-decode", "tags"] }
 windows-core = "0.62.2"
 windows = { version = "0.62.2", features = [

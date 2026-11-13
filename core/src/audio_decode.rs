@@ -13,7 +13,7 @@ use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::units::{Time, TimeBase, Timestamp};
 
-/// Consecutive undecodable packets after which the stream is treated as finished.
+/// Consecutive undecodable packets tolerated during playback (analysis rejects the first).
 const MAX_BAD_PACKETS: u32 = 64;
 
 /// Sequential decoder of the default audio track of a file.
@@ -81,17 +81,27 @@ impl AudioDecoder {
 
     /// Decodes the next run of samples; `None` at the end of the stream (or on a fatal error).
     pub fn next_chunk(&mut self) -> Option<Chunk<'_>> {
+        self.read_chunk(false).ok().flatten()
+    }
+
+    /// Analysis must distinguish clean EOF from a skipped packet or a fatal decoder error.
+    pub fn next_chunk_checked(&mut self) -> io::Result<Option<Chunk<'_>>> {
+        self.read_chunk(true)
+    }
+
+    fn read_chunk(&mut self, strict: bool) -> io::Result<Option<Chunk<'_>>> {
         let mut bad_packets = 0;
         loop {
             let packet = match self.format.next_packet() {
                 Ok(Some(p)) => p,
+                Ok(None) => return Ok(None),
                 Err(Error::IoError(_)) | Err(Error::DecodeError(_))
-                    if bad_packets < MAX_BAD_PACKETS =>
+                    if !strict && bad_packets < MAX_BAD_PACKETS =>
                 {
                     bad_packets += 1;
                     continue;
                 }
-                _ => return None,
+                Err(e) => return Err(io::Error::other(e)),
             };
             if packet.track_id != self.track_id {
                 continue;
@@ -99,12 +109,12 @@ impl AudioDecoder {
             let buf = match self.decoder.decode(&packet) {
                 Ok(buf) => buf,
                 Err(Error::IoError(_)) | Err(Error::DecodeError(_))
-                    if bad_packets < MAX_BAD_PACKETS =>
+                    if !strict && bad_packets < MAX_BAD_PACKETS =>
                 {
                     bad_packets += 1;
                     continue;
                 }
-                Err(_) => return None,
+                Err(e) => return Err(io::Error::other(e)),
             };
             let frames = buf.frames();
             if frames == 0 {
@@ -139,10 +149,10 @@ impl AudioDecoder {
                 self.channels as usize,
                 &mut self.out,
             );
-            return Some(Chunk {
+            return Ok(Some(Chunk {
                 start,
                 samples: &self.out,
-            });
+            }));
         }
     }
 

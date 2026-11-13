@@ -44,12 +44,15 @@ pub enum AudioError {
     /// The host asked to stop; the result must not be cached.
     Cancelled,
     Unsupported,
+    /// Decoding stopped early or encountered damaged packets. Never fingerprint a prefix.
+    Invalid,
 }
 
 /// Interleaved PCM from either decoder.
 trait PcmSource {
     fn format(&self) -> (u32, usize);
-    fn next_samples(&mut self) -> Option<&[f32]>;
+    fn duration(&self) -> Option<f64>;
+    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>>;
 }
 
 impl PcmSource for AudioDecoder {
@@ -57,8 +60,12 @@ impl PcmSource for AudioDecoder {
         (self.sample_rate, self.channels as usize)
     }
 
-    fn next_samples(&mut self) -> Option<&[f32]> {
-        self.next_chunk().map(|c| c.samples)
+    fn duration(&self) -> Option<f64> {
+        self.duration
+    }
+
+    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
+        self.next_chunk_checked().map(|c| c.map(|c| c.samples))
     }
 }
 
@@ -67,7 +74,11 @@ impl PcmSource for MfAudioReader {
         (self.sample_rate, self.channels as usize)
     }
 
-    fn next_samples(&mut self) -> Option<&[f32]> {
+    fn duration(&self) -> Option<f64> {
+        self.duration
+    }
+
+    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
         self.next_chunk()
     }
 }
@@ -94,12 +105,22 @@ fn analyze_source(
     cancelled: &dyn Fn() -> bool,
 ) -> Result<AudioAnalysis, AudioError> {
     let (rate, channels) = source.format();
+    if rate == 0 || channels == 0 {
+        return Err(AudioError::Invalid);
+    }
+    let expected = source.duration();
     let mut pcm = PcmHash::new(rate, channels);
     let mut bands = BandAnalyzer::new(rate);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
-    while let Some(samples) = source.next_samples() {
+    while let Some(samples) = source.next_samples().map_err(|_| {
+        if frames_total == 0 {
+            AudioError::Unsupported
+        } else {
+            AudioError::Invalid
+        }
+    })? {
         chunks += 1;
         if chunks.is_multiple_of(CANCEL_CHECK_EVERY) && cancelled() {
             return Err(AudioError::Cancelled);
@@ -115,6 +136,13 @@ fn analyze_source(
     }
 
     let duration = frames_total as f64 / rate as f64;
+    // Allow codec padding/rounding, but not a file ending seconds before its declared end.
+    if expected.is_some_and(|expected| expected.is_finite() && expected > duration + 0.25) {
+        return Err(AudioError::Invalid);
+    }
+    if cancelled() {
+        return Err(AudioError::Cancelled);
+    }
     Ok(AudioAnalysis {
         duration_sec: duration.round() as u32,
         pcm_hash: pcm.finish(),
@@ -412,6 +440,50 @@ fn split_even<T>(items: &[T], parts: usize) -> impl Iterator<Item = &[T]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn truncated_audio_does_not_get_a_hash_of_its_valid_prefix() {
+        let path = crate::test_util::pcm16_wav("truncated-analysis", 8000, 1, 32000, |i| {
+            (i % 1000) as i16 * 16
+        });
+        assert!(analyze_audio(&path, &|| false).is_ok());
+        let mut bytes = std::fs::read(&path).unwrap();
+        // The same prefix, with a header declaring five times as much PCM.
+        bytes[4..8].copy_from_slice(&(36u32 + 32000 * 2 * 5).to_le_bytes());
+        bytes[40..44].copy_from_slice(&(32000u32 * 2 * 5).to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            analyze_audio(&path, &|| false),
+            Err(AudioError::Invalid)
+        ));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn errors_after_decoded_samples_are_not_clean_eof() {
+        struct Broken {
+            read: bool,
+        }
+        impl PcmSource for Broken {
+            fn format(&self) -> (u32, usize) {
+                (8000, 1)
+            }
+            fn duration(&self) -> Option<f64> {
+                None
+            }
+            fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
+                if std::mem::replace(&mut self.read, true) {
+                    Err(std::io::Error::other("broken packet"))
+                } else {
+                    Ok(Some(&[0.5; 256]))
+                }
+            }
+        }
+        assert!(matches!(
+            analyze_source(&mut Broken { read: false }, &|| false),
+            Err(AudioError::Invalid)
+        ));
+    }
 
     #[test]
     fn fft_finds_a_tone() {
