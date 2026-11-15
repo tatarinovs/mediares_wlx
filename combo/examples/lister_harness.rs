@@ -15,7 +15,7 @@
 //!        copy:<name>     ListSendCommand(lc_copy), clipboard DIB saved as <name>.png
 //!        print           open print preview through ListPrintW (pair with dialog to cancel)
 //!        print-check     check preview orientation/margins/copies, capture it, then cancel
-//!        print-pdf-check print through the preview and the PDF driver's Save As dialog
+//!        print-pdf-check[:pages[|copies]] print through the preview and PDF Save As dialog
 //!        print-pdf-cancel-check cancel the PDF filename dialog and return to the preview
 //!        thumb:<w>,<h>,<name>[,<file>]  ListGetPreviewBitmapW saved as <name>.png
 //!        dialog:<name>[,<pages>]  put before the step that opens a modal dialog: waits for it,
@@ -285,7 +285,7 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print
                 String::from_utf16_lossy(&buf[..len])
             };
             let preferred_printer = get(100) == "Microsoft Print to PDF";
-            let tc_margin = get(110).replace(',', ".") == "12.5";
+            let tc_margin = (110..114).all(|id| get(id).replace(',', ".") == "10");
             click(103);
             let landscape = checked(103) && !checked(102) && checked(171);
             let print = GetDlgItem(Some(dlg), IDOK.0).unwrap();
@@ -376,7 +376,7 @@ fn shoot_dialog(thread: u32, name: String, pages: usize, out_dir: PathBuf, print
 }
 
 /// Exercises the actual preview -> worker -> PDF driver's filename dialog -> completion path.
-fn print_pdf_check(thread: u32, out_dir: PathBuf, cancel: bool) {
+fn print_pdf_check(thread: u32, out_dir: PathBuf, cancel: bool, selection: String) {
     unsafe extern "system" fn find_save(hwnd: HWND, found: LPARAM) -> windows::core::BOOL {
         let mut process = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut process));
@@ -417,6 +417,51 @@ fn print_pdf_check(thread: u32, out_dir: PathBuf, cancel: bool) {
         };
         std::thread::sleep(Duration::from_millis(300));
         let print = GetDlgItem(Some(dlg), IDOK.0).unwrap();
+        if let Ok(next) = GetDlgItem(Some(dlg), 201) {
+            let label = || {
+                let mut value = [0u16; 128];
+                let len = GetWindowTextW(GetDlgItem(Some(dlg), 202).unwrap(), &mut value);
+                String::from_utf16_lossy(&value[..len as usize])
+            };
+            let before = label();
+            SendMessageW(next, BM_CLICK, None, None);
+            while !IsWindowEnabled(print).as_bool() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_ne!(label(), before, "preview must advance");
+            let mut rc = RECT::default();
+            GetWindowRect(dlg, &mut rc).unwrap();
+            capture(rc, &out_dir.join("multipage-preview.png"));
+            SendMessageW(GetDlgItem(Some(dlg), 200).unwrap(), BM_CLICK, None, None);
+            while !IsWindowEnabled(print).as_bool() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            assert_eq!(label(), before, "preview must return");
+        }
+        if !selection.is_empty() {
+            let (pages, copies) = selection.split_once('|').unwrap_or((&selection, "1"));
+            let scope = GetDlgItem(Some(dlg), 203).expect("multipage selection");
+            SendMessageW(scope, CB_SETCURSEL, Some(WPARAM(1)), None);
+            SendMessageW(
+                dlg,
+                WM_COMMAND,
+                Some(WPARAM(203 | ((CBN_SELCHANGE as usize) << 16))),
+                Some(LPARAM(scope.0 as isize)),
+            );
+            let range = GetDlgItem(Some(dlg), 204).unwrap();
+            SetWindowTextW(range, &windows::core::HSTRING::from("0,999999")).unwrap();
+            assert!(
+                !IsWindowEnabled(print).as_bool(),
+                "invalid pages must block printing"
+            );
+            SetWindowTextW(range, &windows::core::HSTRING::from(pages)).unwrap();
+            SetWindowTextW(
+                GetDlgItem(Some(dlg), 116).unwrap(),
+                &windows::core::HSTRING::from(copies),
+            )
+            .unwrap();
+            assert!(IsWindowEnabled(print).as_bool(), "valid pages and copies");
+        }
         SendMessageW(print, BM_CLICK, None, None);
         let busy = !IsWindowEnabled(print).as_bool()
             && IsWindowEnabled(GetDlgItem(Some(dlg), IDCANCEL.0).unwrap()).as_bool();
@@ -745,8 +790,9 @@ fn main() {
                         let thread = windows::Win32::System::Threading::GetCurrentThreadId();
                         let out = out_dir.clone();
                         let cancel = cmd == "print-pdf-cancel-check";
+                        let selection = arg.to_string();
                         Some(std::thread::spawn(move || {
-                            print_pdf_check(thread, out, cancel)
+                            print_pdf_check(thread, out, cancel, selection)
                         }))
                     } else {
                         None

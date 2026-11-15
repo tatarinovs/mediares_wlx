@@ -141,5 +141,23 @@ pub(crate) unsafe fn print(hwnd: HWND, printer: Option<&str>, margins: Option<RE
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    crate::print::print(dialog::modal_owner(hwnd), picture, &name, printer, margins)
+    let source = (picture.pages > 1 && state.media.is_none()).then(|| crate::print::Source {
+        path: state.file_path.clone(),
+        kind: mediares_core::probe::probe_file(&state.file_path),
+        options: crate::image_cache::DecodeOptions {
+            auto_rotate: state.config.auto_rotate_exif,
+            background: state.config.photo_background,
+            fit: 0,
+            page: state.page,
+        },
+        quarter_turns: state.quarter_turns,
+    });
+    crate::print::print(
+        dialog::modal_owner(hwnd),
+        picture,
+        source,
+        &name,
+        printer,
+        margins,
+    )
 }

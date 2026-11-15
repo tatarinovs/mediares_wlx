@@ -267,10 +267,12 @@ mod tests {
     }
 
     fn orientation_of(jpeg: &[u8]) -> Option<u16> {
+        // Each call needs a distinct file: equal-sized JPEGs can share an mtime and cache key.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let path = std::env::temp_dir().join(format!(
             "mediares_{}_{}.jpg",
             std::process::id(),
-            jpeg.len()
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         std::fs::write(&path, jpeg).unwrap();
         let o = crate::exif::read_orientation(&path);

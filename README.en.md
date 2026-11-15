@@ -57,6 +57,7 @@ Features:
 - Zoom, magnifier, rotation, two-photo comparison and slideshow.
 - EXIF display and shooting location on a map.
 - Save as JPEG/PNG, copy, print and open in an external editor.
+- Print multipage TIFFs: all pages or selected numbers and ranges (e.g. `1-3, 5`), with page navigation in the preview.
 - Lossless JPEG rotation and metadata removal.
 - Skip RAW files when a matching JPEG exists.
 

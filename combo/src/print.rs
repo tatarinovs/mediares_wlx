@@ -3,7 +3,10 @@
 mod controls;
 mod job;
 mod layout;
+mod pages;
 mod printer;
+use pages::Pages;
+pub(crate) use pages::Source;
 
 use std::sync::Arc;
 use windows::core::{w, HSTRING, PCWSTR};
@@ -57,6 +60,11 @@ const DEFAULT_MARGIN_MM: i32 = 10;
 const MM100_PER_MM: i32 = 100;
 const STATUS: usize = 190;
 const PRINT_TIMER: usize = 1;
+const PAGE_PREV: usize = 200;
+const PAGE_NEXT: usize = 201;
+const PAGE_LABEL: usize = 202;
+const PAGE_SCOPE: usize = 203;
+const PAGE_RANGE: usize = 204;
 
 /// The Lister SDK passes MM_LOMETRIC (1/10 mm); internally margins use 1/100 mm.
 pub(crate) fn tc_margins(m: RECT) -> RECT {
@@ -72,6 +80,10 @@ struct Preview {
     printer: Printer,
     available: bool,
     image: Arc<DecodedImage>,
+    source: Option<Source>,
+    page: u32,
+    page_count: u32,
+    pending: Option<crate::image_cache::Ticket>,
     preview: Arc<DecodedImage>,
     name: String,
     printed: bool,
@@ -268,9 +280,10 @@ unsafe fn refresh_printers(dlg: HWND, data: &mut Preview) {
 pub unsafe fn print(
     owner: HWND,
     img: Arc<DecodedImage>,
+    source: Option<Source>,
     doc_name: &str,
     preferred_printer: Option<&str>,
-    margins: Option<RECT>,
+    _margins: Option<RECT>,
 ) -> bool {
     let printers = printer::enumerate();
     let default = printer::default_name();
@@ -306,7 +319,15 @@ pub unsafe fn print(
         job: None,
         caption_font: HFONT::default(),
         preview: preview_copy(&img),
-        image: img,
+        image: img.clone(),
+        page: source.as_ref().map_or(0, |s| s.options.page),
+        page_count: if source.is_some() {
+            img.pages.max(1)
+        } else {
+            1
+        },
+        source,
+        pending: None,
         name: doc_name.to_string(),
         printed: false,
         papers: Vec::new(),
@@ -315,11 +336,12 @@ pub unsafe fn print(
     };
     SetWindowLongPtrW(dlg, GWLP_USERDATA, &mut data as *mut _ as isize);
 
-    let (print_button, _small_font) = controls::build(dlg, &mut data, margins, &font, printers);
+    let (print_button, _small_font) = controls::build(dlg, &mut data, &font, printers);
 
     data.initializing = false;
     sync_orientation(dlg, data.printer.dc);
     refresh_papers(dlg, &mut data);
+    page_controls(dlg, &data);
     validate(dlg, &data);
     dialog::run_modal(dlg, print_button);
     data.printed
@@ -400,6 +422,83 @@ unsafe fn preview_rect(dlg: HWND) -> RECT {
     rc
 }
 
+unsafe fn selected_pages(dlg: HWND, data: &Preview) -> Result<Pages, &'static str> {
+    let selected =
+        SendDlgItemMessageW(dlg, PAGE_SCOPE as i32, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+    if data.page_count == 1 || selected <= 0 {
+        Ok(Pages::all(data.page_count))
+    } else {
+        Pages::parse(&dialog::item_text(dlg, PAGE_RANGE as i32), data.page_count)
+            .ok_or(tr("Enter page numbers and ranges, e.g. 1-3, 5."))
+    }
+}
+
+unsafe fn page_controls(dlg: HWND, data: &Preview) {
+    text(
+        dlg,
+        PAGE_LABEL,
+        &tr_fmt(
+            "Page {page} of {pages}",
+            &[
+                ("page", &(data.page + 1).to_string()),
+                ("pages", &data.page_count.to_string()),
+            ],
+        ),
+    );
+    for (id, enabled) in [
+        (PAGE_PREV, data.page > 0),
+        (PAGE_NEXT, data.page + 1 < data.page_count),
+    ] {
+        let _ = EnableWindow(
+            GetDlgItem(Some(dlg), id as i32).unwrap_or_default(),
+            enabled && data.pending.is_none(),
+        );
+    }
+    let selected =
+        SendDlgItemMessageW(dlg, PAGE_SCOPE as i32, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
+    let _ = EnableWindow(
+        GetDlgItem(Some(dlg), PAGE_RANGE as i32).unwrap_or_default(),
+        selected == 1,
+    );
+}
+
+unsafe fn show_page(dlg: HWND, data: &mut Preview, page: u32) {
+    let Some(source) = data.source.as_ref() else {
+        return;
+    };
+    if page >= data.page_count {
+        return;
+    }
+    let result = crate::image_cache::request(
+        &source.path,
+        source.kind,
+        crate::image_cache::DecodeOptions {
+            page,
+            fit: 1600,
+            ..source.options
+        },
+        dlg,
+    );
+    let failed = result.is_none();
+    match result {
+        Some(crate::image_cache::Request::Ready(image)) => {
+            data.page = page;
+            data.preview = source.turn(image);
+            data.rotated = None;
+        }
+        Some(crate::image_cache::Request::Pending(ticket)) => {
+            data.page = page;
+            data.pending = Some(ticket);
+        }
+        None => {}
+    }
+    page_controls(dlg, data);
+    validate(dlg, data);
+    if failed {
+        crate::file_actions::show_error(dlg, tr("Could not load the page."));
+    }
+}
+
 unsafe fn validate(dlg: HWND, data: &Preview) {
     validate_options(dlg, data, true);
 }
@@ -408,18 +507,19 @@ unsafe fn validate_options(dlg: HWND, data: &Preview, repaint: bool) {
     if data.initializing || data.job.is_some() {
         return;
     }
-    let result = if !data.available {
+    let result = if data.pending.is_some() {
+        Err(tr("Loading page…"))
+    } else if !data.available {
         Err(tr("No default printer is available."))
     } else {
-        options(dlg, data.alignment).and_then(|opt| {
-            data.printer
-                .geometry()
-                .and_then(|g| {
-                    g.layout((data.image.width, data.image.height), opt)
-                        .map(|p| (g, p))
-                })
-                .ok_or(tr("The image does not fit within these margins."))
-        })
+        selected_pages(dlg, data)
+            .and_then(|_| options(dlg, data.alignment))
+            .and_then(|opt| {
+                data.printer
+                    .geometry()
+                    .and_then(|g| g.layout(data.preview.full, opt).map(|p| (g, p)))
+                    .ok_or(tr("The image does not fit within these margins."))
+            })
     };
     let _ = EnableWindow(
         GetDlgItem(Some(dlg), IDOK.0).unwrap_or_default(),
@@ -480,10 +580,17 @@ unsafe fn start_print(dlg: HWND, data: &mut Preview) {
         validate(dlg, data);
         return;
     };
+    let Ok(pages) = selected_pages(dlg, data) else {
+        validate(dlg, data);
+        return;
+    };
+    if data.pending.is_some() {
+        return;
+    }
     if data
         .printer
         .geometry()
-        .and_then(|g| g.layout((data.image.width, data.image.height), opt))
+        .and_then(|g| g.layout(data.preview.full, opt))
         .is_none()
     {
         return;
@@ -491,6 +598,9 @@ unsafe fn start_print(dlg: HWND, data: &mut Preview) {
     let request = job::Request {
         settings: data.printer.settings(),
         image: data.image.clone(),
+        image_page: data.source.as_ref().map_or(0, |s| s.options.page),
+        source: data.source.clone(),
+        pages,
         name: data.name.clone(),
         options: opt,
     };
@@ -516,6 +626,28 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
     match msg {
+        crate::image_cache::WM_IMAGE_READY => {
+            if let Some(result) = (*ptr).pending.as_ref().and_then(|ticket| ticket.result()) {
+                let failed = result.is_none();
+                (*ptr).pending = None;
+                if let Some(image) = result {
+                    if let Some(source) = (*ptr).source.as_ref() {
+                        (*ptr).preview = source.turn(image);
+                        (*ptr).rotated = None;
+                    }
+                } else {
+                    (*ptr).page = (*ptr).source.as_ref().map_or(0, |s| s.options.page);
+                    (*ptr).preview = preview_copy(&(*ptr).image);
+                    (*ptr).rotated = None;
+                }
+                page_controls(hwnd, &*ptr);
+                validate(hwnd, &*ptr);
+                if failed {
+                    crate::file_actions::show_error(hwnd, tr("Could not load the page."));
+                }
+            }
+            LRESULT(0)
+        }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
             let dc = HDC(wp.0 as _);
             SetBkMode(dc, TRANSPARENT);
@@ -645,6 +777,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 return LRESULT(0);
             }
             match id {
+                PAGE_PREV | PAGE_NEXT if (*ptr).pending.is_none() => {
+                    let page = if id == PAGE_PREV {
+                        (*ptr).page.saturating_sub(1)
+                    } else {
+                        (*ptr).page + 1
+                    };
+                    show_page(hwnd, &mut *ptr, page);
+                }
+                PAGE_SCOPE if code == CBN_SELCHANGE => {
+                    page_controls(hwnd, &*ptr);
+                    validate(hwnd, &*ptr);
+                }
                 id if id == IDOK.0 as usize => start_print(hwnd, &mut *ptr),
                 PRINTER_COMBO if code == CBN_SELCHANGE => {
                     let name = dialog::item_text(hwnd, PRINTER_COMBO as i32);
@@ -757,6 +901,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     }
                     _ => {
                         set_busy(hwnd, false);
+                        page_controls(hwnd, &*ptr);
                         update_mode_controls_visibility(hwnd);
                         refresh_papers(hwnd, &mut *ptr);
                         validate(hwnd, &*ptr);
@@ -802,6 +947,16 @@ unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {
         bottom: bounds.bottom,
     };
     FillRect(dc, &canvas, crate::gdi::solid_brush(0x00F0EEEC).0);
+    if data.page_count > 1 {
+        let center = separator / 2;
+        let navigation = RECT {
+            left: center - px(150),
+            top: px(10),
+            right: center + px(150),
+            bottom: px(38),
+        };
+        FillRect(dc, &navigation, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+    }
     FrameRect(
         dc,
         &RECT {
@@ -815,7 +970,10 @@ unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {
     let Some(g) = data.printer.geometry() else {
         return;
     };
-    let available = preview_rect(hwnd);
+    let mut available = preview_rect(hwnd);
+    if data.page_count > 1 {
+        available.top += px(40);
+    }
     let (mm_w, mm_h) = g.paper_mm();
     crate::gdi::text(
         dc,
@@ -837,14 +995,14 @@ unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {
         0x006A6460,
         DT_CENTER | DT_VCENTER | DT_SINGLELINE,
     );
-    let scale =
-        ((available.right - px(52)) as f64 / mm_w).min((available.bottom - px(48)) as f64 / mm_h);
+    let scale = ((available.right - px(52)) as f64 / mm_w)
+        .min((available.bottom - available.top - px(48)) as f64 / mm_h);
     if scale <= 0.0 {
         return;
     }
     let (w, h) = ((mm_w * scale).round() as i32, (mm_h * scale).round() as i32);
     let left = (available.right - w) / 2;
-    let top = (available.bottom - h) / 2;
+    let top = available.top + (available.bottom - available.top - h) / 2;
     let paper = RECT {
         left,
         top,
@@ -863,7 +1021,10 @@ unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {
     let Ok(opt) = options(hwnd, data.alignment) else {
         return;
     };
-    let Some(p) = g.layout((data.image.width, data.image.height), opt) else {
+    if data.pending.is_some() {
+        return;
+    }
+    let Some(p) = g.layout(data.preview.full, opt) else {
         return;
     };
     let placement = Placement {

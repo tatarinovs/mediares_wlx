@@ -5,7 +5,6 @@ use super::*;
 pub(super) unsafe fn build(
     dlg: HWND,
     data: &mut Preview,
-    margins: Option<RECT>,
     font: &crate::gdi::Font,
     printers: Vec<String>,
 ) -> (HWND, crate::gdi::Font) {
@@ -48,6 +47,47 @@ pub(super) unsafe fn build(
         control(w!("BUTTON"), title, BS_GROUPBOX as u32, (x, y, w, h), 0);
     };
 
+    if data.page_count > 1 {
+        let center = (rc.right - px(SIDEBAR_WIDTH)) / 2;
+        for (id, caption, x) in [
+            (PAGE_PREV, "‹", center - px(150)),
+            (PAGE_NEXT, "›", center + px(110)),
+        ] {
+            control(
+                w!("BUTTON"),
+                caption,
+                WS_TABSTOP.0,
+                (x, px(10), px(40), px(28)),
+                id,
+            );
+        }
+        label("", (center - px(105), px(10), px(210), px(28)), PAGE_LABEL);
+        let scope = control(
+            w!("COMBOBOX"),
+            "",
+            WS_TABSTOP.0 | CBS_DROPDOWNLIST as u32,
+            (right_x + px(12), px(526), px(172), px(120)),
+            PAGE_SCOPE,
+        );
+        for caption in [tr("All pages"), tr("Selected pages")] {
+            let caption = HSTRING::from(caption);
+            SendMessageW(
+                scope,
+                CB_ADDSTRING,
+                None,
+                Some(LPARAM(caption.as_ptr() as isize)),
+            );
+        }
+        SendMessageW(scope, CB_SETCURSEL, Some(WPARAM(0)), None);
+        control(
+            w!("EDIT"),
+            &(data.page + 1).to_string(),
+            WS_TABSTOP.0 | WS_BORDER.0 | dialog::ES_AUTOHSCROLL,
+            (right_x + px(194), px(526), ctrl_w - px(206), px(24)),
+            PAGE_RANGE,
+        );
+    }
+
     // Принтер и бумага
     group(tr("Printer"), right_x, px(6), ctrl_w, px(88));
     control(
@@ -88,12 +128,13 @@ pub(super) unsafe fn build(
 
     // Поля (мм)
     group(tr("Margins (mm)"), left_x, px(100), left_w, px(150));
-    let m = margins.unwrap_or(RECT {
+    // Start with our preview defaults rather than the host's page-setup margins.
+    let m = RECT {
         left: DEFAULT_MARGIN_MM * MM100_PER_MM,
         top: DEFAULT_MARGIN_MM * MM100_PER_MM,
         right: DEFAULT_MARGIN_MM * MM100_PER_MM,
         bottom: DEFAULT_MARGIN_MM * MM100_PER_MM,
-    });
+    };
 
     let spin_style = WS_VISIBLE.0
         | WS_CHILD.0
@@ -331,7 +372,12 @@ pub(super) unsafe fn build(
         w!("STATIC"),
         "",
         dialog::SS_LEFT,
-        (right_x + px(12), px(480), ctrl_w - px(24), px(52)),
+        (
+            right_x + px(12),
+            px(480),
+            ctrl_w - px(24),
+            px(if data.page_count > 1 { 40 } else { 52 }),
+        ),
         STATUS,
     );
 

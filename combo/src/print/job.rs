@@ -14,6 +14,7 @@ use windows::Win32::Storage::Xps::{
 };
 
 use super::layout::{nonempty, Options, Placement};
+use super::pages::{Pages, Source};
 use super::printer::{Printer, Settings};
 use crate::image_cache::{self, DecodedImage};
 
@@ -40,6 +41,9 @@ pub(super) enum Outcome {
 pub(super) struct Request {
     pub settings: Settings,
     pub image: Arc<DecodedImage>,
+    pub image_page: u32,
+    pub source: Option<Source>,
+    pub pages: Pages,
     pub name: String,
     pub options: Options,
 }
@@ -115,23 +119,20 @@ impl Request {
     }
 
     unsafe fn spool(self, cancel: &AtomicBool, output: Option<&Path>) -> bool {
-        let Some((settings, copies, duplex)) = self.settings.copies(self.options.copies) else {
+        // Software document copies preserve collation regardless of the driver's copy mode.
+        let multiple = self.pages.len() > 1;
+        let Some((settings, copies, duplex)) =
+            self.settings
+                .copies(if multiple { 1 } else { self.options.copies })
+        else {
             return false;
         };
         let Some(printer) = Printer::from_settings(settings) else {
             return false;
         };
         let dc = printer.dc;
-        let Some(placement) = printer
-            .geometry()
-            .and_then(|g| g.layout((self.image.width, self.image.height), self.options))
-        else {
+        let Some(geometry) = printer.geometry() else {
             return false;
-        };
-        let image = if placement.rotate {
-            Arc::new(image_cache::rotated(&self.image, true))
-        } else {
-            self.image
         };
         if cancel.load(Ordering::Relaxed) || SetAbortProc(dc, Some(abort_proc)) <= 0 {
             return false;
@@ -159,15 +160,50 @@ impl Request {
             return false;
         }
         let mut document = Document(dc);
-        for page in 0..page_count(copies, duplex) {
-            if cancel.load(Ordering::Relaxed) || StartPage(dc) <= 0 {
-                return false;
+        let copies = if multiple {
+            self.options.copies
+        } else {
+            copies
+        };
+        for copy in 0..copies {
+            for page in self.pages.iter() {
+                if cancel.load(Ordering::Relaxed) {
+                    return false;
+                }
+                let image =
+                    if page == self.image_page {
+                        self.image.clone()
+                    } else {
+                        let Some(image) = self.source.as_ref().and_then(|source| {
+                            source.decode(page, &|| cancel.load(Ordering::Relaxed))
+                        }) else {
+                            return false;
+                        };
+                        image
+                    };
+                // Each page has its own dimensions and may need a different automatic rotation.
+                let Some(placement) = geometry.layout((image.width, image.height), self.options)
+                else {
+                    return false;
+                };
+                let image = if placement.rotate {
+                    Arc::new(image_cache::rotated(&image, true))
+                } else {
+                    image
+                };
+                if cancel.load(Ordering::Relaxed)
+                    || StartPage(dc) <= 0
+                    || !draw_image(dc, &image, placement)
+                    || cancel.load(Ordering::Relaxed)
+                    || EndPage(dc) <= 0
+                {
+                    return false;
+                }
             }
-            // In the software fallback every copy starts on a new sheet, including duplex jobs.
-            if (!duplex || page % 2 == 0) && !draw_image(dc, &image, placement) {
-                return false;
-            }
-            if cancel.load(Ordering::Relaxed) || EndPage(dc) <= 0 {
+            // An odd-length duplex copy must finish before the next document starts.
+            if blank_back(self.pages.len(), copy, copies, duplex)
+                && (cancel.load(Ordering::Relaxed) || StartPage(dc) <= 0 || EndPage(dc) <= 0)
+            {
                 return false;
             }
         }
@@ -179,12 +215,8 @@ impl Request {
     }
 }
 
-fn page_count(copies: u32, duplex: bool) -> u32 {
-    if duplex {
-        copies * 2 - 1
-    } else {
-        copies
-    }
+fn blank_back(pages: u64, copy: u32, copies: u32, duplex: bool) -> bool {
+    duplex && pages % 2 == 1 && copy + 1 < copies
 }
 
 /// Draw the already laid out rectangle exactly, including on devices with non-square pixels.
@@ -251,9 +283,12 @@ mod tests {
     }
     #[test]
     fn duplex_software_copies_have_blank_backs_between_copies() {
-        assert_eq!(page_count(1, true), 1);
-        assert_eq!(page_count(2, true), 3);
-        assert_eq!(page_count(3, false), 3);
+        assert!(!blank_back(1, 0, 1, true));
+        assert!(blank_back(1, 0, 2, true));
+        assert!(blank_back(3, 0, 2, true));
+        assert!(!blank_back(2, 0, 2, true));
+        assert!(!blank_back(3, 1, 2, true));
+        assert!(!blank_back(3, 0, 2, false));
     }
     #[test]
     fn drawing_errors_are_reported() {
@@ -302,6 +337,9 @@ mod tests {
                 let request = || Request {
                     settings: printer.settings(),
                     image: image(),
+                    image_page: 0,
+                    source: None,
+                    pages: Pages::all(1),
                     name: "Mediares print verification".into(),
                     options: opt,
                 };

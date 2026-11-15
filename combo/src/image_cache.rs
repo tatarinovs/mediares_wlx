@@ -520,7 +520,7 @@ fn worker_loop() {
 }
 
 /// `cancelled`: give up a whole picture part way (see `decode_oriented_cancellable`).
-fn decode(
+pub(crate) fn decode(
     path: &Path,
     kind: MediaType,
     options: DecodeOptions,
