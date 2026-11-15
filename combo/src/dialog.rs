@@ -211,3 +211,15 @@ pub unsafe fn close(dlg: HWND) {
 pub fn loword(wparam: WPARAM) -> usize {
     wparam.0 & 0xFFFF
 }
+
+/// Append text to a standard ComboBox; the control copies it during SendMessage.
+pub unsafe fn combo_add(window: HWND, text: &str) {
+    use windows::Win32::UI::WindowsAndMessaging::CB_ADDSTRING;
+    let text = HSTRING::from(text);
+    SendMessageW(
+        window,
+        CB_ADDSTRING,
+        None,
+        Some(LPARAM(text.as_ptr() as isize)),
+    );
+}

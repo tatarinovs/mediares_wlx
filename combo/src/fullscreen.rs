@@ -49,6 +49,7 @@ unsafe fn enter(state: &mut ViewerState) {
     }
     let rc = info.rcMonitor;
     state.fullscreen = Some(rc);
+    crate::window::pin_fullscreen(hwnd, Some(rc));
     set_lister_transitions(state.lister, false);
 
     // Detach first, then switch WS_CHILD -> WS_POPUP (order required by SetParent docs).
@@ -105,6 +106,7 @@ unsafe fn exit(state: &mut ViewerState) {
     sync_overlay(state);
     // Unpin first so the moves below are not overridden.
     state.fullscreen = None;
+    crate::window::pin_fullscreen(hwnd, None);
     SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
     // Switch WS_POPUP -> WS_CHILD before re-parenting.
     set_style(hwnd, WS_CHILD.0, WS_POPUP.0);
@@ -143,7 +145,11 @@ unsafe fn set_lister_transitions(lister: HWND, enabled: bool) {
 
 /// `WM_WINDOWPOSCHANGING`: keeps a fullscreen viewer covering its monitor.
 pub fn pin(state: &ViewerState, pos: &mut WINDOWPOS) {
-    let Some(rc) = state.fullscreen else { return };
+    pin_bounds(state.fullscreen, pos);
+}
+
+pub(crate) fn pin_bounds(bounds: Option<RECT>, pos: &mut WINDOWPOS) {
+    let Some(rc) = bounds else { return };
     if !pos.flags.contains(SWP_NOMOVE) {
         pos.x = rc.left;
         pos.y = rc.top;

@@ -270,6 +270,15 @@ unsafe fn get_value(
     if !field.applies_to(kind) {
         return FT_FIELDEMPTY;
     }
+    // Constants and extension-only fields never need a filesystem identity.
+    if matches!(field.source(), Source::Constant | Source::Probe) {
+        return Output {
+            dest: field_value,
+            max_bytes: max_len.max(0) as usize,
+            unicode,
+        }
+        .value(compute(&path, field, kind));
+    }
     crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
         crate::cache::with_file_key(&path, || {
             if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {

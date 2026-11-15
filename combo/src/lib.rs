@@ -228,7 +228,7 @@ pub unsafe extern "system" fn ListPrintW(
 ) -> c_int {
     guard(LISTPLUGIN_ERROR, || unsafe {
         let printer = pwstr_to_path(def_printer).map(|s| s.to_string_lossy().into_owned());
-        print_result(window::print(
+        print_result(window::print_external(
             list_win,
             printer.as_deref(),
             margins.as_ref().copied().map(print::tc_margins),
@@ -246,7 +246,7 @@ pub unsafe extern "system" fn ListPrint(
 ) -> c_int {
     guard(LISTPLUGIN_ERROR, || unsafe {
         let printer = pstr_to_path(def_printer).map(|s| s.to_string_lossy().into_owned());
-        print_result(window::print(
+        print_result(window::print_external(
             list_win,
             printer.as_deref(),
             margins.as_ref().copied().map(print::tc_margins),

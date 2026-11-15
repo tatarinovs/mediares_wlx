@@ -13,6 +13,8 @@
 //!        oclick:top|bottom,<x>,<y>   click in the fullscreen panel
 //!        move:<x>,<y>    move the real cursor (screen coordinates)
 //!        copy:<name>     ListSendCommand(lc_copy), clipboard DIB saved as <name>.png
+//!        ctrl-key:<vk hex> deterministic Ctrl shortcut on the viewer thread
+//!        destroy-check   destroy the viewer synchronously during a caption update
 //!        print           open print preview through ListPrintW (pair with dialog to cancel)
 //!        print-check     check preview orientation/margins/copies, capture it, then cancel
 //!        print-pdf-check[:pages[|copies]] print through the preview and PDF Save As dialog
@@ -29,6 +31,7 @@
 
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicIsize, Ordering};
 use std::time::{Duration, Instant};
 
 use mediares_combo::{
@@ -138,12 +141,21 @@ unsafe fn send_keys(keys: &[(u16, bool)]) {
     SendInput(&inputs, size_of::<INPUT>() as i32);
 }
 
+/// Simulate a host destroying the plugin synchronously during a caption update.
+static DESTROY_ON_TITLE: AtomicIsize = AtomicIsize::new(0);
+
 unsafe extern "system" fn host_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    if msg == WM_SETTEXT {
+        let viewer = DESTROY_ON_TITLE.swap(0, Ordering::Relaxed);
+        if viewer != 0 {
+            let _ = DestroyWindow(HWND(viewer as *mut _));
+        }
+    }
     if msg == WM_CLOSE {
         // TC would close the Lister here; the scenario goes on and closes it at the end.
         println!("host: WM_CLOSE");
@@ -612,6 +624,18 @@ fn main() {
             let (cmd, arg) = step.split_once(':').unwrap_or((step, ""));
             match cmd {
                 "wait" => pump(arg.parse().expect("ms")),
+                "destroy-check" => {
+                    DESTROY_ON_TITLE.store(viewer.0 as isize, Ordering::Relaxed);
+                    ListLoadNextW(parent, viewer, wide(&file).as_ptr(), 0);
+                    assert!(
+                        !IsWindow(Some(viewer)).as_bool(),
+                        "viewer must be destroyed during the update"
+                    );
+                    println!("reentrant host destruction: survived, viewer destroyed");
+                    let _ = DestroyWindow(host);
+                    pump(100);
+                    return;
+                }
                 "shot" => {
                     // A fullscreen viewer is a top-level popup (GetParent would return its owner).
                     let fullscreen =
@@ -717,6 +741,19 @@ fn main() {
                 "next" => {
                     let r = ListLoadNextW(parent, viewer, wide(Path::new(arg)).as_ptr(), 0);
                     println!("ListLoadNextW -> {}", r);
+                }
+                "ctrl-key" => {
+                    use windows::Win32::UI::Input::KeyboardAndMouse::{
+                        GetKeyboardState, SetKeyboardState,
+                    };
+                    let mut saved = [0u8; 256];
+                    GetKeyboardState(&mut saved).unwrap();
+                    let mut keys = saved;
+                    keys[0x11] = 0x80;
+                    SetKeyboardState(&keys).unwrap();
+                    let key = usize::from_str_radix(arg, 16).expect("hex key");
+                    SendMessageW(viewer, WM_KEYDOWN, Some(WPARAM(key)), Some(LPARAM(1)));
+                    SetKeyboardState(&saved).unwrap();
                 }
                 "input" => {
                     let mut mods = Vec::new();

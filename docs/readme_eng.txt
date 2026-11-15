@@ -110,6 +110,10 @@ Open in editor (F4) uses the program Windows has for editing this file
 type. You can choose your own program in the settings.
 
 
+Temporary PNGs in %TEMP%\Mediares are cleaned up on viewer startup
+or another copy, once at least 24 hours old. The current file
+clipboard and files opened by other applications are kept.
+
 3. PLAYING VIDEO AND AUDIO
 --------------------------
 

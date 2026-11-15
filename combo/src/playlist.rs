@@ -76,18 +76,44 @@ fn is_playable(path: &Path) -> bool {
 /// Nearest playable file after (`forward`) or before `current`, wrapping around if `wrap`.
 /// Photos in between are skipped.
 pub fn step(files: &[PathBuf], current: usize, forward: bool, wrap: bool) -> Option<usize> {
+    following(files, current, forward, wrap).next()
+}
+
+fn following(
+    files: &[PathBuf],
+    current: usize,
+    forward: bool,
+    wrap: bool,
+) -> impl Iterator<Item = usize> + '_ {
     let n = files.len() as isize;
     let dir = if forward { 1 } else { -1 };
     (1..n)
-        .map(|k| current as isize + dir * k)
-        .filter_map(|i| {
+        .map(move |k| current as isize + dir * k)
+        .filter_map(move |i| {
             if (0..n).contains(&i) || wrap {
                 Some(i.rem_euclid(n) as usize)
             } else {
                 None
             }
         })
-        .find(|&i| is_playable(&files[i]))
+        .filter(move |&i| is_playable(&files[i]))
+}
+
+/// Try each successor at most once; opening, rather than a directory probe, decides availability.
+pub fn candidates(
+    files: &[PathBuf],
+    current: usize,
+    forward: bool,
+    wrap: bool,
+    shuffle: bool,
+) -> Vec<usize> {
+    let mut indices: Vec<_> = following(files, current, forward, wrap).collect();
+    if shuffle {
+        for i in (1..indices.len()).rev() {
+            indices.swap(i, next_random() as usize % (i + 1));
+        }
+    }
+    indices
 }
 
 /// A random playable file other than `current`.
@@ -96,19 +122,6 @@ pub fn random(files: &[PathBuf], current: usize) -> Option<usize> {
         .filter(|&i| i != current && is_playable(&files[i]))
         .collect();
     (!candidates.is_empty()).then(|| candidates[next_random() as usize % candidates.len()])
-}
-
-/// Previous / next track for the bar buttons and media keys (always wraps).
-pub fn skip(
-    files: &[PathBuf],
-    current: usize,
-    forward: bool,
-    options: &QueueOptions,
-) -> Option<usize> {
-    if forward && options.shuffle {
-        return random(files, current);
-    }
-    step(files, current, forward, true)
 }
 
 pub fn on_end(files: &[PathBuf], current: usize, options: &QueueOptions) -> EndAction {
@@ -152,18 +165,21 @@ fn next_random() -> u64 {
     x.wrapping_mul(0x2545_F491_4F6C_DD1D)
 }
 
-/// Reads an M3U / M3U8 playlist: entries that exist as files, relative ones resolved against
+/// Reads an M3U / M3U8 playlist without probing every entry: relative paths resolved against
 /// the playlist's folder, `file:///` URLs included. `#` lines (EXTINF etc.) and other URLs are
 /// skipped.
 pub fn read_m3u(path: &Path) -> Vec<PathBuf> {
-    let Ok(bytes) = std::fs::read(path) else {
+    use std::io::Read;
+    const MAX_BYTES: u64 = 16 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    let Ok(file) = std::fs::File::open(path) else {
         return Vec::new();
     };
+    if file.take(MAX_BYTES + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > MAX_BYTES {
+        return Vec::new();
+    }
     let base = path.parent().unwrap_or(Path::new(""));
     parse_m3u(&bytes, base)
-        .into_iter()
-        .filter(|p| p.is_file())
-        .collect()
 }
 
 fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
@@ -238,6 +254,21 @@ mod tests {
     }
 
     #[test]
+    fn playlist_keeps_unavailable_entries_without_probing_them_and_bounds_input() {
+        let path =
+            std::env::temp_dir().join(format!("mediares-playlist-{}.m3u8", std::process::id()));
+        let remote = r"\\unavailable-mediares-test\share\song.mp3";
+        std::fs::write(&path, remote).unwrap();
+        assert_eq!(read_m3u(&path), vec![PathBuf::from(remote)]);
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(16 * 1024 * 1024 + 1)
+            .unwrap();
+        assert!(read_m3u(&path).is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn step_skips_photos_and_respects_wrap() {
         let list = files(&["a.mp3", "b.jpg", "c.mp4", "d.png"]);
         assert_eq!(step(&list, 0, true, false), Some(2));
@@ -246,6 +277,17 @@ mod tests {
         assert_eq!(step(&list, 2, false, false), Some(0));
         assert_eq!(step(&list, 0, false, false), None);
         assert_eq!(step(&list, 0, false, true), Some(2));
+    }
+
+    #[test]
+    fn retry_candidates_preserve_direction_and_never_repeat_even_when_shuffled() {
+        let list = files(&["a.mp3", "photo.jpg", "missing.wav", "b.mp3"]);
+        assert_eq!(candidates(&list, 0, true, false, false), [2, 3]);
+        assert_eq!(candidates(&list, 0, false, true, false), [3, 2]);
+        assert!(candidates(&list, 3, true, false, false).is_empty());
+        let mut shuffled = candidates(&list, 0, true, true, true);
+        shuffled.sort_unstable();
+        assert_eq!(shuffled, [2, 3]);
     }
 
     #[test]

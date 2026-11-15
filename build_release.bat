@@ -62,6 +62,8 @@ if /i "%~1"=="notest"     set "RUN_TESTS=0"
 if "!RUN_TESTS!"=="1" (
     echo:
     echo [1/4] Running workspace tests...
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\test_packaging.ps1"
+    if errorlevel 1 exit /b 1
     cargo +%TOOLCHAIN% test --locked --workspace --target %TARGET%
     if errorlevel 1 (
         echo [ERROR] Tests failed! Aborting release packaging.

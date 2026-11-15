@@ -85,21 +85,31 @@ pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
 /// Least-recently-used map from file versions to values, shared between threads.
 struct FileCache<V> {
     inner: Mutex<Lru<V>>,
+    budget: usize,
+    weigh: fn(&V) -> usize,
 }
 
 struct Lru<V> {
     /// Value and the tick it was last used at.
-    map: HashMap<FileKey, (V, u64)>,
+    map: HashMap<FileKey, (V, u64, usize)>,
+    bytes: usize,
     clock: u64,
     capacity: usize,
 }
 
 impl<V: Clone> FileCache<V> {
     fn new(capacity: usize) -> Self {
+        Self::weighted(capacity, usize::MAX, |_| 0)
+    }
+
+    fn weighted(capacity: usize, budget: usize, weigh: fn(&V) -> usize) -> Self {
         Self {
+            budget,
+            weigh,
             inner: Mutex::new(Lru {
                 map: HashMap::new(),
                 clock: 0,
+                bytes: 0,
                 capacity,
             }),
         }
@@ -117,7 +127,7 @@ impl<V: Clone> FileCache<V> {
             let mut lru = self.lock();
             lru.clock += 1;
             let now = lru.clock;
-            if let Some((value, used)) = lru.map.get_mut(&key) {
+            if let Some((value, used, _)) = lru.map.get_mut(&key) {
                 *used = now;
                 return Some(value.clone());
             }
@@ -128,16 +138,25 @@ impl<V: Clone> FileCache<V> {
         if FileKey::stat(path).as_ref() != Some(&key) {
             return None;
         }
+        let bytes = (self.weigh)(&value)
+            .saturating_add(key.path.as_os_str().len() * 2 + size_of::<FileKey>());
+        if bytes > self.budget {
+            return Some(value);
+        }
         let mut lru = self.lock();
         lru.clock += 1;
         let now = lru.clock;
-        lru.map.insert(key, (value.clone(), now));
-        if lru.map.len() > lru.capacity {
+        if let Some((_, _, old)) = lru.map.insert(key, (value.clone(), now, bytes)) {
+            lru.bytes -= old;
+        }
+        lru.bytes = lru.bytes.saturating_add(bytes);
+        while lru.map.len() > lru.capacity || lru.bytes > self.budget {
             // The least recently used eighth at once: finding them scans the whole map, too slow
             // to repeat for every new file of a folder larger than the cache.
-            let ticks = lru.map.values().map(|&(_, used)| used).collect();
-            let newest_dropped = nth_smallest(ticks, lru.capacity / 8);
-            lru.map.retain(|_, (_, used)| *used > newest_dropped);
+            let ticks = lru.map.values().map(|&(_, used, _)| used).collect();
+            let newest_dropped = nth_smallest(ticks, lru.capacity.min(lru.map.len()) / 8);
+            lru.map.retain(|_, (_, used, _)| *used > newest_dropped);
+            lru.bytes = lru.map.values().map(|(_, _, bytes)| bytes).sum();
         }
         Some(value)
     }
@@ -147,7 +166,9 @@ impl<V: Clone> FileCache<V> {
     }
 
     fn clear(&self) {
-        self.lock().map.clear();
+        let mut lru = self.lock();
+        lru.map.clear();
+        lru.bytes = 0;
     }
 }
 
@@ -168,6 +189,7 @@ impl MediaCache {
         self.0
             .get_or_compute(path, |path| {
                 persistent_result(path, cancelled, || analyze_file(path, cancelled))
+                    .map(|(value, _)| value)
             })
             .unwrap_or(CachedMedia::Unsupported)
     }
@@ -188,7 +210,7 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
     compute: impl FnOnce() -> Option<T>,
-) -> Option<T> {
+) -> Option<(T, usize)> {
     if cancelled() {
         return None;
     }
@@ -200,8 +222,8 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
     if cancelled() || FileKey::stat(path).as_ref() != Some(&key) {
         return None;
     }
-    crate::disk_cache::write(&key, &value);
-    Some(value)
+    let bytes = crate::disk_cache::write(&key, &value);
+    Some((value, bytes))
 }
 
 /// `None` if the host cancelled the analysis.
@@ -229,20 +251,27 @@ fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia
 }
 
 /// Cheap per-file metadata (tags, EXIF, stream properties) keyed by file version: TC asks for
-/// every column separately, and each file is read once. Failed reads are cached too.
-struct MetaCache<T>(FileCache<Option<Arc<T>>>);
+/// every column separately, and each file is read once. Failed reads remain retryable.
+struct MetaCache<T>(FileCache<(Arc<T>, usize)>);
 
 impl<T: crate::disk_cache::DiskValue> MetaCache<T> {
     fn new() -> Self {
-        MetaCache(FileCache::new(META_CAPACITY))
+        // Estimate heap use conservatively from the disk representation; bound each family
+        // independently so long comments or TIFF page lists cannot crowd out all metadata.
+        MetaCache(FileCache::weighted(
+            META_CAPACITY,
+            8 * 1024 * 1024,
+            |(_, bytes)| *bytes,
+        ))
     }
 
     fn get_or_read(&self, path: &Path, read: impl FnOnce(&Path) -> Option<T>) -> Option<Arc<T>> {
         self.0
             .get_or_compute(path, |p| {
-                Some(persistent_result(p, &|| false, || read(p)).map(Arc::new))
+                persistent_result(p, &|| false, || read(p))
+                    .map(|(value, bytes)| (Arc::new(value), bytes))
             })
-            .flatten()
+            .map(|(value, _)| value)
     }
 
     fn contains(&self, path: &Path) -> bool {
@@ -449,6 +478,78 @@ pub fn get_cache() -> &'static MediaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_prepares_its_disk_representation_only_once_on_a_ram_miss() {
+        use crate::disk_cache::{Columns, DiskValue};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static PREPARED: AtomicUsize = AtomicUsize::new(0);
+        struct Counted;
+        impl DiskValue for Counted {
+            const SLOT: i32 = 99;
+
+            fn from_row(_: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+                unreachable!("relative paths never enter SQLite")
+            }
+
+            fn columns(&self) -> Option<Columns<'_>> {
+                PREPARED.fetch_add(1, Ordering::Relaxed);
+                Some(Columns::default())
+            }
+        }
+
+        let path = PathBuf::from(format!("cache-weight-{}.tmp", std::process::id()));
+        fs::write(&path, b"fixture").unwrap();
+        let cache = MetaCache::<Counted>::new();
+        assert!(cache.get_or_read(&path, |_| Some(Counted)).is_some());
+        assert!(cache
+            .get_or_read(&path, |_| panic!("RAM hit must not read metadata"))
+            .is_some());
+        assert_eq!(PREPARED.load(Ordering::Relaxed), 1);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn metadata_retries_failed_reads_but_keeps_successful_empty_records() {
+        let path = PathBuf::from(format!("cache-retry-{}.tmp", std::process::id()));
+        std::fs::write(&path, b"fixture").unwrap();
+        let cache = MetaCache::<crate::video_tags::VideoTags>::new();
+        assert!(cache.get_or_read(&path, |_| None).is_none());
+        assert!(!cache.contains(&path));
+        assert!(cache
+            .get_or_read(&path, |_| Some(Default::default()))
+            .is_some());
+        assert!(cache.contains(&path));
+        assert!(cache
+            .get_or_read(&path, |_| panic!(
+                "successful empty metadata must be cached"
+            ))
+            .is_some());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn byte_budget_evicts_old_metadata_and_does_not_cache_oversized_values() {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let a = dir.join("Cargo.toml");
+        let b = dir.join("src/lib.rs");
+        let cache = FileCache::weighted(8192, 4000, String::capacity);
+        cache.get_or_compute(&a, |_| Some("a".repeat(2400)));
+        cache.get_or_compute(&b, |_| Some("b".repeat(2400)));
+        assert!(!cache.contains(&a));
+        assert!(cache.contains(&b));
+        assert!(cache.lock().bytes <= 4000);
+        assert_eq!(
+            cache
+                .get_or_compute(&a, |_| Some("x".repeat(5000)))
+                .unwrap()
+                .len(),
+            5000
+        );
+        assert!(!cache.contains(&a));
+        assert!(cache.contains(&b));
+    }
 
     #[test]
     fn least_recently_used_goes_first() {

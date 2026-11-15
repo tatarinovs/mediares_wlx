@@ -145,6 +145,13 @@ impl MediaView {
                 Content::Audio(a) if kind == MediaType::Audio => a.open(path, options.replay_gain),
                 _ => false,
             };
+            let same_kind = matches!(
+                (&view.content, kind),
+                (Content::Video(_), MediaType::Video) | (Content::Audio(_), MediaType::Audio)
+            );
+            if !reused && same_kind {
+                return None;
+            }
             if reused {
                 view.end_loupe();
                 view.click_toggled = false;
@@ -601,6 +608,13 @@ impl MediaView {
         self.bar
             .mouse_up(self.content.transport(), &layout, duration, x);
         self.invalidate_bar();
+    }
+
+    pub fn cancel_preload(&mut self) -> bool {
+        match &mut self.content {
+            Content::Audio(a) => a.cancel_preload(),
+            _ => true,
+        }
     }
 
     /// Decodes the next audio file ahead for gapless playback; false if it can't.

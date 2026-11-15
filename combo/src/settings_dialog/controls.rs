@@ -70,13 +70,7 @@ pub(super) unsafe fn build_controls(
             id,
         );
         for item in items {
-            let text = HSTRING::from(item);
-            SendMessageW(
-                hwnd,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(text.as_ptr() as isize)),
-            );
+            dialog::combo_add(hwnd, &(item));
         }
         SendMessageW(hwnd, CB_SETCURSEL, Some(WPARAM(selected)), None);
     };

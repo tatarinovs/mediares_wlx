@@ -142,6 +142,7 @@ stereo=стерео
 Add field...=Добавить поле...
 Default=По умолчанию
 OK=ОК
+Replace the existing file?=Заменить существующий файл?
 Cancel=Отмена
 
 ; playlist.rs

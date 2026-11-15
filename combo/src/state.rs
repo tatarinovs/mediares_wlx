@@ -163,14 +163,18 @@ impl ViewerState {
                 .into_iter()
                 .filter(|p| is_viewable(probe_file(p)))
                 .collect();
-            let Some(first) = entries.first().cloned() else {
-                return false;
-            };
             self.dir_files = entries;
-            self.current_idx = 0;
             self.playlist = Some(path.to_path_buf());
             self.scan = None;
-            return self.show(&first);
+            // Validate only until one opens; later entries are checked on navigation.
+            for idx in 0..self.dir_files.len() {
+                self.current_idx = idx;
+                let file = self.dir_files[idx].clone();
+                if self.show(&file) {
+                    return true;
+                }
+            }
+            return false;
         }
         match self.dir_files.iter().position(|p| same_path(p, path)) {
             Some(pos) => self.current_idx = pos,
@@ -388,15 +392,25 @@ impl ViewerState {
 
     /// The bar's previous / next track and media keys: the adjacent audio/video file.
     pub fn skip_track(&mut self, forward: bool) -> bool {
-        match playlist::skip(
+        let candidates = playlist::candidates(
             &self.dir_files,
             self.current_idx,
             forward,
-            &self.config.queue,
-        ) {
-            Some(idx) => self.go_to(idx),
-            None => false,
+            true,
+            forward && self.config.queue.shuffle,
+        );
+        self.show_first(candidates)
+    }
+
+    /// A failed attempt changes the view too: repaint its error if no candidate opens.
+    fn show_first(&mut self, candidates: Vec<usize>) -> bool {
+        let attempted = !candidates.is_empty();
+        for idx in candidates {
+            if self.go_to(idx) {
+                return true;
+            }
         }
+        attempted
     }
 
     /// Near the end of an audio file: has the one the queue plays next decoded ahead.
@@ -428,7 +442,21 @@ impl ViewerState {
                 }
                 false
             }
-            EndAction::Play(idx) => self.go_to(idx),
+            EndAction::Play(_) => {
+                let wrap = self.config.queue.repeat == playlist::Repeat::All;
+                let mut candidates = playlist::candidates(
+                    &self.dir_files,
+                    self.current_idx,
+                    true,
+                    wrap,
+                    self.config.queue.shuffle,
+                );
+                // "Repeat list" still loops the current track when all other files fail.
+                if wrap {
+                    candidates.push(self.current_idx);
+                }
+                self.show_first(candidates)
+            }
             EndAction::Stop => false,
         }
     }
@@ -438,6 +466,19 @@ impl ViewerState {
         let total = self.dir_files.len();
         if total <= 1 {
             return false;
+        }
+        if self.playlist.is_some() {
+            self.forward = forward;
+            let candidates = (1..total)
+                .map(|k| {
+                    if forward {
+                        (self.current_idx + k) % total
+                    } else {
+                        (self.current_idx + total - k) % total
+                    }
+                })
+                .collect();
+            return self.show_first(candidates);
         }
         let idx = if forward {
             (self.current_idx + 1) % total
@@ -480,6 +521,21 @@ impl ViewerState {
         (self.pages > 1).then_some(self.page)
     }
 
+    pub fn set_queue(&mut self, queue: playlist::QueueOptions) {
+        if self.config.queue == queue {
+            return;
+        }
+        self.cancel_preload();
+        self.config.queue = queue;
+    }
+
+    fn cancel_preload(&mut self) {
+        if self.media.as_mut().is_some_and(|m| !m.cancel_preload()) {
+            self.playback_ended();
+        }
+        self.preloaded = None;
+    }
+
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
         if config.skip_raw_twins != self.config.skip_raw_twins && self.playlist.is_none() {
@@ -488,6 +544,10 @@ impl ViewerState {
                 config.skip_raw_twins,
                 self.hwnd,
             ));
+        }
+        self.set_queue(config.queue);
+        if config.replay_gain != self.config.replay_gain {
+            self.cancel_preload();
         }
         i18n::set(config.language.resolve());
         self.config = config;

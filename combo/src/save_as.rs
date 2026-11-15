@@ -6,6 +6,7 @@
 //! turned like on screen and encoded with the main EXIF fields.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -20,10 +21,11 @@ use mediares_core::raw_preview::extract_raw_preview;
 use windows::core::{w, HSTRING, PCWSTR, PWSTR};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Controls::Dialogs::{
-    GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_OVERWRITEPROMPT, OFN_PATHMUSTEXIST,
-    OPENFILENAMEW,
+    GetSaveFileNameW, OFN_HIDEREADONLY, OFN_NOCHANGEDIR, OFN_PATHMUSTEXIST, OPENFILENAMEW,
 };
-use windows::Win32::UI::WindowsAndMessaging::{LoadCursorW, SetCursor, IDC_WAIT};
+use windows::Win32::UI::WindowsAndMessaging::{
+    LoadCursorW, MessageBoxW, SetCursor, IDC_WAIT, IDYES, MB_DEFBUTTON2, MB_ICONQUESTION, MB_YESNO,
+};
 
 use crate::file_actions::show_error;
 use crate::i18n::tr;
@@ -222,7 +224,7 @@ unsafe fn ask_target(owner: HWND, source: &Path, page: Option<u32>) -> Option<(P
         Format::Jpeg
     };
     let initial = free_name(source, page, format);
-    let mut file = [0u16; 1024];
+    let mut file = vec![0u16; 32768];
     let name: Vec<u16> = initial
         .file_name()
         .unwrap_or_default()
@@ -242,40 +244,77 @@ unsafe fn ask_target(owner: HWND, source: &Path, page: Option<u32>) -> Option<(P
         nMaxFile: file.len() as u32,
         lpstrInitialDir: PCWSTR(dir.as_ptr()),
         lpstrTitle: PCWSTR(title.as_ptr()),
-        lpstrDefExt: w!("jpg"),
-        Flags: OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
+        lpstrDefExt: PCWSTR::null(),
+        Flags: OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_HIDEREADONLY,
         ..Default::default()
     };
     if !GetSaveFileNameW(&mut ofn).as_bool() {
         return None;
     }
     let len = file.iter().position(|&c| c == 0).unwrap_or(file.len());
-    let path = PathBuf::from(String::from_utf16_lossy(&file[..len]));
+    let path = PathBuf::from(std::ffi::OsString::from_wide(&file[..len]));
+    let selected = if ofn.nFilterIndex == 2 {
+        Format::Png
+    } else {
+        Format::Jpeg
+    };
+    let (path, format) = resolve_target(path, selected);
+    // Confirm the actual output, including the extension we may have appended.
+    if path.exists()
+        && MessageBoxW(
+            Some(owner),
+            &HSTRING::from(format!(
+                "{}\n\n{}",
+                tr("Replace the existing file?"),
+                path.display()
+            )),
+            &title,
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+        ) != IDYES
+    {
+        return None;
+    }
+    Some((path, format))
+}
+
+fn resolve_target(path: PathBuf, selected: Format) -> (PathBuf, Format) {
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    Some(match ext.as_str() {
+    match ext.as_str() {
         "png" => (path, Format::Png),
         "jpg" | "jpeg" => (path, Format::Jpeg),
         _ => {
-            let format = if ofn.nFilterIndex == 2 {
-                Format::Png
-            } else {
-                Format::Jpeg
-            };
+            let format = selected;
             let mut name = path.into_os_string();
             name.push(".");
             name.push(format.extension());
             (PathBuf::from(name), format)
         }
-    })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mediares_core::image::RgbaImage;
+
+    #[test]
+    fn final_target_uses_typed_format_or_selected_format_before_confirmation() {
+        assert_eq!(
+            resolve_target("photo.backup".into(), Format::Jpeg),
+            ("photo.backup.jpg".into(), Format::Jpeg)
+        );
+        assert_eq!(
+            resolve_target("photo".into(), Format::Png),
+            ("photo.png".into(), Format::Png)
+        );
+        assert_eq!(
+            resolve_target("photo.PNG".into(), Format::Jpeg),
+            ("photo.PNG".into(), Format::Png)
+        );
+    }
 
     #[test]
     fn transparency_goes_onto_white() {

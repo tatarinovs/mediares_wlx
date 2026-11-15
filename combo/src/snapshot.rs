@@ -3,7 +3,10 @@
 
 use std::io::{self, Write};
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant, SystemTime};
 
 use mediares_core::audio_tags::read_tags;
 use mediares_core::image::codecs::jpeg::JpegEncoder;
@@ -13,11 +16,16 @@ use mediares_core::image_decode::{decode_bytes, decode_oriented_fitted};
 use mediares_core::probe::{probe_file, MediaType};
 use mediares_core::video_frame::video_frame_rgba_fitted;
 use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL, HWND};
+use windows::Win32::Globalization::{CompareStringOrdinal, CSTR_EQUAL};
 use windows::Win32::Graphics::Gdi::{
     CreateDIBSection, DeleteObject, BITMAPINFOHEADER, DIB_RGB_COLORS, HBITMAP,
 };
+use windows::Win32::Storage::FileSystem::{
+    FileDispositionInfo, SetFileInformationByHandle, DELETE, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
@@ -86,25 +94,106 @@ fn temp_dir() -> PathBuf {
     std::env::temp_dir().join("Mediares")
 }
 
-/// Saves `img` as "<name>_<suffix>.png" (a frame's time, "cover", a page) in the temp folder,
-/// clearing out earlier ones. Returns the file for `CF_HDROP`.
-pub fn save_temp_png(img: &DecodedImage, source: &Path, suffix: &str) -> Option<PathBuf> {
-    let dir = temp_dir();
-    // Files from the last minute are kept: a paste of them may still be in progress, possibly
-    // from another Total Commander instance sharing the folder.
-    let stale = |entry: &std::fs::DirEntry| {
-        entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age.as_secs() > 60)
+const EXPORT_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Reclaim old exports periodically without delaying the viewer's first paint.
+pub fn cleanup_on_start(source: &Path) {
+    static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let now = Instant::now();
+    let Ok(mut last) = LAST.try_lock() else {
+        return;
     };
-    if let Ok(entries) = std::fs::read_dir(&dir) {
-        for entry in entries.flatten().filter(stale) {
-            let _ = std::fs::remove_file(entry.path());
+    if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(3600)) {
+        return;
+    }
+    *last = Some(now);
+    drop(last);
+    let source = source.to_path_buf();
+    let _ = std::thread::Builder::new()
+        .name("mediares-clipboard-cleanup".into())
+        .spawn(move || unsafe {
+            if OpenClipboard(None).is_err() {
+                return;
+            }
+            // Do not render or inspect another application's delayed file clipboard.
+            // A later copy through this plugin can clean up with its exact protected filename.
+            if IsClipboardFormatAvailable(CF_HDROP).is_err() {
+                // A PNG being opened may not have a reader yet, or may already be decoded.
+                cleanup_exports(&temp_dir(), Some(&source), SystemTime::now());
+            }
+            let _ = CloseClipboard();
+        });
+}
+
+/// Caller holds the clipboard open, so its protected file cannot change during cleanup.
+fn cleanup_exports(dir: &Path, current: Option<&Path>, now: SystemTime) {
+    let Ok(root) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !root.is_dir() || root.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let expired = |m: &std::fs::Metadata| {
+        m.modified()
+            .ok()
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= EXPORT_RETENTION)
+    };
+    let current = current
+        .and_then(Path::file_name)
+        .map(|name| name.encode_wide().collect::<Vec<_>>());
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !mediares_core::probe::has_extension(&path, &["png"])
+            || !entry.file_type().is_ok_and(|t| t.is_file())
+            || current.as_ref().is_some_and(|name| unsafe {
+                // Protect the basename even if the clipboard uses a verbatim path prefix.
+                CompareStringOrdinal(
+                    name,
+                    &entry.file_name().encode_wide().collect::<Vec<_>>(),
+                    true,
+                ) == CSTR_EQUAL
+            })
+            || !entry.metadata().is_ok_and(|m| expired(&m))
+        {
+            continue;
+        }
+        // Exclusive access rejects even readers which allow FILE_SHARE_DELETE. Keep the
+        // handle until deletion is marked: checking for a reader and then unlinking by name
+        // would leave a race. OPEN_REPARSE_POINT prevents following a replaced symlink.
+        let Ok(file) = std::fs::OpenOptions::new()
+            .access_mode(DELETE.0 | FILE_READ_ATTRIBUTES.0)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT.0)
+            .open(&path)
+        else {
+            continue;
+        };
+        let Ok(meta) = file.metadata() else { continue };
+        if !meta.is_file()
+            || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT.0 != 0
+            || !expired(&meta)
+        {
+            continue;
+        }
+        let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
+        unsafe {
+            let _ = SetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                FileDispositionInfo,
+                &disposition as *const _ as *const _,
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
         }
     }
+}
+
+/// Saves a unique clipboard export. Cleanup happens only after publishing the new clipboard.
+pub fn save_temp_png(img: &DecodedImage, source: &Path, suffix: &str) -> Option<PathBuf> {
+    let dir = temp_dir();
     std::fs::create_dir_all(&dir).ok()?;
     let stem = source.file_stem()?.to_string_lossy();
     save_unique_picture(
@@ -143,10 +232,17 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
         let _ = GlobalFree(Some(dib));
         return false;
     }
-    let _ = EmptyClipboard();
+    if EmptyClipboard().is_err() {
+        let _ = CloseClipboard();
+        let _ = GlobalFree(Some(dib));
+        return false;
+    }
     let ok = set_clipboard(CF_DIB, dib);
     if let Some(drop) = file.and_then(|f| file_drop(f)) {
         set_clipboard(CF_HDROP, drop);
+    }
+    if ok {
+        cleanup_exports(&temp_dir(), file, SystemTime::now());
     }
     let _ = CloseClipboard();
     ok
@@ -319,6 +415,68 @@ pub unsafe fn to_hbitmap(img: &DecodedImage) -> Option<HBITMAP> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_removes_only_expired_unreferenced_pngs_without_open_readers() {
+        use std::io::Read;
+
+        let now = SystemTime::now();
+        let dir = std::env::temp_dir().join(format!(
+            "mediares-cleanup-{}-{}",
+            std::process::id(),
+            now.duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for name in [
+            "old.png",
+            "busy.png",
+            "Текущий.png",
+            "recent.png",
+            "other.txt",
+        ] {
+            let path = dir.join(name);
+            std::fs::write(&path, b"export").unwrap();
+            if name != "recent.png" {
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_times(
+                        std::fs::FileTimes::new()
+                            .set_modified(now - EXPORT_RETENTION - Duration::from_secs(1)),
+                    )
+                    .unwrap();
+            }
+        }
+        std::fs::create_dir(dir.join("directory.png")).unwrap();
+        // Rust's normal reader allows FILE_SHARE_DELETE: a plain remove_file would unlink it.
+        let mut reader = std::fs::File::open(dir.join("busy.png")).unwrap();
+        let protected = dir.join("ТЕКУЩИЙ.PNG");
+        cleanup_exports(&dir, Some(&protected), now);
+        assert!(!dir.join("old.png").exists());
+        for name in [
+            "busy.png",
+            "Текущий.png",
+            "recent.png",
+            "other.txt",
+            "directory.png",
+        ] {
+            assert!(dir.join(name).exists(), "must keep {name}");
+        }
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"export");
+        drop(reader);
+        cleanup_exports(&dir, None, now);
+        assert!(!dir.join("busy.png").exists());
+        assert!(!dir.join("Текущий.png").exists());
+        std::fs::remove_file(dir.join("recent.png")).unwrap();
+        std::fs::remove_file(dir.join("other.txt")).unwrap();
+        std::fs::remove_dir(dir.join("directory.png")).unwrap();
+        std::fs::remove_dir(dir).unwrap();
+    }
 
     #[test]
     fn concurrent_snapshots_reserve_distinct_names_and_keep_existing_files() {

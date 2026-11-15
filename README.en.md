@@ -46,6 +46,8 @@ You can also register them manually: **Configuration → Options → Plugins →
 
 ## Viewer
 
+Temporary PNGs of copied frames and cover art in `%TEMP%\Mediares` are cleaned up on viewer startup or another copy, once at least 24 hours old. The current file clipboard and files opened by other applications are kept.
+
 ### Photos
 
 Supports JPEG, PNG, GIF, WebP, BMP, ICO, TGA, HDR, TIFF, JPEG XR, DDS, PSD/PSB and RAW from popular cameras. RAW files use their embedded JPEG preview; PSD/PSB files use the saved composite image. All pages of multipage TIFF files are available.
@@ -211,6 +213,8 @@ cargo test --workspace --locked  # tests for the entire workspace
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite cache (Python 3)
 # WLX checks, large database and concurrent processes:
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
+cargo build -p mediares_combo --example lister_harness --locked
+python scripts/test_save_as.py  # final filename and overwrite confirmation in the native dialog
 ```
 
 ## License

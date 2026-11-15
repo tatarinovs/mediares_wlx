@@ -73,11 +73,6 @@ pub fn has_tag_reader(path: &Path) -> bool {
     container(path).is_some()
 }
 
-/// Tags of `path`; empty if the container has none or isn't supported.
-pub fn read_video_tags(path: &Path) -> VideoTags {
-    try_read_video_tags(path).unwrap_or_default()
-}
-
 /// Some(empty) means the supported container was read successfully without tags.
 pub(crate) fn try_read_video_tags(path: &Path) -> Option<VideoTags> {
     let container = container(path)?;

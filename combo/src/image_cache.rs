@@ -126,7 +126,12 @@ pub fn load(path: &Path, kind: MediaType, options: DecodeOptions) -> Option<Arc<
         return Some(img);
     }
     let img = Arc::new(decode(path, kind, options, &|| false)?);
-    cache().insert(key, img.clone());
+    // A cover/thumbnail decode can finish after the last viewer closed. Check under the
+    // cache lock: release_all either clears this insertion afterwards or we see zero viewers.
+    let mut cache = cache();
+    if VIEWERS.load(Ordering::SeqCst) > 0 {
+        cache.insert(key, img.clone());
+    }
     Some(img)
 }
 
@@ -613,7 +618,10 @@ pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
     let (src, dst32) = match aligned {
         (([], src, []), ([], dst32, [])) => (src, dst32),
         // Allocations are aligned in practice; a byte-wise turn would do otherwise.
-        _ => return rotated_bytes(img, clockwise),
+        _ => {
+            drop(dst);
+            return rotated_bytes(img, clockwise);
+        }
     };
     for ty in (0..h).step_by(TILE) {
         for tx in (0..w).step_by(TILE) {

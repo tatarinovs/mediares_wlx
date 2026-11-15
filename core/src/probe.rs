@@ -145,14 +145,6 @@ impl MediaType {
     pub fn is_playable(self) -> bool {
         matches!(self, MediaType::Audio | MediaType::Video)
     }
-
-    /// Kinds that are expensive to analyze and should be deferred with `FT_DELAYED`.
-    pub fn is_slow_kind(self) -> bool {
-        matches!(
-            self,
-            MediaType::Video | MediaType::Audio | MediaType::RawImage | MediaType::PsdImage
-        )
-    }
 }
 
 pub fn probe_file(path: &Path) -> MediaType {

@@ -203,13 +203,7 @@ unsafe fn refresh_papers(dlg: HWND, data: &mut Preview) {
     let current = data.printer.paper_id();
     let mut selected = None;
     for (i, paper) in data.papers.iter().enumerate() {
-        let label = HSTRING::from(paper.label.as_str());
-        SendMessageW(
-            combo,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(label.as_ptr() as isize)),
-        );
+        dialog::combo_add(combo, &paper.label);
         if Some(paper.id) == current {
             selected = Some(i);
         }
@@ -221,12 +215,9 @@ unsafe fn refresh_papers(dlg: HWND, data: &mut Preview) {
             .geometry()
             .map(|g| g.paper_mm())
             .unwrap_or((0.0, 0.0));
-        let label = HSTRING::from(format!("{} × {} {}", format_mm(w), format_mm(h), tr("mm")));
-        SendMessageW(
+        dialog::combo_add(
             combo,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(label.as_ptr() as isize)),
+            &(format!("{} × {} {}", format_mm(w), format_mm(h), tr("mm"))),
         );
         selected = Some(data.papers.len());
     }
@@ -246,13 +237,7 @@ unsafe fn fill_printers(dlg: HWND, data: &Preview, mut names: Vec<String>) {
     let combo = GetDlgItem(Some(dlg), PRINTER_COMBO as i32).unwrap_or_default();
     SendMessageW(combo, CB_RESETCONTENT, None, None);
     for (i, name) in names.iter().enumerate() {
-        let label = HSTRING::from(name.as_str());
-        SendMessageW(
-            combo,
-            CB_ADDSTRING,
-            None,
-            Some(LPARAM(label.as_ptr() as isize)),
-        );
+        dialog::combo_add(combo, name);
         if *name == data.printer.name {
             SendMessageW(combo, CB_SETCURSEL, Some(WPARAM(i)), None);
         }

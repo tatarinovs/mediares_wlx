@@ -146,15 +146,11 @@ fn frames(
     if !crate::playback_mpv::available() || duration <= 0.0 {
         return None;
     }
+    let session = crate::playback_mpv::FrameSession::open(video, fit)?;
     let frames: Vec<Option<Shot>> = times
         .iter()
         .take_while(|_| !cancelled())
-        .map(|&t| {
-            crate::playback_mpv::video_frame(video, t / duration, fit).map(|f| {
-                let (w, h) = mediares_core::image_decode::fitted_size(f.dimensions(), fit);
-                shot(mediares_core::image::imageops::thumbnail(&f, w, h), t)
-            })
-        })
+        .map(|&t| session.frame_at(t).map(|(frame, shown)| shot(frame, shown)))
         .collect();
     frames.iter().any(Option::is_some).then_some(frames)
 }

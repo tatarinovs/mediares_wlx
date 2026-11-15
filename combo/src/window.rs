@@ -1,7 +1,7 @@
 //! Lister viewer window: creation, message handling and user commands.
 //!
 //! State lives in a `Box<ViewerState>` behind `GWLP_USERDATA`. Handlers fetch it per message and
-//! never hold it across calls that pump messages (menus, dialogs), re-fetching afterwards.
+//! serialize reentrant callbacks through `access`, re-fetching state after modal loops.
 
 use std::path::Path;
 use std::sync::Once;
@@ -55,7 +55,9 @@ const CLASS_NAME: PCWSTR = w!("MediaresListerViewerClass");
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
 mod file_commands;
-pub(crate) use file_commands::print;
+use file_commands::print;
+mod access;
+pub(crate) use access::fullscreen as pin_fullscreen;
 use file_commands::{delete_current, leave_fullscreen, save_rotation, set_wallpaper};
 mod commands;
 use commands::Command;
@@ -72,6 +74,7 @@ unsafe fn register_class() {
 /// Creates the viewer for `path`, or returns `None` (so TC tries other plugins) if it can't be
 /// displayed.
 pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Option<HWND> {
+    snapshot::cleanup_on_start(path);
     register_class();
 
     let mut rc = RECT::default();
@@ -103,43 +106,52 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
     // Only the standalone Lister (F3) starts fullscreen, not the Quick View panel (Ctrl+Q).
     let start_fullscreen = state.config.start_fullscreen && !is_quick_view(lister);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
-    let _ = ShowWindow(hwnd, SW_SHOW);
+    access::run(hwnd, None, || {
+        let _ = ShowWindow(hwnd, SW_SHOW);
 
-    let state = get_state(hwnd)?;
-    if start_fullscreen {
-        fullscreen::toggle(state);
-        // Paint the popup before returning: TC shows its (white) Lister window right after
-        // `ListLoad`, and an unpainted popup would let it show through until the first WM_PAINT.
-        redraw(hwnd);
-    }
-    update_title(state);
-    Some(hwnd)
+        let state = get_state(hwnd)?;
+        if start_fullscreen {
+            fullscreen::toggle(state);
+            // Paint the popup before returning: TC shows its (white) Lister window right after
+            // `ListLoad`, and an unpainted popup would let it show through until the first WM_PAINT.
+            redraw(hwnd);
+        }
+        update_title(state);
+        Some(hwnd)
+    })
 }
 
 pub unsafe fn close_viewer(hwnd: HWND) {
-    // The player goes first, while the viewer is still whole: libmpv's window lives on its own
-    // thread, and if that thread ended in the middle of destroying the active (fullscreen)
-    // viewer, Windows would activate nothing and TC's panel would be left without the focus.
-    if let Some(state) = get_live_state(hwnd) {
-        state.media = None;
+    if access::defer_close(hwnd) {
+        return;
     }
-    let _ = DestroyWindow(hwnd);
-    crate::smooth::release();
-    gdi::release_buffers();
+    access::run(hwnd, (), || {
+        // The player goes first, while the viewer is still whole: libmpv's window lives on its own
+        // thread, and if that thread ended in the middle of destroying the active (fullscreen)
+        // viewer, Windows would activate nothing and TC's panel would be left without the focus.
+        if let Some(state) = get_live_state(hwnd) {
+            state.media = None;
+        }
+        let _ = DestroyWindow(hwnd);
+        crate::smooth::release();
+        gdi::release_buffers();
+    })
 }
 
 /// `ListLoadNext`: shows `path` in the existing window. False if it can't be displayed.
 pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) -> bool {
-    let Some(state) = get_state(hwnd) else {
-        return false;
-    };
-    state.lister = lister;
-    state.show_flags = show_flags;
-    if !state.set_file(path) {
-        return false;
-    }
-    refresh(state);
-    true
+    access::run(hwnd, false, || {
+        let Some(state) = get_state(hwnd) else {
+            return false;
+        };
+        state.lister = lister;
+        state.show_flags = show_flags;
+        if !state.set_file(path) {
+            return false;
+        }
+        refresh(state);
+        true
+    })
 }
 
 /// `ListSendCommand`. A toggled `LCP_FITTOWINDOW` means the user pressed TC's `F` hotkey,
@@ -147,27 +159,29 @@ pub unsafe fn load_next(lister: HWND, hwnd: HWND, path: &Path, show_flags: i32) 
 /// `LCP_FITLARGERONLY` is TC's `L` ("fit larger only"), our rotate left; a toggled `LCP_CENTER`
 /// is TC's `C` ("center images"), our compare.
 pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
-    let Some(state) = get_state(hwnd) else {
-        return false;
-    };
-    if command != LC_NEWPARAMS && command != LC_COPY {
-        return false;
-    }
-    if command == LC_COPY {
-        execute(hwnd, Command::Copy);
-        return true;
-    }
-    let toggled = state.show_flags ^ parameter;
-    state.show_flags = parameter;
-    // `L` alone, whatever TC does to the fit flag along with it.
-    if toggled & LCP_FITLARGERONLY != 0 {
-        execute(hwnd, Command::RotateLeft);
-    } else if toggled & LCP_FITTOWINDOW != 0 {
-        execute(hwnd, Command::ToggleFullscreen);
-    } else if toggled & LCP_CENTER != 0 && state.media.is_none() {
-        execute(hwnd, Command::ToggleCompare);
-    }
-    true
+    access::run(hwnd, false, || {
+        let Some(state) = get_state(hwnd) else {
+            return false;
+        };
+        if command != LC_NEWPARAMS && command != LC_COPY {
+            return false;
+        }
+        if command == LC_COPY {
+            execute(hwnd, Command::Copy);
+            return true;
+        }
+        let toggled = state.show_flags ^ parameter;
+        state.show_flags = parameter;
+        // `L` alone, whatever TC does to the fit flag along with it.
+        if toggled & LCP_FITLARGERONLY != 0 {
+            execute(hwnd, Command::RotateLeft);
+        } else if toggled & LCP_FITTOWINDOW != 0 {
+            execute(hwnd, Command::ToggleFullscreen);
+        } else if toggled & LCP_CENTER != 0 && state.media.is_none() {
+            execute(hwnd, Command::ToggleCompare);
+        }
+        true
+    })
 }
 
 /// TC's Quick View panel (Ctrl+Q) hosts the plugin in a child window of the main window,
@@ -319,66 +333,90 @@ pub unsafe fn overlay_message(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    let state = get_live_state(viewer)?;
-    let fs = state.overlay.as_mut()?;
-    let kind = fs.kind_of(window)?;
-    let pt = point_from_lparam(lparam.0);
-    if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
-        fs.panel_used(viewer, kind);
+    if access::defer_overlay(viewer, window, msg) {
+        return None;
     }
-    match (msg, kind) {
-        (WM_PAINT, PanelKind::Close) => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(window, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(window, &mut rc);
-            let scale = gdi::dpi_scale(window);
-            let hot = fs.close_hot();
-            gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
-                overlay::paint_close_button(dc, rc, scale, hot)
-            });
-            let _ = EndPaint(window, &ps);
+    access::run(viewer, None, || {
+        let state = get_live_state(viewer)?;
+        let fs = state.overlay.as_mut()?;
+        let kind = fs.kind_of(window)?;
+        let pt = point_from_lparam(lparam.0);
+        if matches!(msg, WM_MOUSEMOVE | WM_LBUTTONDOWN | WM_LBUTTONUP) {
+            fs.panel_used(viewer, kind);
         }
-        // Mouse moves light it up through `panel_used`. Like a caption button: pressed, it closes
-        // on release over it.
-        (WM_MOUSELEAVE, PanelKind::Close) => fs.set_close_hot(false),
-        (WM_LBUTTONDOWN, PanelKind::Close) => {
-            let _ = SetCapture(window);
-        }
-        (WM_LBUTTONUP, PanelKind::Close) => {
-            let _ = ReleaseCapture();
-            if fs.close_hot() {
-                let _ = PostMessageW(
-                    Some(viewer),
-                    WM_OVERLAY_COMMAND,
-                    WPARAM(Command::Close as usize),
-                    LPARAM(0),
-                );
+        match (msg, kind) {
+            (WM_PAINT, PanelKind::Close) => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(window, &mut ps);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(window, &mut rc);
+                let scale = gdi::dpi_scale(window);
+                let hot = fs.close_hot();
+                gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
+                    overlay::paint_close_button(dc, rc, scale, hot)
+                });
+                let _ = EndPaint(window, &ps);
             }
-        }
-        (WM_PAINT, PanelKind::Video) => state.media.as_mut()?.paint_bar_host(window),
-        (WM_PAINT, PanelKind::Photo) => {
-            let mut ps = PAINTSTRUCT::default();
-            let hdc = BeginPaint(window, &mut ps);
-            let mut rc = RECT::default();
-            let _ = GetClientRect(window, &mut rc);
-            let scale = gdi::dpi_scale(window);
-            let playing = state.slideshow;
-            gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
-                overlay::paint_photo_panel(dc, rc, scale, playing)
-            });
-            let _ = EndPaint(window, &ps);
-        }
-        (WM_MOUSEMOVE, PanelKind::Video) => state.media.as_mut()?.bar_host_mouse_move(pt.x, pt.y),
-        (WM_MOUSELEAVE, PanelKind::Video) => state.media.as_ref()?.hide_preview(),
-        (WM_LBUTTONDOWN, PanelKind::Video) => {
-            let media = state.media.as_mut()?;
-            match media.bar_mouse_down(pt.x, pt.y) {
-                Click::Bar if media.is_dragging() => {
-                    let _ = SetCapture(window);
+            // Mouse moves light it up through `panel_used`. Like a caption button: pressed, it closes
+            // on release over it.
+            (WM_MOUSELEAVE, PanelKind::Close) => fs.set_close_hot(false),
+            (WM_LBUTTONDOWN, PanelKind::Close) => {
+                let _ = SetCapture(window);
+            }
+            (WM_LBUTTONUP, PanelKind::Close) => {
+                let _ = ReleaseCapture();
+                if fs.close_hot() {
+                    let _ = PostMessageW(
+                        Some(viewer),
+                        WM_OVERLAY_COMMAND,
+                        WPARAM(Command::Close as usize),
+                        LPARAM(0),
+                    );
                 }
-                Click::Skip(forward) => {
-                    let cmd = Command::track(forward);
+            }
+            (WM_PAINT, PanelKind::Video) => state.media.as_mut()?.paint_bar_host(window),
+            (WM_PAINT, PanelKind::Photo) => {
+                let mut ps = PAINTSTRUCT::default();
+                let hdc = BeginPaint(window, &mut ps);
+                let mut rc = RECT::default();
+                let _ = GetClientRect(window, &mut rc);
+                let scale = gdi::dpi_scale(window);
+                let playing = state.slideshow;
+                gdi::with_buffer(hdc, rc.right, rc.bottom, rc, |dc| unsafe {
+                    overlay::paint_photo_panel(dc, rc, scale, playing)
+                });
+                let _ = EndPaint(window, &ps);
+            }
+            (WM_MOUSEMOVE, PanelKind::Video) => {
+                state.media.as_mut()?.bar_host_mouse_move(pt.x, pt.y)
+            }
+            (WM_MOUSELEAVE, PanelKind::Video) => state.media.as_ref()?.hide_preview(),
+            (WM_LBUTTONDOWN, PanelKind::Video) => {
+                let media = state.media.as_mut()?;
+                match media.bar_mouse_down(pt.x, pt.y) {
+                    Click::Bar if media.is_dragging() => {
+                        let _ = SetCapture(window);
+                    }
+                    Click::Skip(forward) => {
+                        let cmd = Command::track(forward);
+                        let _ = PostMessageW(
+                            Some(viewer),
+                            WM_OVERLAY_COMMAND,
+                            WPARAM(cmd as usize),
+                            LPARAM(0),
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            (WM_LBUTTONDOWN, PanelKind::Photo) => {
+                let command =
+                    overlay::hit_photo(gdi::dpi_scale(window), pt.x, pt.y).map(|b| match b {
+                        PhotoButton::Previous => Command::Previous,
+                        PhotoButton::Slideshow => Command::ToggleSlideshow,
+                        PhotoButton::Next => Command::Next,
+                    });
+                if let Some(cmd) = command {
                     let _ = PostMessageW(
                         Some(viewer),
                         WM_OVERLAY_COMMAND,
@@ -386,50 +424,34 @@ pub unsafe fn overlay_message(
                         LPARAM(0),
                     );
                 }
-                _ => {}
             }
-        }
-        (WM_LBUTTONDOWN, PanelKind::Photo) => {
-            let command = overlay::hit_photo(gdi::dpi_scale(window), pt.x, pt.y).map(|b| match b {
-                PhotoButton::Previous => Command::Previous,
-                PhotoButton::Slideshow => Command::ToggleSlideshow,
-                PhotoButton::Next => Command::Next,
-            });
-            if let Some(cmd) = command {
-                let _ = PostMessageW(
-                    Some(viewer),
-                    WM_OVERLAY_COMMAND,
-                    WPARAM(cmd as usize),
-                    LPARAM(0),
-                );
-            }
-        }
-        (WM_LBUTTONUP, _) => {
-            if kind == PanelKind::Video {
-                if let Some(media) = state.media.as_mut().filter(|m| m.is_dragging()) {
-                    media.mouse_up(pt.x);
+            (WM_LBUTTONUP, _) => {
+                if kind == PanelKind::Video {
+                    if let Some(media) = state.media.as_mut().filter(|m| m.is_dragging()) {
+                        media.mouse_up(pt.x);
+                    }
                 }
+                let _ = ReleaseCapture();
             }
-            let _ = ReleaseCapture();
-        }
-        (WM_CAPTURECHANGED, PanelKind::Video) if HWND(lparam.0 as *mut _) != window => {
-            let x = cursor_in(window).x;
-            state.media.as_mut()?.capture_lost(x);
-        }
-        (WM_MOUSEMOVE, _) => {}
-        // Wheel over the floating bar: volume.
-        (WM_MOUSEWHEEL, PanelKind::Video) => {
-            let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
-            let notches = wheel_notches(&mut state.wheel_rest, delta);
-            let media = state.media.as_mut()?;
-            for _ in 0..notches.unsigned_abs().min(MAX_WHEEL_NOTCHES) {
-                media.change_volume(notches > 0);
+            (WM_CAPTURECHANGED, PanelKind::Video) if HWND(lparam.0 as *mut _) != window => {
+                let x = cursor_in(window).x;
+                state.media.as_mut()?.capture_lost(x);
             }
-            media.invalidate_bar();
+            (WM_MOUSEMOVE, _) => {}
+            // Wheel over the floating bar: volume.
+            (WM_MOUSEWHEEL, PanelKind::Video) => {
+                let delta = ((wparam.0 >> 16) & 0xFFFF) as i16;
+                let notches = wheel_notches(&mut state.wheel_rest, delta);
+                let media = state.media.as_mut()?;
+                for _ in 0..notches.unsigned_abs().min(MAX_WHEEL_NOTCHES) {
+                    media.change_volume(notches > 0);
+                }
+                media.invalidate_bar();
+            }
+            _ => return None,
         }
-        _ => return None,
-    }
-    Some(LRESULT(0))
+        Some(LRESULT(0))
+    })
 }
 
 /// Drops the auto-repeats of `vk` that queued up while a seek step ran: on a long transport
@@ -735,12 +757,13 @@ unsafe fn execute(hwnd: HWND, command: Command) {
         | Command::RepeatOne
         | Command::ToggleShuffle => {
             let before = state.config.clone();
-            let queue = &mut state.config.queue;
+            let mut queue = state.config.queue;
             match command {
                 Command::ToggleAutoAdvance => queue.auto_advance = !queue.auto_advance,
                 Command::ToggleShuffle => queue.shuffle = !queue.shuffle,
                 _ => queue.repeat = command.repeat_mode().unwrap_or_default(),
             }
+            state.set_queue(queue);
             state.config.save(&before);
         }
         Command::ZoomIn | Command::ZoomOut => {
@@ -946,7 +969,23 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
-        handle_message(hwnd, msg, wparam, lparam)
+        // Popup menus send these synchronously from their modal loop. They only borrow
+        // the menu's own style, so they remain safe while ViewerState is in use.
+        match msg {
+            WM_MEASUREITEM if menu_theme::measure_item(lparam) => return LRESULT(1),
+            WM_DRAWITEM if menu_theme::draw_item(lparam) => return LRESULT(1),
+            _ => {}
+        }
+        if let Some(result) = access::nested(hwnd, msg, wparam, lparam) {
+            return if msg == WM_NCDESTROY {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            } else {
+                result
+            };
+        }
+        access::run(hwnd, LRESULT(0), || {
+            handle_message(hwnd, msg, wparam, lparam)
+        })
     })
 }
 
@@ -1131,8 +1170,6 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             let _ = InvalidateRect(Some(hwnd), None, false);
             update_title(state);
         }
-        WM_MEASUREITEM if menu_theme::measure_item(lparam) => return LRESULT(1),
-        WM_DRAWITEM if menu_theme::draw_item(lparam) => return LRESULT(1),
         WM_RBUTTONUP => {
             let mut pt = point_from_lparam(lparam.0);
             let _ = ClientToScreen(hwnd, &mut pt);
@@ -1385,6 +1422,10 @@ unsafe fn ctrl_down() -> bool {
 
 unsafe fn shift_down() -> bool {
     GetKeyState(VK_SHIFT.0 as i32) < 0
+}
+
+pub unsafe fn print_external(hwnd: HWND, printer: Option<&str>, margins: Option<RECT>) -> bool {
+    access::run(hwnd, false, || print(hwnd, printer, margins))
 }
 
 #[cfg(test)]

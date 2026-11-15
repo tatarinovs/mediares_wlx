@@ -83,6 +83,31 @@ def worker(dll_path, paths):
     print(json.dumps({"values": values, "ms": (time.perf_counter() - start) * 1000}))
 
 
+def transient_worker(dll_path, path):
+    """A sharing violation must not poison an unchanged file's RAM metadata entry."""
+    os.environ["MEDIARES_CONTENT_CACHE"] = "off"
+    dll, fields = content_plugin(dll_path)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                                  wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE]
+    kernel.CreateFileW.restype = wintypes.HANDLE
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    lock = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)
+    assert lock != ctypes.c_void_p(-1).value, ctypes.get_last_error()
+    buf = ctypes.create_string_buffer(128)
+    field = fields["Image_Width"][0]
+    try:
+        assert dll.ContentGetValueW(str(path), field, 0, buf, len(buf), 0) == -3
+    finally:
+        kernel.CloseHandle(lock)
+    try:
+        assert dll.ContentGetValueW(str(path), field, 0, buf, len(buf), 0) == 1
+        assert ctypes.c_int.from_buffer(buf).value == 1600
+    finally:
+        dll.ContentPluginUnloading()
+    print(json.dumps({"transient_read_recovered": True}))
+
+
 def quick_worker(dll_path, path):
     dll, fields = content_plugin(dll_path)
     buf = ctypes.create_string_buffer(128)
@@ -247,6 +272,11 @@ def run_check(dll, baseline, viewer_dll, stress):
     make_video_tags(paths[4])
     paths[5].write_bytes(b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff\xd9")
     paths[6].write_bytes(struct.pack(">I4s4sI4s", 12, b"ftyp", b"isom", 8, b"moov"))
+    recovery = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), "--transient-worker", "--dll", str(dll), str(paths[0])],
+        env=dict(os.environ, MEDIARES_CONTENT_CACHE="off"), capture_output=True, text=True,
+        timeout=30, check=True)
+    assert json.loads(recovery.stdout)["transient_read_recovered"]
     db = work / "cache.sqlite3"
 
     def run(cache, library=dll):
@@ -343,7 +373,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     report = {"dll": str(dll), "cold_ms": cold["ms"], "warm_ms": warm["ms"],
               "disabled_ms": disabled["ms"], "database_bytes": db.stat().st_size,
               "dll_bytes": dll.stat().st_size,
-              "checks": ["fresh-process hits", "metadata hits", "metadata edit", "schema upgrade",
+              "checks": ["transient read recovery", "fresh-process hits", "metadata hits", "metadata edit", "schema upgrade",
                          "malformed metadata", "default path", "RAM/UI delay", "Unicode paths", "file edit",
                          "algorithm version", "disabled", "unavailable", "corrupt", "locked",
                          "empty EXIF", "empty video tags"]}
@@ -425,12 +455,15 @@ if __name__ == "__main__":
     parser.add_argument("--viewer-dll", type=Path, help="Also test MF rejection through the WLX API")
     parser.add_argument("--stress", action="store_true", help="Test 500k rows and concurrent processes")
     parser.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--transient-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--quick-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--viewer-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("files", nargs="*", type=Path)
     args = parser.parse_args()
     if args.worker:
         worker(args.dll.resolve(), args.files)
+    elif args.transient_worker:
+        transient_worker(args.dll.resolve(), args.files[0].resolve())
     elif args.quick_worker:
         quick_worker(args.dll.resolve(), args.files[0])
     elif args.viewer_worker:

@@ -193,6 +193,21 @@ impl AudioPlayer {
         true
     }
 
+    /// False if the output already switched; reconcile that transition before changing rules.
+    pub fn cancel_preload(&mut self) -> bool {
+        let mut slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_, track)) = self.pending.as_ref() else {
+            return true;
+        };
+        if slot.is_none() {
+            return false;
+        }
+        track.state.stopped.store(true, Ordering::Relaxed);
+        slot.take();
+        self.pending = None;
+        true
+    }
+
     /// Decodes `path` ahead to follow the current track without a gap, at ReplayGain `gain`.
     /// False if it can't (another sample rate or channel count, or not decodable).
     pub fn preload(&mut self, path: &Path, gain: f32) -> bool {
@@ -607,5 +622,58 @@ impl TrackSource {
         self.buf_start = 0.0;
         self.frames_played = 0;
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancelling_preload_preserves_current_track_and_handles_an_already_taken_successor() {
+        let state = TrackState::new(false, 1.0);
+        let (commands, _rx) = mpsc::channel();
+        let (_tx, chunks) = mpsc::sync_channel(1);
+        let mut player = AudioPlayer {
+            track: None,
+            levels: Arc::new(Levels {
+                paused: AtomicBool::new(false),
+                muted: AtomicBool::new(false),
+                volume: AtomicU32::new(1.0f32.to_bits()),
+            }),
+            next_slot: Arc::new(Mutex::new(Some(NextTrack {
+                state: state.clone(),
+                chunks,
+            }))),
+            pending: Some((
+                "next.wav".into(),
+                Track {
+                    state: state.clone(),
+                    commands,
+                    duration: 10.0,
+                    format: (2, 44100),
+                },
+            )),
+        };
+        assert!(player.cancel_preload());
+        assert!(state.stopped.load(Ordering::Relaxed));
+        assert!(player.pending.is_none());
+        assert!(player.next_slot.lock().unwrap().is_none());
+        assert!(player.cancel_preload());
+
+        let state = TrackState::new(false, 1.0);
+        let (commands, _rx) = mpsc::channel();
+        player.pending = Some((
+            "next.wav".into(),
+            Track {
+                state: state.clone(),
+                commands,
+                duration: 10.0,
+                format: (2, 44100),
+            },
+        ));
+        assert!(!player.cancel_preload());
+        assert!(!state.stopped.load(Ordering::Relaxed));
+        assert!(player.pending.is_some());
     }
 }

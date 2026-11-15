@@ -103,18 +103,24 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> rusqlite::Result<R>) -> Option<R>
     }
 }
 
-pub(crate) fn read<T: DiskValue>(key: &FileKey) -> Option<T> {
+pub(crate) fn read<T: DiskValue>(key: &FileKey) -> Option<(T, usize)> {
     let key = Key::new(key)?;
-    with_store(|store| store.read(&key))
+    let value: T = with_store(|store| store.read(&key))?;
+    let bytes = value.columns().map_or(usize::MAX, |c| c.memory_bytes());
+    Some((value, bytes))
 }
 
-pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) {
+/// Return the RAM weight from the same representation prepared for SQLite.
+pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) -> usize {
     // Unsupported/cancelled analyses must not survive a restart: codecs and permissions change.
     let Some(columns) = value.columns() else {
-        return;
+        return usize::MAX;
     };
-    let Some(key) = Key::new(key) else { return };
-    with_store(|store| store.write(&key, T::SLOT, columns, MAINTENANCE_ALLOWED.get()));
+    let bytes = columns.memory_bytes();
+    if let Some(key) = Key::new(key) {
+        with_store(|store| store.write(&key, T::SLOT, columns, MAINTENANCE_ALLOWED.get()));
+    }
+    bytes
 }
 
 pub(crate) fn close() {
@@ -365,6 +371,18 @@ pub(crate) struct Columns<'a> {
     pcm_hash: Option<&'a str>,
     sharpness: Option<u32>,
     payload: Option<String>,
+}
+
+impl Columns<'_> {
+    pub(crate) fn memory_bytes(&self) -> usize {
+        // JSON length plus allocator/container overhead. Small fixed fields cost little;
+        // variable-length strings and vectors dominate unusually large metadata.
+        self.payload
+            .as_ref()
+            .map_or(0, String::len)
+            .saturating_mul(3)
+            .saturating_add(size_of::<Self>())
+    }
 }
 
 pub(crate) trait DiskValue: Sized {

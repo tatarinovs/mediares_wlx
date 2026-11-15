@@ -46,6 +46,8 @@ Mediares открывает фото, видео и аудио по **F3**, по
 
 ## Просмотрщик
 
+Временные PNG кадров и обложек в `%TEMP%\Mediares` очищаются автоматически при открытии просмотрщика или следующем копировании, не раньше чем через сутки. Текущий файл буфера обмена и файлы, открытые другими программами, не удаляются.
+
 ### Фото
 
 Поддерживаются JPEG, PNG, GIF, WebP, BMP, ICO, TGA, HDR, TIFF, JPEG XR, DDS, PSD/PSB и RAW популярных камер. RAW показывается по встроенному JPEG-превью, PSD/PSB — по сохранённому композитному изображению. Доступны все страницы многостраничного TIFF.
@@ -213,6 +215,8 @@ cargo test --workspace --locked  # тесты всего workspace
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite-кэш (Python 3)
 # Проверка WLX, большой базы и одновременных процессов:
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
+cargo build -p mediares_combo --example lister_harness --locked
+python scripts/test_save_as.py  # окончательное имя и подтверждение замены в настоящем диалоге
 ```
 
 ## Лицензия

@@ -319,6 +319,10 @@ unsafe fn first_frame(
     if !command(api, handle, &["loadfile", &path.to_string_lossy()]) {
         return None;
     }
+    wait_frame(api, handle, timeout)
+}
+
+unsafe fn wait_frame(api: &Api, handle: Handle, timeout: Duration) -> Option<(u32, u32, Vec<u8>)> {
     let deadline = Instant::now() + timeout;
     loop {
         let left = deadline.checked_duration_since(Instant::now())?;
@@ -329,6 +333,73 @@ unsafe fn first_frame(
             EVENT_PLAYBACK_RESTART => return screenshot(api, handle),
             _ => {}
         }
+    }
+}
+
+/// One demuxer/decoder for all the frames of a contact sheet.
+pub struct FrameSession {
+    api: &'static Api,
+    handle: Handle,
+}
+
+impl FrameSession {
+    pub fn open(path: &Path, fit: (u32, u32)) -> Option<Self> {
+        let api = api()?;
+        let filter = format!(
+            "lavfi=[scale=w='min(iw,{})':h='min(ih,{})':force_original_aspect_ratio=decrease]",
+            fit.0.max(1),
+            fit.1.max(1)
+        );
+        unsafe {
+            let handle = create_handle(
+                api,
+                &[
+                    ("vo", "null"),
+                    ("ao", "null"),
+                    ("aid", "no"),
+                    ("sid", "no"),
+                    ("pause", "yes"),
+                    ("hwdec", "no"),
+                    ("hr-seek", "no"),
+                    ("idle", "yes"),
+                    ("keep-open", "yes"),
+                    ("vf", &filter),
+                ],
+            )?;
+            let session = Self { api, handle };
+            first_frame(api, handle, path, VIDEO_FRAME_TIMEOUT)?;
+            Some(session)
+        }
+    }
+
+    pub fn frame_at(&self, seconds: f64) -> Option<(RgbaImage, f64)> {
+        unsafe {
+            if !command(
+                self.api,
+                self.handle,
+                &[
+                    "seek",
+                    &format!("{:.6}", seconds.max(0.0)),
+                    "absolute+keyframes",
+                ],
+            ) {
+                return None;
+            }
+            let (w, h, mut pixels) = wait_frame(self.api, self.handle, VIDEO_FRAME_TIMEOUT)?;
+            let shown = get_f64(self.api, self.handle, "time-pos").unwrap_or(seconds);
+            pixels
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
+                .for_each(|p| p.swap(0, 2));
+            Some((RgbaImage::from_raw(w, h, pixels)?, shown))
+        }
+    }
+}
+
+impl Drop for FrameSession {
+    fn drop(&mut self) {
+        unsafe { (self.api.terminate_destroy)(self.handle) };
     }
 }
 
@@ -1180,6 +1251,25 @@ impl Transport for MpvPlayer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires libmpv and MEDIARES_TEST_VIDEO"]
+    fn contact_sheet_session_seeks_distinct_frames_in_one_decoder() {
+        let video = std::env::var_os("MEDIARES_TEST_VIDEO").expect("fixture video");
+        let path = Path::new(&video);
+        let session = FrameSession::open(path, (120, 90)).expect("open mpv frame session");
+        let mut hashes = std::collections::HashSet::new();
+        for time in [0.2, 0.8, 1.4, 2.0] {
+            let (frame, shown) = session.frame_at(time).expect("seek frame");
+            assert!(frame.width() <= 120 && frame.height() <= 90);
+            assert!(
+                (shown - time).abs() < 0.3,
+                "requested {time}, shown {shown}"
+            );
+            hashes.insert(frame.into_raw());
+        }
+        assert_eq!(hashes.len(), 4);
+    }
 
     #[test]
     fn volume_round_trips() {

@@ -70,13 +70,7 @@ pub(super) unsafe fn build(
             PAGE_SCOPE,
         );
         for caption in [tr("All pages"), tr("Selected pages")] {
-            let caption = HSTRING::from(caption);
-            SendMessageW(
-                scope,
-                CB_ADDSTRING,
-                None,
-                Some(LPARAM(caption.as_ptr() as isize)),
-            );
+            dialog::combo_add(scope, caption);
         }
         SendMessageW(scope, CB_SETCURSEL, Some(WPARAM(0)), None);
         control(

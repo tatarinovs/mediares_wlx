@@ -11,7 +11,7 @@ $rootPath = [IO.Path]::GetFullPath($Root)
 $targetPath = [IO.Path]::Combine($rootPath, 'target')
 $stagePath = [IO.Path]::Combine($targetPath, ('package-' + [Guid]::NewGuid().ToString('N')))
 $distPath = [IO.Path]::Combine($rootPath, 'dist')
-$succeeded = $false
+$keepBackups = $false
 
 function Resolve-Input([string]$Name) {
     $path = if ([IO.Path]::IsPathRooted($Name)) { $Name } else { [IO.Path]::Combine($rootPath, $Name) }
@@ -55,16 +55,59 @@ function Stage-Package([string]$Kind, [string]$Binary) {
     return $zipPath
 }
 
-function Publish-File([string]$Source, [string]$Name) {
-    # Destination temp is unique; an error never deletes or truncates the previous artifact.
-    $destination = [IO.Path]::Combine($distPath, $Name)
-    $temporary = [IO.Path]::Combine($distPath, ('.mediares-' + [Guid]::NewGuid().ToString('N') + '.tmp'))
+function Publish-Release($Files) {
+    $prepared = @()
+    $changed = @()
+    $leases = @()
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $key = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::Unicode.GetBytes($distPath.ToUpperInvariant()))).Replace('-', '') }
+    finally { $sha.Dispose() }
+    $mutex = New-Object Threading.Mutex($false, ('Local\MediaresPackage-' + $key))
+    $held = $false
     try {
-        [IO.File]::Copy($Source, $temporary, $false)
-        if ([IO.File]::Exists($destination)) { [IO.File]::Replace($temporary, $destination, [NullString]::Value) }
-        else { [IO.File]::Move($temporary, $destination) }
+        try { $held = $mutex.WaitOne(0) } catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'Another release is being published to this directory' }
+        # Stage every input and test every existing destination before changing any artifact.
+        foreach ($entry in $Files.GetEnumerator()) {
+            $destination = [IO.Path]::Combine($distPath, $entry.Key)
+            $temporary = [IO.Path]::Combine($distPath, ('.mediares-' + [Guid]::NewGuid().ToString('N') + '.tmp'))
+            $backup = [IO.Path]::Combine($stagePath, [Guid]::NewGuid().ToString('N') + '.bak')
+            $existed = [IO.File]::Exists($destination)
+            $item = [pscustomobject]@{ Destination=$destination; Temporary=$temporary; Backup=$backup; Existed=$existed }
+            $prepared += $item
+            if ($existed) {
+                $leases += [IO.File]::Open($destination, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, ([IO.FileShare]::Read -bor [IO.FileShare]::Delete))
+                [IO.File]::Copy($destination, $backup, $false)
+            }
+            [IO.File]::Copy($entry.Value, $temporary, $false)
+        }
+        foreach ($item in $prepared) {
+            if ($item.Existed) { [IO.File]::Replace($item.Temporary, $item.Destination, [NullString]::Value) }
+            else { [IO.File]::Move($item.Temporary, $item.Destination) }
+            $changed += $item
+        }
+    } catch {
+        $failure = $_
+        $rollbackErrors = @()
+        [array]::Reverse($changed)
+        foreach ($item in $changed) {
+            try {
+                if ($item.Existed) { [IO.File]::Replace($item.Backup, $item.Destination, [NullString]::Value) }
+                else { [IO.File]::Delete($item.Destination) }
+            } catch { $rollbackErrors += $_.ToString() }
+        }
+        if ($rollbackErrors.Count) {
+            $script:keepBackups = $true
+            throw "Publication failed: $failure. Rollback errors: $($rollbackErrors -join '; '). Backups: $stagePath"
+        }
+        throw $failure
     } finally {
-        if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+        foreach ($lease in $leases) { $lease.Dispose() }
+        foreach ($item in $prepared) {
+            if ([IO.File]::Exists($item.Temporary)) { [IO.File]::Delete($item.Temporary) }
+        }
+        if ($held) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
     }
 }
 
@@ -76,12 +119,15 @@ try {
     $wdxZip = Stage-Package 'wdx' $wdx
     $wlxZip = Stage-Package 'wlx' $combo
     [IO.Directory]::CreateDirectory($distPath) | Out-Null
-    Publish-File $wdxZip ([IO.Path]::GetFileName($wdxZip))
-    Publish-File $wlxZip ([IO.Path]::GetFileName($wlxZip))
-    Publish-File $combo 'mediares.wlx64'
-    Publish-File $wdx 'mediares_wdx_only.wdx64'
-    Publish-File (Resolve-Input 'pluginst/pluginst-wlx.inf') 'pluginst.inf'
-    $succeeded = $true
+    Publish-Release ([ordered]@{
+        ([IO.Path]::GetFileName($wdxZip)) = $wdxZip
+        ([IO.Path]::GetFileName($wlxZip)) = $wlxZip
+        'mediares.wlx64' = $combo
+        'mediares_wdx_only.wdx64' = $wdx
+        'mediares.lng' = (Resolve-Input 'pluginst/mediares.lng')
+        'mediares_ui.lng' = (Resolve-Input 'pluginst/mediares_ui.lng')
+        'pluginst.inf' = (Resolve-Input 'pluginst/pluginst-wlx.inf')
+    })
     Write-Output "Verified release archives and DLLs written to $distPath"
 } catch {
     Write-Error "Release packaging failed: $_"
@@ -90,7 +136,7 @@ try {
     # Check the resolved absolute target before the only recursive deletion.
     $resolvedStage = [IO.Path]::GetFullPath($stagePath)
     $allowedPrefix = [IO.Path]::GetFullPath($targetPath).TrimEnd('\') + '\'
-    if ($succeeded -and $resolvedStage.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedStage)) {
+    if (-not $keepBackups -and $resolvedStage.StartsWith($allowedPrefix, [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $resolvedStage)) {
         Remove-Item -LiteralPath $resolvedStage -Recurse -Force
     }
 }

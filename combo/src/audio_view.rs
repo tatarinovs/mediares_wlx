@@ -6,7 +6,7 @@
 //! Foundation engine with a hidden surface.
 
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mediares_core::audio_tags::{read_tags, AudioTags};
 use mediares_core::probe::MediaType;
@@ -137,6 +137,7 @@ pub struct AudioView {
     /// "MP3", "FLAC"...
     format: String,
     cover: Option<Arc<DecodedImage>>,
+    metadata: Option<MetadataTask>,
     error: Option<String>,
     end_reported: bool,
     fonts: Option<Fonts>,
@@ -168,6 +169,7 @@ impl AudioView {
             file_stem: String::new(),
             format: String::new(),
             cover: None,
+            metadata: None,
             error: None,
             end_reported: false,
             fonts: None,
@@ -183,31 +185,33 @@ impl AudioView {
     /// Switches to another file, reusing the output device when possible.
     pub unsafe fn open(&mut self, path: &Path, replay_gain: bool) -> bool {
         self.replay_gain = replay_gain;
-        let backend = match &mut self.backend {
-            Backend::Native(player) => {
-                // A file the pure-Rust player just failed on isn't tried with it again.
-                (!player.open(path)).then(|| Backend::fallback(self.viewer, path))
+        if let Backend::Native(player) = &mut self.backend {
+            if !player.open(path) {
+                let Some(backend) = Backend::fallback(self.viewer, path) else {
+                    return false;
+                };
+                self.backend = backend;
             }
-            Backend::Mpv(_) | Backend::Engine { .. } => Some(Backend::create(self.viewer, path)),
-        };
-        match backend {
-            None => {}
-            Some(Some(backend)) => self.backend = backend,
-            Some(None) => return false,
+        } else {
+            let Some(backend) = Backend::create(self.viewer, path) else {
+                return false;
+            };
+            self.backend = backend;
         }
         self.load_meta(path);
         true
     }
 
     fn load_meta(&mut self, path: &Path) {
-        self.tags = read_tags(path, true).unwrap_or_default();
-        let embedded = self
-            .tags
-            .cover
-            .take()
-            .and_then(|bytes| image_cache::decode_picture(&bytes))
-            .map(Arc::new);
-        self.cover = embedded.or_else(|| folder_cover(path));
+        // ReplayGain affects audible output, so read its small tag record synchronously.
+        // Cover bytes, picture decoding, lyrics and folder scanning are optional UI work.
+        self.tags = if self.replay_gain {
+            mediares_core::cache::get_tags(path).map_or_else(AudioTags::default, |t| (*t).clone())
+        } else {
+            AudioTags::default()
+        };
+        self.cover = None;
+        self.metadata = MetadataTask::start(path);
         self.file_stem = path
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
@@ -241,6 +245,17 @@ impl AudioView {
             Backend::Mpv(player) => player.set_replay_gain(self.replay_gain),
             Backend::Engine { .. } => {}
         }
+    }
+
+    pub fn cancel_preload(&mut self) -> bool {
+        let cancelled = match &mut self.backend {
+            Backend::Native(p) => p.cancel_preload(),
+            _ => true,
+        };
+        if cancelled {
+            self.preload_asked = false;
+        }
+        cancelled
     }
 
     /// Decodes `path`, the next file of the queue, ahead so it follows without a gap. False if
@@ -296,6 +311,16 @@ impl AudioView {
 
     /// `WM_TIMER` with [`PROGRESS_TIMER_ID`].
     pub fn on_tick(&mut self) -> EventEffect {
+        if let Some((mut tags, cover)) = self.metadata.as_ref().and_then(MetadataTask::take) {
+            if let Backend::Mpv(player) = &self.backend {
+                player.fill_tags(&mut tags);
+            }
+            self.tags = tags;
+            self.cover = cover;
+            self.metadata = None;
+            self.apply_replay_gain();
+            return EventEffect::Relayout;
+        }
         self.follow_playback();
         let Backend::Native(player) = &self.backend else {
             return EventEffect::None;
@@ -646,6 +671,41 @@ impl AudioView {
             let _ = InvalidateRect(Some(self.viewer), Some(&r), false);
         }
         true
+    }
+}
+
+type Metadata = (AudioTags, Option<Arc<DecodedImage>>);
+struct MetadataTask(Arc<Mutex<Option<Metadata>>>);
+
+impl MetadataTask {
+    fn start(path: &Path) -> Option<Self> {
+        let result = Arc::new(Mutex::new(None));
+        let weak = Arc::downgrade(&result);
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("mediares-audio-metadata".into())
+            .spawn(move || {
+                if weak.strong_count() == 0 {
+                    return;
+                }
+                let _com = mediares_core::mf_init::ComScope::new();
+                let mut tags = read_tags(&path, true).unwrap_or_default();
+                let cover = tags
+                    .cover
+                    .take()
+                    .and_then(|bytes| image_cache::decode_picture(&bytes))
+                    .map(Arc::new)
+                    .or_else(|| folder_cover(&path));
+                if let Some(result) = weak.upgrade() {
+                    *result.lock().unwrap_or_else(|e| e.into_inner()) = Some((tags, cover));
+                }
+            })
+            .ok()?;
+        Some(Self(result))
+    }
+
+    fn take(&self) -> Option<Metadata> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
 
