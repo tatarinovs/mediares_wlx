@@ -2,7 +2,7 @@
 //! installed in the system. Used by the player in `combo` (and later for waveforms).
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 
 use symphonia::core::codecs::audio::{AudioDecoder as CodecDecoder, AudioDecoderOptions};
@@ -15,6 +15,8 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 /// Consecutive undecodable packets tolerated during playback (analysis rejects the first).
 const MAX_BAD_PACKETS: u32 = 64;
+/// Read-ahead buffer for sequential full-file analysis (fingerprinting / PCM hashing).
+const SCAN_READ_BUF: usize = 1024 * 1024;
 
 /// Sequential decoder of the default audio track of a file.
 pub struct AudioDecoder {
@@ -42,7 +44,16 @@ pub struct Chunk<'a> {
 impl AudioDecoder {
     /// Opens the file; `None` if the container or codec is not supported.
     pub fn open(path: &Path) -> Option<Self> {
-        let format = open_format(path)?;
+        Self::open_with(path, None)
+    }
+
+    /// Opens the file with a 1 MiB read-ahead buffer for sequential full-file analysis.
+    pub fn open_sequential(path: &Path) -> Option<Self> {
+        Self::open_with(path, Some(SCAN_READ_BUF))
+    }
+
+    fn open_with(path: &Path, read_buf: Option<usize>) -> Option<Self> {
+        let format = open_format_with(path, read_buf)?;
         let track = format.default_track(TrackType::Audio)?;
         let params = track.codec_params.as_ref()?.audio()?;
         let decoder = symphonia::default::get_codecs()
@@ -183,23 +194,35 @@ impl AudioDecoder {
 /// PCM — keeping any tags in front of and behind the RIFF structure.
 /// Formats only libmpv plays are refused: APE and WavPack keep the source WAV header inside, and
 /// symphonia's probe finds it and reads the compressed data as PCM.
+#[cfg(feature = "tags")]
 pub(crate) fn open_format(path: &Path) -> Option<Box<dyn FormatReader>> {
+    open_format_with(path, None)
+}
+
+fn open_format_with(path: &Path, read_buf: Option<usize>) -> Option<Box<dyn FormatReader>> {
     if crate::probe::is_mpv_only(path) {
         return None;
     }
     let mut file = File::open(path).ok()?;
     let mut hint = Hint::new();
-    let source: Box<dyn MediaSource> = match riff_mp3_ranges(&mut file) {
+    let (source, byte_len): (Box<dyn MediaSource>, Option<u64>) = match riff_mp3_ranges(&mut file) {
         Some(ranges) => {
             hint.with_extension("mp3");
-            Box::new(Spliced::new(file, ranges))
+            let spliced = Spliced::new(file, ranges);
+            let len = spliced.byte_len();
+            (Box::new(spliced), len)
         }
         None => {
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
                 hint.with_extension(ext);
             }
-            Box::new(file)
+            let len = file.metadata().ok().map(|m| m.len());
+            (Box::new(file), len)
         }
+    };
+    let source: Box<dyn MediaSource> = match read_buf {
+        Some(cap) => Box::new(BufferedSource::new(source, byte_len, cap)),
+        None => source,
     };
     let mss = MediaSourceStream::new(source, Default::default());
     symphonia::default::get_probe()
@@ -355,6 +378,44 @@ impl MediaSource for Spliced {
 
     fn byte_len(&self) -> Option<u64> {
         Some(self.len)
+    }
+}
+
+/// Wraps a seekable [`MediaSource`] in a large [`BufReader`] so sequential full-file scans
+/// issue large OS read calls instead of `symphonia`'s 32 KiB blocks.
+struct BufferedSource<R> {
+    reader: BufReader<R>,
+    len: Option<u64>,
+}
+
+impl<R: Read> BufferedSource<R> {
+    fn new(inner: R, len: Option<u64>, capacity: usize) -> Self {
+        Self {
+            reader: BufReader::with_capacity(capacity, inner),
+            len,
+        }
+    }
+}
+
+impl<R: Read> Read for BufferedSource<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl<R: Seek> Seek for BufferedSource<R> {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        self.reader.seek(pos)
+    }
+}
+
+impl<R: Read + Seek + Send + Sync> MediaSource for BufferedSource<R> {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.len
     }
 }
 

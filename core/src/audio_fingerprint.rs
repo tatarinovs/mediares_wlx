@@ -171,7 +171,7 @@ fn analyze_audio<A: SampleAnalysis>(
     if cancelled() {
         return Err(AudioError::Cancelled);
     }
-    if let Some(mut decoder) = AudioDecoder::open(path) {
+    if let Some(mut decoder) = AudioDecoder::open_sequential(path) {
         match analyze_source::<A>(&mut decoder, cancelled) {
             Err(AudioError::Unsupported) => {}
             result => return result,

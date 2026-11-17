@@ -489,10 +489,14 @@ fn audio_analysis_value(path: &Path, field: Field, cancelled: &dyn Fn() -> bool)
         Field::AudioFingerprint => crate::cache::get_audio_fingerprint(path, cancelled)?
             .fingerprint
             .map(Value::Text),
-        Field::AudioPcmHash => Some(Value::Text(
-            crate::cache::get_audio_pcm_hash(path, cancelled)?.pcm_hash,
-        )),
-        Field::AudioDurationSec => Some(int(crate::cache::get_audio_duration(path, cancelled)?.0)),
+        Field::AudioPcmHash => {
+            let hash = crate::cache::get_audio_pcm_hash(path, cancelled)?.pcm_hash;
+            (!hash.is_empty()).then_some(Value::Text(hash))
+        }
+        Field::AudioDurationSec => {
+            let sec = crate::cache::get_audio_duration(path, cancelled)?.0;
+            (sec != u32::MAX).then_some(int(sec))
+        }
         _ => None,
     }
     #[cfg(not(feature = "audio-decode"))]
