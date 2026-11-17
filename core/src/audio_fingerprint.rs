@@ -13,6 +13,7 @@
 
 use std::f32::consts::PI;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use crate::audio_decode::AudioDecoder;
 use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash};
@@ -120,15 +121,13 @@ impl SampleAnalysis for BandAnalyzer {
     }
 
     fn samples(&mut self, samples: &[f32], channels: usize) {
-        for frame in samples.chunks_exact(channels) {
-            self.push(frame.iter().sum::<f32>() / channels as f32);
-        }
+        self.push_samples(samples, channels);
     }
 
     fn result(self, duration: f64) -> Self::Output {
         AudioFingerprint {
             duration_sec: duration.round() as u32,
-            fingerprint: fingerprint(&self.frames, duration),
+            fingerprint: fingerprint(&self.mono, &self.hop_sq, duration),
         }
     }
 }
@@ -224,6 +223,12 @@ fn analyze_source<A: SampleAnalysis>(
     Ok(analysis.result(duration))
 }
 
+#[inline(always)]
+fn quantize(s: f32) -> i64 {
+    let x = s.clamp(-1.0, 1.0) * 8_388_608.0;
+    (x + 0.5f32.copysign(x)) as i32 as i64
+}
+
 /// 64-bit FNV-1a over the samples quantized to 24 bits (exact for 16/24-bit integer sources),
 /// seeded with the format. Leading and trailing silence is left out: decoders differ in how much
 /// encoder delay they trim, and that must not change the hash.
@@ -257,33 +262,53 @@ impl PcmHash {
     }
 
     fn mix_samples(&mut self, samples: &[f32]) {
+        let mut h = self.hash;
         for &s in samples {
-            self.mix((s.clamp(-1.0, 1.0) * 8_388_608.0).round() as i64);
+            h = (h ^ quantize(s) as u64).wrapping_mul(Self::PRIME);
         }
+        self.hash = h;
     }
 
     fn flush_pending(&mut self) {
+        let mut h = self.hash;
         for &s in &self.pending {
-            let v = (s.clamp(-1.0, 1.0) * 8_388_608.0).round() as i64;
-            self.hash = (self.hash ^ v as u64).wrapping_mul(Self::PRIME);
+            h = (h ^ quantize(s) as u64).wrapping_mul(Self::PRIME);
         }
+        self.hash = h;
         self.pending.clear();
     }
 
     fn update(&mut self, samples: &[f32]) {
-        for frame in samples.chunks_exact(self.channels) {
-            let audible = frame.iter().any(|s| s.abs() >= PCM_SILENCE);
-            if audible {
-                self.started = true;
-                if !self.pending.is_empty() {
-                    self.flush_pending();
-                }
-                self.mix_samples(frame);
-            } else if self.started {
-                self.pending.extend_from_slice(frame);
+        let whole = samples.len() / self.channels * self.channels;
+        let mut samples = &samples[..whole];
+        if samples.is_empty() {
+            return;
+        }
+        let is_audible = |frame: &[f32]| frame.iter().any(|s| s.abs() >= PCM_SILENCE);
+        if !self.started {
+            let Some(first) = samples.chunks_exact(self.channels).position(is_audible) else {
+                return;
+            };
+            self.started = true;
+            samples = &samples[first * self.channels..];
+        }
+        if let Some(last) = samples.chunks_exact(self.channels).rposition(is_audible) {
+            if !self.pending.is_empty() {
+                self.flush_pending();
+            }
+            let active_end = (last + 1) * self.channels;
+            self.mix_samples(&samples[..active_end]);
+            let tail = &samples[active_end..];
+            if !tail.is_empty() {
+                self.pending.extend_from_slice(tail);
                 if self.pending.len() > Self::MAX_PENDING {
                     self.flush_pending();
                 }
+            }
+        } else {
+            self.pending.extend_from_slice(samples);
+            if self.pending.len() > Self::MAX_PENDING {
+                self.flush_pending();
             }
         }
     }
@@ -293,65 +318,128 @@ impl PcmHash {
     }
 }
 
-/// Per-frame loudness and band energies of the mono signal at [`ANALYSIS_RATE`].
+const BLOCKS_PER_FRAME: usize = FFT_SIZE / HOP;
+const _: () = assert!(FFT_SIZE.is_multiple_of(HOP));
+
+struct SpectralTables {
+    window: [f32; FFT_SIZE],
+    sub_band_bins: [(usize, usize); SUB_BANDS],
+    cos: [f32; FFT_SIZE / 2],
+    sin: [f32; FFT_SIZE / 2],
+}
+
+fn spectral_tables() -> &'static SpectralTables {
+    static TABLES: OnceLock<SpectralTables> = OnceLock::new();
+    TABLES.get_or_init(|| {
+        let window =
+            std::array::from_fn(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos());
+        let hz_per_bin = ANALYSIS_RATE as f32 / FFT_SIZE as f32;
+        let edge = |i: usize| LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / SUB_BANDS as f32);
+        let sub_band_bins = std::array::from_fn(|b| {
+            let lo = (edge(b) / hz_per_bin).round() as usize;
+            (
+                lo,
+                ((edge(b + 1) / hz_per_bin).round() as usize).max(lo + 1),
+            )
+        });
+        let cos = std::array::from_fn(|k| (-2.0 * PI * k as f32 / FFT_SIZE as f32).cos());
+        let sin = std::array::from_fn(|k| (-2.0 * PI * k as f32 / FFT_SIZE as f32).sin());
+        SpectralTables {
+            window,
+            sub_band_bins,
+            cos,
+            sin,
+        }
+    })
+}
+
+/// Resampled mono signal at [`ANALYSIS_RATE`] and per-hop energy; FFT runs lazily only on the
+/// three target windows once the audible span is known.
 struct BandAnalyzer {
     rate: u32,
     /// Box-filter decimation state.
     phase: u32,
     sum: f32,
     count: u32,
-    /// The last `FFT_SIZE` samples; a frame is analyzed every `HOP` new ones.
-    ring: Vec<f32>,
-    filled: usize,
-    since_frame: usize,
-    fft: Fft,
-    re: [f32; FFT_SIZE],
-    im: [f32; FFT_SIZE],
-    window: Vec<f32>,
-    sub_band_bins: Vec<(usize, usize)>,
-    frames: Vec<Frame>,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct Frame {
-    rms: f32,
-    bands: [f32; BANDS],
+    mono: Vec<f32>,
+    hop_sq: Vec<f32>,
+    cur_hop_sq: f32,
+    cur_hop_len: usize,
 }
 
 impl BandAnalyzer {
     fn new(rate: u32) -> Self {
-        let window = (0..FFT_SIZE)
-            .map(|i| 0.5 - 0.5 * (2.0 * PI * i as f32 / FFT_SIZE as f32).cos())
-            .collect();
-        let hz_per_bin = ANALYSIS_RATE as f32 / FFT_SIZE as f32;
-        let edge = |i: usize| LOW_HZ * (HIGH_HZ / LOW_HZ).powf(i as f32 / SUB_BANDS as f32);
-        let sub_band_bins = (0..SUB_BANDS)
-            .map(|b| {
-                let lo = (edge(b) / hz_per_bin).round() as usize;
-                (
-                    lo,
-                    ((edge(b + 1) / hz_per_bin).round() as usize).max(lo + 1),
-                )
-            })
-            .collect();
         Self {
             rate,
             phase: 0,
             sum: 0.0,
             count: 0,
-            ring: Vec::with_capacity(FFT_SIZE),
-            filled: 0,
-            since_frame: 0,
-            fft: Fft::new(FFT_SIZE),
-            re: [0.0; FFT_SIZE],
-            im: [0.0; FFT_SIZE],
-            window,
-            sub_band_bins,
-            frames: Vec::new(),
+            mono: Vec::new(),
+            hop_sq: Vec::new(),
+            cur_hop_sq: 0.0,
+            cur_hop_len: 0,
+        }
+    }
+
+    fn push_samples(&mut self, samples: &[f32], channels: usize) {
+        if self.rate == ANALYSIS_RATE * 4 && (channels == 1 || channels == 2) {
+            let mut rest = samples;
+            while !rest.is_empty() && (self.phase != 0 || self.count != 0) {
+                if rest.len() < channels {
+                    return;
+                }
+                let (frame, tail) = rest.split_at(channels);
+                let x = if channels == 2 {
+                    (frame[0] + frame[1]) * 0.5
+                } else {
+                    frame[0]
+                };
+                self.push(x);
+                rest = tail;
+            }
+            if channels == 2 {
+                let (chunks, rem) = rest.as_chunks::<8>();
+                for c in chunks {
+                    self.push_resampled(
+                        (c[0] + c[1] + c[2] + c[3] + c[4] + c[5] + c[6] + c[7]) * 0.125,
+                    );
+                }
+                for frame in rem.as_chunks::<2>().0 {
+                    self.push((frame[0] + frame[1]) * 0.5);
+                }
+            } else {
+                let (chunks, rem) = rest.as_chunks::<4>();
+                for c in chunks {
+                    self.push_resampled((c[0] + c[1] + c[2] + c[3]) * 0.25);
+                }
+                for &x in rem {
+                    self.push(x);
+                }
+            }
+            return;
+        }
+        match channels {
+            1 => {
+                for &x in samples {
+                    self.push(x);
+                }
+            }
+            2 => {
+                for frame in samples.as_chunks::<2>().0 {
+                    self.push((frame[0] + frame[1]) * 0.5);
+                }
+            }
+            _ => {
+                let inv = 1.0 / channels as f32;
+                for frame in samples.chunks_exact(channels) {
+                    self.push(frame.iter().sum::<f32>() * inv);
+                }
+            }
         }
     }
 
     /// One mono sample at the source rate.
+    #[inline]
     fn push(&mut self, x: f32) {
         self.sum += x;
         self.count += 1;
@@ -365,51 +453,81 @@ impl BandAnalyzer {
         }
     }
 
+    #[inline]
     fn push_resampled(&mut self, v: f32) {
-        if self.ring.len() < FFT_SIZE {
-            self.ring.push(v);
-        } else {
-            self.ring[self.filled % FFT_SIZE] = v;
-        }
-        self.filled += 1;
-        if self.filled < FFT_SIZE {
-            return;
-        }
-        self.since_frame += 1;
-        if self.filled == FFT_SIZE || self.since_frame == HOP {
-            self.since_frame = 0;
-            self.analyze_frame();
+        self.mono.push(v);
+        self.cur_hop_sq += v * v;
+        self.cur_hop_len += 1;
+        if self.cur_hop_len == HOP {
+            self.hop_sq.push(self.cur_hop_sq);
+            self.cur_hop_sq = 0.0;
+            self.cur_hop_len = 0;
         }
     }
+}
 
-    fn analyze_frame(&mut self) {
-        // Oldest sample first.
-        let start = self.filled % FFT_SIZE;
-        let sample = |i: usize| self.ring[(start + i) % FFT_SIZE];
-        let rms =
-            ((0..FFT_SIZE).map(|i| sample(i) * sample(i)).sum::<f32>() / FFT_SIZE as f32).sqrt();
-        let (re, im) = (&mut self.re, &mut self.im);
-        im.fill(0.0);
-        for (i, v) in re.iter_mut().enumerate() {
-            *v = sample(i) * self.window[i];
+fn analyze_frame_bands(
+    mono: &[f32],
+    frame_idx: usize,
+    tables: &SpectralTables,
+    re: &mut [f32; FFT_SIZE],
+    im: &mut [f32; FFT_SIZE],
+) -> [f32; BANDS] {
+    let samples = &mono[frame_idx * HOP..frame_idx * HOP + FFT_SIZE];
+    for ((dst, &s), &w) in re.iter_mut().zip(samples).zip(&tables.window) {
+        *dst = s * w;
+    }
+    im.fill(0.0);
+    fft_run(&tables.cos, &tables.sin, re, im);
+    let mut bands = [0.0f32; BANDS];
+    let per_band = SUB_BANDS / BANDS;
+    for (s, &(lo, hi)) in tables.sub_band_bins.iter().enumerate() {
+        let e = (lo..hi).map(|k| re[k] * re[k] + im[k] * im[k]).sum::<f32>() / (hi - lo) as f32;
+        bands[s / per_band] += e / per_band as f32;
+    }
+    bands
+}
+
+fn fft_run<const N: usize>(cos: &[f32], sin: &[f32], re: &mut [f32; N], im: &mut [f32; N]) {
+    let n = N;
+    let mut j = 0;
+    for i in 1..n {
+        let mut bit = n >> 1;
+        while j & bit != 0 {
+            j ^= bit;
+            bit >>= 1;
         }
-        self.fft.run(re, im);
-        let mut bands = [0.0f32; BANDS];
-        let per_band = SUB_BANDS / BANDS;
-        for (s, &(lo, hi)) in self.sub_band_bins.iter().enumerate() {
-            let e = (lo..hi).map(|k| re[k] * re[k] + im[k] * im[k]).sum::<f32>() / (hi - lo) as f32;
-            bands[s / per_band] += e / per_band as f32;
+        j |= bit;
+        if i < j {
+            re.swap(i, j);
+            im.swap(i, j);
         }
-        self.frames.push(Frame { rms, bands });
+    }
+    let mut len = 2;
+    while len <= n {
+        let step = n / len;
+        for start in (0..n).step_by(len) {
+            for k in 0..len / 2 {
+                let (c, s) = (cos[k * step], sin[k * step]);
+                let (a, b) = (start + k, start + k + len / 2);
+                let (tr, ti) = (re[b] * c - im[b] * s, re[b] * s + im[b] * c);
+                (re[b], im[b]) = (re[a] - tr, im[a] - ti);
+                re[a] += tr;
+                im[a] += ti;
+            }
+        }
+        len <<= 1;
     }
 }
 
 /// Radix-2 FFT with precomputed twiddles.
+#[cfg(test)]
 struct Fft {
     cos: Vec<f32>,
     sin: Vec<f32>,
 }
 
+#[cfg(test)]
 impl Fft {
     fn new(n: usize) -> Self {
         let angle = |k: usize| -2.0 * PI * k as f32 / n as f32;
@@ -421,70 +539,62 @@ impl Fft {
 
     /// In place; `re.len()` must be the size given to `new`.
     fn run<const N: usize>(&self, re: &mut [f32; N], im: &mut [f32; N]) {
-        let n = N;
-        let mut j = 0;
-        for i in 1..n {
-            let mut bit = n >> 1;
-            while j & bit != 0 {
-                j ^= bit;
-                bit >>= 1;
-            }
-            j |= bit;
-            if i < j {
-                re.swap(i, j);
-                im.swap(i, j);
-            }
-        }
-        let mut len = 2;
-        while len <= n {
-            let step = n / len;
-            for start in (0..n).step_by(len) {
-                for k in 0..len / 2 {
-                    let (c, s) = (self.cos[k * step], self.sin[k * step]);
-                    let (a, b) = (start + k, start + k + len / 2);
-                    let (tr, ti) = (re[b] * c - im[b] * s, re[b] * s + im[b] * c);
-                    (re[b], im[b]) = (re[a] - tr, im[a] - ti);
-                    re[a] += tr;
-                    im[a] += ti;
-                }
-            }
-            len <<= 1;
-        }
+        fft_run(&self.cos, &self.sin, re, im);
     }
 }
 
 /// `None` when there is too little audible audio to describe.
-fn fingerprint(frames: &[Frame], duration: f64) -> Option<String> {
-    let loudest = frames.iter().map(|f| f.rms).fold(0.0f32, f32::max);
-    let threshold = loudest * 10f32.powf(AUDIBLE_DB / 20.0);
-    let first = frames.iter().position(|f| f.rms > threshold)?;
-    let last = frames.iter().rposition(|f| f.rms > threshold)?;
+fn fingerprint(mono: &[f32], hop_sq: &[f32], duration: f64) -> Option<String> {
+    let n = hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
+    if n == 0 {
+        return None;
+    }
+    let sum_sq = |i: usize| hop_sq[i] + hop_sq[i + 1] + hop_sq[i + 2] + hop_sq[i + 3];
+    let max_sq = (0..n).map(sum_sq).fold(0.0f32, f32::max);
+    let threshold_sq = max_sq * 10f32.powf(AUDIBLE_DB / 10.0);
+    let first = (0..n).position(|i| sum_sq(i) > threshold_sq)?;
+    let last = (0..n).rposition(|i| sum_sq(i) > threshold_sq)?;
     let frames_per_sec = ANALYSIS_RATE as f32 / HOP as f32;
     let span = last - first + 1;
     if (span as f32) < MIN_AUDIBLE_SEC * frames_per_sec {
         return None;
     }
-    let n = frames.len();
     let window = ((WINDOW_SEC * frames_per_sec) as usize).min(n);
-    let hashes: Vec<String> = WINDOW_AT
-        .iter()
-        .map(|&at| {
-            let center = first + (span as f32 * at) as usize;
-            let start = center.saturating_sub(window / 2).min(n - window);
-            format!("{:02x}", window_bits(&frames[start..start + window]))
-        })
-        .collect();
+    let tables = spectral_tables();
+    let mut re = [0.0f32; FFT_SIZE];
+    let mut im = [0.0f32; FFT_SIZE];
+    let mut prev_start = 0usize;
+    let mut prev_frames: Vec<[f32; BANDS]> = Vec::new();
+    let mut hashes = Vec::with_capacity(WINDOW_AT.len());
+
+    for &at in &WINDOW_AT {
+        let center = first + (span as f32 * at) as usize;
+        let start = center.saturating_sub(window / 2).min(n - window);
+        let prev_end = prev_start + prev_frames.len();
+        let mut cur_frames = Vec::with_capacity(window);
+        for i in start..start + window {
+            let bands = if i >= prev_start && i < prev_end {
+                prev_frames[i - prev_start]
+            } else {
+                analyze_frame_bands(mono, i, tables, &mut re, &mut im)
+            };
+            cur_frames.push(bands);
+        }
+        hashes.push(format!("{:02x}", window_bits(&cur_frames)));
+        prev_start = start;
+        prev_frames = cur_frames;
+    }
     Some(format!("{}s_{}", duration.round() as u32, hashes.join("_")))
 }
 
 /// Signs of the change of the spectral slope between neighbouring slices (Haitsma–Kalker style,
 /// on long slices): (SLICES-1)*(BANDS-1) bits.
-fn window_bits(frames: &[Frame]) -> u32 {
+fn window_bits(frames: &[[f32; BANDS]]) -> u32 {
     // Mean of the log energies (geometric mean): a few loud frames don't dominate a slice.
     let mut energy = [[0.0f32; BANDS]; SLICES];
     for (t, slice) in split_even(frames, SLICES).enumerate() {
         for (b, e) in energy[t].iter_mut().enumerate() {
-            *e = slice.iter().map(|f| (f.bands[b] + 1e-9).ln()).sum::<f32>()
+            *e = slice.iter().map(|bands| (bands[b] + 1e-9).ln()).sum::<f32>()
                 / slice.len().max(1) as f32;
         }
     }
@@ -592,14 +702,11 @@ mod tests {
 
     #[test]
     fn silence_has_no_fingerprint() {
-        let frames = vec![
-            Frame {
-                rms: 0.0,
-                bands: [0.0; BANDS]
-            };
-            5000
-        ];
-        assert_eq!(fingerprint(&frames, 120.0), None);
+        let mut analyzer = BandAnalyzer::new(ANALYSIS_RATE);
+        for _ in 0..(120 * ANALYSIS_RATE as usize) {
+            analyzer.push_resampled(0.0);
+        }
+        assert_eq!(fingerprint(&analyzer.mono, &analyzer.hop_sq, 120.0), None);
     }
 
     #[test]

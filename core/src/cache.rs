@@ -1,14 +1,14 @@
 //! MediaCache: in-memory LRU cache of image, video and audio analysis results.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
 
-use crate::hashing::{analyze, ImageAnalysis};
-use crate::image_decode::decode_file;
+use crate::hashing::ImageAnalysis;
+use crate::image_decode::decode_for_gray_analysis;
 use crate::probe::{probe_file, MediaType};
 use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoError, VideoMeta};
 
@@ -60,6 +60,10 @@ pub struct FileKey {
 thread_local! {
     /// The key of the file a TC call is about, while [`with_file_key`] runs.
     static SCOPED_KEY: RefCell<Option<FileKey>> = const { RefCell::new(None) };
+    /// Background prefetch skips files already being decoded instead of blocking on Condvar.
+    static NON_BLOCKING_FLIGHT: Cell<bool> = const { Cell::new(false) };
+    /// Key whose stat/freshness was already verified inside `persistent_result`.
+    static VERIFIED_KEY: RefCell<Option<FileKey>> = const { RefCell::new(None) };
 }
 
 impl FileKey {
@@ -76,12 +80,19 @@ impl FileKey {
             modified: meta.modified().ok(),
         })
     }
+
+    pub(crate) fn from_dir_entry(entry: &fs::DirEntry) -> Option<Self> {
+        let meta = entry.metadata().ok()?;
+        Some(FileKey {
+            path: entry.path(),
+            size: meta.len(),
+            modified: meta.modified().ok(),
+        })
+    }
 }
 
-/// Runs `f` with the version of `path` looked up once: TC asks for each column separately, and
-/// every cache lookup on the way would otherwise ask the file system again (slow on network
-/// drives and under antivirus scanners).
-pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+/// Runs `f` with a pre-resolved version key of the file, avoiding redundant filesystem stats.
+pub fn with_known_file_key<R>(key: Option<FileKey>, f: impl FnOnce() -> R) -> R {
     /// Puts the previous key back, also when `f` panics (the FFI guard catches it, and a key
     /// left behind would make later lookups miss edits of the file).
     struct Restore(Option<FileKey>);
@@ -90,7 +101,25 @@ pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
             let _ = SCOPED_KEY.try_with(|k| k.replace(self.0.take()));
         }
     }
-    let _restore = Restore(SCOPED_KEY.replace(FileKey::stat(path)));
+    let _restore = Restore(SCOPED_KEY.replace(key));
+    f()
+}
+
+/// Runs `f` with the version of `path` looked up once: TC asks for each column separately, and
+/// every cache lookup on the way would otherwise ask the file system again (slow on network
+/// drives and under antivirus scanners).
+pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
+    with_known_file_key(FileKey::stat(path), f)
+}
+
+pub(crate) fn with_non_blocking_flight<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = NON_BLOCKING_FLIGHT.try_with(|b| b.set(self.0));
+        }
+    }
+    let _restore = Restore(NON_BLOCKING_FLIGHT.replace(true));
     f()
 }
 
@@ -139,10 +168,23 @@ impl<V: Clone> FileCache<V> {
     /// it is `None`). `None` also if the file is gone.
     fn get_or_compute(&self, path: &Path, compute: impl FnOnce(&Path) -> Option<V>) -> Option<V> {
         let key = FileKey::for_path(path)?;
+        {
+            let mut lru = self.lock();
+            let next_tick = lru.clock + 1;
+            if let Some((value, used, _)) = lru.map.get_mut(&key) {
+                *used = next_tick;
+                let value = value.clone();
+                lru.clock = next_tick;
+                return Some(value);
+            }
+        }
         // A foreground request may meet a prefetch already decoding this file. Serialize only
         // the same file/version in this cache family; unrelated files remain parallel.
         let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
         while flights.contains(&key) {
+            if NON_BLOCKING_FLIGHT.get() {
+                return None;
+            }
             flights = self.ready.wait(flights).unwrap_or_else(|e| e.into_inner());
         }
         flights.insert(key.clone());
@@ -160,17 +202,19 @@ impl<V: Clone> FileCache<V> {
         let _flight = Flight(&self.flights, &self.ready, key.clone());
         {
             let mut lru = self.lock();
-            lru.clock += 1;
-            let now = lru.clock;
+            let next_tick = lru.clock + 1;
             if let Some((value, used, _)) = lru.map.get_mut(&key) {
-                *used = now;
-                return Some(value.clone());
+                *used = next_tick;
+                let value = value.clone();
+                lru.clock = next_tick;
+                return Some(value);
             }
         }
         let value = compute(path)?;
         // An editor may have saved the file while a decoder was reading it. Do not attach
         // the result to either version; the next call must read the file again.
-        if FileKey::stat(path).as_ref() != Some(&key) {
+        let verified = VERIFIED_KEY.with_borrow_mut(|v| v.take());
+        if verified.as_ref() != Some(&key) && FileKey::stat(path).as_ref() != Some(&key) {
             return None;
         }
         let bytes = (self.weigh)(&value)
@@ -262,22 +306,31 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
     }
     let key = FileKey::for_path(path)?;
     if let Some(value) = crate::disk_cache::read(&key) {
-        return (!cancelled()).then_some(value);
+        if cancelled() {
+            return None;
+        }
+        VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
+        return Some(value);
     }
     let value = compute()?;
     if cancelled() || FileKey::stat(path).as_ref() != Some(&key) {
         return None;
     }
     let bytes = crate::disk_cache::write(&key, &value);
+    VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
     Some((value, bytes))
 }
 
 /// `None` if the host cancelled the analysis.
 fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia> {
     Some(match probe_file(path) {
-        kind if kind.is_image_kind() => decode_file(path, kind)
-            .map(|img| CachedMedia::Image(Arc::new(analyze(&img))))
-            .unwrap_or(CachedMedia::Unsupported),
+        kind if kind.is_image_kind() => {
+            decode_for_gray_analysis(path, kind, crate::hashing::WORKING_SIZE)
+                .map(|(gray, (w, h))| {
+                    CachedMedia::Image(Arc::new(crate::hashing::analyze_gray(&gray, w, h)))
+                })
+                .unwrap_or(CachedMedia::Unsupported)
+        }
         MediaType::Video => match analyze_video(path, cancelled) {
             Ok(v) => CachedMedia::Video(Arc::new(v)),
             Err(VideoError::Cancelled) => return None,
@@ -489,8 +542,8 @@ pub fn get_sharpness(path: &Path) -> Option<u32> {
     sharpness_cache()
         .get_or_read(path, |p| {
             let side = crate::hashing::SHARPNESS_SIZE;
-            let (img, _) = crate::image_decode::decode_file_fitted(p, probe_file(p), (side, side))?;
-            Some(crate::hashing::sharpness(&img))
+            let (gray, _) = decode_for_gray_analysis(p, probe_file(p), side)?;
+            Some(crate::hashing::sharpness_gray(&gray))
         })
         .map(|s| *s)
 }

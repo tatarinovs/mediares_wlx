@@ -10,7 +10,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use rusqlite::{named_params, Connection, Row};
 
 use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash, CachedMedia, FileKey};
-use crate::hashing::{compute_aspect_ratio, ImageAnalysis};
+use crate::hashing::ImageAnalysis;
 use crate::video_frame::VideoAnalysis;
 
 // Schema upgrades preserve existing analysis records; record versions invalidate stale results.
@@ -196,10 +196,10 @@ impl Store {
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=NORMAL;
-             PRAGMA cache_size=-1024;
+             PRAGMA cache_size=-4096;
              PRAGMA mmap_size=0;
-             PRAGMA wal_autocheckpoint=256;
-             PRAGMA journal_size_limit=1048576;",
+             PRAGMA wal_autocheckpoint=2048;
+             PRAGMA journal_size_limit=8388608;",
         )?;
         if version < SCHEMA_VERSION {
             db.execute_batch(
@@ -426,7 +426,6 @@ impl DiskValue for CachedMedia {
                 Self::Image(Arc::new(ImageAnalysis {
                     width,
                     height,
-                    aspect_ratio: compute_aspect_ratio(width, height),
                     dhash: r.get::<_, i64>("hash_a")? as u64,
                     phash: r.get::<_, i64>("hash_b")? as u64,
                     coarse_hash: r.get("coarse")?,
@@ -839,7 +838,6 @@ mod tests {
         let analysis = CachedMedia::Image(Arc::new(ImageAnalysis {
             width: 2,
             height: 1,
-            aspect_ratio: "2:1".into(),
             dhash: u64::MAX,
             phash: 1 << 63,
             coarse_hash: 123,
@@ -1032,7 +1030,6 @@ mod tests {
             CachedMedia::Image(Arc::new(ImageAnalysis {
                 width: 6000,
                 height: 4000,
-                aspect_ratio: "3:2".into(),
                 dhash: u64::MAX,
                 phash: 1 << 63,
                 coarse_hash: u32::MAX,

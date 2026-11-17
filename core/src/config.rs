@@ -53,6 +53,13 @@ pub fn ini_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("mediares.ini"))
 }
 
+const MAX_PREFETCH_THREADS: usize = 16;
+
+pub(crate) fn default_prefetch_threads() -> usize {
+    let available = std::thread::available_parallelism().map_or(1, usize::from);
+    available.saturating_sub(1).clamp(1, 8)
+}
+
 pub(crate) fn prefetch_threads() -> usize {
     read_prefetch_threads(&ini_path())
 }
@@ -63,7 +70,7 @@ fn read_prefetch_threads(path: &Path) -> usize {
         GetPrivateProfileStringW(
             w!("Settings"),
             w!("PrefetchThreads"),
-            w!("3"),
+            w!(""),
             Some(&mut buf),
             &HSTRING::from(path.as_os_str()),
         )
@@ -71,8 +78,8 @@ fn read_prefetch_threads(path: &Path) -> usize {
     String::from_utf16_lossy(&buf[..len as usize])
         .trim()
         .parse::<usize>()
-        .unwrap_or(3)
-        .min(8)
+        .unwrap_or_else(|_| default_prefetch_threads())
+        .min(MAX_PREFETCH_THREADS)
 }
 
 #[cfg(test)]
@@ -84,13 +91,14 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("mediares_prefetch_ini_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
+        let default = default_prefetch_threads();
         for (i, (value, expected)) in [
-            ("", 3),
+            ("", default),
             ("PrefetchThreads=0", 0),
             ("PrefetchThreads=7", 7),
-            ("PrefetchThreads=99", 8),
-            ("PrefetchThreads=-1", 3),
-            ("PrefetchThreads=bad", 3),
+            ("PrefetchThreads=99", MAX_PREFETCH_THREADS),
+            ("PrefetchThreads=-1", default),
+            ("PrefetchThreads=bad", default),
         ]
         .into_iter()
         .enumerate()

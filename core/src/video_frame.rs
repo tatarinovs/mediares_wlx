@@ -287,11 +287,11 @@ pub fn analyze_video(
     unsafe {
         let reader = open_reader(path, true)?;
 
-        let format = if set_output_format(&reader, &MFVideoFormat_RGB32).is_ok() {
-            PixelFormat::Rgb32
-        } else {
-            set_output_format(&reader, &MFVideoFormat_NV12)?;
+        let format = if set_output_format(&reader, &MFVideoFormat_NV12).is_ok() {
             PixelFormat::Nv12
+        } else {
+            set_output_format(&reader, &MFVideoFormat_RGB32)?;
+            PixelFormat::Rgb32
         };
 
         let geometry = FrameGeometry::current(&reader, format)

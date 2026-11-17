@@ -21,6 +21,33 @@ const MODE_INDEXED: u16 = 2;
 const MODE_RGB: u16 = 3;
 const MODE_CMYK: u16 = 4;
 
+/// Read the document dimensions from the 26-byte PSD/PSB header without decoding pixels.
+pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
+    let mut file = File::open(path).ok()?;
+    let mut header = [0u8; 26];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..4] != b"8BPS" {
+        return None;
+    }
+    let version = u16::from_be_bytes([header[4], header[5]]);
+    if !matches!(version, 1 | 2) {
+        return None;
+    }
+    let height = u32::from_be_bytes([header[14], header[15], header[16], header[17]]);
+    let width = u32::from_be_bytes([header[18], header[19], header[20], header[21]]);
+    valid_dimensions(width, height).then_some((width, height))
+}
+
+/// Load a PSD/PSB image for perceptual hashing: prefer the fast embedded JPEG thumbnail while
+/// keeping the true full dimensions from the header; fall back to the merged composite.
+pub fn load_psd_for_analysis(path: &Path) -> Option<(DynamicImage, (u32, u32))> {
+    let full = header_dimensions(path)?;
+    let img = extract_psd_preview(path)
+        .and_then(|bytes| decode_bytes(&bytes))
+        .or_else(|| decode_psd_composite(path))?;
+    Some((img, full))
+}
+
 /// Load the PSD image (merged composite image, or the embedded JPEG thumbnail).
 pub fn load_psd_image(path: &Path) -> Option<DynamicImage> {
     decode_psd_composite(path).or_else(|| decode_bytes(&extract_psd_preview(path)?))

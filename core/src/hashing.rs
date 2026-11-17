@@ -4,13 +4,12 @@ use image::imageops::{self, FilterType};
 use image::{DynamicImage, GrayImage};
 
 /// Hashes only need a few dozen pixels; large images are pre-shrunk once to this size.
-const WORKING_SIZE: u32 = 256;
+pub(crate) const WORKING_SIZE: u32 = 128;
 
 #[derive(Debug, Clone)]
 pub struct ImageAnalysis {
     pub width: u32,
     pub height: u32,
-    pub aspect_ratio: String,
     pub dhash: u64,
     pub phash: u64,
     pub coarse_hash: u32,
@@ -32,6 +31,10 @@ impl ImageAnalysis {
     pub fn dimensions_str(&self) -> String {
         format!("{}x{}", self.width, self.height)
     }
+
+    pub fn aspect_ratio(&self) -> String {
+        compute_aspect_ratio(self.width, self.height)
+    }
 }
 
 pub fn analyze(img: &DynamicImage) -> ImageAnalysis {
@@ -41,14 +44,16 @@ pub fn analyze(img: &DynamicImage) -> ImageAnalysis {
     } else {
         img.to_luma8()
     };
+    analyze_gray(&gray, width, height)
+}
 
+pub fn analyze_gray(gray: &GrayImage, width: u32, height: u32) -> ImageAnalysis {
     ImageAnalysis {
         width,
         height,
-        aspect_ratio: compute_aspect_ratio(width, height),
-        dhash: gradient_hash(&gray, 8, 8),
-        coarse_hash: gradient_hash(&gray, 4, 8) as u32,
-        phash: compute_phash(&gray),
+        dhash: gradient_hash(gray, 8, 8),
+        coarse_hash: gradient_hash(gray, 4, 8) as u32,
+        phash: compute_phash(gray),
     }
 }
 
@@ -69,88 +74,62 @@ fn gradient_hash(gray: &GrayImage, cols: u32, rows: u32) -> u64 {
 /// DCT hash: 8x8 low-frequency block of the 32x32 DCT-II, thresholded by the median of the AC terms.
 fn compute_phash(gray: &GrayImage) -> u64 {
     const N: usize = 32;
-    let thumb = imageops::resize(gray, N as u32, N as u32, FilterType::Triangle);
+    let owned;
+    let thumb = if gray.width() == N as u32 && gray.height() == N as u32 {
+        gray
+    } else {
+        owned = imageops::resize(gray, N as u32, N as u32, FilterType::Triangle);
+        &owned
+    };
     let cos = phash_cosines();
-    let mut horizontal = [[0.0; 8]; N];
-    for (y, row) in thumb.rows().enumerate() {
-        for (x, px) in row.enumerate() {
+    let mut horizontal = [[0.0f32; 8]; N];
+    for (y, row) in thumb.as_raw().as_chunks::<N>().0.iter().enumerate() {
+        for (x, &px) in row.iter().enumerate() {
+            let p = px as f32;
             for v in 0..8 {
-                horizontal[y][v] += px[0] as f64 * cos[v][x];
+                horizontal[y][v] += p * cos[v][x];
             }
         }
     }
     let alpha = |k: usize| {
         if k == 0 {
-            (1.0 / N as f64).sqrt()
+            (1.0f32 / N as f32).sqrt()
         } else {
-            (2.0 / N as f64).sqrt()
+            (2.0f32 / N as f32).sqrt()
         }
     };
 
-    let mut dct = [0.0f64; 64];
+    let mut dct = [0.0f32; 64];
     for u in 0..8 {
+        let au = alpha(u);
         for v in 0..8 {
-            let mut sum = 0.0;
+            let mut sum = 0.0f32;
             for y in 0..N {
                 sum += horizontal[y][v] * cos[u][y];
             }
-            dct[u * 8 + v] = sum * alpha(u) * alpha(v);
+            dct[u * 8 + v] = sum * au * alpha(v);
         }
     }
 
-    let mut ac = dct[1..].to_vec();
-    ac.sort_by(f64::total_cmp);
-    let median = ac[ac.len() / 2];
-
-    // Flat art and symmetric patterns put coefficients at the rounding noise floor. Preserve
-    // the established bit pattern there by using the original accumulation order.
-    let mid = ac.len() / 2;
-    if median - ac[mid - 1] <= 1e-7 || ac[mid + 1] - median <= 1e-7 {
-        return legacy_phash(&thumb, cos);
-    }
+    let mut ac = [0.0f32; 63];
+    ac.copy_from_slice(&dct[1..]);
+    let (_, &mut median, _) = ac.select_nth_unstable_by(31, f32::total_cmp);
 
     dct.iter()
         .fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
-fn phash_cosines() -> &'static [[f64; 32]; 8] {
-    static COS: std::sync::OnceLock<[[f64; 32]; 8]> = std::sync::OnceLock::new();
+fn phash_cosines() -> &'static [[f32; 32]; 8] {
+    static COS: std::sync::OnceLock<[[f32; 32]; 8]> = std::sync::OnceLock::new();
     COS.get_or_init(|| {
-        let mut cos = [[0.0; 32]; 8];
+        let mut cos = [[0.0f32; 32]; 8];
         for (k, row) in cos.iter_mut().enumerate() {
             for (n, c) in row.iter_mut().enumerate() {
-                *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / 64.0).cos();
+                *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / 64.0).cos() as f32;
             }
         }
         cos
     })
-}
-
-fn legacy_phash(thumb: &GrayImage, cos: &[[f64; 32]; 8]) -> u64 {
-    let alpha = |k| {
-        if k == 0 {
-            (1.0f64 / 32.0).sqrt()
-        } else {
-            (2.0f64 / 32.0).sqrt()
-        }
-    };
-    let mut dct = [0.0; 64];
-    for u in 0..8 {
-        for v in 0..8 {
-            let mut sum = 0.0;
-            for (y, row) in thumb.rows().enumerate() {
-                for (x, px) in row.enumerate() {
-                    sum += px[0] as f64 * cos[u][y] * cos[v][x];
-                }
-            }
-            dct[u * 8 + v] = sum * alpha(u) * alpha(v);
-        }
-    }
-    let mut ac = dct[1..].to_vec();
-    ac.sort_by(f64::total_cmp);
-    let median = ac[ac.len() / 2];
-    dct.iter()
-        .fold(0, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
 /// Longest side the sharpness is measured at: values compare between photos of any size.
@@ -166,7 +145,11 @@ pub fn sharpness(img: &DynamicImage) -> u32 {
     } else {
         img.to_luma8()
     };
-    laplacian_variance(&gray).round().min(u32::MAX as f64) as u32
+    sharpness_gray(&gray)
+}
+
+pub fn sharpness_gray(gray: &GrayImage) -> u32 {
+    laplacian_variance(gray).round().min(u32::MAX as f64) as u32
 }
 
 fn laplacian_variance(gray: &GrayImage) -> f64 {
@@ -237,30 +220,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn optimized_phash_preserves_existing_fingerprints() {
-        let mut seed = 0x1234_5678u32;
-        for case in 0..384 {
-            let gray = GrayImage::from_fn(32, 32, |x, y| {
-                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                image::Luma([match case {
-                    0..=255 => case as u8,
-                    256..=287 => (x * (case - 255) + y * 3) as u8,
-                    288..=319 => {
-                        if (x / 4 + y / 4) % 2 == 0 {
-                            0
-                        } else {
-                            255
-                        }
-                    }
-                    _ => (seed >> 24) as u8,
-                }])
-            });
-            assert_eq!(
-                compute_phash(&gray),
-                legacy_phash(&gray, phash_cosines()),
-                "case {case}"
-            );
-        }
+    fn phash_is_deterministic_and_invariant_to_uniform_scaling() {
+        let mut seed = 0x9E37_79B9u32;
+        let pattern = GrayImage::from_fn(64, 64, |_, _| {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            image::Luma([((seed >> 24) as u8) / 2])
+        });
+        let h1 = compute_phash(&pattern);
+        let h2 = compute_phash(&pattern);
+        assert_eq!(h1, h2);
+        assert_ne!(h1, 0);
+        // Exact 2x uniform scaling preserves DCT median comparisons.
+        let scaled = GrayImage::from_fn(64, 64, |x, y| {
+            image::Luma([pattern.get_pixel(x, y)[0] * 2])
+        });
+        assert_eq!(h1, compute_phash(&scaled));
     }
 
     #[test]

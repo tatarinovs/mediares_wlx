@@ -12,6 +12,13 @@ use crate::probe::{probe_file, MediaType};
 use crate::wdx_api::{prefetch_value, Field, Source};
 
 const LOOKAHEAD: usize = 32;
+const MAX_SKIP: usize = 4096;
+
+enum NextEntry {
+    Match(PathBuf, Option<crate::cache::FileKey>),
+    Exhausted,
+    Paused,
+}
 
 struct Lane {
     parent: PathBuf,
@@ -160,7 +167,7 @@ fn run(shared: Arc<Shared>) {
         if cancelled() {
             continue;
         }
-        let path = {
+        let next = {
             let mut cursor = lane.cursor.lock().unwrap_or_else(|e| e.into_inner());
             if cancelled() {
                 continue;
@@ -168,30 +175,60 @@ fn run(shared: Arc<Shared>) {
             if cursor.is_none() {
                 *cursor = std::fs::read_dir(&lane.parent).ok();
             }
-            cursor
-                .as_mut()
-                .and_then(|entries| entries.next())
-                .and_then(Result::ok)
-                .map(|e| e.path())
-        };
-        let Some(path) = path else {
-            let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(p) = state.lanes.iter_mut().find(|p| Arc::ptr_eq(&p.lane, &lane)) {
-                p.exhausted = true;
+            match cursor.as_mut() {
+                None => NextEntry::Exhausted,
+                Some(entries) => {
+                    let mut skipped = 0usize;
+                    loop {
+                        if cancelled() {
+                            break NextEntry::Paused;
+                        }
+                        let Some(entry) = entries.next() else {
+                            break NextEntry::Exhausted;
+                        };
+                        let Ok(entry) = entry else {
+                            continue;
+                        };
+                        let path = entry.path();
+                        if extension(&path).as_deref() == Some(lane.extension.as_str()) {
+                            let kind = probe_file(&path);
+                            if kind == lane.kind && lane.field.applies_to(kind) {
+                                let key = crate::cache::FileKey::from_dir_entry(&entry);
+                                break NextEntry::Match(path, key);
+                            }
+                        }
+                        skipped += 1;
+                        if skipped >= MAX_SKIP {
+                            break NextEntry::Paused;
+                        }
+                    }
+                }
             }
-            continue;
         };
-        if extension(&path).as_deref() != Some(lane.extension.as_str()) {
-            continue;
+        match next {
+            NextEntry::Exhausted => {
+                let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(p) = state.lanes.iter_mut().find(|p| Arc::ptr_eq(&p.lane, &lane)) {
+                    p.exhausted = true;
+                }
+            }
+            NextEntry::Paused => {
+                if !cancelled() {
+                    let mut state = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                    if let Some(p) = state.lanes.iter_mut().find(|p| Arc::ptr_eq(&p.lane, &lane)) {
+                        if !p.exhausted && p.allowance < LOOKAHEAD {
+                            p.allowance += 1;
+                        }
+                    }
+                }
+            }
+            NextEntry::Match(path, key) => {
+                // Decoder errors/panics must not kill a worker or leave a foreground waiter behind.
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    prefetch_value(&path, key, lane.field, &cancelled);
+                }));
+            }
         }
-        let kind = probe_file(&path);
-        if kind != lane.kind || !lane.field.applies_to(kind) || cancelled() {
-            continue;
-        }
-        // Decoder errors/panics must not kill a worker or leave a foreground waiter behind.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            prefetch_value(&path, lane.field, &cancelled);
-        }));
     }
 }
 

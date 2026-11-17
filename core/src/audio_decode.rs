@@ -143,16 +143,14 @@ impl AudioDecoder {
             }
 
             let start = self.seconds(packet.pts) + skip as f64 / self.sample_rate as f64;
-            remap_channels(
-                &self.decoded[skip * src_channels..],
-                src_channels,
-                self.channels as usize,
-                &mut self.out,
-            );
-            return Ok(Some(Chunk {
-                start,
-                samples: &self.out,
-            }));
+            let slice = &self.decoded[skip * src_channels..];
+            let samples = if src_channels == self.channels as usize {
+                slice
+            } else {
+                remap_channels(slice, src_channels, self.channels as usize, &mut self.out);
+                &self.out
+            };
+            return Ok(Some(Chunk { start, samples }));
         }
     }
 

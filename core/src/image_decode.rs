@@ -229,6 +229,55 @@ pub fn decode_file_fitted(
     decode_turned_fitted(path, kind, 0, fit, 1).map(|(img, full, _)| (img, full))
 }
 
+/// Decodes a photo into 8-bit grayscale fitted into `side x side`, returning the full original
+/// dimensions as well. Uses WIC DCT scaling + grayscale conversion where supported, compact RAW
+/// previews, and embedded PSD thumbnails.
+pub fn decode_for_gray_analysis(
+    path: &Path,
+    kind: MediaType,
+    side: u32,
+) -> Option<(image::GrayImage, (u32, u32))> {
+    let fit = (side, side);
+    match kind {
+        MediaType::StandardImage => {
+            if by_wic(path, kind) {
+                if let Some(res) =
+                    crate::wic_decode::decode_gray_fitted(crate::wic_decode::Input::File(path), fit)
+                {
+                    return Some(res);
+                }
+            }
+            let img = decode_standard(path)?;
+            let full = (img.width(), img.height());
+            Some((shrunk(img, fit).into_luma8(), full))
+        }
+        #[cfg(feature = "raw-preview")]
+        MediaType::RawImage => {
+            let preview = crate::raw_preview::extract_raw_preview_for(path, Some(side))?;
+            let (gray, preview_full) = crate::wic_decode::decode_gray_fitted(
+                crate::wic_decode::Input::Memory(&preview),
+                fit,
+            )
+            .or_else(|| {
+                let img = decode_bytes(&preview)?;
+                let full = (img.width(), img.height());
+                Some((shrunk(img, fit).into_luma8(), full))
+            })?;
+            let full = crate::cache::get_exif(path)
+                .and_then(|e| e.width.zip(e.height))
+                .filter(|&(w, h)| w > 0 && h > 0)
+                .unwrap_or(preview_full);
+            Some((gray, full))
+        }
+        #[cfg(feature = "psd-preview")]
+        MediaType::PsdImage => {
+            let (img, full) = crate::psd_preview::load_psd_for_analysis(path)?;
+            Some((shrunk(img, fit).into_luma8(), full))
+        }
+        _ => None,
+    }
+}
+
 /// [`decode_file_fitted`] of WIC frame `frame` (a page of a TIFF) that also tries to turn the
 /// picture by the EXIF `orientation` while decoding. Returns the picture, the size of the whole picture before any
 /// turn, and whether the turn was made.

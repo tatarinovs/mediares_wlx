@@ -379,11 +379,19 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
     compute_cancelled(path, field, kind, &is_stop_requested)
 }
 
-pub(crate) fn prefetch_value(path: &Path, field: Field, cancelled: &dyn Fn() -> bool) {
+pub(crate) fn prefetch_value(
+    path: &Path,
+    key: Option<crate::cache::FileKey>,
+    field: Field,
+    cancelled: &dyn Fn() -> bool,
+) {
     if !cancelled() {
         crate::disk_cache::with_maintenance(true, || {
-            crate::cache::with_file_key(path, || {
-                let _ = compute_cancelled(path, field, probe_file(path), cancelled);
+            crate::cache::with_non_blocking_flight(|| {
+                let key = key.or_else(|| crate::cache::FileKey::stat(path));
+                crate::cache::with_known_file_key(key, || {
+                    let _ = compute_cancelled(path, field, probe_file(path), cancelled);
+                });
             });
         });
     }
@@ -457,7 +465,7 @@ fn compute_cancelled(
         (ImagePHash, CachedMedia::Image(img)) => text(img.phash_hex()),
         (ImageCoarseHash, CachedMedia::Image(img)) => text(img.coarse_hash_hex()),
         (ImageDimensions, CachedMedia::Image(img)) => text(img.dimensions_str()),
-        (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio.clone()),
+        (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio()),
         (VideoFingerprint, CachedMedia::Video(vid)) => vid.fingerprint.clone().map(Value::Text),
         (VideoDHashMid, CachedMedia::Video(vid)) => vid.dhash_mid_hex().map(Value::Text),
         _ => None,

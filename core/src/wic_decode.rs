@@ -8,13 +8,13 @@
 
 use std::path::Path;
 
-use image::{DynamicImage, RgbaImage};
+use image::{DynamicImage, GrayImage, RgbaImage};
 use windows::core::{Interface, HSTRING, PCWSTR};
 use windows::Win32::Foundation::GENERIC_READ;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, IWICBitmapDecoder,
-    IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory, IWICMetadataQueryReader,
-    IWICPixelFormatInfo2, WICBitmapCacheOnLoad, WICBitmapDitherTypeNone,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA, GUID_WICPixelFormat8bppGray,
+    IWICBitmapDecoder, IWICBitmapFrameDecode, IWICBitmapSource, IWICImagingFactory,
+    IWICMetadataQueryReader, IWICPixelFormatInfo2, WICBitmapCacheOnLoad, WICBitmapDitherTypeNone,
     WICBitmapInterpolationModeFant, WICBitmapPaletteTypeCustom, WICBitmapTransformFlipHorizontal,
     WICBitmapTransformFlipVertical, WICBitmapTransformOptions, WICBitmapTransformRotate0,
     WICBitmapTransformRotate180, WICBitmapTransformRotate270, WICBitmapTransformRotate90,
@@ -182,6 +182,46 @@ pub fn pixel_format(path: &Path) -> Option<crate::image_decode::PixelFormat> {
 /// Decodes the first frame to RGBA under the shared size limits.
 pub fn decode(path: &Path) -> Option<DynamicImage> {
     decode_turned(Input::File(path), 0, None, 1).map(|(img, _)| img)
+}
+
+/// Decodes the first frame to 8-bit grayscale, fitted into `fit` (aspect kept, never enlarged),
+/// along with the full dimensions. Scaling runs before format conversion so codecs that support it
+/// (JPEG, HEIC) can downscale during decoding.
+pub fn decode_gray_fitted(input: Input<'_>, fit: (u32, u32)) -> Option<(GrayImage, (u32, u32))> {
+    let _com = ComScope::new();
+    let Frame { frame, factory, .. } = &open_frame(input, 0)?;
+    let (w, h) = frame_size(frame)?;
+    if w > MAX_DIMENSION || h > MAX_DIMENSION || u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return None;
+    }
+    let (tw, th) = crate::image_decode::fitted_size((w, h), fit);
+    let mut gray = crate::image_decode::zeroed_bytes(tw as usize * th as usize)?;
+    unsafe {
+        let mut source: IWICBitmapSource = frame.cast().ok()?;
+        if (tw, th) != (w, h) {
+            let scaler = factory.CreateBitmapScaler().ok()?;
+            scaler
+                .Initialize(&source, tw, th, WICBitmapInterpolationModeFant)
+                .ok()?;
+            source = scaler.cast().ok()?;
+        }
+        let converter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &source,
+                &GUID_WICPixelFormat8bppGray,
+                WICBitmapDitherTypeNone,
+                None,
+                0.0,
+                WICBitmapPaletteTypeCustom,
+            )
+            .ok()?;
+        converter
+            .CopyPixels(std::ptr::null(), tw, &mut gray)
+            .ok()?;
+    }
+    let img = GrayImage::from_raw(tw, th, gray)?;
+    Some((img, (w, h)))
 }
 
 /// Decodes frame `frame` to RGBA, fitted into `fit` (aspect kept, never enlarged) when given,
@@ -485,5 +525,30 @@ mod tests {
                 "orientation {orientation}"
             );
         }
+    }
+
+    #[test]
+    fn gray_fitted_decodes_and_downscales() {
+        use image::codecs::png::PngEncoder;
+        use image::{ExtendedColorType, ImageEncoder, Rgba, RgbaImage};
+        let tiff = rgb_tiff();
+        let (gray, full) =
+            super::decode_gray_fitted(super::Input::Memory(&tiff), (64, 64)).expect("tiff gray");
+        assert_eq!(full, (2, 1));
+        assert_eq!(gray.dimensions(), (2, 1));
+        // Red (255,0,0) and green (0,255,0): green is brighter in luma than red.
+        assert!(gray.get_pixel(1, 0)[0] > gray.get_pixel(0, 0)[0]);
+
+        let src = RgbaImage::from_fn(81, 61, |x, y| {
+            Rgba([(x * 3) as u8, (y * 4) as u8, 128, 255])
+        });
+        let mut png = Vec::new();
+        PngEncoder::new(&mut png)
+            .write_image(src.as_raw(), 81, 61, ExtendedColorType::Rgba8)
+            .unwrap();
+        let (gray, full) =
+            super::decode_gray_fitted(super::Input::Memory(&png), (32, 32)).expect("png gray");
+        assert_eq!(full, (81, 61));
+        assert_eq!(gray.width().max(gray.height()), 32);
     }
 }
