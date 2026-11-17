@@ -17,9 +17,28 @@ import time
 import uuid
 import wave
 
+def stage_plugin(dll_path, folder, threads):
+    """Isolate settings from installed plugins; retain the tested INI with the fixtures."""
+    folder.mkdir(parents=True, exist_ok=True)
+    staged = folder / dll_path.name
+    if not staged.exists():
+        shutil.copy2(dll_path, staged)
+    (folder / "mediares.ini").write_text(f"[Settings]\nPrefetchThreads={threads}\n", encoding="utf-16")
+    return staged
 
-def content_plugin(dll_path):
+
+def content_plugin(dll_path, tc_ini=None):
     dll = ctypes.WinDLL(str(dll_path))
+    if tc_ini is not None:
+        class DefaultParams(ctypes.Structure):
+            _fields_ = [("size", ctypes.c_int), ("version_low", ctypes.c_uint32),
+                        ("version_high", ctypes.c_uint32), ("ini", ctypes.c_char * 260)]
+        params = DefaultParams()
+        params.size = ctypes.sizeof(params)
+        params.ini = str(tc_ini).encode("mbcs")
+        dll.ContentSetDefaultParams.argtypes = [ctypes.POINTER(DefaultParams)]
+        dll.ContentSetDefaultParams.restype = None
+        dll.ContentSetDefaultParams(ctypes.byref(params))
     dll.ContentGetSupportedField.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int]
     dll.ContentGetSupportedField.restype = ctypes.c_int
     dll.ContentGetValueW.argtypes = [ctypes.c_wchar_p, ctypes.c_int, ctypes.c_int,
@@ -263,6 +282,8 @@ def run_check(dll, baseline, viewer_dll, stress):
     root = Path(__file__).resolve().parent.parent
     work = root / "target" / ("cache-check-" + uuid.uuid4().hex)
     work.mkdir(parents=True)
+    # This suite asserts exact cache-miss/delayed transitions; disable speculative work.
+    dll = stage_plugin(dll, work / "plugin", 0)
     paths = [work / "фото 🦊.bmp", work / "audio.wav", work / "video.avi",
              work / "camera.jpg", work / "tags.mp4", work / "no-exif.jpg", work / "no-tags.mp4"]
     make_bmp(paths[0])
@@ -296,10 +317,10 @@ def run_check(dll, baseline, viewer_dll, stress):
 
     cold = run(db)
     original = rows()
-    assert len(original) == 12, original  # Includes successful empty JPEG EXIF and video tags.
+    assert len(original) == 13, original  # Separate audio hashes; empty JPEG EXIF/video tags.
     with closing(sqlite3.connect(db)) as conn:
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
-        assert slots == {0, 1, 2, 3, 4, 6, 7, 8}, slots
+        assert slots == {0, 1, 2, 3, 4, 6, 7, 8, 10, 11}, slots
     warm = run(db)
     assert cold["values"] == warm["values"]
     assert rows() == original, "A fresh process recomputed cached results"

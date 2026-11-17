@@ -1,10 +1,10 @@
 //! MediaCache: in-memory LRU cache of image, video and audio analysis results.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::SystemTime;
 
 use crate::hashing::{analyze, ImageAnalysis};
@@ -23,18 +23,30 @@ const META_CAPACITY: usize = 8192;
 pub enum CachedMedia {
     Image(Arc<ImageAnalysis>),
     Video(Arc<VideoAnalysis>),
-    Audio(Arc<AudioAnalysis>),
     Unsupported,
 }
 
-/// Duplicate-detection fields of an audio file (see `audio_fingerprint`).
+/// Spectral fingerprint; `None` for (nearly) silent files.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AudioAnalysis {
+pub struct AudioFingerprint {
     pub duration_sec: u32,
-    /// Hash of the decoded samples (hex).
-    pub pcm_hash: String,
-    /// `None` for (nearly) silent files.
     pub fingerprint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioPcmHash {
+    pub duration_sec: u32,
+    pub pcm_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AudioDuration(pub u32);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioField {
+    Fingerprint,
+    PcmHash,
+    Duration,
 }
 
 /// Identifies a specific version of a file: edits change size or mtime and miss the cache.
@@ -85,6 +97,8 @@ pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
 /// Least-recently-used map from file versions to values, shared between threads.
 struct FileCache<V> {
     inner: Mutex<Lru<V>>,
+    flights: Mutex<HashSet<FileKey>>,
+    ready: Condvar,
     budget: usize,
     weigh: fn(&V) -> usize,
 }
@@ -104,6 +118,8 @@ impl<V: Clone> FileCache<V> {
 
     fn weighted(capacity: usize, budget: usize, weigh: fn(&V) -> usize) -> Self {
         Self {
+            flights: Mutex::new(HashSet::new()),
+            ready: Condvar::new(),
             budget,
             weigh,
             inner: Mutex::new(Lru {
@@ -123,6 +139,25 @@ impl<V: Clone> FileCache<V> {
     /// it is `None`). `None` also if the file is gone.
     fn get_or_compute(&self, path: &Path, compute: impl FnOnce(&Path) -> Option<V>) -> Option<V> {
         let key = FileKey::for_path(path)?;
+        // A foreground request may meet a prefetch already decoding this file. Serialize only
+        // the same file/version in this cache family; unrelated files remain parallel.
+        let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
+        while flights.contains(&key) {
+            flights = self.ready.wait(flights).unwrap_or_else(|e| e.into_inner());
+        }
+        flights.insert(key.clone());
+        drop(flights);
+        struct Flight<'a>(&'a Mutex<HashSet<FileKey>>, &'a Condvar, FileKey);
+        impl Drop for Flight<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.2);
+                self.1.notify_all();
+            }
+        }
+        let _flight = Flight(&self.flights, &self.ready, key.clone());
         {
             let mut lru = self.lock();
             lru.clock += 1;
@@ -163,6 +198,17 @@ impl<V: Clone> FileCache<V> {
 
     fn contains(&self, path: &Path) -> bool {
         FileKey::for_path(path).is_some_and(|key| self.lock().map.contains_key(&key))
+    }
+
+    #[cfg(feature = "audio-decode")]
+    fn cached(&self, path: &Path) -> Option<V> {
+        let key = FileKey::for_path(path)?;
+        let mut lru = self.lock();
+        lru.clock += 1;
+        let now = lru.clock;
+        let (value, used, _) = lru.map.get_mut(&key)?;
+        *used = now;
+        Some(value.clone())
     }
 
     fn clear(&self) {
@@ -237,16 +283,90 @@ fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia
             Err(VideoError::Cancelled) => return None,
             Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
         },
-        #[cfg(feature = "audio-decode")]
-        MediaType::Audio => match crate::audio_fingerprint::analyze_audio(path, cancelled) {
-            Ok(a) => CachedMedia::Audio(Arc::new(a)),
-            Err(crate::audio_fingerprint::AudioError::Cancelled) => return None,
-            Err(
-                crate::audio_fingerprint::AudioError::Unsupported
-                | crate::audio_fingerprint::AudioError::Invalid,
-            ) => CachedMedia::Unsupported,
-        },
         _ => CachedMedia::Unsupported,
+    })
+}
+
+fn audio_fingerprint_cache() -> &'static FileCache<AudioFingerprint> {
+    static CACHE: OnceLock<FileCache<AudioFingerprint>> = OnceLock::new();
+    CACHE.get_or_init(|| FileCache::new(CAPACITY))
+}
+
+fn audio_pcm_cache() -> &'static FileCache<AudioPcmHash> {
+    static CACHE: OnceLock<FileCache<AudioPcmHash>> = OnceLock::new();
+    CACHE.get_or_init(|| FileCache::new(CAPACITY))
+}
+
+fn audio_duration_cache() -> &'static FileCache<AudioDuration> {
+    static CACHE: OnceLock<FileCache<AudioDuration>> = OnceLock::new();
+    CACHE.get_or_init(|| FileCache::new(CAPACITY))
+}
+
+pub(crate) fn is_audio_cached(path: &Path, field: AudioField) -> bool {
+    match field {
+        AudioField::Fingerprint => audio_fingerprint_cache().contains(path),
+        AudioField::PcmHash => audio_pcm_cache().contains(path),
+        AudioField::Duration => {
+            audio_duration_cache().contains(path)
+                || audio_fingerprint_cache().contains(path)
+                || audio_pcm_cache().contains(path)
+        }
+    }
+}
+
+#[cfg(feature = "audio-decode")]
+fn audio_result<T: crate::disk_cache::DiskValue + Clone>(
+    cache: &FileCache<T>,
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+    analyze: impl FnOnce() -> Result<T, crate::audio_fingerprint::AudioError>,
+) -> Option<T> {
+    cache.get_or_compute(path, |path| {
+        persistent_result(path, cancelled, || analyze().ok()).map(|(value, _)| value)
+    })
+}
+
+#[cfg(feature = "audio-decode")]
+pub fn get_audio_fingerprint(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<AudioFingerprint> {
+    audio_result(audio_fingerprint_cache(), path, cancelled, || {
+        crate::audio_fingerprint::fingerprint_audio(path, cancelled)
+    })
+}
+
+#[cfg(feature = "audio-decode")]
+pub fn get_audio_pcm_hash(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<AudioPcmHash> {
+    audio_result(audio_pcm_cache(), path, cancelled, || {
+        crate::audio_fingerprint::hash_audio_pcm(path, cancelled)
+    })
+}
+
+#[cfg(feature = "audio-decode")]
+pub fn get_audio_duration(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<AudioDuration> {
+    if cancelled() {
+        return None;
+    }
+    // Both hash passes already count frames. Reuse that byproduct without starting the
+    // other algorithm or doing SQLite work on a RAM hit.
+    if let Some(duration) = audio_fingerprint_cache()
+        .cached(path)
+        .map(|a| a.duration_sec)
+        .or_else(|| audio_pcm_cache().cached(path).map(|a| a.duration_sec))
+    {
+        return Some(AudioDuration(duration));
+    }
+    audio_result(audio_duration_cache(), path, cancelled, || {
+        let key =
+            FileKey::for_path(path).ok_or(crate::audio_fingerprint::AudioError::Unsupported)?;
+        if let Some(duration) = crate::disk_cache::read::<AudioFingerprint>(&key)
+            .map(|(a, _)| a.duration_sec)
+            .or_else(|| crate::disk_cache::read::<AudioPcmHash>(&key).map(|(a, _)| a.duration_sec))
+        {
+            return Ok(AudioDuration(duration));
+        }
+        crate::audio_fingerprint::decoded_duration(path, cancelled)
     })
 }
 
@@ -457,6 +577,9 @@ pub fn is_video_tags_cached(path: &Path) -> bool {
 /// Empties every cache (the plugin is being unloaded).
 pub fn clear_all() {
     get_cache().clear();
+    audio_fingerprint_cache().clear();
+    audio_pcm_cache().clear();
+    audio_duration_cache().clear();
     #[cfg(feature = "tags")]
     tags_cache().clear();
     exif_cache().clear();
@@ -478,6 +601,36 @@ pub fn get_cache() -> &'static MediaCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_requests_share_one_computation_and_retry_after_panic() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let path = std::env::temp_dir().join(format!("mediares-flight-{}", std::process::id()));
+        fs::write(&path, b"test").unwrap();
+        let cache = FileCache::new(8);
+        let calls = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(
+                        cache.get_or_compute(&path, |_| {
+                            calls.fetch_add(1, Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            Some(42)
+                        }),
+                        Some(42)
+                    );
+                });
+            }
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        cache.clear();
+        let _ = std::panic::catch_unwind(|| {
+            cache.get_or_compute(&path, |_| -> Option<i32> { panic!("decoder") })
+        });
+        assert_eq!(cache.get_or_compute(&path, |_| Some(7)), Some(7));
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn metadata_prepares_its_disk_representation_only_once_on_a_ram_miss() {

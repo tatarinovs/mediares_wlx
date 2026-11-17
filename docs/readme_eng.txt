@@ -228,6 +228,28 @@ starting TC; an absolute database path on a local drive can be used
 instead of off. Media files themselves may reside on a network drive.
 
 
+Hash, fingerprint and sharpness requests in columns or duplicate search also
+prepare the requested family for nearby files in the current folder.
+Metadata and duration are read and cached only when TC requests them, without
+prefetching neighboring files. Three background workers are used by default.
+Read-ahead is limited to 32 directory entries per family, replenished by further
+TC requests; no subfolder traversal. Set the worker count in mediares.ini:
+
+[Settings]
+PrefetchThreads=3
+
+0 disables read-ahead; 1–8 select the worker count (also limited by CPUs).
+The default is three workers. Restart TC after editing. An existing INI
+beside the DLL takes priority; otherwise mediares.ini in TC's settings
+directory is used. Saving through the GUI preserves this key. Audio
+fingerprint and PCM hash are computed, cached and prefetched independently.
+Duration reuses an existing result or counts decoded frames without hashing.
+Requesting both hashes runs two independent passes. Results in the previous
+combined audio cache remain readable without recalculating them.
+
+Read-ahead selects neighbors with the same extension, ignoring case.
+Different extensions have separate queues; TC does not expose its search mask.
+
 5.1. Finding duplicates
 
 Total Commander can find duplicates by a plugin field: in file search

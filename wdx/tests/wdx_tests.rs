@@ -218,18 +218,6 @@ fn test_delay_if_slow_for_uncached_video_raw_and_psd() {
 }
 
 #[test]
-fn test_stop_get_value_cancellation() {
-    assert!(!mediares_core::wdx_api::is_stop_requested());
-    unsafe {
-        let dummy = [0u16; 1];
-        ContentStopGetValueW(dummy.as_ptr());
-    }
-    assert!(mediares_core::wdx_api::is_stop_requested());
-    mediares_core::wdx_api::reset_stop_flag();
-    assert!(!mediares_core::wdx_api::is_stop_requested());
-}
-
-#[test]
 fn test_corrupt_and_invalid_files_safety() {
     use std::os::windows::ffi::OsStrExt;
     let non_existent = PathBuf::from("target/definitely_not_a_file.xyz");

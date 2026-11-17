@@ -1,5 +1,5 @@
 //! Disposable local SQLite cache of analysis and metadata, accessed on a RAM miss.
-//! No worker thread outlives the DLL. Locks are never waited for and decoding runs outside them.
+//! Decoding runs outside database locks; quick UI reads never wait for the connection.
 
 use std::cell::Cell;
 use std::os::windows::ffi::OsStrExt;
@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use rusqlite::{named_params, Connection, Row};
 
-use crate::cache::{AudioAnalysis, CachedMedia, FileKey};
+use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash, CachedMedia, FileKey};
 use crate::hashing::{compute_aspect_ratio, ImageAnalysis};
 use crate::video_frame::VideoAnalysis;
 
@@ -94,8 +94,13 @@ fn cache_path() -> Option<PathBuf> {
 }
 
 fn with_store<R>(f: impl FnOnce(&mut Store) -> rusqlite::Result<R>) -> Option<R> {
-    // A busy SQLite connection is a cache miss, including another call in this DLL.
-    let mut state = CACHE.try_lock().ok()?;
+    // Serialize short background operations so parallel prefetch writes are not lost. Quick
+    // UI reads still treat a busy connection as a miss. Never wait on an external DB lock.
+    let mut state = if MAINTENANCE_ALLOWED.get() {
+        CACHE.lock().ok()?
+    } else {
+        CACHE.try_lock().ok()?
+    };
     state.open_if_needed(cache_path, Instant::now());
     match &mut *state {
         State::Open(store) => f(store).ok(),
@@ -220,18 +225,36 @@ impl Store {
     }
 
     fn read<T: DiskValue>(&self, key: &Key) -> rusqlite::Result<T> {
+        let result = self.read_slot(key, T::SLOT, None);
+        if T::LEGACY_AUDIO && matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)) {
+            // Old audio entries already contain both hashes. Project only the requested
+            // value so upgrading does not force a collection-wide decode again.
+            self.read_slot(key, 0, Some(3))
+        } else {
+            result
+        }
+    }
+
+    fn read_slot<T: DiskValue>(
+        &self,
+        key: &Key,
+        slot: i32,
+        kind: Option<i32>,
+    ) -> rusqlite::Result<T> {
         self.db.query_row(
             "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
                     fingerprint, pcm_hash, sharpness, payload FROM entries
              WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
-               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)
+               AND (?7 IS NULL OR kind=?7)",
             (
                 &key.path,
-                T::SLOT,
+                slot,
                 key.size,
                 &key.modified[..],
                 VERSION,
                 MAX_PAYLOAD as i64,
+                kind,
             ),
             T::from_row,
         )
@@ -387,6 +410,7 @@ impl Columns<'_> {
 
 pub(crate) trait DiskValue: Sized {
     const SLOT: i32;
+    const LEGACY_AUDIO: bool = false;
     fn from_row(row: &Row<'_>) -> rusqlite::Result<Self>;
     fn columns(&self) -> Option<Columns<'_>>;
 }
@@ -415,11 +439,6 @@ impl DiskValue for CachedMedia {
                 dhash_mid: r.get::<_, Option<i64>>("hash_a")?.map(|v| v as u64),
                 fingerprint: r.get("fingerprint")?,
             })),
-            3 => Self::Audio(Arc::new(AudioAnalysis {
-                duration_sec: r.get("duration")?,
-                pcm_hash: r.get("pcm_hash")?,
-                fingerprint: r.get("fingerprint")?,
-            })),
             _ => return Err(rusqlite::Error::InvalidQuery),
         })
     }
@@ -444,16 +463,71 @@ impl DiskValue for CachedMedia {
                 fingerprint: v.fingerprint.as_deref(),
                 ..Columns::default()
             },
-            Self::Audio(a) => Columns {
-                kind: 3,
-                duration: Some(a.duration_sec),
-                pcm_hash: Some(&a.pcm_hash),
-                fingerprint: a.fingerprint.as_deref(),
-                ..Columns::default()
-            },
             // A decoder failure can leave valid dimensions/duration but missing hashes.
             // Keep that in RAM only, so another session can retry decoding the video.
             Self::Video(_) | Self::Unsupported => return None,
+        })
+    }
+}
+
+// Independent slots: a missing spectral fingerprint (silence) is a successful result,
+// never evidence that PCM hashing has already run. Old complete audio records remain readable;
+// new work writes only the requested field. The cache schema/version remain valid.
+impl DiskValue for AudioFingerprint {
+    const SLOT: i32 = 10;
+    const LEGACY_AUDIO: bool = true;
+
+    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            duration_sec: r.get("duration")?,
+            fingerprint: r.get("fingerprint")?,
+        })
+    }
+
+    fn columns(&self) -> Option<Columns<'_>> {
+        Some(Columns {
+            kind: 3,
+            duration: Some(self.duration_sec),
+            fingerprint: self.fingerprint.as_deref(),
+            ..Columns::default()
+        })
+    }
+}
+
+impl DiskValue for AudioPcmHash {
+    const SLOT: i32 = 11;
+    const LEGACY_AUDIO: bool = true;
+
+    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            duration_sec: r.get("duration")?,
+            pcm_hash: r.get("pcm_hash")?,
+        })
+    }
+
+    fn columns(&self) -> Option<Columns<'_>> {
+        Some(Columns {
+            kind: 3,
+            duration: Some(self.duration_sec),
+            pcm_hash: Some(&self.pcm_hash),
+            ..Columns::default()
+        })
+    }
+}
+
+impl DiskValue for AudioDuration {
+    const SLOT: i32 = 12;
+    const LEGACY_AUDIO: bool = true;
+
+    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
+        r.get("duration").map(Self)
+    }
+
+    fn columns(&self) -> Option<Columns<'_>> {
+        Some(Columns {
+            kind: 3,
+            duration: Some(self.0),
+            ..Columns::default()
         })
     }
 }
@@ -847,6 +921,110 @@ mod tests {
     }
 
     #[test]
+    fn old_complete_audio_records_remain_readable_without_rehashing() {
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        let mut store = Store::open(&fixture.path()).unwrap();
+        store
+            .write(
+                &key,
+                0,
+                Columns {
+                    kind: 3,
+                    duration: Some(180),
+                    fingerprint: Some("180s_12_34_56"),
+                    pcm_hash: Some("0123456789abcdef"),
+                    ..Columns::default()
+                },
+                true,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read::<AudioFingerprint>(&key)
+                .unwrap()
+                .fingerprint
+                .as_deref(),
+            Some("180s_12_34_56")
+        );
+        assert_eq!(
+            store.read::<AudioPcmHash>(&key).unwrap().pcm_hash,
+            "0123456789abcdef"
+        );
+        assert_eq!(
+            store.read::<AudioDuration>(&key).unwrap(),
+            AudioDuration(180)
+        );
+        put(
+            &mut store,
+            &key,
+            &AudioFingerprint {
+                duration_sec: 181,
+                fingerprint: None,
+            },
+        );
+        assert_eq!(
+            store.read::<AudioFingerprint>(&key).unwrap().fingerprint,
+            None
+        );
+        // An image/video record in slot 0 must never be mistaken for legacy audio.
+        store
+            .db
+            .execute("DELETE FROM entries WHERE slot=10", [])
+            .unwrap();
+        store
+            .db
+            .execute("UPDATE entries SET kind=2 WHERE slot=0", [])
+            .unwrap();
+        assert!(store.read::<AudioFingerprint>(&key).is_err());
+        assert!(store.read::<AudioPcmHash>(&key).is_err());
+        assert!(store.read::<AudioDuration>(&key).is_err());
+    }
+
+    #[test]
+    fn audio_fields_persist_independently_including_silent_fingerprints() {
+        let fixture = Fixture::new();
+        let key = fixture.key();
+        for fingerprint in [Some("180s_12_34_56".into()), None] {
+            let expected = AudioFingerprint {
+                duration_sec: 180,
+                fingerprint,
+            };
+            let pcm = AudioPcmHash {
+                duration_sec: 180,
+                pcm_hash: "ffffffffffffffff".into(),
+            };
+            let mut store = Store::open(&fixture.path()).unwrap();
+            store.db.execute("DELETE FROM entries", []).unwrap();
+            put(&mut store, &key, &expected);
+            assert!(store.read::<AudioPcmHash>(&key).is_err());
+            assert!(store.read::<AudioDuration>(&key).is_err());
+            put(&mut store, &key, &pcm);
+            put(&mut store, &key, &AudioDuration(180));
+            drop(store);
+            let store = Store::open(&fixture.path()).unwrap();
+            assert_eq!(store.read::<AudioFingerprint>(&key).unwrap(), expected);
+            assert_eq!(store.read::<AudioPcmHash>(&key).unwrap(), pcm);
+            assert_eq!(
+                store.read::<AudioDuration>(&key).unwrap(),
+                AudioDuration(180)
+            );
+            assert_eq!(
+                store
+                    .db
+                    .query_row(
+                        "SELECT count(*) FROM entries WHERE (slot=10 AND pcm_hash IS NOT NULL)
+                     OR (slot=11 AND fingerprint IS NOT NULL)",
+                        [],
+                        |r| r.get::<_, i64>(0),
+                    )
+                    .unwrap(),
+                0,
+            );
+        }
+    }
+
+    #[test]
     fn results_survive_reopening_with_all_hash_bits_and_nullable_fields() {
         let fixture = Fixture::new();
         let key = fixture.key();
@@ -865,16 +1043,6 @@ mod tests {
                 duration_sec: 3600,
                 dhash_mid: Some(u64::MAX),
                 fingerprint: Some("video-fingerprint".into()),
-            })),
-            CachedMedia::Audio(Arc::new(AudioAnalysis {
-                duration_sec: 180,
-                pcm_hash: "pcm-hash".into(),
-                fingerprint: Some("audio-fp".into()),
-            })),
-            CachedMedia::Audio(Arc::new(AudioAnalysis {
-                duration_sec: 1,
-                pcm_hash: "silence".into(),
-                fingerprint: None,
             })),
         ];
         for expected in values {
@@ -1099,13 +1267,12 @@ mod tests {
             .pragma_update_and_check(None, "max_page_count", pages, |r| r.get::<_, i64>(0))
             .unwrap();
         let huge = "x".repeat((pages * 4096) as usize);
-        let value = CachedMedia::Audio(Arc::new(AudioAnalysis {
+        let value = AudioPcmHash {
             duration_sec: 1,
             pcm_hash: huge,
-            fingerprint: None,
-        }));
+        };
         assert!(store
-            .write(&key, CachedMedia::SLOT, value.columns().unwrap(), true)
+            .write(&key, AudioPcmHash::SLOT, value.columns().unwrap(), true)
             .is_err());
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
     }

@@ -203,6 +203,17 @@ For a portable installation, place `mediares.ini` next to the plugin. Otherwise,
 
 Hashes, fingerprints, sharpness and metadata (EXIF, tags, stream properties, dimensions and pixel format) survive restarts in `%LOCALAPPDATA%\mediares\content-cache-v1.sqlite3`. Results are reread when the file size, modification time or algorithm version changes. The limits are 256 MiB for the main database and about 500,000 records; old records are evicted when full. To clear it, close all TC instances and delete the cache database. There is no need to disable caching during normal use; for diagnostics, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
 
+Hash, fingerprint and sharpness requests in columns or duplicate search also prepare the requested family for nearby files in the same folder. Metadata and duration are read and cached only when TC requests them, without prefetching neighboring files. Three background workers are used by default. Read-ahead is limited to 32 directory entries per family and replenished by further TC requests; subfolders are not traversed. Set the worker count manually in `mediares.ini`:
+
+```ini
+[Settings]
+PrefetchThreads=3
+```
+
+`0` disables read-ahead; `1`–`8` select the background worker count (also limited by available CPUs). The default is three workers. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. Audio fingerprint and PCM hash are computed, cached and prefetched independently: only the requested kind is calculated. Requesting duration does not start hashing.
+
+Read-ahead selects neighbors with the same extension, ignoring case. Different extensions have separate queues. TC does not expose its search mask to the plugin.
+
 ## Building
 
 Checks require Rust and build tools for the selected toolchain. Release script `build_release.bat` uses `stable-x86_64-pc-windows-gnu` (installed through rustup if missing); first add the `bin` directory from w64devkit, containing `dlltool.exe`, to `PATH`.
@@ -211,6 +222,7 @@ Checks require Rust and build tools for the selected toolchain. Release script `
 cargo test --workspace --locked  # tests for the entire workspace
 .\build_release.bat              # release DLLs and installation archives in dist/
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite cache (Python 3)
+python scripts/test_prefetch.py --dll dist/mediares_wdx_only.wdx64 # read-ahead, cancellation and unload
 # WLX checks, large database and concurrent processes:
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
 cargo build -p mediares_combo --example lister_harness --locked

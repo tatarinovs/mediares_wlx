@@ -26,7 +26,7 @@ pub fn reset_stop_flag() {
 
 /// The work needed to obtain a field, used to keep slow reads off TC's UI thread.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Source {
+pub(crate) enum Source {
     Constant,
     Probe,
     Tags,
@@ -36,6 +36,9 @@ enum Source {
     Sharpness,
     VideoMeta,
     VideoTags,
+    AudioFingerprint,
+    AudioPcmHash,
+    AudioDuration,
     Analysis,
 }
 
@@ -65,11 +68,11 @@ impl Scope {
 macro_rules! fields {
     ($( $field:ident, $name:literal, $kind:ident, $source:ident, $scope:ident; )*) => {
         #[derive(Clone, Copy, PartialEq, Eq)]
-        enum Field { $($field,)* }
+        pub(crate) enum Field { $($field,)* }
         const FIELDS: &[(Field, &str, c_int)] = &[$((Field::$field, $name, $kind),)*];
         impl Field {
-            fn source(self) -> Source { match self { $(Self::$field => Source::$source,)* } }
-            fn applies_to(self, kind: MediaType) -> bool { match self { $(Self::$field => Scope::$scope.accepts(kind),)* } }
+            pub(crate) fn source(self) -> Source { match self { $(Self::$field => Source::$source,)* } }
+            pub(crate) fn applies_to(self, kind: MediaType) -> bool { match self { $(Self::$field => Scope::$scope.accepts(kind),)* } }
         }
     };
 }
@@ -80,8 +83,8 @@ fields! {
     ImageCoarseHash, "Image_CoarseHash", FT_STRINGW, Analysis, Image;
     VideoFingerprint, "Video_Fingerprint", FT_STRINGW, Analysis, Video;
     VideoDHashMid, "Video_dHash_Mid", FT_STRINGW, Analysis, Video;
-    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, Analysis, Audio;
-    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, Analysis, Audio;
+    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, AudioFingerprint, Audio;
+    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, AudioPcmHash, Audio;
     MediaTypeName, "Media_Type", FT_STRINGW, Probe, Media;
     ImageWidth, "Image_Width", FT_NUMERIC_32, ImageSize, Image;
     ImageHeight, "Image_Height", FT_NUMERIC_32, ImageSize, Image;
@@ -126,7 +129,7 @@ fields! {
     VideoYear, "Video_Year", FT_NUMERIC_32, VideoTags, Video;
     VideoGenre, "Video_Genre", FT_STRINGW, VideoTags, Video;
     VideoComment, "Video_Comment", FT_STRINGW, VideoTags, Video;
-    AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32, Analysis, Audio;
+    AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32, AudioDuration, Audio;
     AudioLength, "Audio_Length", FT_TIME, Tags, Audio;
     AudioArtistTitle, "Audio_Artist_Title", FT_STRINGW, Tags, Audio;
     AudioArtist, "Audio_Artist", FT_STRINGW, Tags, Audio;
@@ -230,6 +233,7 @@ pub unsafe fn content_get_value_a(
 
 pub fn content_stop_get_value() {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
+    crate::prefetch::cancel();
 }
 
 /// # Safety
@@ -239,6 +243,7 @@ pub unsafe fn content_get_detect_string(detect_string: *mut c_char, max_len: c_i
 }
 
 pub fn content_plugin_unloading() {
+    crate::prefetch::shutdown();
     crate::cache::clear_all();
 }
 
@@ -279,6 +284,7 @@ unsafe fn get_value(
         }
         .value(compute(&path, field, kind));
     }
+    crate::prefetch::request(&path, field, kind);
     crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
         crate::cache::with_file_key(&path, || {
             if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
@@ -347,6 +353,9 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && header_size(path, kind).is_none()
         }
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
+        Source::AudioFingerprint | Source::AudioPcmHash | Source::AudioDuration => {
+            !crate::cache::is_audio_cached(path, audio_field(field))
+        }
         Source::Analysis => analysis_pending(),
     }
 }
@@ -367,6 +376,25 @@ fn int(n: u32) -> Value {
 }
 
 fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
+    compute_cancelled(path, field, kind, &is_stop_requested)
+}
+
+pub(crate) fn prefetch_value(path: &Path, field: Field, cancelled: &dyn Fn() -> bool) {
+    if !cancelled() {
+        crate::disk_cache::with_maintenance(true, || {
+            crate::cache::with_file_key(path, || {
+                let _ = compute_cancelled(path, field, probe_file(path), cancelled);
+            });
+        });
+    }
+}
+
+fn compute_cancelled(
+    path: &Path,
+    field: Field,
+    kind: MediaType,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Value> {
     use Field::*;
     let text = |s: String| Some(Value::Text(s));
     match field.source() {
@@ -384,6 +412,9 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
+        Source::AudioFingerprint | Source::AudioPcmHash | Source::AudioDuration => {
+            return audio_analysis_value(path, field, cancelled);
+        }
         Source::PixelFormat => {
             let format = (kind == MediaType::StandardImage)
                 .then(|| crate::cache::get_pixel_format(path))
@@ -416,7 +447,7 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         }
         Source::Analysis => {}
     }
-    match (field, get_cache().get_or_analyze(path, &is_stop_requested)) {
+    match (field, get_cache().get_or_analyze(path, cancelled)) {
         (ImageWidth, CachedMedia::Image(img)) => Some(int(img.width)),
         (ImageHeight, CachedMedia::Image(img)) => Some(int(img.height)),
         (ImageMegapixels, CachedMedia::Image(img)) => Some(Value::Float(
@@ -429,10 +460,36 @@ fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio.clone()),
         (VideoFingerprint, CachedMedia::Video(vid)) => vid.fingerprint.clone().map(Value::Text),
         (VideoDHashMid, CachedMedia::Video(vid)) => vid.dhash_mid_hex().map(Value::Text),
-        (AudioFingerprint, CachedMedia::Audio(a)) => a.fingerprint.clone().map(Value::Text),
-        (AudioPcmHash, CachedMedia::Audio(a)) => text(a.pcm_hash.clone()),
-        (AudioDurationSec, CachedMedia::Audio(a)) => Some(int(a.duration_sec)),
         _ => None,
+    }
+}
+
+fn audio_field(field: Field) -> crate::cache::AudioField {
+    use crate::cache::AudioField;
+    match field {
+        Field::AudioFingerprint => AudioField::Fingerprint,
+        Field::AudioPcmHash => AudioField::PcmHash,
+        Field::AudioDurationSec => AudioField::Duration,
+        _ => unreachable!("audio analysis field"),
+    }
+}
+
+fn audio_analysis_value(path: &Path, field: Field, cancelled: &dyn Fn() -> bool) -> Option<Value> {
+    #[cfg(feature = "audio-decode")]
+    match field {
+        Field::AudioFingerprint => crate::cache::get_audio_fingerprint(path, cancelled)?
+            .fingerprint
+            .map(Value::Text),
+        Field::AudioPcmHash => Some(Value::Text(
+            crate::cache::get_audio_pcm_hash(path, cancelled)?.pcm_hash,
+        )),
+        Field::AudioDurationSec => Some(int(crate::cache::get_audio_duration(path, cancelled)?.0)),
+        _ => None,
+    }
+    #[cfg(not(feature = "audio-decode"))]
+    {
+        let _ = (path, field, cancelled);
+        None
     }
 }
 
@@ -841,8 +898,19 @@ macro_rules! export_content_plugin {
 
         #[no_mangle]
         pub unsafe extern "system" fn ContentSetDefaultParams(
-            _dps: *mut $crate::tc_api::ContentDefaultParamStruct,
+            dps: *mut $crate::tc_api::ContentDefaultParamStruct,
         ) {
+            $crate::ffi::guard((), || unsafe {
+                if let Some(dps) = dps.as_ref() {
+                    // Bound the C string even if a host omits its trailing NUL.
+                    if dps.default_ini_name.contains(&0) {
+                        if let Some(ini) = $crate::ffi::pstr_to_path(dps.default_ini_name.as_ptr())
+                        {
+                            $crate::config::set_tc_ini_path(&ini);
+                        }
+                    }
+                }
+            })
         }
 
         #[no_mangle]

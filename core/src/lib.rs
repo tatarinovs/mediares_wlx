@@ -8,6 +8,7 @@ pub mod audio_fingerprint;
 #[cfg(feature = "tags")]
 pub mod audio_tags;
 pub mod cache;
+pub mod config;
 mod disk_cache;
 pub mod exif;
 pub mod ffi;
@@ -20,6 +21,7 @@ pub mod keyframes;
 pub mod mf_audio;
 pub mod mf_init;
 pub mod orientation;
+mod prefetch;
 pub mod probe;
 #[cfg(feature = "psd-preview")]
 pub mod psd_preview;

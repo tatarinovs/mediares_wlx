@@ -1,4 +1,4 @@
-//! Audio duplicate detection fields, computed in one decoding pass:
+//! Independent audio duplicate detection fields, each computed only when requested:
 //!
 //! - **PCM hash** — hash of the decoded samples between the leading and trailing silence: equal for
 //!   the same audio in any lossless container or with different tags (WAV → FLAC, retagged MP3).
@@ -15,7 +15,7 @@ use std::f32::consts::PI;
 use std::path::Path;
 
 use crate::audio_decode::AudioDecoder;
-use crate::cache::AudioAnalysis;
+use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash};
 use crate::mf_audio::MfAudioReader;
 
 const ANALYSIS_RATE: u32 = 11_025;
@@ -83,34 +83,115 @@ impl PcmSource for MfAudioReader {
     }
 }
 
+pub fn fingerprint_audio(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioFingerprint, AudioError> {
+    analyze_audio::<BandAnalyzer>(path, cancelled)
+}
+
+pub fn hash_audio_pcm(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioPcmHash, AudioError> {
+    analyze_audio::<PcmHash>(path, cancelled)
+}
+
+/// Counts decoded frames without hashing samples or analyzing their spectrum.
+pub fn decoded_duration(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<AudioDuration, AudioError> {
+    analyze_audio::<()>(path, cancelled)
+}
+
+trait SampleAnalysis {
+    type Output;
+    fn start(rate: u32, channels: usize) -> Self;
+    fn samples(&mut self, samples: &[f32], channels: usize);
+    fn result(self, duration: f64) -> Self::Output;
+}
+
+impl SampleAnalysis for BandAnalyzer {
+    type Output = AudioFingerprint;
+
+    fn start(rate: u32, _: usize) -> Self {
+        Self::new(rate)
+    }
+
+    fn samples(&mut self, samples: &[f32], channels: usize) {
+        for frame in samples.chunks_exact(channels) {
+            self.push(frame.iter().sum::<f32>() / channels as f32);
+        }
+    }
+
+    fn result(self, duration: f64) -> Self::Output {
+        AudioFingerprint {
+            duration_sec: duration.round() as u32,
+            fingerprint: fingerprint(&self.frames, duration),
+        }
+    }
+}
+
+impl SampleAnalysis for PcmHash {
+    type Output = AudioPcmHash;
+
+    fn start(rate: u32, channels: usize) -> Self {
+        Self::new(rate, channels)
+    }
+
+    fn samples(&mut self, samples: &[f32], _: usize) {
+        self.update(samples);
+    }
+
+    fn result(self, duration: f64) -> Self::Output {
+        AudioPcmHash {
+            duration_sec: duration.round() as u32,
+            pcm_hash: self.finish(),
+        }
+    }
+}
+
+impl SampleAnalysis for () {
+    type Output = AudioDuration;
+
+    fn start(_: u32, _: usize) -> Self {}
+    fn samples(&mut self, _: &[f32], _: usize) {}
+    fn result(self, duration: f64) -> Self::Output {
+        AudioDuration(duration.round() as u32)
+    }
+}
+
 /// Decodes with symphonia; files it can't open or decode go through Media Foundation, whose
 /// results depend on the system's decoders (still stable on one machine, which is what TC's
 /// duplicate search compares).
-pub fn analyze_audio(
+fn analyze_audio<A: SampleAnalysis>(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
-) -> Result<AudioAnalysis, AudioError> {
+) -> Result<A::Output, AudioError> {
+    if cancelled() {
+        return Err(AudioError::Cancelled);
+    }
     if let Some(mut decoder) = AudioDecoder::open(path) {
-        match analyze_source(&mut decoder, cancelled) {
+        match analyze_source::<A>(&mut decoder, cancelled) {
             Err(AudioError::Unsupported) => {}
             result => return result,
         }
     }
     let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
-    analyze_source(&mut reader, cancelled)
+    analyze_source::<A>(&mut reader, cancelled)
 }
 
-fn analyze_source(
+fn analyze_source<A: SampleAnalysis>(
     source: &mut dyn PcmSource,
     cancelled: &dyn Fn() -> bool,
-) -> Result<AudioAnalysis, AudioError> {
+) -> Result<A::Output, AudioError> {
     let (rate, channels) = source.format();
     if rate == 0 || channels == 0 {
         return Err(AudioError::Invalid);
     }
     let expected = source.duration();
-    let mut pcm = PcmHash::new(rate, channels);
-    let mut bands = BandAnalyzer::new(rate);
+    let mut analysis = A::start(rate, channels);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
@@ -125,10 +206,7 @@ fn analyze_source(
         if chunks.is_multiple_of(CANCEL_CHECK_EVERY) && cancelled() {
             return Err(AudioError::Cancelled);
         }
-        pcm.update(samples);
-        for frame in samples.chunks_exact(channels) {
-            bands.push(frame.iter().sum::<f32>() / channels as f32);
-        }
+        analysis.samples(samples, channels);
         frames_total += (samples.len() / channels) as u64;
     }
     if frames_total == 0 {
@@ -143,11 +221,7 @@ fn analyze_source(
     if cancelled() {
         return Err(AudioError::Cancelled);
     }
-    Ok(AudioAnalysis {
-        duration_sec: duration.round() as u32,
-        pcm_hash: pcm.finish(),
-        fingerprint: fingerprint(&bands.frames, duration),
-    })
+    Ok(analysis.result(duration))
 }
 
 /// 64-bit FNV-1a over the samples quantized to 24 bits (exact for 16/24-bit integer sources),
@@ -446,14 +520,24 @@ mod tests {
         let path = crate::test_util::pcm16_wav("truncated-analysis", 8000, 1, 32000, |i| {
             (i % 1000) as i16 * 16
         });
-        assert!(analyze_audio(&path, &|| false).is_ok());
+        assert!(fingerprint_audio(&path, &|| false).is_ok());
+        assert!(hash_audio_pcm(&path, &|| false).is_ok());
+        assert!(decoded_duration(&path, &|| false).is_ok());
         let mut bytes = std::fs::read(&path).unwrap();
         // The same prefix, with a header declaring five times as much PCM.
         bytes[4..8].copy_from_slice(&(36u32 + 32000 * 2 * 5).to_le_bytes());
         bytes[40..44].copy_from_slice(&(32000u32 * 2 * 5).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         assert!(matches!(
-            analyze_audio(&path, &|| false),
+            fingerprint_audio(&path, &|| false),
+            Err(AudioError::Invalid)
+        ));
+        assert!(matches!(
+            hash_audio_pcm(&path, &|| false),
+            Err(AudioError::Invalid)
+        ));
+        assert!(matches!(
+            decoded_duration(&path, &|| false),
             Err(AudioError::Invalid)
         ));
         std::fs::remove_file(path).unwrap();
@@ -480,7 +564,15 @@ mod tests {
             }
         }
         assert!(matches!(
-            analyze_source(&mut Broken { read: false }, &|| false),
+            analyze_source::<BandAnalyzer>(&mut Broken { read: false }, &|| false),
+            Err(AudioError::Invalid)
+        ));
+        assert!(matches!(
+            analyze_source::<PcmHash>(&mut Broken { read: false }, &|| false),
+            Err(AudioError::Invalid)
+        ));
+        assert!(matches!(
+            analyze_source::<()>(&mut Broken { read: false }, &|| false),
             Err(AudioError::Invalid)
         ));
     }

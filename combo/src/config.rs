@@ -4,9 +4,7 @@
 //! otherwise in the directory of TC's plugin INI passed via `ListSetDefaultParams` — the plugin
 //! folder is often read-only (Program Files).
 
-use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use windows::core::{w, HSTRING, PCWSTR};
 
@@ -14,34 +12,13 @@ use crate::i18n::{tr, LangSetting};
 use crate::osd_template;
 use crate::playlist::{QueueOptions, Repeat};
 use crate::snapshot::PictureFormat;
-use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::System::WindowsProgramming::{
     GetPrivateProfileIntW, GetPrivateProfileSectionW, WritePrivateProfileStringW,
 };
 
-const INI_NAME: &str = "mediares.ini";
 const SECTION: PCWSTR = w!("Settings");
 
-static TC_INI_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
-
-/// Remembers the directory of TC's default plugin INI (from `ListSetDefaultParams`).
-pub fn set_tc_ini_path(ini: &Path) {
-    if let Some(dir) = ini.parent() {
-        *TC_INI_DIR.lock().unwrap_or_else(|e| e.into_inner()) = Some(dir.to_path_buf());
-    }
-}
-
-/// The INI the settings are read from and written to.
-pub fn ini_path() -> PathBuf {
-    let portable = dll_dir().map(|d| d.join(INI_NAME));
-    if let Some(p) = portable.as_ref().filter(|p| p.exists()) {
-        return p.clone();
-    }
-    tc_ini_dir()
-        .map(|d| d.join(INI_NAME))
-        .or(portable)
-        .unwrap_or_else(|| PathBuf::from(INI_NAME))
-}
+pub use mediares_core::config::{dll_path, ini_path, set_tc_ini_path, tc_ini_dir};
 
 /// A file or folder that only makes sense on this machine (shader cache, video positions,
 /// wallpaper), in `%LOCALAPPDATA%\mediares` — a portable TC carries just `mediares.ini`.
@@ -108,25 +85,6 @@ fn prepare_unicode(ini: &Path) {
         .flat_map(u16::to_le_bytes)
         .collect();
     let _ = mediares_core::file_write::replace(ini, |out| out.write_all(&wide));
-}
-
-/// Directory of TC's default plugin INI — normally the one holding `wincmd.ini` too.
-pub fn tc_ini_dir() -> Option<PathBuf> {
-    TC_INI_DIR.lock().unwrap_or_else(|e| e.into_inner()).clone()
-}
-
-/// Full path of this DLL.
-pub fn dll_path() -> Option<PathBuf> {
-    let mut buf = [0u16; 1024];
-    let len = unsafe { GetModuleFileNameW(Some(crate::module().into()), &mut buf) } as usize;
-    if len == 0 || len >= buf.len() {
-        return None;
-    }
-    Some(PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
-}
-
-fn dll_dir() -> Option<PathBuf> {
-    dll_path()?.parent().map(Path::to_path_buf)
 }
 
 /// Where the on-screen info line is shown.
@@ -510,6 +468,10 @@ impl ViewerConfig {
     /// another viewer window or the user changed in the meantime are kept. Returns false if any
     /// write failed (e.g. read-only location).
     pub fn save(&self, before: &ViewerConfig) -> bool {
+        self.save_to(before, &ini_path())
+    }
+
+    fn save_to(&self, before: &ViewerConfig, path: &Path) -> bool {
         let changed: Vec<(PCWSTR, String)> = self
             .entries()
             .into_iter()
@@ -520,8 +482,7 @@ impl ViewerConfig {
         if changed.is_empty() {
             return true;
         }
-        let path = ini_path();
-        prepare_unicode(&path);
+        prepare_unicode(path);
         let ini = HSTRING::from(path.as_os_str());
         changed
             .into_iter()
@@ -538,6 +499,36 @@ impl ViewerConfig {
 mod tests {
     use super::*;
     use windows::Win32::System::WindowsProgramming::GetPrivateProfileStringW;
+
+    #[test]
+    fn saving_viewer_settings_preserves_manual_prefetch_key() {
+        let path =
+            std::env::temp_dir().join(format!("mediares_manual_ini_{}.ini", std::process::id()));
+        std::fs::write(
+            &path,
+            "[Settings]\r\nPrefetchThreads=7\r\nVolume=40\r\n[Other]\r\nCustom=keep\r\n",
+        )
+        .unwrap();
+        let before = ViewerConfig::default();
+        let mut after = before.clone();
+        after.wheel_zoom = !before.wheel_zoom;
+        assert!(after.save_to(&before, &path));
+        let ini = HSTRING::from(path.as_os_str());
+        let section = Section::read(&ini);
+        assert_eq!(section.int("PrefetchThreads", -1), 7);
+        assert_eq!(section.int("Volume", -1), 40);
+        assert_eq!(section.int("WheelZoom", -1), i32::from(after.wheel_zoom));
+        assert!(String::from_utf16_lossy(
+            &std::fs::read(&path).unwrap()[2..]
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect::<Vec<_>>()
+        )
+        .contains("Custom=keep"));
+        std::fs::remove_file(path).unwrap();
+    }
 
     /// The section read gives what the per-key calls it replaced gave, on the same file.
     #[test]
