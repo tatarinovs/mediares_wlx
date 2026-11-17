@@ -86,8 +86,9 @@ fn compute_phash(gray: &GrayImage) -> u64 {
     for (y, row) in thumb.as_raw().as_chunks::<N>().0.iter().enumerate() {
         for (x, &px) in row.iter().enumerate() {
             let p = px as f32;
+            let row_cos = &cos[x];
             for v in 0..8 {
-                horizontal[y][v] += p * cos[v][x];
+                horizontal[y][v] += p * row_cos[v];
             }
         }
     }
@@ -105,7 +106,7 @@ fn compute_phash(gray: &GrayImage) -> u64 {
         for v in 0..8 {
             let mut sum = 0.0f32;
             for y in 0..N {
-                sum += horizontal[y][v] * cos[u][y];
+                sum += horizontal[y][v] * cos[y][u];
             }
             dct[u * 8 + v] = sum * au * alpha(v);
         }
@@ -119,12 +120,12 @@ fn compute_phash(gray: &GrayImage) -> u64 {
         .fold(0u64, |hash, &c| (hash << 1) | (c > median) as u64)
 }
 
-fn phash_cosines() -> &'static [[f32; 32]; 8] {
-    static COS: std::sync::OnceLock<[[f32; 32]; 8]> = std::sync::OnceLock::new();
+fn phash_cosines() -> &'static [[f32; 8]; 32] {
+    static COS: std::sync::OnceLock<[[f32; 8]; 32]> = std::sync::OnceLock::new();
     COS.get_or_init(|| {
-        let mut cos = [[0.0f32; 32]; 8];
-        for (k, row) in cos.iter_mut().enumerate() {
-            for (n, c) in row.iter_mut().enumerate() {
+        let mut cos = [[0.0f32; 8]; 32];
+        for (n, row) in cos.iter_mut().enumerate() {
+            for (k, c) in row.iter_mut().enumerate() {
                 *c = (((2 * n + 1) * k) as f64 * std::f64::consts::PI / 64.0).cos() as f32;
             }
         }
@@ -158,7 +159,7 @@ fn laplacian_variance(gray: &GrayImage) -> f64 {
         return 0.0;
     }
     let px = gray.as_raw();
-    let (mut sum, mut sum_sq) = (0.0f64, 0.0f64);
+    let (mut sum, mut sum_sq) = (0i64, 0i64);
     for y in 1..h - 1 {
         let (up, row, down) = (
             &px[(y - 1) * w..y * w],
@@ -171,14 +172,14 @@ fn laplacian_variance(gray: &GrayImage) -> f64 {
                 - i32::from(row[x + 1])
                 - i32::from(up[x])
                 - i32::from(down[x]);
-            let lap = f64::from(lap);
+            let lap = i64::from(lap);
             sum += lap;
             sum_sq += lap * lap;
         }
     }
     let n = ((w - 2) * (h - 2)) as f64;
-    let mean = sum / n;
-    sum_sq / n - mean * mean
+    let mean = sum as f64 / n;
+    sum_sq as f64 / n - mean * mean
 }
 
 pub fn compute_aspect_ratio(w: u32, h: u32) -> String {

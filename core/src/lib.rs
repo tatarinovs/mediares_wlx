@@ -27,6 +27,7 @@ pub mod probe;
 pub mod psd_preview;
 #[cfg(feature = "raw-preview")]
 pub mod raw_preview;
+pub mod sqlite;
 pub mod svg;
 mod svg_css;
 pub mod tc_api;

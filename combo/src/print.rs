@@ -606,317 +606,324 @@ unsafe fn start_print(dlg: HWND, data: &mut Preview) {
 }
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Preview;
-    if ptr.is_null() {
-        return DefWindowProcW(hwnd, msg, wp, lp);
-    }
-    match msg {
-        crate::image_cache::WM_IMAGE_READY => {
-            if let Some(result) = (*ptr).pending.as_ref().and_then(|ticket| ticket.result()) {
-                let failed = result.is_none();
-                (*ptr).pending = None;
-                if let Some(image) = result {
-                    if let Some(source) = (*ptr).source.as_ref() {
-                        (*ptr).preview = source.turn(image);
+    mediares_core::ffi::guard(LRESULT(0), || unsafe {
+        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Preview;
+        if ptr.is_null() {
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+        match msg {
+            crate::image_cache::WM_IMAGE_READY => {
+                if let Some(result) = (*ptr).pending.as_ref().and_then(|ticket| ticket.result()) {
+                    let failed = result.is_none();
+                    (*ptr).pending = None;
+                    if let Some(image) = result {
+                        if let Some(source) = (*ptr).source.as_ref() {
+                            (*ptr).preview = source.turn(image);
+                            (*ptr).rotated = None;
+                        }
+                    } else {
+                        (*ptr).page = (*ptr).source.as_ref().map_or(0, |s| s.options.page);
+                        (*ptr).preview = preview_copy(&(*ptr).image);
                         (*ptr).rotated = None;
                     }
-                } else {
-                    (*ptr).page = (*ptr).source.as_ref().map_or(0, |s| s.options.page);
-                    (*ptr).preview = preview_copy(&(*ptr).image);
-                    (*ptr).rotated = None;
-                }
-                page_controls(hwnd, &*ptr);
-                validate(hwnd, &*ptr);
-                if failed {
-                    crate::file_actions::show_error(hwnd, tr("Could not load the page."));
-                }
-            }
-            LRESULT(0)
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            let dc = HDC(wp.0 as _);
-            SetBkMode(dc, TRANSPARENT);
-            SetTextColor(dc, COLORREF(GetSysColor(COLOR_BTNTEXT)));
-            LRESULT(GetStockObject(WHITE_BRUSH).0 as isize)
-        }
-        WM_ERASEBKGND => LRESULT(1),
-        WM_DRAWITEM => {
-            let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
-            if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&(dis.CtlID as usize)) {
-                let index = dis.CtlID as usize - ALIGN_FIRST;
-                let is_selected = (*ptr).alignment == index;
-                let rc = dis.rcItem;
-                let dc = dis.hDC;
-                let px = |v| dialog::px(hwnd, v);
-
-                // The selected button gets a soft accent fill and a two-pixel accent border,
-                // so the active placement stands out at a glance. The brush must outlive the
-                // `FillRect` call, so it is not extracted into a temporary handle.
-                if is_selected {
-                    FillRect(dc, &rc, crate::gdi::solid_brush(ACCENT_SOFT).0);
-                } else {
-                    FillRect(dc, &rc, HBRUSH(GetStockObject(WHITE_BRUSH).0));
-                }
-
-                let border = if is_selected { ACCENT } else { NEUTRAL };
-                FrameRect(dc, &rc, crate::gdi::solid_brush(border).0);
-                if is_selected {
-                    let inner = RECT {
-                        left: rc.left + 1,
-                        top: rc.top + 1,
-                        right: rc.right - 1,
-                        bottom: rc.bottom - 1,
-                    };
-                    FrameRect(dc, &inner, crate::gdi::solid_brush(ACCENT).0);
-                }
-
-                let sheet_w = px(22);
-                let sheet_h = px(20);
-                let cx = (rc.left + rc.right) / 2;
-                let cy = (rc.top + rc.bottom) / 2;
-                let sheet_rc = RECT {
-                    left: cx - sheet_w / 2,
-                    top: cy - sheet_h / 2,
-                    right: cx + (sheet_w + 1) / 2,
-                    bottom: cy + (sheet_h + 1) / 2,
-                };
-                FillRect(dc, &sheet_rc, HBRUSH(GetStockObject(WHITE_BRUSH).0));
-                FrameRect(
-                    dc,
-                    &sheet_rc,
-                    crate::gdi::solid_brush(if is_selected { ACCENT } else { NEUTRAL }).0,
-                );
-
-                let col = index % 3;
-                let row = index / 3;
-                let m_w = px(7).max(3);
-                let m_h = px(6).max(3);
-                let m_x = match col {
-                    0 => sheet_rc.left + px(2),
-                    1 => cx - m_w / 2,
-                    _ => sheet_rc.right - px(2) - m_w,
-                };
-                let m_y = match row {
-                    0 => sheet_rc.top + px(2),
-                    1 => cy - m_h / 2,
-                    _ => sheet_rc.bottom - px(2) - m_h,
-                };
-                let marker_rc = RECT {
-                    left: m_x,
-                    top: m_y,
-                    right: m_x + m_w,
-                    bottom: m_y + m_h,
-                };
-                let marker = if is_selected { ACCENT } else { 0x00808080 };
-                FillRect(dc, &marker_rc, crate::gdi::solid_brush(marker).0);
-
-                if dis.itemState.0 & ODS_FOCUS.0 != 0 {
-                    let focus = RECT {
-                        left: rc.left + px(3),
-                        top: rc.top + px(3),
-                        right: rc.right - px(3),
-                        bottom: rc.bottom - px(3),
-                    };
-                    let _ = DrawFocusRect(dc, &focus);
-                }
-                return LRESULT(1);
-            }
-            DefWindowProcW(hwnd, msg, wp, lp)
-        }
-        WM_NOTIFY if lp.0 != 0 => {
-            let header = &*(lp.0 as *const NMHDR);
-            if header.code == UDN_DELTAPOS {
-                let notice = &*(lp.0 as *const NMUPDOWN);
-                let field = match header.idFrom {
-                    id if (SPIN_FIRST..SPIN_FIRST + 4).contains(&id) => {
-                        Some((MARGIN_FIRST + id - SPIN_FIRST, 0.0, 300.0))
-                    }
-                    id if id == SPIN_FIRST + 4 => Some((COPIES, 1.0, 99.0)),
-                    CUSTOM_W_SPIN => Some((CUSTOM_WIDTH, 1.0, 1000.0)),
-                    CUSTOM_H_SPIN => Some((CUSTOM_HEIGHT, 1.0, 1000.0)),
-                    _ => None,
-                };
-                if let Some((id, min, max)) = field {
-                    if (*ptr).job.is_none() {
-                        let current =
-                            parse_mm(&dialog::item_text(hwnd, id as i32), min, max).unwrap_or(min);
-                        text(
-                            hwnd,
-                            id,
-                            &format_mm((current + notice.iDelta as f64).clamp(min, max)),
-                        );
-                    }
-                    return LRESULT(1); // Keep decimal fractions; prevent the integer buddy rewrite.
-                }
-            }
-            LRESULT(0)
-        }
-        WM_COMMAND => {
-            let id = dialog::loword(wp);
-            let code = (wp.0 >> 16) as u32;
-            if id == IDCANCEL.0 as usize {
-                dialog::close(hwnd);
-                return LRESULT(0);
-            }
-            if (*ptr).initializing || (*ptr).job.is_some() {
-                return LRESULT(0);
-            }
-            match id {
-                PAGE_PREV | PAGE_NEXT if (*ptr).pending.is_none() => {
-                    let page = if id == PAGE_PREV {
-                        (*ptr).page.saturating_sub(1)
-                    } else {
-                        (*ptr).page + 1
-                    };
-                    show_page(hwnd, &mut *ptr, page);
-                }
-                PAGE_SCOPE if code == CBN_SELCHANGE => {
                     page_controls(hwnd, &*ptr);
                     validate(hwnd, &*ptr);
+                    if failed {
+                        crate::file_actions::show_error(hwnd, tr("Could not load the page."));
+                    }
                 }
-                id if id == IDOK.0 as usize => start_print(hwnd, &mut *ptr),
-                PRINTER_COMBO if code == CBN_SELCHANGE => {
-                    let name = dialog::item_text(hwnd, PRINTER_COMBO as i32);
-                    if let Some(mut next) = Printer::create(&name) {
-                        if let Some(g) = (*ptr).printer.geometry() {
-                            next.orient(g.paper_mm().0 > g.paper_mm().1);
+                LRESULT(0)
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                let dc = HDC(wp.0 as _);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, COLORREF(GetSysColor(COLOR_BTNTEXT)));
+                LRESULT(GetStockObject(WHITE_BRUSH).0 as isize)
+            }
+            WM_ERASEBKGND => LRESULT(1),
+            WM_DRAWITEM => {
+                let dis = &*(lp.0 as *const DRAWITEMSTRUCT);
+                if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&(dis.CtlID as usize)) {
+                    let index = dis.CtlID as usize - ALIGN_FIRST;
+                    let is_selected = (*ptr).alignment == index;
+                    let rc = dis.rcItem;
+                    let dc = dis.hDC;
+                    let px = |v| dialog::px(hwnd, v);
+
+                    // The selected button gets a soft accent fill and a two-pixel accent border,
+                    // so the active placement stands out at a glance. The brush must outlive the
+                    // `FillRect` call, so it is not extracted into a temporary handle.
+                    if is_selected {
+                        FillRect(dc, &rc, crate::gdi::solid_brush(ACCENT_SOFT).0);
+                    } else {
+                        FillRect(dc, &rc, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+                    }
+
+                    let border = if is_selected { ACCENT } else { NEUTRAL };
+                    FrameRect(dc, &rc, crate::gdi::solid_brush(border).0);
+                    if is_selected {
+                        let inner = RECT {
+                            left: rc.left + 1,
+                            top: rc.top + 1,
+                            right: rc.right - 1,
+                            bottom: rc.bottom - 1,
+                        };
+                        FrameRect(dc, &inner, crate::gdi::solid_brush(ACCENT).0);
+                    }
+
+                    let sheet_w = px(22);
+                    let sheet_h = px(20);
+                    let cx = (rc.left + rc.right) / 2;
+                    let cy = (rc.top + rc.bottom) / 2;
+                    let sheet_rc = RECT {
+                        left: cx - sheet_w / 2,
+                        top: cy - sheet_h / 2,
+                        right: cx + (sheet_w + 1) / 2,
+                        bottom: cy + (sheet_h + 1) / 2,
+                    };
+                    FillRect(dc, &sheet_rc, HBRUSH(GetStockObject(WHITE_BRUSH).0));
+                    FrameRect(
+                        dc,
+                        &sheet_rc,
+                        crate::gdi::solid_brush(if is_selected { ACCENT } else { NEUTRAL }).0,
+                    );
+
+                    let col = index % 3;
+                    let row = index / 3;
+                    let m_w = px(7).max(3);
+                    let m_h = px(6).max(3);
+                    let m_x = match col {
+                        0 => sheet_rc.left + px(2),
+                        1 => cx - m_w / 2,
+                        _ => sheet_rc.right - px(2) - m_w,
+                    };
+                    let m_y = match row {
+                        0 => sheet_rc.top + px(2),
+                        1 => cy - m_h / 2,
+                        _ => sheet_rc.bottom - px(2) - m_h,
+                    };
+                    let marker_rc = RECT {
+                        left: m_x,
+                        top: m_y,
+                        right: m_x + m_w,
+                        bottom: m_y + m_h,
+                    };
+                    let marker = if is_selected { ACCENT } else { 0x00808080 };
+                    FillRect(dc, &marker_rc, crate::gdi::solid_brush(marker).0);
+
+                    if dis.itemState.0 & ODS_FOCUS.0 != 0 {
+                        let focus = RECT {
+                            left: rc.left + px(3),
+                            top: rc.top + px(3),
+                            right: rc.right - px(3),
+                            bottom: rc.bottom - px(3),
+                        };
+                        let _ = DrawFocusRect(dc, &focus);
+                    }
+                    return LRESULT(1);
+                }
+                DefWindowProcW(hwnd, msg, wp, lp)
+            }
+            WM_NOTIFY if lp.0 != 0 => {
+                let header = &*(lp.0 as *const NMHDR);
+                if header.code == UDN_DELTAPOS {
+                    let notice = &*(lp.0 as *const NMUPDOWN);
+                    let field = match header.idFrom {
+                        id if (SPIN_FIRST..SPIN_FIRST + 4).contains(&id) => {
+                            Some((MARGIN_FIRST + id - SPIN_FIRST, 0.0, 300.0))
                         }
-                        (*ptr).printer = next;
-                        (*ptr).available = true;
+                        id if id == SPIN_FIRST + 4 => Some((COPIES, 1.0, 99.0)),
+                        CUSTOM_W_SPIN => Some((CUSTOM_WIDTH, 1.0, 1000.0)),
+                        CUSTOM_H_SPIN => Some((CUSTOM_HEIGHT, 1.0, 1000.0)),
+                        _ => None,
+                    };
+                    if let Some((id, min, max)) = field {
+                        if (*ptr).job.is_none() {
+                            let current = parse_mm(&dialog::item_text(hwnd, id as i32), min, max)
+                                .unwrap_or(min);
+                            text(
+                                hwnd,
+                                id,
+                                &format_mm((current + notice.iDelta as f64).clamp(min, max)),
+                            );
+                        }
+                        return LRESULT(1); // Keep decimal fractions; prevent the integer buddy rewrite.
+                    }
+                }
+                LRESULT(0)
+            }
+            WM_COMMAND => {
+                let id = dialog::loword(wp);
+                let code = (wp.0 >> 16) as u32;
+                if id == IDCANCEL.0 as usize {
+                    dialog::close(hwnd);
+                    return LRESULT(0);
+                }
+                if (*ptr).initializing || (*ptr).job.is_some() {
+                    return LRESULT(0);
+                }
+                match id {
+                    PAGE_PREV | PAGE_NEXT if (*ptr).pending.is_none() => {
+                        let page = if id == PAGE_PREV {
+                            (*ptr).page.saturating_sub(1)
+                        } else {
+                            (*ptr).page + 1
+                        };
+                        show_page(hwnd, &mut *ptr, page);
+                    }
+                    PAGE_SCOPE if code == CBN_SELCHANGE => {
+                        page_controls(hwnd, &*ptr);
+                        validate(hwnd, &*ptr);
+                    }
+                    id if id == IDOK.0 as usize => start_print(hwnd, &mut *ptr),
+                    PRINTER_COMBO if code == CBN_SELCHANGE => {
+                        let name = dialog::item_text(hwnd, PRINTER_COMBO as i32);
+                        if let Some(mut next) = Printer::create(&name) {
+                            if let Some(g) = (*ptr).printer.geometry() {
+                                next.orient(g.paper_mm().0 > g.paper_mm().1);
+                            }
+                            (*ptr).printer = next;
+                            (*ptr).available = true;
+                            sync_orientation(hwnd, (*ptr).printer.dc);
+                            refresh_papers(hwnd, &mut *ptr);
+                            validate(hwnd, &*ptr);
+                        } else {
+                            fill_printers(hwnd, &*ptr, printer::enumerate());
+                            crate::file_actions::show_error(
+                                hwnd,
+                                tr("Could not open the selected printer."),
+                            );
+                        }
+                    }
+                    PRINTER_PROPS => {
+                        // The driver runs a nested modal loop. Keep the active printer untouched
+                        // while that loop can paint the preview or close it on host shutdown.
+                        let candidate = Printer::from_settings((*ptr).printer.settings());
+                        if let Some(mut candidate) = candidate {
+                            let accepted = candidate.properties(hwnd);
+                            if !IsWindow(Some(hwnd)).as_bool() {
+                                return LRESULT(0);
+                            }
+                            match accepted {
+                                Ok(true) => {
+                                    (*ptr).printer = candidate;
+                                    sync_orientation(hwnd, (*ptr).printer.dc);
+                                    refresh_papers(hwnd, &mut *ptr);
+                                    validate(hwnd, &*ptr);
+                                }
+                                Ok(false) => {}
+                                Err(()) => crate::file_actions::show_error(
+                                    hwnd,
+                                    tr("Could not apply the printer settings."),
+                                ),
+                            }
+                        } else {
+                            crate::file_actions::show_error(
+                                hwnd,
+                                tr("Could not apply the printer settings."),
+                            );
+                        }
+                    }
+                    id if (ORIENTATION..ORIENTATION + 2).contains(&id) && code == BN_CLICKED => {
+                        if !(*ptr).printer.orient(id == ORIENTATION + 1) {
+                            crate::file_actions::show_error(
+                                hwnd,
+                                tr("Could not change the paper orientation."),
+                            );
+                        }
                         sync_orientation(hwnd, (*ptr).printer.dc);
                         refresh_papers(hwnd, &mut *ptr);
                         validate(hwnd, &*ptr);
-                    } else {
-                        fill_printers(hwnd, &*ptr, printer::enumerate());
-                        crate::file_actions::show_error(
-                            hwnd,
-                            tr("Could not open the selected printer."),
-                        );
                     }
-                }
-                PRINTER_PROPS => {
-                    // The driver runs a nested modal loop. Keep the active printer untouched
-                    // while that loop can paint the preview or close it on host shutdown.
-                    let candidate = Printer::from_settings((*ptr).printer.settings());
-                    if let Some(mut candidate) = candidate {
-                        let accepted = candidate.properties(hwnd);
-                        if !IsWindow(Some(hwnd)).as_bool() {
-                            return LRESULT(0);
+                    id if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&id) && code == BN_CLICKED => {
+                        let old = (*ptr).alignment;
+                        (*ptr).alignment = id - ALIGN_FIRST;
+                        for id in [ALIGN_FIRST + old, id] {
+                            let _ =
+                                InvalidateRect(GetDlgItem(Some(hwnd), id as i32).ok(), None, true);
                         }
-                        match accepted {
-                            Ok(true) => {
-                                (*ptr).printer = candidate;
+                        validate(hwnd, &*ptr);
+                    }
+                    id if (MODE_FIRST..MODE_FIRST + 4).contains(&id) => {
+                        update_mode_controls_visibility(hwnd);
+                        validate(hwnd, &*ptr);
+                    }
+                    AUTO_CROP | AUTO_ROTATE => validate(hwnd, &*ptr),
+                    PRINTER_REFRESH => refresh_printers(hwnd, &mut *ptr),
+                    id if id == PAPER_INFO as usize && code == CBN_SELCHANGE => {
+                        let sel =
+                            SendDlgItemMessageW(hwnd, PAPER_INFO, CB_GETCURSEL, WPARAM(0), LPARAM(0))
+                                .0;
+                        if sel >= 0 {
+                            let papers = &(*ptr).papers;
+                            if let Some(paper) = papers.get(sel as usize).cloned() {
+                                if !(*ptr).printer.set_paper(paper.id) {
+                                    crate::file_actions::show_error(
+                                        hwnd,
+                                        tr("Could not change the paper size."),
+                                    );
+                                }
                                 sync_orientation(hwnd, (*ptr).printer.dc);
                                 refresh_papers(hwnd, &mut *ptr);
                                 validate(hwnd, &*ptr);
                             }
-                            Ok(false) => {}
-                            Err(()) => crate::file_actions::show_error(
-                                hwnd,
-                                tr("Could not apply the printer settings."),
-                            ),
                         }
-                    } else {
-                        crate::file_actions::show_error(
-                            hwnd,
-                            tr("Could not apply the printer settings."),
-                        );
                     }
-                }
-                id if (ORIENTATION..ORIENTATION + 2).contains(&id) && code == BN_CLICKED => {
-                    if !(*ptr).printer.orient(id == ORIENTATION + 1) {
-                        crate::file_actions::show_error(
-                            hwnd,
-                            tr("Could not change the paper orientation."),
-                        );
+                    COPIES if code == EN_CHANGE => {
+                        validate_options(hwnd, &*ptr, false);
                     }
-                    sync_orientation(hwnd, (*ptr).printer.dc);
-                    refresh_papers(hwnd, &mut *ptr);
-                    validate(hwnd, &*ptr);
+                    _ if code == EN_CHANGE => validate(hwnd, &*ptr),
+                    _ => {}
                 }
-                id if (ALIGN_FIRST..ALIGN_FIRST + 9).contains(&id) && code == BN_CLICKED => {
-                    let old = (*ptr).alignment;
-                    (*ptr).alignment = id - ALIGN_FIRST;
-                    for id in [ALIGN_FIRST + old, id] {
-                        let _ = InvalidateRect(GetDlgItem(Some(hwnd), id as i32).ok(), None, true);
-                    }
-                    validate(hwnd, &*ptr);
-                }
-                id if (MODE_FIRST..MODE_FIRST + 4).contains(&id) => {
-                    update_mode_controls_visibility(hwnd);
-                    validate(hwnd, &*ptr);
-                }
-                AUTO_CROP | AUTO_ROTATE => validate(hwnd, &*ptr),
-                PRINTER_REFRESH => refresh_printers(hwnd, &mut *ptr),
-                id if id == PAPER_INFO as usize && code == CBN_SELCHANGE => {
-                    let sel =
-                        SendDlgItemMessageW(hwnd, PAPER_INFO, CB_GETCURSEL, WPARAM(0), LPARAM(0)).0;
-                    if sel >= 0 {
-                        let papers = &(*ptr).papers;
-                        if let Some(paper) = papers.get(sel as usize).cloned() {
-                            if !(*ptr).printer.set_paper(paper.id) {
-                                crate::file_actions::show_error(
-                                    hwnd,
-                                    tr("Could not change the paper size."),
-                                );
-                            }
-                            sync_orientation(hwnd, (*ptr).printer.dc);
+                LRESULT(0)
+            }
+            WM_TIMER if wp.0 == PRINT_TIMER => {
+                let outcome = (*ptr).job.as_ref().and_then(Task::poll);
+                if let Some(outcome) = outcome {
+                    let _ = KillTimer(Some(hwnd), PRINT_TIMER);
+                    (*ptr).job = None;
+                    match outcome {
+                        Outcome::Printed => {
+                            (*ptr).printed = true;
+                            dialog::close(hwnd);
+                        }
+                        _ => {
+                            set_busy(hwnd, false);
+                            page_controls(hwnd, &*ptr);
+                            update_mode_controls_visibility(hwnd);
                             refresh_papers(hwnd, &mut *ptr);
                             validate(hwnd, &*ptr);
+                            if outcome == Outcome::Failed {
+                                crate::file_actions::show_error(
+                                    hwnd,
+                                    tr("Could not print the image."),
+                                );
+                            }
                         }
                     }
                 }
-                COPIES if code == EN_CHANGE => {
-                    validate_options(hwnd, &*ptr, false);
-                }
-                _ if code == EN_CHANGE => validate(hwnd, &*ptr),
-                _ => {}
+                LRESULT(0)
             }
-            LRESULT(0)
-        }
-        WM_TIMER if wp.0 == PRINT_TIMER => {
-            let outcome = (*ptr).job.as_ref().and_then(Task::poll);
-            if let Some(outcome) = outcome {
-                let _ = KillTimer(Some(hwnd), PRINT_TIMER);
+            WM_PAINT => {
+                let mut ps = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut ps);
+                paint(hwnd, dc, &mut *ptr);
+                let _ = EndPaint(hwnd, &ps);
+                LRESULT(0)
+            }
+            WM_CLOSE => {
+                dialog::close(hwnd);
+                LRESULT(0)
+            }
+            WM_NCDESTROY => {
+                // The modal loop keeps Preview alive through destruction; workers never reference it.
                 (*ptr).job = None;
-                match outcome {
-                    Outcome::Printed => {
-                        (*ptr).printed = true;
-                        dialog::close(hwnd);
-                    }
-                    _ => {
-                        set_busy(hwnd, false);
-                        page_controls(hwnd, &*ptr);
-                        update_mode_controls_visibility(hwnd);
-                        refresh_papers(hwnd, &mut *ptr);
-                        validate(hwnd, &*ptr);
-                        if outcome == Outcome::Failed {
-                            crate::file_actions::show_error(hwnd, tr("Could not print the image."));
-                        }
-                    }
-                }
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                DefWindowProcW(hwnd, msg, wp, lp)
             }
-            LRESULT(0)
+            _ => DefWindowProcW(hwnd, msg, wp, lp),
         }
-        WM_PAINT => {
-            let mut ps = PAINTSTRUCT::default();
-            let dc = BeginPaint(hwnd, &mut ps);
-            paint(hwnd, dc, &mut *ptr);
-            let _ = EndPaint(hwnd, &ps);
-            LRESULT(0)
-        }
-        WM_CLOSE => {
-            dialog::close(hwnd);
-            LRESULT(0)
-        }
-        WM_NCDESTROY => {
-            // The modal loop keeps Preview alive through destruction; workers never reference it.
-            (*ptr).job = None;
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            DefWindowProcW(hwnd, msg, wp, lp)
-        }
-        _ => DefWindowProcW(hwnd, msg, wp, lp),
-    }
+    })
 }
 
 unsafe fn paint(hwnd: HWND, dc: HDC, data: &mut Preview) {

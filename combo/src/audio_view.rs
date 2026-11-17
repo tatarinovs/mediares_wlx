@@ -203,9 +203,9 @@ impl AudioView {
     }
 
     fn load_meta(&mut self, path: &Path) {
-        // ReplayGain affects audible output, so read its small tag record synchronously.
-        // Cover bytes, picture decoding, lyrics and folder scanning are optional UI work.
-        self.tags = if self.replay_gain {
+        // ReplayGain is applied immediately when tags are already cached in RAM; otherwise
+        // MetadataTask loads tags, ReplayGain, and cover art off the UI thread.
+        self.tags = if self.replay_gain && mediares_core::cache::is_tags_cached(path) {
             mediares_core::cache::get_tags(path).map_or_else(AudioTags::default, |t| (*t).clone())
         } else {
             AudioTags::default()

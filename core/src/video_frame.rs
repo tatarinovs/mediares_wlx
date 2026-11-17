@@ -43,7 +43,7 @@ impl VideoAnalysis {
 }
 
 /// Stream properties for WDX columns: codecs, frame rate, bitrate, the audio track. No decoding.
-#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct VideoMeta {
     pub width: u32,
     pub height: u32,
@@ -62,7 +62,6 @@ pub struct VideoMeta {
     pub rotation: Option<u32>,
     /// "HDR10" (PQ) or "HLG" for high dynamic range video, "SDR" otherwise; `None` if the stream
     /// doesn't say.
-    #[serde(deserialize_with = "crate::disk_cache::dynamic_range")]
     pub dynamic_range: Option<crate::disk_cache::StaticName>,
 }
 
@@ -133,7 +132,7 @@ pub(crate) unsafe fn duration_sec(reader: &IMFSourceReader) -> f64 {
 
 /// Average bitrate of the whole file (size / duration), kbit/s.
 pub(crate) fn file_bitrate_kbps(path: &Path, duration_sec: f64) -> Option<u32> {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let size = crate::cache::scoped_file_size(path).unwrap_or(0);
     (duration_sec >= 1.0 && size > 0)
         .then(|| (size as f64 * 8.0 / 1000.0 / duration_sec).round() as u32)
 }

@@ -2,15 +2,15 @@
 //! Decoding runs outside database locks; quick UI reads never wait for the connection.
 
 use std::cell::Cell;
+use std::fmt::Write as _;
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use rusqlite::{named_params, Connection, Row};
-
 use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash, CachedMedia, FileKey};
 use crate::hashing::ImageAnalysis;
+use crate::sqlite::{Connection, Error, Result, Row, Statement};
 use crate::video_frame::VideoAnalysis;
 
 // Schema upgrades preserve existing analysis records; record versions invalidate stale results.
@@ -93,7 +93,7 @@ fn cache_path() -> Option<PathBuf> {
     path.is_absolute().then_some(path)
 }
 
-fn with_store<R>(f: impl FnOnce(&mut Store) -> rusqlite::Result<R>) -> Option<R> {
+fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R>) -> Option<R> {
     // Serialize short background operations so parallel prefetch writes are not lost. Quick
     // UI reads still treat a busy connection as a miss. Never wait on an external DB lock.
     let mut state = if MAINTENANCE_ALLOWED.get() {
@@ -110,9 +110,7 @@ fn with_store<R>(f: impl FnOnce(&mut Store) -> rusqlite::Result<R>) -> Option<R>
 
 pub(crate) fn read<T: DiskValue>(key: &FileKey) -> Option<(T, usize)> {
     let key = Key::new(key)?;
-    let value: T = with_store(|store| store.read(&key))?;
-    let bytes = value.columns().map_or(usize::MAX, |c| c.memory_bytes());
-    Some((value, bytes))
+    with_store(|store| store.read_with_weight(&key))
 }
 
 /// Return the RAM weight from the same representation prepared for SQLite.
@@ -166,32 +164,33 @@ impl Key {
 }
 
 struct Store {
+    read_stmt: Statement,
+    insert_stmt: Statement,
     db: Connection,
     writes: u32,
 }
 
 impl Store {
-    fn open(path: &Path) -> rusqlite::Result<Self> {
+    fn open(path: &Path) -> Result<Self> {
         // No fallback to the DLL or media directory: those may be read-only or on a NAS.
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|_| rusqlite::Error::InvalidPath(path.into()))?;
+            std::fs::create_dir_all(parent).map_err(|_| Error::InvalidPath)?;
         }
         let db = Connection::open(path)?;
         db.busy_timeout(Duration::ZERO)?;
-        let version: i32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if !(0..=SCHEMA_VERSION).contains(&version) {
-            return Err(rusqlite::Error::InvalidQuery);
+        let version = db.pragma_query_i64("user_version")?;
+        if !(0..=SCHEMA_VERSION as i64).contains(&version) {
+            return Err(Error::InvalidQuery);
         }
         // Bound the main database and SQLite's RAM. WAL is checkpointed every ~1 MiB and
         // truncated after checkpoints; only short transactions are used by this plugin.
-        let page_size: i64 = db.pragma_query_value(None, "page_size", |row| row.get(0))?;
-        let pages: i64 =
-            db.pragma_update_and_check(None, "max_page_count", MAX_BYTES / page_size, |r| {
-                r.get(0)
-            })?;
+        let page_size = db.pragma_query_i64("page_size")?;
+        if page_size <= 0 {
+            return Err(Error::InvalidQuery);
+        }
+        let pages = db.pragma_update_and_check_i64("max_page_count", MAX_BYTES / page_size)?;
         if pages > MAX_BYTES / page_size {
-            return Err(rusqlite::Error::InvalidQuery);
+            return Err(Error::InvalidQuery);
         }
         db.execute_batch(
             "PRAGMA journal_mode=WAL;
@@ -201,7 +200,7 @@ impl Store {
              PRAGMA wal_autocheckpoint=2048;
              PRAGMA journal_size_limit=8388608;",
         )?;
-        if version < SCHEMA_VERSION {
+        if version < SCHEMA_VERSION as i64 {
             db.execute_batch(
                 "BEGIN IMMEDIATE;
                  CREATE TABLE IF NOT EXISTS entries (
@@ -217,46 +216,66 @@ impl Store {
                  COMMIT;",
             )?;
         }
-        // First maintenance is due, but opening for a quick read must not scan the database.
-        Ok(Self {
-            db,
-            writes: MAINTENANCE_INTERVAL,
-        })
-    }
-
-    fn read<T: DiskValue>(&self, key: &Key) -> rusqlite::Result<T> {
-        let result = self.read_slot(key, T::SLOT, None);
-        if T::LEGACY_AUDIO && matches!(result, Err(rusqlite::Error::QueryReturnedNoRows)) {
-            // Old audio entries already contain both hashes. Project only the requested
-            // value so upgrading does not force a collection-wide decode again.
-            self.read_slot(key, 0, Some(3))
-        } else {
-            result
-        }
-    }
-
-    fn read_slot<T: DiskValue>(
-        &self,
-        key: &Key,
-        slot: i32,
-        kind: Option<i32>,
-    ) -> rusqlite::Result<T> {
-        self.db.query_row(
+        let read_stmt = db.prepare(
             "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
                     fingerprint, pcm_hash, sharpness, payload FROM entries
              WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
                AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)
                AND (?7 IS NULL OR kind=?7)",
-            (
+        )?;
+        let insert_stmt = db.prepare(
+            "INSERT OR REPLACE INTO entries
+             (path, slot, size, modified, version, kind, width, height, duration,
+              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )?;
+        // First maintenance is due, but opening for a quick read must not scan the database.
+        Ok(Self {
+            read_stmt,
+            insert_stmt,
+            db,
+            writes: MAINTENANCE_INTERVAL,
+        })
+    }
+
+    #[cfg(test)]
+    fn read<T: DiskValue>(&self, key: &Key) -> Result<T> {
+        self.read_with_weight(key).map(|(value, _)| value)
+    }
+
+    fn read_with_weight<T: DiskValue>(&self, key: &Key) -> Result<(T, usize)> {
+        let result = self.read_slot_with_weight(key, T::SLOT, None);
+        if T::LEGACY_AUDIO && matches!(result, Err(Error::QueryReturnedNoRows)) {
+            // Old audio entries already contain both hashes. Project only the requested
+            // value so upgrading does not force a collection-wide decode again.
+            self.read_slot_with_weight(key, 0, Some(3))
+        } else {
+            result
+        }
+    }
+
+    fn read_slot_with_weight<T: DiskValue>(
+        &self,
+        key: &Key,
+        slot: i32,
+        kind: Option<i32>,
+    ) -> Result<(T, usize)> {
+        let modified: &[u8] = &key.modified;
+        self.read_stmt.query_row(
+            &[
                 &key.path,
-                slot,
-                key.size,
-                &key.modified[..],
-                VERSION,
-                MAX_PAYLOAD as i64,
-                kind,
-            ),
-            T::from_row,
+                &slot,
+                &key.size,
+                &modified,
+                &VERSION,
+                &(MAX_PAYLOAD as i64),
+                &kind,
+            ],
+            |row| {
+                let payload_len = row.column_bytes(COL_PAYLOAD).unwrap_or(0);
+                let value = T::from_row(row)?;
+                Ok((value, Columns::memory_bytes_for_len(payload_len)))
+            },
         )
     }
 
@@ -266,21 +285,21 @@ impl Store {
         slot: i32,
         c: Columns<'_>,
         allow_eviction: bool,
-    ) -> rusqlite::Result<()> {
+    ) -> Result<()> {
         // Reject unbounded records before eviction (normal analysis strings are tiny).
         if c.payload.as_ref().map_or(0, String::len)
             + c.fingerprint.map_or(0, str::len)
             + c.pcm_hash.map_or(0, str::len)
             > MAX_PAYLOAD
         {
-            return Err(rusqlite::Error::InvalidQuery);
+            return Err(Error::InvalidQuery);
         }
         if !allow_eviction && self.writes >= MAINTENANCE_INTERVAL {
             // max(rowid) is an indexed endpoint lookup, not a count scan. Once this
             // conservative bound is reached, leave new writes to a background request.
             let newest: i64 =
                 self.db
-                    .query_row("SELECT coalesce(max(rowid), 0) FROM entries", [], |r| {
+                    .query_row("SELECT coalesce(max(rowid), 0) FROM entries", &[], |r| {
                         r.get(0)
                     })?;
             if newest >= MAX_ENTRIES {
@@ -288,9 +307,7 @@ impl Store {
             }
         }
         if let Err(error) = self.insert(key, slot, &c) {
-            if !allow_eviction
-                || !matches!(&error, rusqlite::Error::SqliteFailure(e, _) if e.code == rusqlite::ErrorCode::DiskFull)
-            {
+            if !allow_eviction || !error.is_full() {
                 return Err(error);
             }
             // Also handles a larger replacement or another process filling our reserved room.
@@ -301,7 +318,7 @@ impl Store {
         Ok(())
     }
 
-    fn maintain(&mut self) -> rusqlite::Result<()> {
+    fn maintain(&mut self) -> Result<()> {
         if self.writes >= MAINTENANCE_INTERVAL {
             self.prune(MAX_ENTRIES)?;
             self.make_room()?;
@@ -310,48 +327,44 @@ impl Store {
         Ok(())
     }
 
-    fn insert(&self, key: &Key, slot: i32, c: &Columns<'_>) -> rusqlite::Result<()> {
-        self.db.execute(
-            "INSERT OR REPLACE INTO entries
-             (path, slot, size, modified, version, kind, width, height, duration,
-              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
-             VALUES (:path, :slot, :size, :modified, :version, :kind, :width, :height,
-                     :duration, :hash_a, :hash_b, :coarse, :fingerprint, :pcm_hash, :sharpness, :payload)",
-            named_params! {
-                ":path": &key.path, ":slot": slot, ":size": key.size,
-                ":modified": &key.modified[..], ":version": VERSION, ":kind": c.kind,
-                ":width": c.width, ":height": c.height, ":duration": c.duration,
-                ":hash_a": c.hash_a, ":hash_b": c.hash_b, ":coarse": c.coarse,
-                ":fingerprint": c.fingerprint, ":pcm_hash": c.pcm_hash, ":sharpness": c.sharpness,
-                ":payload": &c.payload,
-            },
-        )?;
+    fn insert(&self, key: &Key, slot: i32, c: &Columns<'_>) -> Result<()> {
+        let modified: &[u8] = &key.modified;
+        self.insert_stmt.execute(&[
+            &key.path,
+            &slot,
+            &key.size,
+            &modified,
+            &VERSION,
+            &c.kind,
+            &c.width,
+            &c.height,
+            &c.duration,
+            &c.hash_a,
+            &c.hash_b,
+            &c.coarse,
+            &c.fingerprint,
+            &c.pcm_hash,
+            &c.sharpness,
+            &c.payload,
+        ])?;
         Ok(())
     }
 
-    fn make_room(&self) -> rusqlite::Result<()> {
-        let page_size: i64 = self
-            .db
-            .pragma_query_value(None, "page_size", |r| r.get(0))?;
-        let limit: i64 = self
-            .db
-            .pragma_query_value(None, "max_page_count", |r| r.get(0))?;
+    fn make_room(&self) -> Result<()> {
+        let page_size = self.db.pragma_query_i64("page_size")?;
+        let limit = self.db.pragma_query_i64("max_page_count")?;
         let reserve = (2 * MAX_PAYLOAD as i64).min(limit * page_size / 4);
+        let delete_stmt = self.db.prepare(
+            "DELETE FROM entries WHERE rowid IN
+             (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
+        )?;
         loop {
-            let pages: i64 = self
-                .db
-                .pragma_query_value(None, "page_count", |r| r.get(0))?;
-            let free: i64 = self
-                .db
-                .pragma_query_value(None, "freelist_count", |r| r.get(0))?;
+            let pages = self.db.pragma_query_i64("page_count")?;
+            let free = self.db.pragma_query_i64("freelist_count")?;
             if (limit - pages + free) * page_size >= reserve {
                 break;
             }
-            let removed = self.db.execute(
-                "DELETE FROM entries WHERE rowid IN
-                 (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
-                [PRUNE_BATCH],
-            )?;
+            let removed = delete_stmt.execute(&[&PRUNE_BATCH])?;
             if removed == 0 {
                 break;
             }
@@ -359,10 +372,10 @@ impl Store {
         Ok(())
     }
 
-    fn prune(&self, limit: i64) -> rusqlite::Result<()> {
+    fn prune(&self, limit: i64) -> Result<()> {
         let count: i64 = self
             .db
-            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))?;
+            .query_row("SELECT count(*) FROM entries", &[], |r| r.get(0))?;
         if count > limit {
             // FIFO, without a disk write on every hit. Deleted pages are reused, not VACUUMed.
             self.prune_oldest(count.saturating_sub(limit).max(PRUNE_BATCH))?;
@@ -370,11 +383,11 @@ impl Store {
         Ok(())
     }
 
-    fn prune_oldest(&self, count: i64) -> rusqlite::Result<()> {
+    fn prune_oldest(&self, count: i64) -> Result<()> {
         self.db.execute(
             "DELETE FROM entries WHERE rowid IN
              (SELECT rowid FROM entries ORDER BY rowid LIMIT ?1)",
-            [count],
+            &[&count],
         )?;
         Ok(())
     }
@@ -397,48 +410,62 @@ pub(crate) struct Columns<'a> {
 }
 
 impl Columns<'_> {
-    pub(crate) fn memory_bytes(&self) -> usize {
+    pub(crate) fn memory_bytes_for_len(payload_len: usize) -> usize {
         // JSON length plus allocator/container overhead. Small fixed fields cost little;
         // variable-length strings and vectors dominate unusually large metadata.
-        self.payload
-            .as_ref()
-            .map_or(0, String::len)
+        payload_len
             .saturating_mul(3)
             .saturating_add(size_of::<Self>())
     }
+
+    pub(crate) fn memory_bytes(&self) -> usize {
+        Self::memory_bytes_for_len(self.payload.as_ref().map_or(0, String::len))
+    }
 }
+
+const COL_KIND: usize = 0;
+const COL_WIDTH: usize = 1;
+const COL_HEIGHT: usize = 2;
+const COL_DURATION: usize = 3;
+const COL_HASH_A: usize = 4;
+const COL_HASH_B: usize = 5;
+const COL_COARSE: usize = 6;
+const COL_FINGERPRINT: usize = 7;
+const COL_PCM_HASH: usize = 8;
+const COL_SHARPNESS: usize = 9;
+const COL_PAYLOAD: usize = 10;
 
 pub(crate) trait DiskValue: Sized {
     const SLOT: i32;
     const LEGACY_AUDIO: bool = false;
-    fn from_row(row: &Row<'_>) -> rusqlite::Result<Self>;
+    fn from_row(row: &Row<'_>) -> Result<Self>;
     fn columns(&self) -> Option<Columns<'_>>;
 }
 
 impl DiskValue for CachedMedia {
     const SLOT: i32 = 0;
 
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
-        Ok(match r.get::<_, i32>("kind")? {
+    fn from_row(r: &Row<'_>) -> Result<Self> {
+        Ok(match r.get::<i32>(COL_KIND)? {
             1 => {
-                let width = r.get("width")?;
-                let height = r.get("height")?;
+                let width = r.get(COL_WIDTH)?;
+                let height = r.get(COL_HEIGHT)?;
                 Self::Image(Arc::new(ImageAnalysis {
                     width,
                     height,
-                    dhash: r.get::<_, i64>("hash_a")? as u64,
-                    phash: r.get::<_, i64>("hash_b")? as u64,
-                    coarse_hash: r.get("coarse")?,
+                    dhash: r.get::<i64>(COL_HASH_A)? as u64,
+                    phash: r.get::<i64>(COL_HASH_B)? as u64,
+                    coarse_hash: r.get(COL_COARSE)?,
                 }))
             }
             2 => Self::Video(Arc::new(VideoAnalysis {
-                width: r.get("width")?,
-                height: r.get("height")?,
-                duration_sec: r.get("duration")?,
-                dhash_mid: r.get::<_, Option<i64>>("hash_a")?.map(|v| v as u64),
-                fingerprint: r.get("fingerprint")?,
+                width: r.get(COL_WIDTH)?,
+                height: r.get(COL_HEIGHT)?,
+                duration_sec: r.get(COL_DURATION)?,
+                dhash_mid: r.get::<Option<i64>>(COL_HASH_A)?.map(|v| v as u64),
+                fingerprint: r.get(COL_FINGERPRINT)?,
             })),
-            _ => return Err(rusqlite::Error::InvalidQuery),
+            _ => return Err(Error::InvalidQuery),
         })
     }
 
@@ -476,10 +503,10 @@ impl DiskValue for AudioFingerprint {
     const SLOT: i32 = 10;
     const LEGACY_AUDIO: bool = true;
 
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(r: &Row<'_>) -> Result<Self> {
         Ok(Self {
-            duration_sec: r.get("duration")?,
-            fingerprint: r.get("fingerprint")?,
+            duration_sec: r.get(COL_DURATION)?,
+            fingerprint: r.get(COL_FINGERPRINT)?,
         })
     }
 
@@ -497,10 +524,10 @@ impl DiskValue for AudioPcmHash {
     const SLOT: i32 = 11;
     const LEGACY_AUDIO: bool = true;
 
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
+    fn from_row(r: &Row<'_>) -> Result<Self> {
         Ok(Self {
-            duration_sec: r.get("duration")?,
-            pcm_hash: r.get("pcm_hash")?,
+            duration_sec: r.get(COL_DURATION)?,
+            pcm_hash: r.get(COL_PCM_HASH)?,
         })
     }
 
@@ -518,8 +545,8 @@ impl DiskValue for AudioDuration {
     const SLOT: i32 = 12;
     const LEGACY_AUDIO: bool = true;
 
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
-        r.get("duration").map(Self)
+    fn from_row(r: &Row<'_>) -> Result<Self> {
+        r.get(COL_DURATION).map(Self)
     }
 
     fn columns(&self) -> Option<Columns<'_>> {
@@ -534,8 +561,8 @@ impl DiskValue for AudioDuration {
 impl DiskValue for u32 {
     const SLOT: i32 = 1;
 
-    fn from_row(r: &Row<'_>) -> rusqlite::Result<Self> {
-        r.get("sharpness")
+    fn from_row(r: &Row<'_>) -> Result<Self> {
+        r.get(COL_SHARPNESS)
     }
 
     fn columns(&self) -> Option<Columns<'_>> {
@@ -549,24 +576,23 @@ impl DiskValue for u32 {
 
 // JSON keeps each metadata family together without growing a mostly-empty SQL schema.
 // Only successful reads are written; a missing tag inside a successful record stays missing.
+trait JsonCodec: Sized {
+    fn to_json(&self) -> Option<String>;
+    fn from_json(s: &str) -> Option<Self>;
+}
+
 macro_rules! metadata {
     ($ty:ty, $slot:expr) => {
         impl DiskValue for $ty {
             const SLOT: i32 = $slot;
 
-            fn from_row(row: &Row<'_>) -> rusqlite::Result<Self> {
-                let payload: String = row.get("payload")?;
-                serde_json::from_str(&payload).map_err(|e| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        row.as_ref().column_index("payload").unwrap_or(0),
-                        rusqlite::types::Type::Text,
-                        Box::new(e),
-                    )
-                })
+            fn from_row(row: &Row<'_>) -> Result<Self> {
+                let payload: String = row.get(COL_PAYLOAD)?;
+                <$ty as JsonCodec>::from_json(&payload).ok_or(Error::InvalidQuery)
             }
 
             fn columns(&self) -> Option<Columns<'_>> {
-                let payload = serde_json::to_string(self).ok()?;
+                let payload = <$ty as JsonCodec>::to_json(self)?;
                 (payload.len() <= MAX_PAYLOAD).then_some(Columns {
                     kind: 5,
                     payload: Some(payload),
@@ -587,61 +613,802 @@ metadata!((u32, u32), 7);
 metadata!(crate::image_decode::PixelFormat, 8);
 metadata!(Vec<crate::wic_decode::TiffPage>, 9);
 
-// The public models use static names. Resolve only known literals; never leak a string read
-// from disk to manufacture a 'static lifetime. Unknown names cause a normal cache miss.
-fn static_name<'de, D: serde::Deserializer<'de>>(
-    de: D,
-    names: &[&'static str],
-) -> Result<Option<&'static str>, D::Error> {
-    use serde::Deserialize;
-    Option::<String>::deserialize(de)?
-        .map(|value| {
-            names
-                .iter()
-                .copied()
-                .find(|&name| name == value)
-                .ok_or_else(|| serde::de::Error::custom("unknown cached name"))
-        })
-        .transpose()
+fn write_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    let mut last = 0;
+    for (i, ch) in s.char_indices() {
+        let esc = match ch {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            c if (c as u32) < 0x20 => {
+                out.push_str(&s[last..i]);
+                let _ = write!(out, "\\u{:04x}", c as u32);
+                last = i + ch.len_utf8();
+                continue;
+            }
+            _ => continue,
+        };
+        out.push_str(&s[last..i]);
+        out.push_str(esc);
+        last = i + ch.len_utf8();
+    }
+    out.push_str(&s[last..]);
+    out.push('"');
 }
 
-pub(crate) fn dynamic_range<'de, D: serde::Deserializer<'de>>(
-    de: D,
-) -> Result<Option<&'static str>, D::Error> {
-    static_name(de, &["SDR", "HDR10", "HLG"])
+struct ObjWriter {
+    buf: String,
+    first: bool,
+}
+
+impl ObjWriter {
+    fn new() -> Self {
+        Self {
+            buf: String::from("{"),
+            first: true,
+        }
+    }
+
+    fn key(&mut self, k: &str) {
+        if !self.first {
+            self.buf.push(',');
+        }
+        self.first = false;
+        write_json_str(&mut self.buf, k);
+        self.buf.push(':');
+    }
+
+    fn str_opt(&mut self, k: &str, v: Option<&str>) {
+        self.key(k);
+        match v {
+            Some(s) => write_json_str(&mut self.buf, s),
+            None => self.buf.push_str("null"),
+        }
+    }
+
+    fn u64_opt(&mut self, k: &str, v: Option<u64>) {
+        self.key(k);
+        match v {
+            Some(n) => {
+                let _ = write!(self.buf, "{n}");
+            }
+            None => self.buf.push_str("null"),
+        }
+    }
+
+    fn u32_opt(&mut self, k: &str, v: Option<u32>) {
+        self.u64_opt(k, v.map(u64::from));
+    }
+
+    fn u16_opt(&mut self, k: &str, v: Option<u16>) {
+        self.u64_opt(k, v.map(u64::from));
+    }
+
+    fn u8_opt(&mut self, k: &str, v: Option<u8>) {
+        self.u64_opt(k, v.map(u64::from));
+    }
+
+    fn u32_val(&mut self, k: &str, v: u32) {
+        self.u64_opt(k, Some(u64::from(v)));
+    }
+
+    fn bool_opt(&mut self, k: &str, v: Option<bool>) {
+        self.key(k);
+        match v {
+            Some(b) => self.buf.push_str(if b { "true" } else { "false" }),
+            None => self.buf.push_str("null"),
+        }
+    }
+
+    fn bool_val(&mut self, k: &str, v: bool) {
+        self.bool_opt(k, Some(v));
+    }
+
+    fn f64_val(&mut self, k: &str, v: f64) -> bool {
+        if !v.is_finite() {
+            return false;
+        }
+        self.key(k);
+        let _ = write!(self.buf, "{v:?}");
+        true
+    }
+
+    fn f64_opt(&mut self, k: &str, v: Option<f64>) -> bool {
+        match v {
+            Some(n) => self.f64_val(k, n),
+            None => {
+                self.key(k);
+                self.buf.push_str("null");
+                true
+            }
+        }
+    }
+
+    fn f32_opt(&mut self, k: &str, v: Option<f32>) -> bool {
+        match v {
+            Some(n) => {
+                if !n.is_finite() {
+                    return false;
+                }
+                self.key(k);
+                let _ = write!(self.buf, "{n:?}");
+                true
+            }
+            None => {
+                self.key(k);
+                self.buf.push_str("null");
+                true
+            }
+        }
+    }
+
+    fn finish(mut self) -> String {
+        self.buf.push('}');
+        self.buf
+    }
+}
+
+struct JsonParser<'a> {
+    s: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> JsonParser<'a> {
+    fn new(s: &'a str) -> Self {
+        Self {
+            s,
+            bytes: s.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn skip_ws(&mut self) {
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn try_eat(&mut self, byte: u8) -> bool {
+        self.skip_ws();
+        if self.bytes.get(self.pos) == Some(&byte) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn expect(&mut self, byte: u8) -> Option<()> {
+        self.try_eat(byte).then_some(())
+    }
+
+    fn eat_lit(&mut self, lit: &[u8]) -> bool {
+        self.skip_ws();
+        if self.bytes.get(self.pos..self.pos + lit.len()) == Some(lit) {
+            self.pos += lit.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn finish(&mut self) -> Option<()> {
+        self.skip_ws();
+        (self.pos == self.bytes.len()).then_some(())
+    }
+
+    fn parse_hex4(&mut self) -> Option<u16> {
+        let hex = self.s.get(self.pos..self.pos + 4)?;
+        let v = u16::from_str_radix(hex, 16).ok()?;
+        self.pos += 4;
+        Some(v)
+    }
+
+    fn parse_str(&mut self) -> Option<String> {
+        self.expect(b'"')?;
+        let start = self.pos;
+        let mut i = start;
+        while i < self.bytes.len() {
+            let b = self.bytes[i];
+            if b == b'"' {
+                let plain = self.s.get(start..i)?.to_owned();
+                self.pos = i + 1;
+                return Some(plain);
+            }
+            if b == b'\\' || b < 0x20 {
+                break;
+            }
+            i += 1;
+        }
+        let mut out = String::from(self.s.get(start..i)?);
+        self.pos = i;
+        while self.pos < self.bytes.len() {
+            let b = self.bytes[self.pos];
+            if b == b'"' {
+                self.pos += 1;
+                return Some(out);
+            }
+            if b < 0x20 {
+                return None;
+            }
+            if b == b'\\' {
+                self.pos += 1;
+                let esc = *self.bytes.get(self.pos)?;
+                self.pos += 1;
+                match esc {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        let code = self.parse_hex4()?;
+                        if (0xD800..=0xDBFF).contains(&code) {
+                            if self.bytes.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                return None;
+                            }
+                            self.pos += 2;
+                            let low = self.parse_hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return None;
+                            }
+                            let cp = 0x10000
+                                + (((u32::from(code) - 0xD800) << 10) | (u32::from(low) - 0xDC00));
+                            out.push(char::from_u32(cp)?);
+                        } else {
+                            out.push(char::from_u32(u32::from(code))?);
+                        }
+                    }
+                    _ => return None,
+                }
+            } else {
+                let ch = self.s.get(self.pos..)?.chars().next()?;
+                out.push(ch);
+                self.pos += ch.len_utf8();
+            }
+        }
+        None
+    }
+
+    fn parse_bool(&mut self) -> Option<bool> {
+        if self.eat_lit(b"true") {
+            Some(true)
+        } else if self.eat_lit(b"false") {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    fn parse_num_str(&mut self) -> Option<&'a str> {
+        self.skip_ws();
+        let start = self.pos;
+        while let Some(&b) = self.bytes.get(self.pos) {
+            if matches!(b, b'0'..=b'9' | b'-' | b'+' | b'.' | b'e' | b'E') {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        (self.pos > start).then(|| &self.s[start..self.pos])
+    }
+
+    fn parse_u64(&mut self) -> Option<u64> {
+        self.parse_num_str()?.parse().ok()
+    }
+
+    fn parse_u32(&mut self) -> Option<u32> {
+        self.parse_num_str()?.parse().ok()
+    }
+
+    fn parse_u16(&mut self) -> Option<u16> {
+        self.parse_num_str()?.parse().ok()
+    }
+
+    fn parse_u8(&mut self) -> Option<u8> {
+        self.parse_num_str()?.parse().ok()
+    }
+
+    fn parse_f64(&mut self) -> Option<f64> {
+        self.parse_num_str()?.parse::<f64>().ok().filter(|v| v.is_finite())
+    }
+
+    fn parse_f32(&mut self) -> Option<f32> {
+        self.parse_num_str()?.parse::<f32>().ok().filter(|v| v.is_finite())
+    }
+
+    fn parse_opt<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<Option<T>> {
+        if self.eat_lit(b"null") {
+            Some(None)
+        } else {
+            f(self).map(Some)
+        }
+    }
+
+    fn parse_arr(&mut self, mut on_elem: impl FnMut(&mut Self) -> Option<()>) -> Option<()> {
+        self.expect(b'[')?;
+        self.skip_ws();
+        if self.try_eat(b']') {
+            return Some(());
+        }
+        loop {
+            on_elem(self)?;
+            self.skip_ws();
+            if self.try_eat(b']') {
+                return Some(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn parse_obj(&mut self, mut on_field: impl FnMut(&str, &mut Self) -> Option<()>) -> Option<()> {
+        self.expect(b'{')?;
+        self.skip_ws();
+        if self.try_eat(b'}') {
+            return Some(());
+        }
+        loop {
+            let key = self.parse_str()?;
+            self.expect(b':')?;
+            on_field(&key, self)?;
+            self.skip_ws();
+            if self.try_eat(b'}') {
+                return Some(());
+            }
+            self.expect(b',')?;
+        }
+    }
+
+    fn skip_value(&mut self) -> Option<()> {
+        self.skip_value_depth(32)
+    }
+
+    fn skip_value_depth(&mut self, depth: u8) -> Option<()> {
+        if depth == 0 {
+            return None;
+        }
+        self.skip_ws();
+        match *self.bytes.get(self.pos)? {
+            b'"' => {
+                self.parse_str()?;
+                Some(())
+            }
+            b'{' => self.parse_obj(|_, p| p.skip_value_depth(depth - 1)),
+            b'[' => self.parse_arr(|p| p.skip_value_depth(depth - 1)),
+            b't' => self.eat_lit(b"true").then_some(()),
+            b'f' => self.eat_lit(b"false").then_some(()),
+            b'n' => self.eat_lit(b"null").then_some(()),
+            b'-' | b'0'..=b'9' => self.parse_num_str().map(|_| ()),
+            _ => None,
+        }
+    }
+}
+
+// The public models use static names. Resolve only known literals; never leak a string read
+// from disk to manufacture a 'static lifetime. Unknown names cause a normal cache miss.
+fn static_lookup(value: &str, names: &[&'static str]) -> Option<&'static str> {
+    names.iter().copied().find(|&name| name == value)
 }
 
 #[cfg(feature = "tags")]
-pub(crate) fn audio_codec<'de, D: serde::Deserializer<'de>>(
-    de: D,
-) -> Result<Option<&'static str>, D::Error> {
-    // Names returned by audio_tags::codec_name. New names safely miss until added here.
-    static_name(
-        de,
-        &[
-            "PCM float",
-            "PCM",
-            "ADPCM",
-            "MP1",
-            "MP2",
-            "MP3",
-            "AAC",
-            "Vorbis",
-            "Opus",
-            "Speex",
-            "Musepack",
-            "AC-3",
-            "E-AC-3",
-            "DTS",
-            "WMA",
-            "FLAC",
-            "WavPack",
-            "Monkey's Audio",
-            "ALAC",
-            "TTA",
-            "TrueHD",
-        ],
-    )
+const AUDIO_CODECS: &[&'static str] = &[
+    "PCM float",
+    "PCM",
+    "ADPCM",
+    "MP1",
+    "MP2",
+    "MP3",
+    "AAC",
+    "Vorbis",
+    "Opus",
+    "Speex",
+    "Musepack",
+    "AC-3",
+    "E-AC-3",
+    "DTS",
+    "WMA",
+    "FLAC",
+    "WavPack",
+    "Monkey's Audio",
+    "ALAC",
+    "TTA",
+    "TrueHD",
+];
+
+impl JsonCodec for crate::exif::ExifInfo {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.str_opt("make", self.make.as_deref());
+        w.str_opt("model", self.model.as_deref());
+        w.str_opt("date_time", self.date_time.as_deref());
+        w.str_opt("date_time_original", self.date_time_original.as_deref());
+        w.str_opt("exposure_time", self.exposure_time.as_deref());
+        if !w.f64_opt("f_number", self.f_number) {
+            return None;
+        }
+        w.u32_opt("iso", self.iso);
+        if !w.f64_opt("focal_length", self.focal_length) {
+            return None;
+        }
+        w.u32_opt("focal_length_35mm", self.focal_length_35mm);
+        w.str_opt("lens_model", self.lens_model.as_deref());
+        w.bool_opt("flash_fired", self.flash_fired);
+        w.u16_opt("orientation", self.orientation);
+        w.u32_opt("width", self.width);
+        w.u32_opt("height", self.height);
+        w.str_opt("software", self.software.as_deref());
+        if !w.f64_opt("gps_latitude", self.gps_latitude)
+            || !w.f64_opt("gps_longitude", self.gps_longitude)
+        {
+            return None;
+        }
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "make" => v.make = p.parse_opt(JsonParser::parse_str)?,
+                "model" => v.model = p.parse_opt(JsonParser::parse_str)?,
+                "date_time" => v.date_time = p.parse_opt(JsonParser::parse_str)?,
+                "date_time_original" => {
+                    v.date_time_original = p.parse_opt(JsonParser::parse_str)?;
+                }
+                "exposure_time" => v.exposure_time = p.parse_opt(JsonParser::parse_str)?,
+                "f_number" => v.f_number = p.parse_opt(JsonParser::parse_f64)?,
+                "iso" => v.iso = p.parse_opt(JsonParser::parse_u32)?,
+                "focal_length" => v.focal_length = p.parse_opt(JsonParser::parse_f64)?,
+                "focal_length_35mm" => v.focal_length_35mm = p.parse_opt(JsonParser::parse_u32)?,
+                "lens_model" => v.lens_model = p.parse_opt(JsonParser::parse_str)?,
+                "flash_fired" => v.flash_fired = p.parse_opt(JsonParser::parse_bool)?,
+                "orientation" => v.orientation = p.parse_opt(JsonParser::parse_u16)?,
+                "width" => v.width = p.parse_opt(JsonParser::parse_u32)?,
+                "height" => v.height = p.parse_opt(JsonParser::parse_u32)?,
+                "software" => v.software = p.parse_opt(JsonParser::parse_str)?,
+                "gps_latitude" => v.gps_latitude = p.parse_opt(JsonParser::parse_f64)?,
+                "gps_longitude" => v.gps_longitude = p.parse_opt(JsonParser::parse_f64)?,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
+    }
+}
+
+#[cfg(feature = "tags")]
+impl JsonCodec for crate::audio_tags::AudioTags {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.str_opt("title", self.title.as_deref());
+        w.str_opt("artist", self.artist.as_deref());
+        w.str_opt("album", self.album.as_deref());
+        w.str_opt("album_artist", self.album_artist.as_deref());
+        w.str_opt("genre", self.genre.as_deref());
+        w.str_opt("comment", self.comment.as_deref());
+        w.u32_opt("year", self.year);
+        w.u32_opt("track", self.track);
+        w.u32_opt("disc", self.disc);
+        if !w.f64_val("duration_sec", self.duration_sec) {
+            return None;
+        }
+        w.u32_opt("bitrate_kbps", self.bitrate_kbps);
+        w.u32_opt("sample_rate", self.sample_rate);
+        w.u8_opt("bit_depth", self.bit_depth);
+        w.u8_opt("channels", self.channels);
+        w.str_opt("composer", self.composer.as_deref());
+        w.u32_opt("track_total", self.track_total);
+        w.u32_opt("disc_total", self.disc_total);
+        w.str_opt("codec", self.codec);
+        w.bool_opt("lossless", self.lossless);
+        w.bool_val("has_cover", self.has_cover);
+        if !w.f32_opt("replay_gain_db", self.replay_gain_db)
+            || !w.f32_opt("replay_peak", self.replay_peak)
+        {
+            return None;
+        }
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "title" => v.title = p.parse_opt(JsonParser::parse_str)?,
+                "artist" => v.artist = p.parse_opt(JsonParser::parse_str)?,
+                "album" => v.album = p.parse_opt(JsonParser::parse_str)?,
+                "album_artist" => v.album_artist = p.parse_opt(JsonParser::parse_str)?,
+                "genre" => v.genre = p.parse_opt(JsonParser::parse_str)?,
+                "comment" => v.comment = p.parse_opt(JsonParser::parse_str)?,
+                "year" => v.year = p.parse_opt(JsonParser::parse_u32)?,
+                "track" => v.track = p.parse_opt(JsonParser::parse_u32)?,
+                "disc" => v.disc = p.parse_opt(JsonParser::parse_u32)?,
+                "duration_sec" => v.duration_sec = p.parse_f64()?,
+                "bitrate_kbps" => v.bitrate_kbps = p.parse_opt(JsonParser::parse_u32)?,
+                "sample_rate" => v.sample_rate = p.parse_opt(JsonParser::parse_u32)?,
+                "bit_depth" => v.bit_depth = p.parse_opt(JsonParser::parse_u8)?,
+                "channels" => v.channels = p.parse_opt(JsonParser::parse_u8)?,
+                "composer" => v.composer = p.parse_opt(JsonParser::parse_str)?,
+                "track_total" => v.track_total = p.parse_opt(JsonParser::parse_u32)?,
+                "disc_total" => v.disc_total = p.parse_opt(JsonParser::parse_u32)?,
+                "codec" => {
+                    v.codec = match p.parse_opt(JsonParser::parse_str)? {
+                        Some(name) => Some(static_lookup(&name, AUDIO_CODECS)?),
+                        None => None,
+                    };
+                }
+                "lossless" => v.lossless = p.parse_opt(JsonParser::parse_bool)?,
+                "has_cover" => v.has_cover = p.parse_bool()?,
+                "replay_gain_db" => v.replay_gain_db = p.parse_opt(JsonParser::parse_f32)?,
+                "replay_peak" => v.replay_peak = p.parse_opt(JsonParser::parse_f32)?,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
+    }
+}
+
+impl JsonCodec for crate::video_frame::VideoMeta {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.u32_val("width", self.width);
+        w.u32_val("height", self.height);
+        if !w.f64_val("duration_sec", self.duration_sec)
+            || !w.f64_val("frame_rate", self.frame_rate)
+        {
+            return None;
+        }
+        w.str_opt("codec", self.codec.as_deref());
+        w.u32_opt("bitrate_kbps", self.bitrate_kbps);
+        w.str_opt("audio_codec", self.audio_codec.as_deref());
+        w.u32_opt("audio_channels", self.audio_channels);
+        w.u32_opt("audio_sample_rate", self.audio_sample_rate);
+        w.u32_opt("rotation", self.rotation);
+        w.str_opt("dynamic_range", self.dynamic_range);
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "width" => v.width = p.parse_u32()?,
+                "height" => v.height = p.parse_u32()?,
+                "duration_sec" => v.duration_sec = p.parse_f64()?,
+                "frame_rate" => v.frame_rate = p.parse_f64()?,
+                "codec" => v.codec = p.parse_opt(JsonParser::parse_str)?,
+                "bitrate_kbps" => v.bitrate_kbps = p.parse_opt(JsonParser::parse_u32)?,
+                "audio_codec" => v.audio_codec = p.parse_opt(JsonParser::parse_str)?,
+                "audio_channels" => v.audio_channels = p.parse_opt(JsonParser::parse_u32)?,
+                "audio_sample_rate" => v.audio_sample_rate = p.parse_opt(JsonParser::parse_u32)?,
+                "rotation" => v.rotation = p.parse_opt(JsonParser::parse_u32)?,
+                "dynamic_range" => {
+                    v.dynamic_range = match p.parse_opt(JsonParser::parse_str)? {
+                        Some(name) => Some(static_lookup(&name, &["SDR", "HDR10", "HLG"])?),
+                        None => None,
+                    };
+                }
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
+    }
+}
+
+impl JsonCodec for crate::mf_audio::AudioStreamMeta {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.str_opt("codec", self.codec.as_deref());
+        w.bool_opt("lossless", self.lossless);
+        if !w.f64_val("duration_sec", self.duration_sec) {
+            return None;
+        }
+        w.u32_opt("bitrate_kbps", self.bitrate_kbps);
+        w.u32_opt("sample_rate", self.sample_rate);
+        w.u32_opt("channels", self.channels);
+        w.u32_opt("bit_depth", self.bit_depth);
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "codec" => v.codec = p.parse_opt(JsonParser::parse_str)?,
+                "lossless" => v.lossless = p.parse_opt(JsonParser::parse_bool)?,
+                "duration_sec" => v.duration_sec = p.parse_f64()?,
+                "bitrate_kbps" => v.bitrate_kbps = p.parse_opt(JsonParser::parse_u32)?,
+                "sample_rate" => v.sample_rate = p.parse_opt(JsonParser::parse_u32)?,
+                "channels" => v.channels = p.parse_opt(JsonParser::parse_u32)?,
+                "bit_depth" => v.bit_depth = p.parse_opt(JsonParser::parse_u32)?,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
+    }
+}
+
+impl JsonCodec for crate::video_tags::VideoTags {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.str_opt("title", self.title.as_deref());
+        w.str_opt("artist", self.artist.as_deref());
+        w.str_opt("director", self.director.as_deref());
+        w.str_opt("date", self.date.as_deref());
+        w.str_opt("genre", self.genre.as_deref());
+        w.str_opt("comment", self.comment.as_deref());
+        w.u64_opt("transfer", self.transfer);
+        w.key("chapters");
+        w.buf.push('[');
+        for (i, (time, name)) in self.chapters.iter().enumerate() {
+            if !time.is_finite() {
+                return None;
+            }
+            if i > 0 {
+                w.buf.push(',');
+            }
+            let _ = write!(w.buf, "[{time:?},");
+            write_json_str(&mut w.buf, name);
+            w.buf.push(']');
+        }
+        w.buf.push(']');
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "title" => v.title = p.parse_opt(JsonParser::parse_str)?,
+                "artist" => v.artist = p.parse_opt(JsonParser::parse_str)?,
+                "director" => v.director = p.parse_opt(JsonParser::parse_str)?,
+                "date" => v.date = p.parse_opt(JsonParser::parse_str)?,
+                "genre" => v.genre = p.parse_opt(JsonParser::parse_str)?,
+                "comment" => v.comment = p.parse_opt(JsonParser::parse_str)?,
+                "transfer" => v.transfer = p.parse_opt(JsonParser::parse_u64)?,
+                "chapters" => {
+                    let mut chapters = Vec::new();
+                    p.parse_arr(|p| {
+                        p.expect(b'[')?;
+                        let time = p.parse_f64()?;
+                        p.expect(b',')?;
+                        let name = p.parse_str()?;
+                        p.expect(b']')?;
+                        chapters.push((time, name));
+                        Some(())
+                    })?;
+                    v.chapters = chapters;
+                }
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
+    }
+}
+
+impl JsonCodec for (u32, u32) {
+    fn to_json(&self) -> Option<String> {
+        Some(format!("[{},{}]", self.0, self.1))
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut p = JsonParser::new(s);
+        p.expect(b'[')?;
+        let w = p.parse_u32()?;
+        p.expect(b',')?;
+        let h = p.parse_u32()?;
+        p.expect(b']')?;
+        p.finish()?;
+        Some((w, h))
+    }
+}
+
+impl JsonCodec for crate::image_decode::PixelFormat {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.u32_val("bits_per_channel", self.bits_per_channel);
+        w.u32_val("channels", self.channels);
+        w.bool_val("alpha", self.alpha);
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let (mut bits, mut ch, mut alpha) = (0, 0, false);
+        let (mut seen_bits, mut seen_ch, mut seen_alpha) = (false, false, false);
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "bits_per_channel" => {
+                    bits = p.parse_u32()?;
+                    seen_bits = true;
+                }
+                "channels" => {
+                    ch = p.parse_u32()?;
+                    seen_ch = true;
+                }
+                "alpha" => {
+                    alpha = p.parse_bool()?;
+                    seen_alpha = true;
+                }
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        (seen_bits && seen_ch && seen_alpha).then_some(Self {
+            bits_per_channel: bits,
+            channels: ch,
+            alpha,
+        })
+    }
+}
+
+impl JsonCodec for Vec<crate::wic_decode::TiffPage> {
+    fn to_json(&self) -> Option<String> {
+        let mut buf = String::from("[");
+        for (i, page) in self.iter().enumerate() {
+            if i > 0 {
+                buf.push(',');
+            }
+            let mut w = ObjWriter::new();
+            w.u32_val("frame", page.frame);
+            w.u16_opt("orientation", page.orientation);
+            buf.push_str(&w.finish());
+        }
+        buf.push(']');
+        Some(buf)
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut pages = Vec::new();
+        let mut p = JsonParser::new(s);
+        p.parse_arr(|p| {
+            let (mut frame, mut orientation, mut seen_frame) = (0, None, false);
+            p.parse_obj(|k, p| {
+                match k {
+                    "frame" => {
+                        frame = p.parse_u32()?;
+                        seen_frame = true;
+                    }
+                    "orientation" => orientation = p.parse_opt(JsonParser::parse_u16)?,
+                    _ => p.skip_value()?,
+                }
+                Some(())
+            })?;
+            if !seen_frame {
+                return None;
+            }
+            pages.push(crate::wic_decode::TiffPage { frame, orientation });
+            Some(())
+        })?;
+        p.finish()?;
+        Some(pages)
+    }
 }
 
 #[cfg(test)]
@@ -848,9 +1615,7 @@ mod tests {
             .db
             .prepare("SELECT rowid FROM entries ORDER BY rowid")
             .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
+            .query_map(&[], |r| r.get(0))
             .unwrap();
         // This is exactly the previous schema: metadata payloads did not exist yet.
         store
@@ -868,17 +1633,12 @@ mod tests {
             .db
             .prepare("SELECT rowid FROM entries ORDER BY rowid")
             .unwrap()
-            .query_map([], |r| r.get(0))
-            .unwrap()
-            .collect::<Result<_, _>>()
+            .query_map(&[], |r| r.get(0))
             .unwrap();
         assert_eq!(rows_before, rows_after);
         assert_eq!(
-            store
-                .db
-                .pragma_query_value::<i32, _>(None, "user_version", |r| r.get(0))
-                .unwrap(),
-            SCHEMA_VERSION
+            store.db.pragma_query_i64("user_version").unwrap(),
+            SCHEMA_VERSION as i64
         );
     }
 
@@ -894,7 +1654,7 @@ mod tests {
                 .db
                 .execute(
                     "UPDATE entries SET payload=?1 WHERE slot=?2",
-                    (&payload, ExifInfo::SLOT),
+                    &[&payload, &ExifInfo::SLOT],
                 )
                 .unwrap();
             assert!(store.read::<ExifInfo>(&fixture.key()).is_err());
@@ -968,11 +1728,11 @@ mod tests {
         // An image/video record in slot 0 must never be mistaken for legacy audio.
         store
             .db
-            .execute("DELETE FROM entries WHERE slot=10", [])
+            .execute("DELETE FROM entries WHERE slot=10", &[])
             .unwrap();
         store
             .db
-            .execute("UPDATE entries SET kind=2 WHERE slot=0", [])
+            .execute("UPDATE entries SET kind=2 WHERE slot=0", &[])
             .unwrap();
         assert!(store.read::<AudioFingerprint>(&key).is_err());
         assert!(store.read::<AudioPcmHash>(&key).is_err());
@@ -993,7 +1753,7 @@ mod tests {
                 pcm_hash: "ffffffffffffffff".into(),
             };
             let mut store = Store::open(&fixture.path()).unwrap();
-            store.db.execute("DELETE FROM entries", []).unwrap();
+            store.db.execute("DELETE FROM entries", &[]).unwrap();
             put(&mut store, &key, &expected);
             assert!(store.read::<AudioPcmHash>(&key).is_err());
             assert!(store.read::<AudioDuration>(&key).is_err());
@@ -1013,8 +1773,8 @@ mod tests {
                     .query_row(
                         "SELECT count(*) FROM entries WHERE (slot=10 AND pcm_hash IS NOT NULL)
                      OR (slot=11 AND fingerprint IS NOT NULL)",
-                        [],
-                        |r| r.get::<_, i64>(0),
+                        &[],
+                        |r| r.get::<i64>(0),
                     )
                     .unwrap(),
                 0,
@@ -1078,12 +1838,12 @@ mod tests {
         assert_eq!(store.read::<u32>(&key).unwrap(), 43);
         let count: i64 = store
             .db
-            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM entries", &[], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
         store
             .db
-            .execute("UPDATE entries SET version=99", [])
+            .execute("UPDATE entries SET version=99", &[])
             .unwrap();
         assert!(store.read::<u32>(&key).is_err());
         put(&mut store, &key, &44u32);
@@ -1131,7 +1891,7 @@ mod tests {
     fn quick_writes_do_not_evict_and_background_writes_can_recover() {
         let fixture = Fixture::new();
         let mut store = Store::open(&fixture.path()).unwrap();
-        store.db.pragma_update(None, "max_page_count", 512).unwrap();
+        store.db.pragma_update_i64("max_page_count", 512).unwrap();
         let mut key = fixture.key();
         let tags = crate::exif::ExifInfo {
             make: Some("x".repeat(32 * 1024)),
@@ -1171,7 +1931,7 @@ mod tests {
         // Sparse rowids can overestimate the count: defer rather than scan from a quick call.
         store
             .db
-            .execute("UPDATE entries SET rowid=?1", [MAX_ENTRIES])
+            .execute("UPDATE entries SET rowid=?1", &[&MAX_ENTRIES])
             .unwrap();
         let mut next = fixture.key();
         next.path.push(1);
@@ -1190,7 +1950,7 @@ mod tests {
     fn byte_limit_evicts_records_before_the_row_limit_and_keeps_accepting_writes() {
         let fixture = Fixture::new();
         let mut store = Store::open(&fixture.path()).unwrap();
-        store.db.pragma_update(None, "max_page_count", 512).unwrap(); // 2 MiB test limit.
+        store.db.pragma_update_i64("max_page_count", 512).unwrap(); // 2 MiB test limit.
         let mut key = fixture.key();
         let tags = crate::exif::ExifInfo {
             make: Some("x".repeat(32 * 1024)),
@@ -1204,13 +1964,10 @@ mod tests {
         assert_eq!(store.read::<crate::exif::ExifInfo>(&key).unwrap(), tags);
         let count: i64 = store
             .db
-            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM entries", &[], |r| r.get(0))
             .unwrap();
         assert!(count < 150);
-        let pages: i64 = store
-            .db
-            .pragma_query_value(None, "page_count", |r| r.get(0))
-            .unwrap();
+        let pages = store.db.pragma_query_i64("page_count").unwrap();
         assert!(pages <= 512);
         assert!(store.db.is_autocommit()); // Recovery must leave the connection usable.
     }
@@ -1226,13 +1983,9 @@ mod tests {
         );
         let unknown = fixture.0.join("future.sqlite3");
         let db = Connection::open(&unknown).unwrap();
-        db.pragma_update(None, "user_version", 99).unwrap();
+        db.pragma_update_i64("user_version", 99).unwrap();
         assert!(Store::open(&unknown).is_err());
-        assert_eq!(
-            db.pragma_query_value::<i32, _>(None, "user_version", |r| r.get(0))
-                .unwrap(),
-            99
-        );
+        assert_eq!(db.pragma_query_i64("user_version").unwrap(), 99);
         assert!(Store::open(&fixture.0).is_err());
         assert!(Store::open(&fixture.0.join("фото 🦊.jpg/cache.sqlite3")).is_err());
     }
@@ -1252,16 +2005,13 @@ mod tests {
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
         let count: i64 = store
             .db
-            .query_row("SELECT count(*) FROM entries", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM entries", &[], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 4);
-        let pages: i64 = store
-            .db
-            .pragma_query_value(None, "page_count", |r| r.get(0))
-            .unwrap();
+        let pages = store.db.pragma_query_i64("page_count").unwrap();
         store
             .db
-            .pragma_update_and_check(None, "max_page_count", pages, |r| r.get::<_, i64>(0))
+            .pragma_update_and_check_i64("max_page_count", pages)
             .unwrap();
         let huge = "x".repeat((pages * 4096) as usize);
         let value = AudioPcmHash {

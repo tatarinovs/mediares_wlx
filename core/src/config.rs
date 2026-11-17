@@ -2,7 +2,7 @@
 
 use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::HMODULE;
@@ -27,18 +27,24 @@ pub fn tc_ini_dir() -> Option<PathBuf> {
 
 /// Resolve this code's DLL, even when loaded only as a WDX without DllMain state.
 pub fn dll_path() -> Option<PathBuf> {
-    let mut module = HMODULE::default();
-    unsafe {
-        GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            PCWSTR(dll_path as *const () as *const u16),
-            &mut module,
-        )
-        .ok()?;
-    }
-    let mut buf = [0u16; 32768];
-    let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
-    (len > 0 && len < buf.len()).then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
+    static PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+    PATH.get_or_init(|| {
+        let mut module = HMODULE::default();
+        unsafe {
+            GetModuleHandleExW(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                    | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                PCWSTR(dll_path as *const () as *const u16),
+                &mut module,
+            )
+            .ok()?;
+        }
+        let mut buf = [0u16; 32768];
+        let len = unsafe { GetModuleFileNameW(Some(module), &mut buf) } as usize;
+        (len > 0 && len < buf.len())
+            .then(|| PathBuf::from(std::ffi::OsString::from_wide(&buf[..len])))
+    })
+    .clone()
 }
 
 /// An existing portable INI beside the DLL wins; otherwise use TC's plugin INI directory.

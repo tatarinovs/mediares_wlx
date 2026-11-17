@@ -446,7 +446,7 @@ pub fn header_dimensions(path: &Path) -> Option<(u32, u32)> {
 }
 
 /// How a standard image stores its pixels.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PixelFormat {
     /// 8 for most pictures; 16 for 16-bit PNG/TIFF, 10-12 for HDR HEIC/AVIF, 32 for float.
     pub bits_per_channel: u32,
@@ -560,7 +560,13 @@ pub fn decode_oriented_cancellable(
         None => return None,
     };
     // Read first: the decoders that can turn the picture on the way get the orientation.
-    let exif = (page == 0).then(|| crate::exif::read_exif(path)).flatten();
+    let exif = (page == 0)
+        .then(|| {
+            crate::cache::get_exif(path)
+                .filter(|e| **e != crate::exif::ExifInfo::default())
+                .map(|e| (*e).clone())
+        })
+        .flatten();
     let orientation = own_orientation
         .unwrap_or_else(|| exif.as_ref().and_then(|e| e.orientation))
         .filter(|o| auto_rotate && (1..=8).contains(o))

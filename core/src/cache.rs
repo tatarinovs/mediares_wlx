@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::hashing::ImageAnalysis;
 use crate::image_decode::decode_for_gray_analysis;
@@ -57,9 +57,18 @@ pub struct FileKey {
     pub(crate) modified: Option<SystemTime>,
 }
 
+struct RowKey {
+    key: FileKey,
+    flags: i32,
+    seen_fields: u128,
+    at: Instant,
+}
+
 thread_local! {
     /// The key of the file a TC call is about, while [`with_file_key`] runs.
     static SCOPED_KEY: RefCell<Option<FileKey>> = const { RefCell::new(None) };
+    /// Short-lived thread-local key shared across columns of the same row (e.g. WDX queries).
+    static ROW_KEY: RefCell<Option<RowKey>> = const { RefCell::new(None) };
     /// Background prefetch skips files already being decoded instead of blocking on Condvar.
     static NON_BLOCKING_FLIGHT: Cell<bool> = const { Cell::new(false) };
     /// Key whose stat/freshness was already verified inside `persistent_result`.
@@ -91,6 +100,15 @@ impl FileKey {
     }
 }
 
+pub(crate) fn scoped_file_size(path: &Path) -> Option<u64> {
+    let scoped = SCOPED_KEY.with_borrow(|k| k.as_ref().filter(|k| k.path == path).map(|k| k.size));
+    scoped.or_else(|| fs::metadata(path).ok().map(|m| m.len()))
+}
+
+pub fn clear_row_key() {
+    let _ = ROW_KEY.try_with(|slot| *slot.borrow_mut() = None);
+}
+
 /// Runs `f` with a pre-resolved version key of the file, avoiding redundant filesystem stats.
 pub fn with_known_file_key<R>(key: Option<FileKey>, f: impl FnOnce() -> R) -> R {
     /// Puts the previous key back, also when `f` panics (the FFI guard catches it, and a key
@@ -110,6 +128,35 @@ pub fn with_known_file_key<R>(key: Option<FileKey>, f: impl FnOnce() -> R) -> R 
 /// drives and under antivirus scanners).
 pub fn with_file_key<R>(path: &Path, f: impl FnOnce() -> R) -> R {
     with_known_file_key(FileKey::stat(path), f)
+}
+
+/// Like [`with_file_key`], reusing the `FileKey` across consecutive queries for distinct columns
+/// (`field_bit`) of the same file with matching `flags` inside a brief window.
+pub fn with_row_file_key<R>(path: &Path, field_bit: u32, flags: i32, f: impl FnOnce() -> R) -> R {
+    const TTL: Duration = Duration::from_millis(50);
+    let mask = 1u128.checked_shl(field_bit).unwrap_or(0);
+    let key = ROW_KEY.with_borrow_mut(|slot| {
+        if let Some(entry) = slot.as_mut() {
+            if mask != 0
+                && entry.flags == flags
+                && (entry.seen_fields & mask) == 0
+                && entry.at.elapsed() < TTL
+                && entry.key.path == path
+            {
+                entry.seen_fields |= mask;
+                return Some(entry.key.clone());
+            }
+        }
+        let fresh = FileKey::stat(path);
+        *slot = fresh.as_ref().map(|k| RowKey {
+            key: k.clone(),
+            flags,
+            seen_fields: mask,
+            at: Instant::now(),
+        });
+        fresh
+    });
+    with_known_file_key(key, f)
 }
 
 pub(crate) fn with_non_blocking_flight<R>(f: impl FnOnce() -> R) -> R {
@@ -215,6 +262,7 @@ impl<V: Clone> FileCache<V> {
         // the result to either version; the next call must read the file again.
         let verified = VERIFIED_KEY.with_borrow_mut(|v| v.take());
         if verified.as_ref() != Some(&key) && FileKey::stat(path).as_ref() != Some(&key) {
+            clear_row_key();
             return None;
         }
         let bytes = (self.weigh)(&value)
@@ -314,6 +362,7 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
     }
     let value = compute()?;
     if cancelled() || FileKey::stat(path).as_ref() != Some(&key) {
+        clear_row_key();
         return None;
     }
     let bytes = crate::disk_cache::write(&key, &value);
@@ -629,6 +678,7 @@ pub fn is_video_tags_cached(path: &Path) -> bool {
 
 /// Empties every cache (the plugin is being unloaded).
 pub fn clear_all() {
+    clear_row_key();
     get_cache().clear();
     audio_fingerprint_cache().clear();
     audio_pcm_cache().clear();
@@ -695,7 +745,7 @@ mod tests {
         impl DiskValue for Counted {
             const SLOT: i32 = 99;
 
-            fn from_row(_: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+            fn from_row(_: &crate::sqlite::Row<'_>) -> crate::sqlite::Result<Self> {
                 unreachable!("relative paths never enter SQLite")
             }
 

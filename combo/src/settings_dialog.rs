@@ -319,25 +319,27 @@ unsafe fn create_pages(dlg: HWND, tabs: HWND) -> (Pages, (i32, i32)) {
 
 /// A page hands its controls' commands and the previews' colors to the dialog.
 unsafe extern "system" fn page_proc(page: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> isize {
-    match msg {
-        WM_COMMAND => {
-            if let Ok(dlg) = GetParent(page) {
-                SendMessageW(dlg, msg, Some(wparam), Some(lparam));
+    mediares_core::ffi::guard(0, || unsafe {
+        match msg {
+            WM_COMMAND => {
+                if let Ok(dlg) = GetParent(page) {
+                    SendMessageW(dlg, msg, Some(wparam), Some(lparam));
+                }
+                1
             }
-            1
+            WM_CTLCOLORSTATIC
+                if matches!(
+                    GetDlgCtrlID(HWND(lparam.0 as *mut _)),
+                    IDC_COLOR_PREVIEW | IDC_BACKGROUND_PREVIEW
+                ) =>
+            {
+                GetParent(page).map_or(0, |dlg| {
+                    SendMessageW(dlg, msg, Some(wparam), Some(lparam)).0
+                })
+            }
+            _ => 0,
         }
-        WM_CTLCOLORSTATIC
-            if matches!(
-                GetDlgCtrlID(HWND(lparam.0 as *mut _)),
-                IDC_COLOR_PREVIEW | IDC_BACKGROUND_PREVIEW
-            ) =>
-        {
-            GetParent(page).map_or(0, |dlg| {
-                SendMessageW(dlg, msg, Some(wparam), Some(lparam)).0
-            })
-        }
-        _ => 0,
-    }
+    })
 }
 
 /// The control `id`, on whichever page it is. `pages` are the already-resolved page windows

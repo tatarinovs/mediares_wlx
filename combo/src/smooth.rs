@@ -9,7 +9,7 @@ use windows::Win32::Graphics::Direct2D::Common::{
     D2D1_ALPHA_MODE_IGNORE, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory,
+    D2D1CreateFactory, ID2D1Bitmap, ID2D1DCRenderTarget, ID2D1DeviceContext, ID2D1Factory,
     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_PROPERTIES,
     D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_FEATURE_LEVEL_DEFAULT,
     D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC, D2D1_RENDER_TARGET_PROPERTIES,
@@ -27,13 +27,27 @@ const FORMAT: D2D1_PIXEL_FORMAT = D2D1_PIXEL_FORMAT {
 };
 /// 96 DPI: one Direct2D unit is one pixel of the buffer.
 const DPI: f32 = 96.0;
+const MAX_CACHED_SIDE: u32 = 4096;
 
 thread_local! {
     /// Painting happens on the window's thread; the target is reused between paints.
     static TARGET: RefCell<Target> = const { RefCell::new(Target(None)) };
 }
 
-struct Target(Option<ID2D1DCRenderTarget>);
+struct CachedBitmap {
+    data_ptr: usize,
+    width: u32,
+    height: u32,
+    bitmap: ID2D1Bitmap,
+}
+
+struct CachedTarget {
+    bitmap: Option<CachedBitmap>,
+    context: Option<ID2D1DeviceContext>,
+    rt: ID2D1DCRenderTarget,
+}
+
+struct Target(Option<CachedTarget>);
 
 impl Drop for Target {
     /// Thread-local destructors run when TC unloads the DLL, under the loader lock: releasing
@@ -41,7 +55,11 @@ impl Drop for Target {
     /// for the loader lock — TC hangs on exit. [`release`] frees the target before that; whatever
     /// is left at unload is leaked.
     fn drop(&mut self) {
-        std::mem::forget(self.0.take());
+        if let Some(cached) = self.0.take() {
+            std::mem::forget(cached.bitmap);
+            std::mem::forget(cached.context);
+            std::mem::forget(cached.rt);
+        }
     }
 }
 
@@ -50,11 +68,11 @@ pub fn release() {
     let _ = TARGET.try_with(|target| target.borrow_mut().0 = None);
 }
 
-fn create_target() -> Option<ID2D1DCRenderTarget> {
+fn create_target() -> Option<CachedTarget> {
     unsafe {
         let factory: ID2D1Factory =
             D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None).ok()?;
-        factory
+        let rt = factory
             .CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
                 r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 pixelFormat: FORMAT,
@@ -63,7 +81,13 @@ fn create_target() -> Option<ID2D1DCRenderTarget> {
                 usage: D2D1_RENDER_TARGET_USAGE_NONE,
                 minLevel: D2D1_FEATURE_LEVEL_DEFAULT,
             })
-            .ok()
+            .ok()?;
+        let context = rt.cast::<ID2D1DeviceContext>().ok();
+        Some(CachedTarget {
+            bitmap: None,
+            context,
+            rt,
+        })
     }
 }
 
@@ -90,10 +114,10 @@ pub unsafe fn draw(
         if target.is_none() {
             *target = create_target();
         }
-        let Some(rt) = target.as_ref() else {
+        let Some(cached) = target.as_mut() else {
             return false;
         };
-        let ok = render(rt, dc, img, (sx, sy, sw, sh), bound, (dx, dy, dw, dh));
+        let ok = render(cached, dc, img, (sx, sy, sw, sh), bound, (dx, dy, dw, dh));
         if !ok {
             // A lost device (or anything else): start afresh next time.
             *target = None;
@@ -104,14 +128,14 @@ pub unsafe fn draw(
 }
 
 unsafe fn render(
-    rt: &ID2D1DCRenderTarget,
+    cached: &mut CachedTarget,
     dc: HDC,
     img: &DecodedImage,
     (sx, sy, sw, sh): (i32, i32, i32, i32),
     bound: RECT,
     (dx, dy, dw, dh): (i32, i32, i32, i32),
 ) -> bool {
-    if rt.BindDC(dc, &bound).is_err() {
+    if cached.rt.BindDC(dc, &bound).is_err() {
         return false;
     }
     let pitch = img.width as usize * 4;
@@ -120,21 +144,66 @@ unsafe fn render(
     if needed > img.bgra.len() {
         return false;
     }
-    rt.BeginDraw();
-    let bitmap = rt.CreateBitmap(
-        D2D_SIZE_U {
-            width: sw as u32,
-            height: sh as u32,
-        },
-        Some(img.bgra[start..].as_ptr() as *const _),
-        pitch as u32,
-        &D2D1_BITMAP_PROPERTIES {
-            pixelFormat: FORMAT,
-            dpiX: DPI,
-            dpiY: DPI,
-        },
-    );
-    if let Ok(bitmap) = &bitmap {
+    let props = D2D1_BITMAP_PROPERTIES {
+        pixelFormat: FORMAT,
+        dpiX: DPI,
+        dpiY: DPI,
+    };
+    let can_cache = img.width <= MAX_CACHED_SIDE
+        && img.height <= MAX_CACHED_SIDE
+        && img.bgra.len() >= img.height as usize * pitch;
+    cached.rt.BeginDraw();
+    let temp;
+    let (bitmap, src_rect): (Option<&ID2D1Bitmap>, Option<D2D_RECT_F>) = if can_cache {
+        let ptr = img.bgra.as_ptr() as usize;
+        let hit = cached
+            .bitmap
+            .as_ref()
+            .is_some_and(|b| b.data_ptr == ptr && b.width == img.width && b.height == img.height);
+        if !hit {
+            cached.bitmap = cached
+                .rt
+                .CreateBitmap(
+                    D2D_SIZE_U {
+                        width: img.width,
+                        height: img.height,
+                    },
+                    Some(img.bgra.as_ptr() as *const _),
+                    pitch as u32,
+                    &props,
+                )
+                .ok()
+                .map(|bitmap| CachedBitmap {
+                    data_ptr: ptr,
+                    width: img.width,
+                    height: img.height,
+                    bitmap,
+                });
+        }
+        let src = D2D_RECT_F {
+            left: sx as f32,
+            top: sy as f32,
+            right: (sx + sw) as f32,
+            bottom: (sy + sh) as f32,
+        };
+        (cached.bitmap.as_ref().map(|b| &b.bitmap), Some(src))
+    } else {
+        temp = cached
+            .rt
+            .CreateBitmap(
+                D2D_SIZE_U {
+                    width: sw as u32,
+                    height: sh as u32,
+                },
+                Some(img.bgra[start..].as_ptr() as *const _),
+                pitch as u32,
+                &props,
+            )
+            .ok();
+        (temp.as_ref(), None)
+    };
+    let had_bitmap = bitmap.is_some();
+    if let Some(bitmap) = bitmap {
         // Relative to the bound rectangle, which is the target's origin.
         let dest = D2D_RECT_F {
             left: (dx - bound.left) as f32,
@@ -142,24 +211,25 @@ unsafe fn render(
             right: (dx + dw - bound.left) as f32,
             bottom: (dy + dh - bound.top) as f32,
         };
-        match rt.cast::<ID2D1DeviceContext>() {
-            Ok(context) => context.DrawBitmap(
+        let src = src_rect.as_ref().map(|r| r as *const D2D_RECT_F);
+        match cached.context.as_ref() {
+            Some(context) => context.DrawBitmap(
                 bitmap,
                 Some(&dest),
                 1.0,
                 D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC,
-                None,
+                src,
                 None,
             ),
             // Windows 7 without the platform update: bilinear.
-            Err(_) => rt.DrawBitmap(
+            None => cached.rt.DrawBitmap(
                 bitmap,
                 Some(&dest),
                 1.0,
                 D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
-                None,
+                src,
             ),
         }
     }
-    rt.EndDraw(None, None).is_ok() && bitmap.is_ok()
+    cached.rt.EndDraw(None, None).is_ok() && had_bitmap
 }

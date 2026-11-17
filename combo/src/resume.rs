@@ -5,7 +5,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use mediares_core::sqlite::{Connection, Result};
 
 use crate::config;
 
@@ -14,7 +14,7 @@ const MAX_ENTRIES: usize = 200;
 pub const DEFAULT_MIN_DURATION_SEC: f64 = 300.0;
 const EDGE_SEC: f64 = 30.0;
 
-fn open(path: &Path) -> rusqlite::Result<Connection> {
+fn open(path: &Path) -> Result<Connection> {
     let db = Connection::open(path)?;
     db.busy_timeout(Duration::from_millis(50))?;
     db.execute_batch(
@@ -45,13 +45,12 @@ pub fn load(video: &Path) -> Option<f64> {
     load_from(&db, video).ok().flatten()
 }
 
-fn load_from(db: &Connection, video: &Path) -> rusqlite::Result<Option<f64>> {
-    db.query_row(
+fn load_from(db: &Connection, video: &Path) -> Result<Option<f64>> {
+    db.query_row_optional(
         "SELECT position FROM resume WHERE path=?1",
-        [key(video)],
+        &[&key(video)],
         |r| r.get(0),
     )
-    .optional()
     .map(|position: Option<f64>| position.filter(|p| p.is_finite() && *p >= 0.0))
 }
 
@@ -69,21 +68,21 @@ pub fn store(video: &Path, position: f64, duration: f64, min_duration: f64) {
     }
 }
 
-fn store_in(db: &mut Connection, video: &Path, position: Option<f64>) -> rusqlite::Result<()> {
-    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+fn store_in(db: &mut Connection, video: &Path, position: Option<f64>) -> Result<()> {
+    let tx = db.transaction_immediate()?;
     let path = key(video);
     if let Some(position) = position.filter(|p| p.is_finite() && *p >= 0.0) {
         tx.execute(
             "INSERT OR REPLACE INTO resume(path,position) VALUES (?1,?2)",
-            (&path, position),
+            &[&path, &position],
         )?;
         tx.execute(
             "DELETE FROM resume WHERE rowid IN
              (SELECT rowid FROM resume ORDER BY rowid DESC LIMIT -1 OFFSET ?1)",
-            [MAX_ENTRIES as i64],
+            &[&(MAX_ENTRIES as i64)],
         )?;
     } else {
-        tx.execute("DELETE FROM resume WHERE path=?1", [&path])?;
+        tx.execute("DELETE FROM resume WHERE path=?1", &[&path])?;
     }
     tx.commit()
 }
@@ -119,9 +118,7 @@ mod tests {
         {
             let mut first = open(&file).unwrap();
             let mut second = open(&file).unwrap();
-            let lock = first
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .unwrap();
+            let lock = first.transaction_immediate().unwrap();
             assert!(store_in(&mut second, video, Some(75.0)).is_err());
             lock.commit().unwrap();
             store_in(&mut second, video, Some(75.0)).unwrap();

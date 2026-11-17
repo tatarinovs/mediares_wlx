@@ -917,21 +917,25 @@ enum Chunk {
 
 /// Sort key splitting a name into case-insensitive text and numeric runs.
 fn natural_key(name: &str) -> Vec<Chunk> {
-    let mut chunks = Vec::new();
+    let mut chunks = Vec::with_capacity(4);
     let mut chars = name.chars().peekable();
     while let Some(&c) = chars.peek() {
         let digits = c.is_ascii_digit();
-        let mut run = String::new();
-        while let Some(&c) = chars.peek().filter(|c| c.is_ascii_digit() == digits) {
-            run.push(c);
-            chars.next();
-        }
-        chunks.push(if digits {
+        let mut run = String::with_capacity(if digits { 8 } else { 16 });
+        if digits {
+            while let Some(c) = chars.next_if(char::is_ascii_digit) {
+                run.push(c);
+            }
             // Leading zeros break ties so "01" and "1" still have a stable order.
-            Chunk::Num(run.parse().unwrap_or(u64::MAX), run.len())
+            chunks.push(Chunk::Num(run.parse().unwrap_or(u64::MAX), run.len()));
         } else {
-            Chunk::Text(run.to_lowercase())
-        });
+            while let Some(c) = chars.next_if(|c| !c.is_ascii_digit()) {
+                for lc in c.to_lowercase() {
+                    run.push(lc);
+                }
+            }
+            chunks.push(Chunk::Text(run));
+        }
     }
     chunks
 }

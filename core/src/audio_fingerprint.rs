@@ -108,7 +108,7 @@ pub fn decoded_duration(
 
 trait SampleAnalysis {
     type Output;
-    fn start(rate: u32, channels: usize) -> Self;
+    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self;
     fn samples(&mut self, samples: &[f32], channels: usize);
     fn result(self, duration: f64) -> Self::Output;
 }
@@ -116,8 +116,8 @@ trait SampleAnalysis {
 impl SampleAnalysis for BandAnalyzer {
     type Output = AudioFingerprint;
 
-    fn start(rate: u32, _: usize) -> Self {
-        Self::new(rate)
+    fn start(rate: u32, _: usize, duration_sec: Option<f64>) -> Self {
+        Self::with_duration(rate, duration_sec)
     }
 
     fn samples(&mut self, samples: &[f32], channels: usize) {
@@ -135,7 +135,7 @@ impl SampleAnalysis for BandAnalyzer {
 impl SampleAnalysis for PcmHash {
     type Output = AudioPcmHash;
 
-    fn start(rate: u32, channels: usize) -> Self {
+    fn start(rate: u32, channels: usize, _: Option<f64>) -> Self {
         Self::new(rate, channels)
     }
 
@@ -154,7 +154,7 @@ impl SampleAnalysis for PcmHash {
 impl SampleAnalysis for () {
     type Output = AudioDuration;
 
-    fn start(_: u32, _: usize) -> Self {}
+    fn start(_: u32, _: usize, _: Option<f64>) -> Self {}
     fn samples(&mut self, _: &[f32], _: usize) {}
     fn result(self, duration: f64) -> Self::Output {
         AudioDuration(duration.round() as u32)
@@ -190,7 +190,7 @@ fn analyze_source<A: SampleAnalysis>(
         return Err(AudioError::Invalid);
     }
     let expected = source.duration();
-    let mut analysis = A::start(rate, channels);
+    let mut analysis = A::start(rate, channels, expected);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
@@ -284,15 +284,17 @@ impl PcmHash {
         if samples.is_empty() {
             return;
         }
-        let is_audible = |frame: &[f32]| frame.iter().any(|s| s.abs() >= PCM_SILENCE);
+        let is_audible = |s: &f32| s.abs() >= PCM_SILENCE;
         if !self.started {
-            let Some(first) = samples.chunks_exact(self.channels).position(is_audible) else {
+            let Some(first_sample) = samples.iter().position(is_audible) else {
                 return;
             };
+            let first = first_sample / self.channels;
             self.started = true;
             samples = &samples[first * self.channels..];
         }
-        if let Some(last) = samples.chunks_exact(self.channels).rposition(is_audible) {
+        if let Some(last_sample) = samples.iter().rposition(is_audible) {
+            let last = last_sample / self.channels;
             if !self.pending.is_empty() {
                 self.flush_pending();
             }
@@ -324,6 +326,7 @@ const _: () = assert!(FFT_SIZE.is_multiple_of(HOP));
 struct SpectralTables {
     window: [f32; FFT_SIZE],
     sub_band_bins: [(usize, usize); SUB_BANDS],
+    bitrev: [u16; FFT_SIZE],
     cos: [f32; FFT_SIZE / 2],
     sin: [f32; FFT_SIZE / 2],
 }
@@ -342,11 +345,24 @@ fn spectral_tables() -> &'static SpectralTables {
                 ((edge(b + 1) / hz_per_bin).round() as usize).max(lo + 1),
             )
         });
+        let bitrev = std::array::from_fn(|mut i| {
+            let mut rev = 0usize;
+            let mut bit = FFT_SIZE >> 1;
+            while i > 0 {
+                if i & 1 != 0 {
+                    rev |= bit;
+                }
+                i >>= 1;
+                bit >>= 1;
+            }
+            rev as u16
+        });
         let cos = std::array::from_fn(|k| (-2.0 * PI * k as f32 / FFT_SIZE as f32).cos());
         let sin = std::array::from_fn(|k| (-2.0 * PI * k as f32 / FFT_SIZE as f32).sin());
         SpectralTables {
             window,
             sub_band_bins,
+            bitrev,
             cos,
             sin,
         }
@@ -368,14 +384,22 @@ struct BandAnalyzer {
 }
 
 impl BandAnalyzer {
+    #[cfg(test)]
     fn new(rate: u32) -> Self {
+        Self::with_duration(rate, None)
+    }
+
+    fn with_duration(rate: u32, duration_sec: Option<f64>) -> Self {
+        let samples = duration_sec
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map_or(0, |d| (d.min(7200.0) * ANALYSIS_RATE as f64) as usize);
         Self {
             rate,
             phase: 0,
             sum: 0.0,
             count: 0,
-            mono: Vec::new(),
-            hop_sq: Vec::new(),
+            mono: Vec::with_capacity(samples),
+            hop_sq: Vec::with_capacity(if samples > 0 { samples / HOP + 1 } else { 0 }),
             cur_hop_sq: 0.0,
             cur_hop_len: 0,
         }
@@ -474,11 +498,17 @@ fn analyze_frame_bands(
     im: &mut [f32; FFT_SIZE],
 ) -> [f32; BANDS] {
     let samples = &mono[frame_idx * HOP..frame_idx * HOP + FFT_SIZE];
-    for ((dst, &s), &w) in re.iter_mut().zip(samples).zip(&tables.window) {
-        *dst = s * w;
+    for (dst, &rev) in re.iter_mut().zip(&tables.bitrev) {
+        let idx = rev as usize;
+        *dst = samples[idx] * tables.window[idx];
+    }
+    for pair in re.as_chunks_mut::<2>().0 {
+        let (a, b) = (pair[0], pair[1]);
+        pair[0] = a + b;
+        pair[1] = a - b;
     }
     im.fill(0.0);
-    fft_run(&tables.cos, &tables.sin, re, im);
+    fft_stages(&tables.cos, &tables.sin, re, im, 4);
     let mut bands = [0.0f32; BANDS];
     let per_band = SUB_BANDS / BANDS;
     for (s, &(lo, hi)) in tables.sub_band_bins.iter().enumerate() {
@@ -488,6 +518,7 @@ fn analyze_frame_bands(
     bands
 }
 
+#[cfg(test)]
 fn fft_run<const N: usize>(cos: &[f32], sin: &[f32], re: &mut [f32; N], im: &mut [f32; N]) {
     let n = N;
     let mut j = 0;
@@ -503,7 +534,17 @@ fn fft_run<const N: usize>(cos: &[f32], sin: &[f32], re: &mut [f32; N], im: &mut
             im.swap(i, j);
         }
     }
-    let mut len = 2;
+    fft_stages(cos, sin, re, im, 2);
+}
+
+fn fft_stages<const N: usize>(
+    cos: &[f32],
+    sin: &[f32],
+    re: &mut [f32; N],
+    im: &mut [f32; N],
+    mut len: usize,
+) {
+    let n = N;
     while len <= n {
         let step = n / len;
         for start in (0..n).step_by(len) {

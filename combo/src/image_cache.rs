@@ -573,27 +573,34 @@ pub fn decode_picture(bytes: &[u8]) -> Option<DecodedImage> {
 
 /// Converts to BGRA in place, compositing alpha over the COLORREF `background`.
 pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedImage {
+    let has_alpha = img.color().has_alpha();
     let rgba = img.into_rgba8();
     let (width, height) = rgba.dimensions();
     let mut bgra = rgba.into_raw();
-    let bg = [
-        background & 0xFF,
-        (background >> 8) & 0xFF,
-        (background >> 16) & 0xFF,
-    ];
-    for px in bgra.as_chunks_mut::<4>().0 {
-        let a = px[3] as u32;
-        let blend = |c: u8, bg: u32| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
-        let (r, g, b) = if a == 255 {
-            (px[0], px[1], px[2])
-        } else {
-            (
-                blend(px[0], bg[0]),
-                blend(px[1], bg[1]),
-                blend(px[2], bg[2]),
-            )
-        };
-        px.copy_from_slice(&[b, g, r, 255]);
+    if !has_alpha {
+        for px in bgra.as_chunks_mut::<4>().0 {
+            px.swap(0, 2);
+        }
+    } else {
+        let bg = [
+            background & 0xFF,
+            (background >> 8) & 0xFF,
+            (background >> 16) & 0xFF,
+        ];
+        for px in bgra.as_chunks_mut::<4>().0 {
+            let a = px[3] as u32;
+            let blend = |c: u8, bg: u32| ((c as u32 * a + bg * (255 - a) + 127) / 255) as u8;
+            let (r, g, b) = if a == 255 {
+                (px[0], px[1], px[2])
+            } else {
+                (
+                    blend(px[0], bg[0]),
+                    blend(px[1], bg[1]),
+                    blend(px[2], bg[2]),
+                )
+            };
+            px.copy_from_slice(&[b, g, r, 255]);
+        }
     }
     DecodedImage {
         width,

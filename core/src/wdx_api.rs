@@ -233,6 +233,7 @@ pub unsafe fn content_get_value_a(
 
 pub fn content_stop_get_value() {
     STOP_REQUESTED.store(true, Ordering::Relaxed);
+    crate::cache::clear_row_key();
     crate::prefetch::cancel();
 }
 
@@ -286,7 +287,7 @@ unsafe fn get_value(
     }
     crate::prefetch::request(&path, field, kind);
     crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
-        crate::cache::with_file_key(&path, || {
+        crate::cache::with_row_file_key(&path, field as u32, flags, || {
             if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
                 return FT_DELAYED;
             }

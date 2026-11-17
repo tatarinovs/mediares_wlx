@@ -46,7 +46,9 @@ pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
         return false;
     };
 
-    let info = read_exif(file_path);
+    let info = mediares_core::cache::get_exif(file_path)
+        .filter(|e| **e != ExifInfo::default())
+        .map(|e| (*e).clone());
     // Monospace so the label column lines up.
     let font = dialog::font(dlg, "Consolas", -13);
     let ui_font = dialog::font(dlg, "Segoe UI", -12);

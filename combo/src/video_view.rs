@@ -153,16 +153,20 @@ impl Player {
 
     /// MF must reject unreadable sources before returning from ListLoad(W)/ListLoadNext(W),
     /// so Total Commander can try the next plugin. mpv supplies uncached metadata itself.
-    fn file_meta(&self, path: &Path) -> Option<VideoMeta> {
-        match self {
+    fn probe_meta(path: &Path) -> Option<VideoMeta> {
+        if playback_mpv::available() {
+            if is_video_meta_cached(path) {
+                Some(
+                    get_video_meta(path)
+                        .map(|m| (*m).clone())
+                        .unwrap_or_default(),
+                )
+            } else {
+                Some(VideoMeta::default())
+            }
+        } else {
             // Cached properties do not prove that MF can open the source now.
-            Self::Mf(_) => probe_video_meta(path),
-            Self::Mpv(_) if is_video_meta_cached(path) => Some(
-                get_video_meta(path)
-                    .map(|m| (*m).clone())
-                    .unwrap_or_default(),
-            ),
-            Self::Mpv(_) => Some(VideoMeta::default()),
+            probe_video_meta(path)
         }
     }
 
@@ -471,9 +475,12 @@ impl VideoView {
         resume: bool,
         resume_threshold: f64,
     ) -> Option<Self> {
+        let mut info = Player::probe_meta(path)?;
         let surface = Surface::new(viewer, true)?;
         let player = Player::new(surface.0, viewer)?;
-        let info = player.file_meta(path)?;
+        if matches!(player, Player::Mf(_)) && playback_mpv::available() {
+            info = probe_video_meta(path)?;
+        }
         transport_bar::restore_audio_level(&*player);
         if !player.open(path) {
             return None;
@@ -516,15 +523,21 @@ impl VideoView {
         // Neither engine identifies the source of every callback. Give each file its own
         // engine/mailbox, so even a callback delivered late cannot acquire the next file's token.
         // A flip-model swap chain is exclusive to its HWND while the old engine shuts down.
+        let Some(mut info) = Player::probe_meta(path) else {
+            return false;
+        };
         let Some(surface) = Surface::new(self.viewer, true) else {
             return false;
         };
         let Some(player) = Player::new(surface.0, self.viewer) else {
             return false;
         };
-        let Some(info) = player.file_meta(path) else {
-            return false;
-        };
+        if matches!(player, Player::Mf(_)) && playback_mpv::available() {
+            let Some(mf_info) = probe_video_meta(path) else {
+                return false;
+            };
+            info = mf_info;
+        }
         self.remember_position();
         self.loupe_end();
         self.loaded = false;
