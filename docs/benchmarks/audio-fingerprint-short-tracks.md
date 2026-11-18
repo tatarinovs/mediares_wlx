@@ -1,7 +1,7 @@
 # Проблема коллизий `Audio_Fingerprint` на коротких треках (< 30 с)
 
 **Дата:** 2026-11-17  
-**Источник:** [core/src/audio_fingerprint.rs](../core/src/audio_fingerprint.rs)
+**Источник:** [core/src/audio_fingerprint.rs](../../core/src/audio_fingerprint.rs)
 
 ## Суть проблемы
 
@@ -19,7 +19,7 @@ d:\MP3\Гражданская оборона\Издания на CDs 2004–2012
 
 ## Причина в коде
 
-1. В `fingerprint()` ([audio_fingerprint.rs](../core/src/audio_fingerprint.rs#L603-L613)):
+1. В `fingerprint()` ([audio_fingerprint.rs](../../core/src/audio_fingerprint.rs)):
    - `WINDOW_SEC = 30.0`, `WINDOW_AT = [0.25, 0.5, 0.75]`.
    - `let window = ((WINDOW_SEC * frames_per_sec) as usize).min(n);`
    - `let start = center.saturating_sub(window / 2).min(n - window);`

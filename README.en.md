@@ -92,7 +92,7 @@ Download it from [shinchiro releases](https://github.com/shinchiro/mpv-winbuild-
 
 | Action | Keys |
 |---|---|
-| Next / previous file | PgDn / PgUp, N / P; Backspace — previous |
+| Next / previous file | PgDn / PgUp, N / P, Space for photos; Backspace — previous |
 | Fullscreen | Enter, F, F11 or double-click; Esc — exit |
 | On-screen information (OSD) | O or I |
 | Settings | S |
@@ -106,7 +106,8 @@ Download it from [shinchiro releases](https://github.com/shinchiro/mpv-winbuild-
 | Action | Keys / mouse |
 |---|---|
 | Zoom | + / −, Ctrl+wheel |
-| 100% / fit to window | Ctrl+1 / Ctrl+0 |
+| 100% / fit to window | Ctrl+1 / Ctrl+0 (fit: also * and / on numpad) |
+| 200% / 300% | Ctrl+2 / Ctrl+3 |
 | Pan a zoomed photo | Arrow keys or drag |
 | Magnifier in fit mode | Hold the left mouse button |
 | TIFF pages | ← / →; when zoomed — Ctrl+PgUp / Ctrl+PgDn |
@@ -201,18 +202,18 @@ Press **S** in the viewer or choose **“Settings...”** from the context menu.
 
 The interface is available in Russian and English; additional translations can be added through `mediares_ui.lng`.
 
-For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions are stored in `%LOCALAPPDATA%\mediares\mediares.sqlite3` (up to 200 videos), separately from the local cache. The old `mediares_resume.txt` is no longer used and may be deleted.
+For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions are stored in `%LOCALAPPDATA%\mediares\mediares.sqlite3` (up to 200 videos), separately from the local cache.
 
 Hashes, fingerprints, sharpness and metadata (EXIF, tags, stream properties, dimensions and pixel format) survive restarts in `%LOCALAPPDATA%\mediares\content-cache-v1.sqlite3`. Results are reread when the file size, modification time or algorithm version changes. The limits are 256 MiB for the main database and about 500,000 records; old records are evicted when full. To clear it, close all TC instances and delete the cache database. There is no need to disable caching during normal use; for diagnostics, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
 
-Hash, fingerprint and sharpness requests in columns or duplicate search also prepare the requested family for nearby files in the same folder. Metadata and duration are read and cached only when TC requests them, without prefetching neighboring files. Three background workers are used by default. Read-ahead is limited to 32 directory entries per family and replenished by further TC requests; subfolders are not traversed. Set the worker count manually in `mediares.ini`:
+Hash, fingerprint and sharpness requests in columns or duplicate search also prepare the requested family for nearby files in the same folder. Metadata and duration are read and cached only when TC requests them, without prefetching neighboring files. By default, the number of worker threads is chosen automatically based on CPU cores (up to 8). Read-ahead is limited to 32 directory entries per family and replenished by further TC requests; subfolders are not traversed. If needed, set the worker count manually in `mediares.ini`:
 
 ```ini
 [Settings]
-PrefetchThreads=3
+PrefetchThreads=4
 ```
 
-`0` disables read-ahead; `1`–`8` select the background worker count (also limited by available CPUs). The default is three workers. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. `Audio_Fingerprint` and `Audio_PCM_Hash` are computed and cached together in a single decoding pass; `Audio_Fast_Fingerprint` is computed and prefetched independently. Requesting duration does not start hashing.
+`0` disables read-ahead; `1`–`16` select the background worker count (also limited by available CPUs). Without the key, the thread count is determined automatically. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. `Audio_Fingerprint` and `Audio_PCM_Hash` are computed and cached together in a single decoding pass; `Audio_Fast_Fingerprint` is computed and prefetched independently. Requesting duration does not start hashing.
 
 Read-ahead selects neighbors with the same extension, ignoring case. Different extensions have separate queues. TC does not expose its search mask to the plugin.
 

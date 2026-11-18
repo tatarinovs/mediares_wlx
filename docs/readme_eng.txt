@@ -1,4 +1,4 @@
-﻿MEDIARES — media viewer and duplicate finder for Total Commander
+MEDIARES — media viewer and duplicate finder for Total Commander
 =================================================================
 
 Mediares is a pair of plugins for Total Commander (64-bit):
@@ -46,7 +46,8 @@ The fields then appear in the "mediares" group.
 -----------------
 
 Formats: JPEG, PNG, GIF, WEBP, BMP, ICO, TGA, HDR, TIFF, JPEG XR (JXR),
-DDS; SVG/SVGZ; HEIC/HEIF, AVIF and JPEG XL when the Microsoft Store
+DDS; SVG/SVGZ (Windows 10 1703+, without text, filters or masks);
+HEIC/HEIF, AVIF and JPEG XL when the Microsoft Store
 extensions are installed ("HEIF Image Extensions" with "HEVC Video
 Extensions", "AV1 Video Extension", "JPEG XL Image Extension"); RAW
 (CR2, CR3, CRW, NEF, ARW, ORF, RW2, DNG, RAF, PEF, RAW) — the preview
@@ -85,6 +86,11 @@ Neighbouring photos are loaded in advance, so paging is instant.
   Settings ................. S
 
 The right-click menu also has "Set as desktop background".
+
+Print with preview (Ctrl+P) — for photos and multipage TIFFs:
+prints all pages or selected numbers and ranges (e.g. 1-3, 5),
+with page navigation in the preview, printer selection, orientation
+and margins.
 
 Save as (Ctrl+S) saves the photo as JPEG or PNG. Without quality loss
 where possible: a file already in that format is simply copied, and
@@ -232,22 +238,22 @@ instead of off. Media files themselves may reside on a network drive.
 Hash, fingerprint and sharpness requests in columns or duplicate search also
 prepare the requested family for nearby files in the current folder.
 Metadata and duration are read and cached only when TC requests them, without
-prefetching neighboring files. Three background workers are used by default.
-Read-ahead is limited to 32 directory entries per family, replenished by further
-TC requests; no subfolder traversal. Set the worker count in mediares.ini:
+prefetching neighboring files. By default, the number of worker threads is chosen
+automatically based on CPU cores (up to 8). Read-ahead is limited to 32 directory
+entries per family, replenished by further TC requests; no subfolder traversal.
+If needed, set the worker count manually in mediares.ini:
 
 [Settings]
-PrefetchThreads=3
+PrefetchThreads=4
 
-0 disables read-ahead; 1–8 select the worker count (also limited by CPUs).
-The default is three workers. Restart TC after editing. An existing INI
-beside the DLL takes priority; otherwise mediares.ini in TC's settings
-directory is used. Saving through the GUI preserves this key. Audio_Fingerprint
-and Audio_PCM_Hash are computed, cached and prefetched together in a single
-decoding pass; Audio_Fast_Fingerprint is computed and prefetched independently.
-Duration reuses an existing full analysis or counts decoded frames without
-hashing. Results in the previous combined audio cache remain readable without
-recalculating them.
+0 disables read-ahead; 1–16 select the worker count (also limited by CPUs).
+Without the key, the thread count is determined automatically. Restart TC after
+editing. An existing INI beside the DLL takes priority; otherwise mediares.ini
+in TC's settings directory is used. Saving through the GUI preserves this key.
+Audio_Fingerprint and Audio_PCM_Hash are computed, cached and prefetched
+together in a single decoding pass; Audio_Fast_Fingerprint is computed and
+prefetched independently. Duration reuses an existing full analysis or counts
+decoded frames without hashing.
 
 Read-ahead selects neighbors with the same extension, ignoring case.
 Different extensions have separate queues; TC does not expose its search mask.
@@ -317,6 +323,11 @@ first pass.
 
 
 5.2. All fields
+
+Duplicate detection fields (hashes and fingerprints) are described in section 5.1:
+  Image_dHash, Image_pHash, Image_CoarseHash
+  Video_Fingerprint, Video_dHash_Mid
+  Audio_Fingerprint, Audio_Fast_Fingerprint, Audio_PCM_Hash, Audio_Artist_Title
 
 General:
   Media_Type            File type: Image, Video or Audio
@@ -423,8 +434,7 @@ The settings are stored in mediares.ini next to Total Commander's
 settings. If you put mediares.ini next to the plugin file itself, it is
 used from there (handy for a portable installation).
 Video resume positions are stored in mediares.sqlite3 (up to 200 videos),
-separately from the disposable content cache. The old mediares_resume.txt
-is no longer used and may be deleted.
+separately from the disposable content cache.
 The history database, wallpaper image and libmpv shader cache belong
 to the particular computer and are kept in %LOCALAPPDATA%\mediares.
 
