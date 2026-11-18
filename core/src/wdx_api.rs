@@ -36,8 +36,8 @@ pub(crate) enum Source {
     Sharpness,
     VideoMeta,
     VideoTags,
-    AudioFingerprint,
-    AudioPcmHash,
+    AudioAnalysis,
+    AudioFastFingerprint,
     AudioDuration,
     Analysis,
 }
@@ -83,8 +83,9 @@ fields! {
     ImageCoarseHash, "Image_CoarseHash", FT_STRINGW, Analysis, Image;
     VideoFingerprint, "Video_Fingerprint", FT_STRINGW, Analysis, Video;
     VideoDHashMid, "Video_dHash_Mid", FT_STRINGW, Analysis, Video;
-    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, AudioFingerprint, Audio;
-    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, AudioPcmHash, Audio;
+    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, AudioAnalysis, Audio;
+    AudioFastFingerprint, "Audio_Fast_Fingerprint", FT_STRINGW, AudioFastFingerprint, Audio;
+    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, AudioAnalysis, Audio;
     MediaTypeName, "Media_Type", FT_STRINGW, Probe, Media;
     ImageWidth, "Image_Width", FT_NUMERIC_32, ImageSize, Image;
     ImageHeight, "Image_Height", FT_NUMERIC_32, ImageSize, Image;
@@ -354,7 +355,7 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && header_size(path, kind).is_none()
         }
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
-        Source::AudioFingerprint | Source::AudioPcmHash | Source::AudioDuration => {
+        Source::AudioAnalysis | Source::AudioFastFingerprint | Source::AudioDuration => {
             !crate::cache::is_audio_cached(path, audio_field(field))
         }
         Source::Analysis => analysis_pending(),
@@ -421,7 +422,7 @@ fn compute_cancelled(
         Source::Exif => return exif_value(path, field, kind),
         Source::VideoMeta => return video_meta_value(path, field, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
-        Source::AudioFingerprint | Source::AudioPcmHash | Source::AudioDuration => {
+        Source::AudioAnalysis | Source::AudioFastFingerprint | Source::AudioDuration => {
             return audio_analysis_value(path, field, cancelled);
         }
         Source::PixelFormat => {
@@ -476,8 +477,8 @@ fn compute_cancelled(
 fn audio_field(field: Field) -> crate::cache::AudioField {
     use crate::cache::AudioField;
     match field {
-        Field::AudioFingerprint => AudioField::Fingerprint,
-        Field::AudioPcmHash => AudioField::PcmHash,
+        Field::AudioFingerprint | Field::AudioPcmHash => AudioField::Analysis,
+        Field::AudioFastFingerprint => AudioField::FastFingerprint,
         Field::AudioDurationSec => AudioField::Duration,
         _ => unreachable!("audio analysis field"),
     }
@@ -486,11 +487,14 @@ fn audio_field(field: Field) -> crate::cache::AudioField {
 fn audio_analysis_value(path: &Path, field: Field, cancelled: &dyn Fn() -> bool) -> Option<Value> {
     #[cfg(feature = "audio-decode")]
     match field {
-        Field::AudioFingerprint => crate::cache::get_audio_fingerprint(path, cancelled)?
+        Field::AudioFingerprint => crate::cache::get_audio_analysis(path, cancelled)?
+            .fingerprint
+            .map(Value::Text),
+        Field::AudioFastFingerprint => crate::cache::get_audio_fast_fingerprint(path, cancelled)?
             .fingerprint
             .map(Value::Text),
         Field::AudioPcmHash => {
-            let hash = crate::cache::get_audio_pcm_hash(path, cancelled)?.pcm_hash;
+            let hash = crate::cache::get_audio_analysis(path, cancelled)?.pcm_hash;
             (!hash.is_empty()).then_some(Value::Text(hash))
         }
         Field::AudioDurationSec => {

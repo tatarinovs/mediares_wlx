@@ -58,16 +58,39 @@ impl MfAudioReader {
         }
     }
 
+    pub fn seek(&mut self, seconds: f64) -> Option<f64> {
+        let seconds = match self.duration {
+            Some(d) => seconds.clamp(0.0, d),
+            None => seconds.max(0.0),
+        };
+        let hns = (seconds * crate::video_frame::HNS_PER_SEC).round() as i64;
+        unsafe { crate::video_frame::set_position(&self.reader, hns).ok()? };
+        self.ended = false;
+        Some(seconds)
+    }
+
     /// Clean EOF is `Ok(None)`; decoder errors and format changes must not hash as success.
     pub fn next_chunk(&mut self) -> io::Result<Option<&[f32]>> {
+        self.next_chunk_timed().map(|opt| opt.map(|(_, s)| s))
+    }
+
+    /// Like [`Self::next_chunk`], also returning the chunk's stream timestamp in seconds when known.
+    pub fn next_chunk_timed(&mut self) -> io::Result<Option<(Option<f64>, &[f32])>> {
         if self.ended {
             return Ok(None);
         }
         unsafe {
             for _ in 0..MAX_EMPTY_READS {
-                let (mut flags, mut sample) = (0u32, None);
+                let (mut flags, mut timestamp, mut sample) = (0u32, 0i64, None);
                 self.reader
-                    .ReadSample(STREAM, 0, None, Some(&mut flags), None, Some(&mut sample))
+                    .ReadSample(
+                        STREAM,
+                        0,
+                        None,
+                        Some(&mut flags),
+                        Some(&mut timestamp),
+                        Some(&mut sample),
+                    )
                     .map_err(io::Error::other)?;
                 if flags & MF_SOURCE_READERF_ERROR.0 as u32 != 0 {
                     return Err(io::Error::other("audio source reader failed"));
@@ -107,7 +130,9 @@ impl MfAudioReader {
                 }
                 let _ = buffer.Unlock();
                 if !self.out.is_empty() {
-                    return Ok(Some(&self.out));
+                    let start =
+                        (timestamp >= 0).then_some(timestamp as f64 / crate::video_frame::HNS_PER_SEC);
+                    return Ok(Some((start, &self.out)));
                 }
                 if self.ended {
                     return Ok(None);

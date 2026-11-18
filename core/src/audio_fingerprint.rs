@@ -1,12 +1,13 @@
-//! Independent audio duplicate detection fields, each computed only when requested:
+//! Audio duplicate detection fields:
 //!
-//! - **PCM hash** — hash of the decoded samples between the leading and trailing silence: equal for
-//!   the same audio in any lossless container or with different tags (WAV → FLAC, retagged MP3).
-//! - **Fingerprint** — `<seconds>s_<h25>_<h50>_<h75>`: coarse spectral hashes of three windows at
-//!   25/50/75 % of the non-silent part. Built to survive re-encoding (bitrate, codec, sample rate,
-//!   mono, gain), because TC's duplicate search compares field values for equality — there is no
-//!   fuzzy matching, so every bit has to be stable. That is why there are only 6 bits per window:
-//!   tuned on re-encoded copies of real tracks, ~99 % of copies give exactly the original's value.
+//! - **PCM hash** and **Fingerprint** are computed in one sequential decoding pass:
+//!   - **PCM hash** — hash of the decoded samples between the leading and trailing silence: equal
+//!     for the same audio in any lossless container or with different tags (WAV → FLAC, retagged MP3).
+//!   - **Fingerprint** — `<audible_sec>s_<h25>_<h50>_<h75>`: 24-bit coarse spectral hashes of three
+//!     windows at 25/50/75 % of the non-silent part (proportional windows on tracks `< 60` s, and
+//!     `<audible_sec>s_pcm_<pcm_hash>` fallback when the audible part is `< 3` s).
+//! - **Fast fingerprint** — seek-based variant for long tracks (`> 75` s) that probes head/tail
+//!   silence boundaries and decodes only three 12 s windows instead of the full file.
 //!
 //! The signal is downmixed to mono and resampled to [`ANALYSIS_RATE`]; per frame only a few band
 //! energies are kept, so hours of audio are fine.
@@ -16,7 +17,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use crate::audio_decode::AudioDecoder;
-use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash};
+use crate::cache::{AudioAnalysis, AudioDuration, AudioFastFingerprint};
 use crate::mf_audio::MfAudioReader;
 
 const ANALYSIS_RATE: u32 = 11_025;
@@ -26,17 +27,23 @@ const HOP: usize = 256;
 /// Log-spaced sub-bands between these frequencies, averaged in groups into [`BANDS`] bands.
 const LOW_HZ: f32 = 150.0;
 const HIGH_HZ: f32 = 5000.0;
-const SUB_BANDS: usize = 24;
-const BANDS: usize = 4;
+const SUB_BANDS: usize = 25;
+const BANDS: usize = 5;
+const _: () = assert!(SUB_BANDS.is_multiple_of(BANDS));
 const SLICES: usize = 3;
 const WINDOW_SEC: f32 = 30.0;
+const FAST_WINDOW_SEC: f32 = 12.0;
+const EDGE_PROBE_SEC: f64 = 15.0;
+const SEEK_THRESHOLD_SEC: f64 = 75.0;
 const WINDOW_AT: [f32; 3] = [0.25, 0.5, 0.75];
 /// Start / end of the audible part: frames louder than this relative to the loudest (dB).
 const AUDIBLE_DB: f32 = -30.0;
-/// Shortest audible part that gets a fingerprint.
+/// Shortest audible part that gets a spectral fingerprint (shorter audible files fall back to PCM hash).
 const MIN_AUDIBLE_SEC: f32 = 3.0;
 /// Samples quieter than this (below one 16-bit step) are silence for the PCM hash.
 const PCM_SILENCE: f32 = 1.5 / 32768.0;
+/// Minimum peak frame energy required to consider a track non-silent.
+const SILENCE_FLOOR_SQ: f32 = (PCM_SILENCE * PCM_SILENCE) * FFT_SIZE as f32;
 /// Checks for cancellation this often (decoded chunks).
 const CANCEL_CHECK_EVERY: u32 = 64;
 
@@ -53,7 +60,8 @@ pub enum AudioError {
 trait PcmSource {
     fn format(&self) -> (u32, usize);
     fn duration(&self) -> Option<f64>;
-    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>>;
+    fn next_timed_samples(&mut self) -> std::io::Result<Option<(Option<f64>, &[f32])>>;
+    fn seek(&mut self, seconds: f64) -> Option<f64>;
 }
 
 impl PcmSource for AudioDecoder {
@@ -65,8 +73,13 @@ impl PcmSource for AudioDecoder {
         self.duration
     }
 
-    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
-        self.next_chunk_checked().map(|c| c.map(|c| c.samples))
+    fn next_timed_samples(&mut self) -> std::io::Result<Option<(Option<f64>, &[f32])>> {
+        self.next_chunk_checked()
+            .map(|c| c.map(|c| (Some(c.start), c.samples)))
+    }
+
+    fn seek(&mut self, seconds: f64) -> Option<f64> {
+        AudioDecoder::seek(self, seconds)
     }
 }
 
@@ -79,23 +92,73 @@ impl PcmSource for MfAudioReader {
         self.duration
     }
 
-    fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
-        self.next_chunk()
+    fn next_timed_samples(&mut self) -> std::io::Result<Option<(Option<f64>, &[f32])>> {
+        self.next_chunk_timed()
+    }
+
+    fn seek(&mut self, seconds: f64) -> Option<f64> {
+        MfAudioReader::seek(self, seconds)
     }
 }
 
-pub fn fingerprint_audio(
+pub fn analyze_audio(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
-) -> Result<AudioFingerprint, AudioError> {
-    analyze_audio::<BandAnalyzer>(path, cancelled)
+) -> Result<AudioAnalysis, AudioError> {
+    analyze_sequential::<(BandAnalyzer, PcmHash)>(path, cancelled)
 }
 
-pub fn hash_audio_pcm(
+pub fn fast_fingerprint_audio(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
-) -> Result<AudioPcmHash, AudioError> {
-    analyze_audio::<PcmHash>(path, cancelled)
+) -> Result<AudioFastFingerprint, AudioError> {
+    if cancelled() {
+        return Err(AudioError::Cancelled);
+    }
+    if let Some(mut decoder) = AudioDecoder::open(path) {
+        if let Some(expected) = decoder
+            .duration
+            .filter(|d| d.is_finite() && *d > SEEK_THRESHOLD_SEC)
+        {
+            match analyze_source_seek(&mut decoder, expected, cancelled) {
+                Ok(SeekProbe::Done(fingerprint)) => {
+                    return Ok(AudioFastFingerprint {
+                        duration_sec: expected.round() as u32,
+                        fingerprint,
+                    });
+                }
+                Ok(SeekProbe::FallbackSequential) => {
+                    return analyze_sequential::<FastSequential>(path, cancelled);
+                }
+                Err(AudioError::Unsupported) => {}
+                Err(e) => return Err(e),
+            }
+        } else {
+            drop(decoder);
+            return analyze_sequential::<FastSequential>(path, cancelled);
+        }
+    }
+    let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
+    if let Some(expected) = reader
+        .duration
+        .filter(|d| d.is_finite() && *d > SEEK_THRESHOLD_SEC)
+    {
+        match analyze_source_seek(&mut reader, expected, cancelled) {
+            Ok(SeekProbe::Done(fingerprint)) => {
+                return Ok(AudioFastFingerprint {
+                    duration_sec: expected.round() as u32,
+                    fingerprint,
+                });
+            }
+            Ok(SeekProbe::FallbackSequential) => {
+                drop(reader);
+                let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
+                return analyze_source::<FastSequential>(&mut reader, cancelled);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    analyze_source::<FastSequential>(&mut reader, cancelled)
 }
 
 /// Counts decoded frames without hashing samples or analyzing their spectrum.
@@ -103,7 +166,7 @@ pub fn decoded_duration(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<AudioDuration, AudioError> {
-    analyze_audio::<()>(path, cancelled)
+    analyze_sequential::<()>(path, cancelled)
 }
 
 trait SampleAnalysis {
@@ -111,44 +174,6 @@ trait SampleAnalysis {
     fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self;
     fn samples(&mut self, samples: &[f32], channels: usize);
     fn result(self, duration: f64) -> Self::Output;
-}
-
-impl SampleAnalysis for BandAnalyzer {
-    type Output = AudioFingerprint;
-
-    fn start(rate: u32, _: usize, duration_sec: Option<f64>) -> Self {
-        Self::with_duration(rate, duration_sec)
-    }
-
-    fn samples(&mut self, samples: &[f32], channels: usize) {
-        self.push_samples(samples, channels);
-    }
-
-    fn result(self, duration: f64) -> Self::Output {
-        AudioFingerprint {
-            duration_sec: duration.round() as u32,
-            fingerprint: fingerprint(&self.mono, &self.hop_sq, duration),
-        }
-    }
-}
-
-impl SampleAnalysis for PcmHash {
-    type Output = AudioPcmHash;
-
-    fn start(rate: u32, channels: usize, _: Option<f64>) -> Self {
-        Self::new(rate, channels)
-    }
-
-    fn samples(&mut self, samples: &[f32], _: usize) {
-        self.update(samples);
-    }
-
-    fn result(self, duration: f64) -> Self::Output {
-        AudioPcmHash {
-            duration_sec: duration.round() as u32,
-            pcm_hash: self.finish(),
-        }
-    }
 }
 
 impl SampleAnalysis for () {
@@ -161,10 +186,69 @@ impl SampleAnalysis for () {
     }
 }
 
+impl SampleAnalysis for (BandAnalyzer, PcmHash) {
+    type Output = AudioAnalysis;
+
+    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self {
+        (
+            BandAnalyzer::with_duration(rate, duration_sec),
+            PcmHash::new(rate, channels),
+        )
+    }
+
+    fn samples(&mut self, samples: &[f32], channels: usize) {
+        self.0.push_samples(samples, channels);
+        self.1.update(samples);
+    }
+
+    fn result(self, duration: f64) -> Self::Output {
+        let pcm_hash = self.1.finish();
+        let fingerprint =
+            fingerprint_with_window(&self.0.mono, &self.0.hop_sq, WINDOW_SEC, Some(&pcm_hash));
+        AudioAnalysis {
+            duration_sec: duration.round() as u32,
+            pcm_hash,
+            fingerprint,
+        }
+    }
+}
+
+struct FastSequential(BandAnalyzer, PcmHash);
+
+impl SampleAnalysis for FastSequential {
+    type Output = AudioFastFingerprint;
+
+    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self {
+        Self(
+            BandAnalyzer::with_duration(rate, duration_sec),
+            PcmHash::new(rate, channels),
+        )
+    }
+
+    fn samples(&mut self, samples: &[f32], channels: usize) {
+        self.0.push_samples(samples, channels);
+        self.1.update(samples);
+    }
+
+    fn result(self, duration: f64) -> Self::Output {
+        let pcm_hash = self.1.finish();
+        let fingerprint = fingerprint_with_window(
+            &self.0.mono,
+            &self.0.hop_sq,
+            FAST_WINDOW_SEC,
+            Some(&pcm_hash),
+        );
+        AudioFastFingerprint {
+            duration_sec: duration.round() as u32,
+            fingerprint,
+        }
+    }
+}
+
 /// Decodes with symphonia; files it can't open or decode go through Media Foundation, whose
 /// results depend on the system's decoders (still stable on one machine, which is what TC's
 /// duplicate search compares).
-fn analyze_audio<A: SampleAnalysis>(
+fn analyze_sequential<A: SampleAnalysis>(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<A::Output, AudioError> {
@@ -194,7 +278,7 @@ fn analyze_source<A: SampleAnalysis>(
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
-    while let Some(samples) = source.next_samples().map_err(|_| {
+    while let Some((_, samples)) = source.next_timed_samples().map_err(|_| {
         if frames_total == 0 {
             AudioError::Unsupported
         } else {
@@ -221,6 +305,176 @@ fn analyze_source<A: SampleAnalysis>(
         return Err(AudioError::Cancelled);
     }
     Ok(analysis.result(duration))
+}
+
+enum SeekProbe {
+    Done(Option<String>),
+    FallbackSequential,
+}
+
+fn read_window(
+    source: &mut dyn PcmSource,
+    target_frames: Option<u64>,
+    max_frames: u64,
+    fallback_start: f64,
+    analyzer: &mut BandAnalyzer,
+    cancelled: &dyn Fn() -> bool,
+    unsupported_if_empty: bool,
+) -> Result<(u64, f64), AudioError> {
+    let (_, channels) = source.format();
+    let mut frames_read = 0u64;
+    let mut chunks = 0u32;
+    let mut start_sec = None;
+
+    while let Some((chunk_start, samples)) = source.next_timed_samples().map_err(|_| {
+        if unsupported_if_empty && frames_read == 0 {
+            AudioError::Unsupported
+        } else {
+            AudioError::Invalid
+        }
+    })? {
+        if start_sec.is_none() {
+            start_sec = Some(chunk_start.unwrap_or(fallback_start));
+        }
+        chunks += 1;
+        if chunks.is_multiple_of(CANCEL_CHECK_EVERY) && cancelled() {
+            return Err(AudioError::Cancelled);
+        }
+        let chunk_frames = (samples.len() / channels) as u64;
+        let take_frames = match target_frames {
+            Some(target) => chunk_frames.min(target.saturating_sub(frames_read)),
+            None => chunk_frames,
+        };
+        if take_frames > 0 {
+            analyzer.push_samples(&samples[..take_frames as usize * channels], channels);
+            frames_read += take_frames;
+        }
+        if target_frames.is_some_and(|t| frames_read >= t) || frames_read >= max_frames {
+            break;
+        }
+    }
+    if cancelled() {
+        return Err(AudioError::Cancelled);
+    }
+    Ok((frames_read, start_sec.unwrap_or(fallback_start)))
+}
+
+fn analyze_source_seek(
+    source: &mut dyn PcmSource,
+    expected: f64,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SeekProbe, AudioError> {
+    let (rate, channels) = source.format();
+    if rate == 0 || channels == 0 {
+        return Err(AudioError::Invalid);
+    }
+
+    let head_target = (EDGE_PROBE_SEC * rate as f64).ceil() as u64;
+    let mut head = BandAnalyzer::with_duration(rate, Some(EDGE_PROBE_SEC));
+    let (head_frames, head_start) = read_window(
+        source,
+        Some(head_target),
+        head_target,
+        0.0,
+        &mut head,
+        cancelled,
+        true,
+    )?;
+    if head_frames == 0 {
+        return Err(AudioError::Unsupported);
+    }
+    if head_frames < head_target {
+        return Ok(SeekProbe::FallbackSequential);
+    }
+
+    let tail_target_sec = (expected - EDGE_PROBE_SEC).max(EDGE_PROBE_SEC);
+    let Some(tail_seek_sec) = source.seek(tail_target_sec) else {
+        return Ok(SeekProbe::FallbackSequential);
+    };
+    let max_tail_frames = ((EDGE_PROBE_SEC + 30.0) * rate as f64).ceil() as u64;
+    let mut tail = BandAnalyzer::with_duration(rate, Some(EDGE_PROBE_SEC + 2.0));
+    let (tail_frames, tail_start) = read_window(
+        source,
+        None,
+        max_tail_frames,
+        tail_seek_sec,
+        &mut tail,
+        cancelled,
+        false,
+    )?;
+    if tail_frames == 0
+        || tail_frames >= max_tail_frames
+        || tail_start < tail_target_sec - 15.0
+    {
+        return Ok(SeekProbe::FallbackSequential);
+    }
+
+    let head_n = head.hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
+    let tail_n = tail.hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
+    if head_n == 0 || tail_n == 0 {
+        return Ok(SeekProbe::FallbackSequential);
+    }
+    let max_sq = max_frame_sq(&head.hop_sq, head_n).max(max_frame_sq(&tail.hop_sq, tail_n));
+    if max_sq <= SILENCE_FLOOR_SQ {
+        return Ok(SeekProbe::FallbackSequential);
+    }
+    let threshold_sq = max_sq * 10f32.powf(AUDIBLE_DB / 10.0);
+    let Some(first) = (0..head_n).position(|i| frame_sum_sq(&head.hop_sq, i) > threshold_sq) else {
+        return Ok(SeekProbe::FallbackSequential);
+    };
+    let Some(last) = (0..tail_n).rposition(|i| frame_sum_sq(&tail.hop_sq, i) > threshold_sq) else {
+        return Ok(SeekProbe::FallbackSequential);
+    };
+
+    let audible_start_sec = head_start + (first * HOP) as f64 / ANALYSIS_RATE as f64;
+    let audible_end_sec =
+        tail_start + ((last + BLOCKS_PER_FRAME) * HOP) as f64 / ANALYSIS_RATE as f64;
+    let span_sec = audible_end_sec - audible_start_sec;
+    if span_sec < MIN_AUDIBLE_SEC as f64 {
+        return Ok(SeekProbe::FallbackSequential);
+    }
+
+    let audible_sec = span_sec.round().max(1.0) as u32;
+    let win_sec = (FAST_WINDOW_SEC as f64).min(span_sec * 0.5);
+    let win_target_frames = (win_sec * rate as f64).ceil() as u64;
+    let tables = spectral_tables();
+    let mut re = [0.0f32; FFT_SIZE];
+    let mut im = [0.0f32; FFT_SIZE];
+    let mut hashes = Vec::with_capacity(WINDOW_AT.len());
+
+    for &at in &WINDOW_AT {
+        let center = audible_start_sec + span_sec * at as f64;
+        let win_start = (center - win_sec * 0.5).clamp(audible_start_sec, audible_end_sec - win_sec);
+        let Some(seek_sec) = source.seek(win_start) else {
+            return Ok(SeekProbe::FallbackSequential);
+        };
+        let mut analyzer = BandAnalyzer::with_duration(rate, Some(win_sec));
+        let (got_frames, _) = read_window(
+            source,
+            Some(win_target_frames),
+            win_target_frames,
+            seek_sec,
+            &mut analyzer,
+            cancelled,
+            false,
+        )?;
+        if got_frames == 0 {
+            return Ok(SeekProbe::FallbackSequential);
+        }
+        let n = analyzer.hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
+        if n < SLICES {
+            return Ok(SeekProbe::FallbackSequential);
+        }
+        let cur_frames: Vec<[f32; BANDS]> = (0..n)
+            .map(|i| analyze_frame_bands(&analyzer.mono, i, tables, &mut re, &mut im))
+            .collect();
+        hashes.push(format!("{:02x}", window_bits(&cur_frames)));
+    }
+
+    Ok(SeekProbe::Done(Some(format!(
+        "{audible_sec}s_{}",
+        hashes.join("_")
+    ))))
 }
 
 #[inline(always)]
@@ -584,23 +838,45 @@ impl Fft {
     }
 }
 
-/// `None` when there is too little audible audio to describe.
-fn fingerprint(mono: &[f32], hop_sq: &[f32], duration: f64) -> Option<String> {
+#[inline]
+fn frame_sum_sq(hop_sq: &[f32], i: usize) -> f32 {
+    hop_sq[i] + hop_sq[i + 1] + hop_sq[i + 2] + hop_sq[i + 3]
+}
+
+fn max_frame_sq(hop_sq: &[f32], n: usize) -> f32 {
+    (0..n).map(|i| frame_sum_sq(hop_sq, i)).fold(0.0f32, f32::max)
+}
+
+/// `None` when there is too little audible audio to describe (falls back to PCM hash if `< 3` s).
+fn fingerprint_with_window(
+    mono: &[f32],
+    hop_sq: &[f32],
+    window_sec: f32,
+    pcm_fallback: Option<&str>,
+) -> Option<String> {
     let n = hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
     if n == 0 {
         return None;
     }
-    let sum_sq = |i: usize| hop_sq[i] + hop_sq[i + 1] + hop_sq[i + 2] + hop_sq[i + 3];
-    let max_sq = (0..n).map(sum_sq).fold(0.0f32, f32::max);
-    let threshold_sq = max_sq * 10f32.powf(AUDIBLE_DB / 10.0);
-    let first = (0..n).position(|i| sum_sq(i) > threshold_sq)?;
-    let last = (0..n).rposition(|i| sum_sq(i) > threshold_sq)?;
-    let frames_per_sec = ANALYSIS_RATE as f32 / HOP as f32;
-    let span = last - first + 1;
-    if (span as f32) < MIN_AUDIBLE_SEC * frames_per_sec {
+    let max_sq = max_frame_sq(hop_sq, n);
+    if max_sq <= SILENCE_FLOOR_SQ {
         return None;
     }
-    let window = ((WINDOW_SEC * frames_per_sec) as usize).min(n);
+    let threshold_sq = max_sq * 10f32.powf(AUDIBLE_DB / 10.0);
+    let first = (0..n).position(|i| frame_sum_sq(hop_sq, i) > threshold_sq)?;
+    let last = (0..n).rposition(|i| frame_sum_sq(hop_sq, i) > threshold_sq)?;
+    let frames_per_sec = ANALYSIS_RATE as f32 / HOP as f32;
+    let span = last - first + 1;
+    let audible_sec = (((span + BLOCKS_PER_FRAME - 1) * HOP) as f64 / ANALYSIS_RATE as f64)
+        .round()
+        .max(1.0) as u32;
+    if (span as f32) < MIN_AUDIBLE_SEC * frames_per_sec {
+        return pcm_fallback.map(|h| format!("{audible_sec}s_pcm_{h}"));
+    }
+    let window = ((window_sec * frames_per_sec) as usize)
+        .min(span / 2)
+        .max(SLICES)
+        .min(span);
     let tables = spectral_tables();
     let mut re = [0.0f32; FFT_SIZE];
     let mut im = [0.0f32; FFT_SIZE];
@@ -610,7 +886,9 @@ fn fingerprint(mono: &[f32], hop_sq: &[f32], duration: f64) -> Option<String> {
 
     for &at in &WINDOW_AT {
         let center = first + (span as f32 * at) as usize;
-        let start = center.saturating_sub(window / 2).min(n - window);
+        let start = center
+            .saturating_sub(window / 2)
+            .clamp(first, first + span - window);
         let prev_end = prev_start + prev_frames.len();
         let mut cur_frames = Vec::with_capacity(window);
         for i in start..start + window {
@@ -625,7 +903,7 @@ fn fingerprint(mono: &[f32], hop_sq: &[f32], duration: f64) -> Option<String> {
         prev_start = start;
         prev_frames = cur_frames;
     }
-    Some(format!("{}s_{}", duration.round() as u32, hashes.join("_")))
+    Some(format!("{audible_sec}s_{}", hashes.join("_")))
 }
 
 /// Signs of the change of the spectral slope between neighbouring slices (Haitsma–Kalker style,
@@ -635,7 +913,7 @@ fn window_bits(frames: &[[f32; BANDS]]) -> u32 {
     let mut energy = [[0.0f32; BANDS]; SLICES];
     for (t, slice) in split_even(frames, SLICES).enumerate() {
         for (b, e) in energy[t].iter_mut().enumerate() {
-            *e = slice.iter().map(|bands| (bands[b] + 1e-9).ln()).sum::<f32>()
+            *e = slice.iter().map(|bands| (bands[b] + 1e-3).ln()).sum::<f32>()
                 / slice.len().max(1) as f32;
         }
     }
@@ -671,8 +949,8 @@ mod tests {
         let path = crate::test_util::pcm16_wav("truncated-analysis", 8000, 1, 32000, |i| {
             (i % 1000) as i16 * 16
         });
-        assert!(fingerprint_audio(&path, &|| false).is_ok());
-        assert!(hash_audio_pcm(&path, &|| false).is_ok());
+        assert!(analyze_audio(&path, &|| false).is_ok());
+        assert!(fast_fingerprint_audio(&path, &|| false).is_ok());
         assert!(decoded_duration(&path, &|| false).is_ok());
         let mut bytes = std::fs::read(&path).unwrap();
         // The same prefix, with a header declaring five times as much PCM.
@@ -680,11 +958,11 @@ mod tests {
         bytes[40..44].copy_from_slice(&(32000u32 * 2 * 5).to_le_bytes());
         std::fs::write(&path, bytes).unwrap();
         assert!(matches!(
-            fingerprint_audio(&path, &|| false),
+            analyze_audio(&path, &|| false),
             Err(AudioError::Invalid)
         ));
         assert!(matches!(
-            hash_audio_pcm(&path, &|| false),
+            fast_fingerprint_audio(&path, &|| false),
             Err(AudioError::Invalid)
         ));
         assert!(matches!(
@@ -706,26 +984,131 @@ mod tests {
             fn duration(&self) -> Option<f64> {
                 None
             }
-            fn next_samples(&mut self) -> std::io::Result<Option<&[f32]>> {
+            fn next_timed_samples(&mut self) -> std::io::Result<Option<(Option<f64>, &[f32])>> {
                 if std::mem::replace(&mut self.read, true) {
                     Err(std::io::Error::other("broken packet"))
                 } else {
-                    Ok(Some(&[0.5; 256]))
+                    Ok(Some((Some(0.0), &[0.5; 256])))
                 }
+            }
+            fn seek(&mut self, _: f64) -> Option<f64> {
+                None
             }
         }
         assert!(matches!(
-            analyze_source::<BandAnalyzer>(&mut Broken { read: false }, &|| false),
+            analyze_source::<(BandAnalyzer, PcmHash)>(&mut Broken { read: false }, &|| false),
             Err(AudioError::Invalid)
         ));
         assert!(matches!(
-            analyze_source::<PcmHash>(&mut Broken { read: false }, &|| false),
+            analyze_source::<FastSequential>(&mut Broken { read: false }, &|| false),
             Err(AudioError::Invalid)
         ));
         assert!(matches!(
             analyze_source::<()>(&mut Broken { read: false }, &|| false),
             Err(AudioError::Invalid)
         ));
+    }
+
+    #[test]
+    fn short_tracks_with_different_spectra_do_not_collide() {
+        let rate = 11_025u32;
+        let frames = rate * 10;
+        // Track A: tone rises in frequency over 10 s; Track B: tone falls over 10 s.
+        let make_sweep = |name: &str, ascending: bool| {
+            let dur = frames as f32 / rate as f32;
+            let (f0, f1) = if ascending {
+                (250.0f32, 3250.0f32)
+            } else {
+                (3250.0f32, 250.0f32)
+            };
+            crate::test_util::pcm16_wav(name, rate, 1, frames, move |i| {
+                let t = i as f32 / rate as f32;
+                let phase = 2.0 * PI * (f0 * t + 0.5 * (f1 - f0) * t * t / dur);
+                (phase.sin() * 12000.0) as i16
+            })
+        };
+        let a = make_sweep("short-asc", true);
+        let b = make_sweep("short-desc", false);
+        let fp_a = analyze_audio(&a, &|| false).unwrap().fingerprint.unwrap();
+        let fp_b = analyze_audio(&b, &|| false).unwrap().fingerprint.unwrap();
+        let _ = std::fs::remove_file(a);
+        let _ = std::fs::remove_file(b);
+        assert!(fp_a.starts_with("10s_"), "{fp_a}");
+        assert!(fp_b.starts_with("10s_"), "{fp_b}");
+        assert_ne!(fp_a, fp_b);
+        let parts: Vec<&str> = fp_a.split('_').collect();
+        assert_eq!(parts.len(), 4);
+        assert!(parts[1] != parts[2] || parts[2] != parts[3], "{fp_a}");
+    }
+
+    #[test]
+    fn very_short_audible_track_falls_back_to_pcm_hash_while_silence_stays_empty() {
+        let rate = 11_025u32;
+        let frames = rate * 16 / 10; // 1.6 s < MIN_AUDIBLE_SEC
+        let path = crate::test_util::pcm16_wav("tiny-audible", rate, 1, frames, |i| {
+            ((2.0 * PI * 440.0 * i as f32 / rate as f32).sin() * 12000.0) as i16
+        });
+        let analysis = analyze_audio(&path, &|| false).unwrap();
+        let fast = fast_fingerprint_audio(&path, &|| false).unwrap();
+        let _ = std::fs::remove_file(path);
+        let fp = analysis.fingerprint.expect("PCM fallback expected");
+        assert!(fp.starts_with("2s_pcm_"), "{fp}");
+        assert!(fp.ends_with(&analysis.pcm_hash), "{fp}");
+        assert_eq!(fast.fingerprint.as_deref(), Some(fp.as_str()));
+
+        let silent = crate::test_util::pcm16_wav("tiny-silent", rate, 1, frames, |_| 0);
+        assert_eq!(analyze_audio(&silent, &|| false).unwrap().fingerprint, None);
+        assert_eq!(
+            fast_fingerprint_audio(&silent, &|| false)
+                .unwrap()
+                .fingerprint,
+            None
+        );
+        let _ = std::fs::remove_file(silent);
+    }
+
+    #[test]
+    fn fast_fingerprint_handles_long_tracks_and_edge_silence() {
+        let rate = 11_025u32;
+        let make_long = |name: &str, lead_silence_sec: u32, trail_silence_sec: u32| {
+            let audible_sec = 80u32;
+            let total = rate * (lead_silence_sec + audible_sec + trail_silence_sec);
+            let dur = audible_sec as f32;
+            crate::test_util::pcm16_wav(name, rate, 1, total, move |i| {
+                let sec = i / rate;
+                if sec < lead_silence_sec || sec >= lead_silence_sec + audible_sec {
+                    0
+                } else {
+                    let t = (i - lead_silence_sec * rate) as f32 / rate as f32;
+                    let phase = 2.0 * PI * (250.0 * t + 0.5 * 3000.0 * t * t / dur);
+                    (phase.sin() * 12000.0) as i16
+                }
+            })
+        };
+        let clean = make_long("long-clean", 0, 0);
+        let padded = make_long("long-padded", 2, 2);
+        let fp_clean = fast_fingerprint_audio(&clean, &|| false)
+            .unwrap()
+            .fingerprint
+            .unwrap();
+        let fp_padded = fast_fingerprint_audio(&padded, &|| false)
+            .unwrap()
+            .fingerprint
+            .unwrap();
+        let seq_clean = analyze_audio(&clean, &|| false)
+            .unwrap()
+            .fingerprint
+            .unwrap();
+        let seq_padded = analyze_audio(&padded, &|| false)
+            .unwrap()
+            .fingerprint
+            .unwrap();
+        let _ = std::fs::remove_file(clean);
+        let _ = std::fs::remove_file(padded);
+        assert!(fp_clean.starts_with("80s_"), "{fp_clean}");
+        assert_eq!(fp_clean, fp_padded);
+        assert!(seq_clean.starts_with("80s_"), "{seq_clean}");
+        assert_eq!(seq_clean, seq_padded);
     }
 
     #[test]
@@ -747,7 +1130,10 @@ mod tests {
         for _ in 0..(120 * ANALYSIS_RATE as usize) {
             analyzer.push_resampled(0.0);
         }
-        assert_eq!(fingerprint(&analyzer.mono, &analyzer.hop_sq, 120.0), None);
+        assert_eq!(
+            fingerprint_with_window(&analyzer.mono, &analyzer.hop_sq, WINDOW_SEC, None),
+            None
+        );
     }
 
     #[test]

@@ -243,7 +243,10 @@ pub(crate) fn request(path: &Path, field: Field, kind: MediaType) {
     // start workers or open neighboring files, even when reading them can be slow.
     if !matches!(
         field.source(),
-        Source::Analysis | Source::Sharpness | Source::AudioFingerprint | Source::AudioPcmHash
+        Source::Analysis
+            | Source::Sharpness
+            | Source::AudioAnalysis
+            | Source::AudioFastFingerprint
     ) {
         return;
     }

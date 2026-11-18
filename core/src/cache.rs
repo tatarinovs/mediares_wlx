@@ -26,17 +26,19 @@ pub enum CachedMedia {
     Unsupported,
 }
 
-/// Spectral fingerprint; `None` for (nearly) silent files.
+/// Combined sequential audio analysis: spectral fingerprint + PCM hash + decoded duration.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AudioFingerprint {
+pub struct AudioAnalysis {
     pub duration_sec: u32,
+    pub pcm_hash: String,
     pub fingerprint: Option<String>,
 }
 
+/// Seek-based spectral fingerprint; `None` for (nearly) silent files.
 #[derive(Debug, Clone, PartialEq)]
-pub struct AudioPcmHash {
+pub struct AudioFastFingerprint {
     pub duration_sec: u32,
-    pub pcm_hash: String,
+    pub fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -44,8 +46,8 @@ pub struct AudioDuration(pub u32);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioField {
-    Fingerprint,
-    PcmHash,
+    Analysis,
+    FastFingerprint,
     Duration,
 }
 
@@ -389,13 +391,13 @@ fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia
     })
 }
 
-fn audio_fingerprint_cache() -> &'static FileCache<AudioFingerprint> {
-    static CACHE: OnceLock<FileCache<AudioFingerprint>> = OnceLock::new();
+fn audio_analysis_cache() -> &'static FileCache<AudioAnalysis> {
+    static CACHE: OnceLock<FileCache<AudioAnalysis>> = OnceLock::new();
     CACHE.get_or_init(|| FileCache::new(CAPACITY))
 }
 
-fn audio_pcm_cache() -> &'static FileCache<AudioPcmHash> {
-    static CACHE: OnceLock<FileCache<AudioPcmHash>> = OnceLock::new();
+fn audio_fast_fingerprint_cache() -> &'static FileCache<AudioFastFingerprint> {
+    static CACHE: OnceLock<FileCache<AudioFastFingerprint>> = OnceLock::new();
     CACHE.get_or_init(|| FileCache::new(CAPACITY))
 }
 
@@ -406,12 +408,10 @@ fn audio_duration_cache() -> &'static FileCache<AudioDuration> {
 
 pub(crate) fn is_audio_cached(path: &Path, field: AudioField) -> bool {
     match field {
-        AudioField::Fingerprint => audio_fingerprint_cache().contains(path),
-        AudioField::PcmHash => audio_pcm_cache().contains(path),
+        AudioField::Analysis => audio_analysis_cache().contains(path),
+        AudioField::FastFingerprint => audio_fast_fingerprint_cache().contains(path),
         AudioField::Duration => {
-            audio_duration_cache().contains(path)
-                || audio_fingerprint_cache().contains(path)
-                || audio_pcm_cache().contains(path)
+            audio_duration_cache().contains(path) || audio_analysis_cache().contains(path)
         }
     }
 }
@@ -438,32 +438,33 @@ fn audio_result<T: crate::disk_cache::DiskValue + Clone>(
 }
 
 #[cfg(feature = "audio-decode")]
-pub fn get_audio_fingerprint(
-    path: &Path,
-    cancelled: &dyn Fn() -> bool,
-) -> Option<AudioFingerprint> {
+pub fn get_audio_analysis(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<AudioAnalysis> {
     audio_result(
-        audio_fingerprint_cache(),
+        audio_analysis_cache(),
         path,
         cancelled,
-        || crate::audio_fingerprint::fingerprint_audio(path, cancelled),
-        || AudioFingerprint {
+        || crate::audio_fingerprint::analyze_audio(path, cancelled),
+        || AudioAnalysis {
             duration_sec: u32::MAX,
+            pcm_hash: String::new(),
             fingerprint: None,
         },
     )
 }
 
 #[cfg(feature = "audio-decode")]
-pub fn get_audio_pcm_hash(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<AudioPcmHash> {
+pub fn get_audio_fast_fingerprint(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<AudioFastFingerprint> {
     audio_result(
-        audio_pcm_cache(),
+        audio_fast_fingerprint_cache(),
         path,
         cancelled,
-        || crate::audio_fingerprint::hash_audio_pcm(path, cancelled),
-        || AudioPcmHash {
+        || crate::audio_fingerprint::fast_fingerprint_audio(path, cancelled),
+        || AudioFastFingerprint {
             duration_sec: u32::MAX,
-            pcm_hash: String::new(),
+            fingerprint: None,
         },
     )
 }
@@ -473,12 +474,11 @@ pub fn get_audio_duration(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<A
     if cancelled() {
         return None;
     }
-    // Both hash passes already count frames. Reuse that byproduct without starting the
-    // other algorithm or doing SQLite work on a RAM hit.
-    if let Some(duration) = audio_fingerprint_cache()
+    // Full audio analysis already counts decoded frames. Reuse that byproduct without doing
+    // SQLite work on a RAM hit.
+    if let Some(duration) = audio_analysis_cache()
         .cached(path)
         .map(|a| a.duration_sec)
-        .or_else(|| audio_pcm_cache().cached(path).map(|a| a.duration_sec))
     {
         return Some(AudioDuration(duration));
     }
@@ -489,11 +489,8 @@ pub fn get_audio_duration(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<A
         || {
             let key =
                 FileKey::for_path(path).ok_or(crate::audio_fingerprint::AudioError::Unsupported)?;
-            if let Some(duration) = crate::disk_cache::read::<AudioFingerprint>(&key)
-                .map(|(a, _)| a.duration_sec)
-                .or_else(|| {
-                    crate::disk_cache::read::<AudioPcmHash>(&key).map(|(a, _)| a.duration_sec)
-                })
+            if let Some(duration) =
+                crate::disk_cache::read::<AudioAnalysis>(&key).map(|(a, _)| a.duration_sec)
             {
                 return Ok(AudioDuration(duration));
             }
@@ -711,8 +708,8 @@ pub fn is_video_tags_cached(path: &Path) -> bool {
 pub fn clear_all() {
     clear_row_key();
     get_cache().clear();
-    audio_fingerprint_cache().clear();
-    audio_pcm_cache().clear();
+    audio_analysis_cache().clear();
+    audio_fast_fingerprint_cache().clear();
     audio_duration_cache().clear();
     #[cfg(feature = "tags")]
     tags_cache().clear();

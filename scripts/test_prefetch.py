@@ -41,10 +41,15 @@ def worker(args):
     started = time.perf_counter()
     result = values(dll, fields, spec["paths"], spec["field"])
     if spec.get("probe_independence"):
-        # With workers disabled, a quick request must defer the other algorithm even
+        # With workers disabled, a quick request must defer unrelated audio algorithms even
         # after this one is in RAM. Checking a disk row alone cannot prove RAM isolation.
-        for other in ("Audio_Fingerprint", "Audio_PCM_Hash"):
-            if other != spec["field"]:
+        shared = (
+            {"Audio_Fingerprint", "Audio_PCM_Hash"}
+            if spec["field"] in ("Audio_Fingerprint", "Audio_PCM_Hash")
+            else {spec["field"]}
+        )
+        for other in ("Audio_Fingerprint", "Audio_Fast_Fingerprint", "Audio_PCM_Hash"):
+            if other not in shared:
                 buf = ctypes.create_string_buffer(8192)
                 assert dll.ContentGetValueW(spec["paths"][0], fields[other][0], 0,
                                             buf, len(buf), 1) == 0, other
@@ -166,8 +171,8 @@ def main(args):
             with closing(sqlite3.connect(work / f"{name}-{threads}.sqlite3")) as db:
                 rows = db.execute("SELECT path,slot FROM entries").fetchall()
                 assert rows == [(str(candidates[0]).encode("utf-16-le"), slot)], (field, rows)
-    for field, slot in (("Audio_Fingerprint", 10), ("Audio_PCM_Hash", 11),
-                        ("Audio_Duration_Sec", 12)):
+    for field, slot in (("Audio_Fingerprint", 10), ("Audio_PCM_Hash", 10),
+                        ("Audio_Fast_Fingerprint", 11), ("Audio_Duration_Sec", 12)):
         baseline = measure(args.dll, work, audio_paths, field, 0, field,
                            probe_independence=True)
         parallel = measure(args.dll, work, audio_paths, field, 3, field)
@@ -176,11 +181,13 @@ def main(args):
             with closing(sqlite3.connect(work / f"{field}-{threads}.sqlite3")) as db:
                 rows = db.execute("SELECT slot,fingerprint,pcm_hash FROM entries").fetchall()
                 assert len(rows) == 8 and {r[0] for r in rows} == {slot}, (field, rows)
-                if slot != 10:
+                if slot not in (10, 11):
                     assert all(r[1] is None for r in rows)
-                if slot != 11:
+                if slot != 10:
                     assert all(r[2] is None for r in rows)
-        if slot == 10:
+                else:
+                    assert all(r[2] is not None for r in rows)
+        if slot in (10, 11) and field != "Audio_PCM_Hash":
             assert baseline["returned"] == 7  # Silence is a successful empty fingerprint.
         else:
             assert baseline["returned"] == 8
@@ -191,7 +198,7 @@ def main(args):
             expected_count = len(rows) == 1 if slot == 12 else 2 <= len(rows) <= 8
             assert expected_count and {r[0] for r in rows} == {slot}, (field, rows)
     measure(args.dll, work, audio_paths[:1], "Audio_Fingerprint", 3, "both-audio",
-            linger=0.5, also_field="Audio_PCM_Hash")
+            linger=0.5, also_field="Audio_Fast_Fingerprint")
     with closing(sqlite3.connect(work / "both-audio-3.sqlite3")) as db:
         counts = dict(db.execute("SELECT slot,count(*) FROM entries GROUP BY slot"))
         assert counts.keys() == {10, 11} and all(2 <= n <= 8 for n in counts.values()), counts
@@ -219,7 +226,7 @@ def main(args):
         selected = selected[:96]
         if not selected:
             raise RuntimeError(f"No media in {root}")
-        for field in (["Audio_Fingerprint", "Audio_PCM_Hash", "Audio_Artist"] if audio else ["Image_pHash", "Photo_Make"]):
+        for field in (["Audio_Fingerprint", "Audio_Fast_Fingerprint", "Audio_PCM_Hash", "Audio_Artist"] if audio else ["Image_pHash", "Photo_Make"]):
             reference = None
             for repeat in range(args.repeats):
                 for threads in ((0, 3, 7) if repeat % 2 == 0 else (7, 3, 0)):

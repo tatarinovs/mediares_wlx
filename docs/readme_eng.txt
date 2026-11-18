@@ -241,11 +241,12 @@ PrefetchThreads=3
 0 disables read-ahead; 1–8 select the worker count (also limited by CPUs).
 The default is three workers. Restart TC after editing. An existing INI
 beside the DLL takes priority; otherwise mediares.ini in TC's settings
-directory is used. Saving through the GUI preserves this key. Audio
-fingerprint and PCM hash are computed, cached and prefetched independently.
-Duration reuses an existing result or counts decoded frames without hashing.
-Requesting both hashes runs two independent passes. Results in the previous
-combined audio cache remain readable without recalculating them.
+directory is used. Saving through the GUI preserves this key. Audio_Fingerprint
+and Audio_PCM_Hash are computed, cached and prefetched together in a single
+decoding pass; Audio_Fast_Fingerprint is computed and prefetched independently.
+Duration reuses an existing full analysis or counts decoded frames without
+hashing. Results in the previous combined audio cache remain readable without
+recalculating them.
 
 Read-ahead selects neighbors with the same extension, ignoring case.
 Different extensions have separate queues; TC does not expose its search mask.
@@ -297,14 +298,18 @@ Video:
 
 Music:
 
-  Audio_Fingerprint  The same recording in different formats and
-                     quality: MP3 ↔ FLAC, another bitrate, mono, another
-                     volume. A different master, a live version or
-                     a trimmed recording will not match.
-  Audio_PCM_Hash     The same sound with other tags or in another
-                     container (a re-tagged MP3, WAV ↔ FLAC).
-  Audio_Artist_Title "artist - title" from the tags, ignoring case
-                     and punctuation.
+  Audio_Fingerprint      The same recording in different formats and
+                         quality: MP3 ↔ FLAC, another bitrate, mono, another
+                         volume. Recordings shorter than 3 s fall back to
+                         PCM hash. A different master, a live version or
+                         a trimmed recording will not match.
+  Audio_Fast_Fingerprint Fast spectral fingerprint: for tracks longer than
+                         75 s, seeks to edges and three 12 s windows instead
+                         of decoding the entire file.
+  Audio_PCM_Hash         The same sound with other tags or in another
+                         container (a re-tagged MP3, WAV ↔ FLAC).
+  Audio_Artist_Title     "artist - title" from the tags, ignoring case
+                         and punctuation.
 
 Sizes, aspect ratio and duration (see below) are useful for a rough
 first pass.

@@ -62,15 +62,16 @@ def worker(dll_path, paths):
     groups = {
         ".bmp": ["Image_dHash", "Image_pHash", "Image_CoarseHash", "Image_Sharpness",
                  "Image_Width", "Image_Height", "Image_Bit_Depth", "Image_Has_Alpha"],
-        ".wav": ["Audio_Fingerprint", "Audio_PCM_Hash", "Audio_Duration_Sec", "Audio_Title",
-                 "Audio_Artist", "Audio_Sample_Rate_Hz", "Audio_Codec", "Audio_Channels"],
+        ".wav": ["Audio_Fingerprint", "Audio_Fast_Fingerprint", "Audio_PCM_Hash",
+                 "Audio_Duration_Sec", "Audio_Title", "Audio_Artist",
+                 "Audio_Sample_Rate_Hz", "Audio_Codec", "Audio_Channels"],
         ".avi": ["Video_Width", "Video_Height", "Video_Dimensions", "Video_Duration_Sec",
                  "Video_Frame_Rate", "Video_Codec", "Video_Fingerprint", "Video_dHash_Mid"],
         ".jpg": ["Photo_Make", "Photo_Model", "Photo_Orientation", "Photo_ISO", "Photo_FNumber"],
         ".mp4": ["Video_Title", "Video_Artist", "Video_Year"],
     }
-    delayed = {"Image_dHash", "Image_Sharpness", "Audio_Fingerprint", "Audio_Title",
-               "Video_Fingerprint", "Video_Width", "Video_Title", "Photo_Make"}
+    delayed = {"Image_dHash", "Image_Sharpness", "Audio_Fingerprint", "Audio_Fast_Fingerprint",
+               "Audio_Title", "Video_Fingerprint", "Video_Width", "Video_Title", "Photo_Make"}
     values = {}
     start = time.perf_counter()
     try:
@@ -317,7 +318,7 @@ def run_check(dll, baseline, viewer_dll, stress):
 
     cold = run(db)
     original = rows()
-    assert len(original) == 13, original  # Separate audio hashes; empty JPEG EXIF/video tags.
+    assert len(original) == 13, original  # Combined audio analysis + fast fingerprint; empty EXIF/video tags.
     with closing(sqlite3.connect(db)) as conn:
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
         assert slots == {0, 1, 2, 3, 4, 6, 7, 8, 10, 11}, slots

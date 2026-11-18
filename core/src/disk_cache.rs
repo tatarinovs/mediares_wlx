@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::cache::{AudioDuration, AudioFingerprint, AudioPcmHash, CachedMedia, FileKey};
+use crate::cache::{AudioAnalysis, AudioDuration, AudioFastFingerprint, CachedMedia, FileKey};
 use crate::hashing::ImageAnalysis;
 use crate::sqlite::{Connection, Error, Result, Row, Statement};
 use crate::video_frame::VideoAnalysis;
@@ -245,7 +245,9 @@ impl Store {
 
     fn read_with_weight<T: DiskValue>(&self, key: &Key) -> Result<(T, usize)> {
         let result = self.read_slot_with_weight(key, T::SLOT, None);
-        if T::LEGACY_AUDIO && matches!(result, Err(Error::QueryReturnedNoRows)) {
+        if T::LEGACY_AUDIO
+            && matches!(result, Err(Error::QueryReturnedNoRows | Error::TypeMismatch))
+        {
             // Old audio entries already contain both hashes. Project only the requested
             // value so upgrading does not force a collection-wide decode again.
             self.read_slot_with_weight(key, 0, Some(3))
@@ -496,14 +498,39 @@ impl DiskValue for CachedMedia {
     }
 }
 
-// Independent slots: a missing spectral fingerprint (silence) is a successful result,
-// never evidence that PCM hashing has already run. Old complete audio records remain readable;
-// new work writes only the requested field. The cache schema/version remain valid.
-impl DiskValue for AudioFingerprint {
+// Combined sequential audio analysis (fingerprint + PCM hash) shares slot 10; seek-based
+// fast fingerprint uses slot 11 independently; decoded duration uses slot 12.
+// Old complete audio records in slot 0 remain readable.
+impl DiskValue for AudioAnalysis {
     const SLOT: i32 = 10;
     const LEGACY_AUDIO: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
+        Ok(Self {
+            duration_sec: r.get(COL_DURATION)?,
+            pcm_hash: r.get(COL_PCM_HASH)?,
+            fingerprint: r.get(COL_FINGERPRINT)?,
+        })
+    }
+
+    fn columns(&self) -> Option<Columns<'_>> {
+        Some(Columns {
+            kind: 3,
+            duration: Some(self.duration_sec),
+            fingerprint: self.fingerprint.as_deref(),
+            pcm_hash: Some(&self.pcm_hash),
+            ..Columns::default()
+        })
+    }
+}
+
+impl DiskValue for AudioFastFingerprint {
+    const SLOT: i32 = 11;
+
+    fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<Option<String>>(COL_PCM_HASH)?.is_some() {
+            return Err(Error::InvalidQuery);
+        }
         Ok(Self {
             duration_sec: r.get(COL_DURATION)?,
             fingerprint: r.get(COL_FINGERPRINT)?,
@@ -515,27 +542,6 @@ impl DiskValue for AudioFingerprint {
             kind: 3,
             duration: Some(self.duration_sec),
             fingerprint: self.fingerprint.as_deref(),
-            ..Columns::default()
-        })
-    }
-}
-
-impl DiskValue for AudioPcmHash {
-    const SLOT: i32 = 11;
-    const LEGACY_AUDIO: bool = true;
-
-    fn from_row(r: &Row<'_>) -> Result<Self> {
-        Ok(Self {
-            duration_sec: r.get(COL_DURATION)?,
-            pcm_hash: r.get(COL_PCM_HASH)?,
-        })
-    }
-
-    fn columns(&self) -> Option<Columns<'_>> {
-        Some(Columns {
-            kind: 3,
-            duration: Some(self.duration_sec),
-            pcm_hash: Some(&self.pcm_hash),
             ..Columns::default()
         })
     }
@@ -1697,18 +1703,10 @@ mod tests {
                 true,
             )
             .unwrap();
-        assert_eq!(
-            store
-                .read::<AudioFingerprint>(&key)
-                .unwrap()
-                .fingerprint
-                .as_deref(),
-            Some("180s_12_34_56")
-        );
-        assert_eq!(
-            store.read::<AudioPcmHash>(&key).unwrap().pcm_hash,
-            "0123456789abcdef"
-        );
+        let analysis = store.read::<AudioAnalysis>(&key).unwrap();
+        assert_eq!(analysis.duration_sec, 180);
+        assert_eq!(analysis.fingerprint.as_deref(), Some("180s_12_34_56"));
+        assert_eq!(analysis.pcm_hash, "0123456789abcdef");
         assert_eq!(
             store.read::<AudioDuration>(&key).unwrap(),
             AudioDuration(180)
@@ -1716,15 +1714,15 @@ mod tests {
         put(
             &mut store,
             &key,
-            &AudioFingerprint {
+            &AudioAnalysis {
                 duration_sec: 181,
+                pcm_hash: "fedcba9876543210".into(),
                 fingerprint: None,
             },
         );
-        assert_eq!(
-            store.read::<AudioFingerprint>(&key).unwrap().fingerprint,
-            None
-        );
+        let updated = store.read::<AudioAnalysis>(&key).unwrap();
+        assert_eq!(updated.fingerprint, None);
+        assert_eq!(updated.pcm_hash, "fedcba9876543210");
         // An image/video record in slot 0 must never be mistaken for legacy audio.
         store
             .db
@@ -1734,8 +1732,7 @@ mod tests {
             .db
             .execute("UPDATE entries SET kind=2 WHERE slot=0", &[])
             .unwrap();
-        assert!(store.read::<AudioFingerprint>(&key).is_err());
-        assert!(store.read::<AudioPcmHash>(&key).is_err());
+        assert!(store.read::<AudioAnalysis>(&key).is_err());
         assert!(store.read::<AudioDuration>(&key).is_err());
     }
 
@@ -1744,25 +1741,26 @@ mod tests {
         let fixture = Fixture::new();
         let key = fixture.key();
         for fingerprint in [Some("180s_12_34_56".into()), None] {
-            let expected = AudioFingerprint {
-                duration_sec: 180,
-                fingerprint,
-            };
-            let pcm = AudioPcmHash {
+            let expected = AudioAnalysis {
                 duration_sec: 180,
                 pcm_hash: "ffffffffffffffff".into(),
+                fingerprint: fingerprint.clone(),
+            };
+            let fast = AudioFastFingerprint {
+                duration_sec: 180,
+                fingerprint,
             };
             let mut store = Store::open(&fixture.path()).unwrap();
             store.db.execute("DELETE FROM entries", &[]).unwrap();
             put(&mut store, &key, &expected);
-            assert!(store.read::<AudioPcmHash>(&key).is_err());
+            assert!(store.read::<AudioFastFingerprint>(&key).is_err());
             assert!(store.read::<AudioDuration>(&key).is_err());
-            put(&mut store, &key, &pcm);
+            put(&mut store, &key, &fast);
             put(&mut store, &key, &AudioDuration(180));
             drop(store);
             let store = Store::open(&fixture.path()).unwrap();
-            assert_eq!(store.read::<AudioFingerprint>(&key).unwrap(), expected);
-            assert_eq!(store.read::<AudioPcmHash>(&key).unwrap(), pcm);
+            assert_eq!(store.read::<AudioAnalysis>(&key).unwrap(), expected);
+            assert_eq!(store.read::<AudioFastFingerprint>(&key).unwrap(), fast);
             assert_eq!(
                 store.read::<AudioDuration>(&key).unwrap(),
                 AudioDuration(180)
@@ -1771,8 +1769,8 @@ mod tests {
                 store
                     .db
                     .query_row(
-                        "SELECT count(*) FROM entries WHERE (slot=10 AND pcm_hash IS NOT NULL)
-                     OR (slot=11 AND fingerprint IS NOT NULL)",
+                        "SELECT count(*) FROM entries WHERE (slot=10 AND pcm_hash IS NULL)
+                     OR (slot=11 AND pcm_hash IS NOT NULL)",
                         &[],
                         |r| r.get::<i64>(0),
                     )
@@ -2014,12 +2012,13 @@ mod tests {
             .pragma_update_and_check_i64("max_page_count", pages)
             .unwrap();
         let huge = "x".repeat((pages * 4096) as usize);
-        let value = AudioPcmHash {
+        let value = AudioAnalysis {
             duration_sec: 1,
             pcm_hash: huge,
+            fingerprint: None,
         };
         assert!(store
-            .write(&key, AudioPcmHash::SLOT, value.columns().unwrap(), true)
+            .write(&key, AudioAnalysis::SLOT, value.columns().unwrap(), true)
             .is_err());
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
     }

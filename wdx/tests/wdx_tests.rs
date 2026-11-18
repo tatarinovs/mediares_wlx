@@ -27,11 +27,11 @@ fn field(name: &str) -> i32 {
 #[test]
 fn test_supported_fields_enumeration() {
     let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
-    assert_eq!(fields.len(), 75);
+    assert_eq!(fields.len(), 76);
     let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     // Hashes for duplicate search come first.
     assert_eq!(
-        names[..7],
+        names[..8],
         [
             "Image_dHash",
             "Image_pHash",
@@ -39,13 +39,14 @@ fn test_supported_fields_enumeration() {
             "Video_Fingerprint",
             "Video_dHash_Mid",
             "Audio_Fingerprint",
+            "Audio_Fast_Fingerprint",
             "Audio_PCM_Hash",
         ]
     );
     assert_eq!(names.last(), Some(&"Plugin_Version"));
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 75, "names are unique");
+    assert_eq!(names.len(), 76, "names are unique");
 
     for (name, kind) in [
         ("Image_dHash", FT_STRINGW),
@@ -264,9 +265,10 @@ fn write_wav_tagged(
         } else {
             // Time from the start of the sound (exact), so padding doesn't change the samples.
             let t = (i - lead_silence * rate) as f32 / rate as f32;
-            let f = (220.0 + 55.0 * (t as u32 % 7) as f32) * pitch_shift;
+            let f = (220.0 + 55.0 * (t as u32 % 7) as f32 + 8.0 * t) * pitch_shift;
             0.3 * (2.0 * std::f32::consts::PI * f * t).sin()
                 + 0.2 * (2.0 * std::f32::consts::PI * f * 2.5 * t).sin()
+                + 0.1 * (2.0 * std::f32::consts::PI * f * 6.0 * t).sin()
         };
         data.extend_from_slice(&((v * 32767.0) as i16).to_le_bytes());
     }
@@ -359,12 +361,20 @@ fn test_audio_fields() {
     let (res, fp) = read(&a, field("Audio_Fingerprint"));
     assert_eq!(res, FT_STRINGW);
     assert!(fp.starts_with("40s_"), "{}", fp);
+    let (fast_res, fast_fp) = read(&a, field("Audio_Fast_Fingerprint"));
+    assert_eq!(fast_res, FT_STRINGW);
+    assert!(fast_fp.starts_with("40s_"), "{}", fast_fp);
     assert_eq!(
         read(&a, field("Audio_Duration_Sec")),
         (FT_NUMERIC_32, "40".to_string())
     );
     assert_eq!(read(&a, field("Media_Type")).1, "Audio");
-    // Leading silence changes neither the PCM hash nor the fingerprint windows' content.
+    // Leading silence changes neither the PCM hash nor either fingerprint.
+    assert_eq!(read(&padded, field("Audio_Fingerprint")), (FT_STRINGW, fp.clone()));
+    assert_eq!(
+        read(&padded, field("Audio_Fast_Fingerprint")),
+        (FT_STRINGW, fast_fp.clone())
+    );
     assert_eq!(
         read(&a, field("Audio_PCM_Hash")),
         read(&padded, field("Audio_PCM_Hash"))
@@ -374,6 +384,7 @@ fn test_audio_fields() {
         read(&other, field("Audio_PCM_Hash"))
     );
     assert_ne!(fp, read(&other, field("Audio_Fingerprint")).1);
+    assert_ne!(fast_fp, read(&other, field("Audio_Fast_Fingerprint")).1);
     // Untagged: no artist/title.
     assert_eq!(read(&a, field("Audio_Artist_Title")).0, FT_FIELDEMPTY);
 }

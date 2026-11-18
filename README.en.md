@@ -185,11 +185,12 @@ In Total Commander's duplicate search, choose comparison by plugin fields and se
 | `Image_CoarseHash` | Photos with contrast changes, slight cropping, RAW + JPEG pairs; more prone to false matches |
 | `Video_Fingerprint` | Video copies and container changes without re-encoding |
 | `Video_dHash_Mid` | Compare videos by a frame in the middle |
-| `Audio_Fingerprint` | Audio copies with a different bitrate or codec |
+| `Audio_Fingerprint` | Audio copies with a different bitrate or codec (full scan; `< 3` s falls back to PCM hash) |
+| `Audio_Fast_Fingerprint` | Fast audio fingerprint: on tracks `> 75` s, seeks to edges and three windows |
 | `Audio_PCM_Hash` | Identical decoded audio, such as WAV and FLAC |
 | `Audio_Artist_Title` | Match artist and title tags |
 
-Total Commander compares values exactly, so some modified copies may not be found. Photo rotation, cropping, video edits or different audio mastering can change the result. Audio analysis reads the entire file. Audio hashes and fingerprints are withheld on a decoding error or detected truncation. `Audio_Duration_Sec` measures the decoded stream; use `Audio_Length` for a normal duration column. Video dimensions and duration come from metadata without analyzing frames.
+Total Commander compares values exactly, so some modified copies may not be found. Photo rotation, cropping, video edits or different audio mastering can change the result. `Audio_Fingerprint` and `Audio_PCM_Hash` read the entire file in one pass; `Audio_Fast_Fingerprint` skips the bulk of tracks longer than 75 s and decodes only short slices. Audio hashes and fingerprints are withheld on a decoding error or detected truncation. `Audio_Duration_Sec` measures the decoded stream; use `Audio_Length` for a normal duration column. Video dimensions and duration come from metadata without analyzing frames.
 
 **Check matches before deleting files.**
 
@@ -210,7 +211,7 @@ Hash, fingerprint and sharpness requests in columns or duplicate search also pre
 PrefetchThreads=3
 ```
 
-`0` disables read-ahead; `1`–`8` select the background worker count (also limited by available CPUs). The default is three workers. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. Audio fingerprint and PCM hash are computed, cached and prefetched independently: only the requested kind is calculated. Requesting duration does not start hashing.
+`0` disables read-ahead; `1`–`8` select the background worker count (also limited by available CPUs). The default is three workers. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. `Audio_Fingerprint` and `Audio_PCM_Hash` are computed and cached together in a single decoding pass; `Audio_Fast_Fingerprint` is computed and prefetched independently. Requesting duration does not start hashing.
 
 Read-ahead selects neighbors with the same extension, ignoring case. Different extensions have separate queues. TC does not expose its search mask to the plugin.
 
