@@ -64,6 +64,26 @@ pub fn save_audio_level() {
     }
 }
 
+/// `None` until the saved time counter mode is first needed.
+static TIME_REMAINING: Mutex<Option<bool>> = Mutex::new(None);
+
+pub fn time_remaining() -> bool {
+    let mut mode = TIME_REMAINING.lock().unwrap_or_else(|e| e.into_inner());
+    *mode.get_or_insert_with(crate::config::load_time_remaining)
+}
+
+fn toggle_time_remaining() -> bool {
+    let next = {
+        let mut mode = TIME_REMAINING.lock().unwrap_or_else(|e| e.into_inner());
+        let current = *mode.get_or_insert_with(crate::config::load_time_remaining);
+        let next = !current;
+        *mode = Some(next);
+        next
+    };
+    crate::config::save_time_remaining(next);
+    next
+}
+
 /// Playback controls shared by the video engine and the audio player.
 pub trait Transport {
     fn is_playing(&self) -> bool;
@@ -166,6 +186,7 @@ pub fn bar_state(t: &dyn Transport, known_duration: f64) -> BarState {
         duration: t.duration().max(known_duration),
         volume: t.volume(),
         muted: t.is_muted(),
+        remaining: time_remaining(),
     }
 }
 
@@ -186,6 +207,7 @@ pub struct BarState {
     pub duration: f64,
     pub volume: f64,
     pub muted: bool,
+    pub remaining: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -206,6 +228,7 @@ pub enum Hit {
     Prev,
     Play,
     Next,
+    Time,
     /// Fraction of the duration under the cursor (0..=1).
     Timeline(f64),
     Speaker,
@@ -294,6 +317,8 @@ pub fn hit(l: &Layout, x: i32, y: i32) -> Hit {
         Hit::Speaker
     } else if contains(&l.volume, x, y) {
         Hit::Volume(fraction(&l.volume, x))
+    } else if contains(&l.time, x, y) {
+        Hit::Time
     } else {
         Hit::Bar
     }
@@ -344,6 +369,9 @@ impl BarControl {
             Hit::Prev => return Click::Skip(false),
             Hit::Next => return Click::Skip(true),
             Hit::Play => t.toggle_play(),
+            Hit::Time => {
+                toggle_time_remaining();
+            }
             Hit::Timeline(f) => {
                 let was_playing = t.is_playing();
                 t.pause();
@@ -407,13 +435,31 @@ impl BarControl {
     }
 }
 
-pub fn format_time(seconds: f64) -> String {
-    let total = seconds.max(0.0) as u64;
+fn format_seconds(total: u64) -> String {
     let (h, m, s) = (total / 3600, total / 60 % 60, total % 60);
     if h > 0 {
         format!("{}:{:02}:{:02}", h, m, s)
     } else {
         format!("{}:{:02}", m, s)
+    }
+}
+
+pub fn format_time(seconds: f64) -> String {
+    format_seconds(seconds.max(0.0) as u64)
+}
+
+pub fn format_counter(position: f64, duration: f64, remaining: bool) -> String {
+    let pos_sec = position.max(0.0) as u64;
+    let total_sec = duration.max(0.0) as u64;
+    if remaining {
+        let rem_sec = total_sec.saturating_sub(pos_sec);
+        format!("{} / -{}", format_seconds(pos_sec), format_seconds(rem_sec))
+    } else {
+        format!(
+            "{} / {}",
+            format_seconds(pos_sec),
+            format_seconds(total_sec)
+        )
     }
 }
 
@@ -586,11 +632,7 @@ pub unsafe fn paint(
         }
     }
 
-    let time = format!(
-        "{} / {}",
-        format_time(state.position),
-        format_time(state.duration)
-    );
+    let time = format_counter(state.position, state.duration, state.remaining);
     text(dc, l.time, &time, TEXT, DT_LEFT);
 
     let progress = if state.duration > 0.0 {
@@ -675,6 +717,12 @@ mod tests {
         assert_eq!(format_time(75.9), "1:15");
         assert_eq!(format_time(3725.0), "1:02:05");
         assert_eq!(format_time(f64::NAN), "0:00");
+
+        assert_eq!(format_counter(10.9, 100.1, false), "0:10 / 1:40");
+        assert_eq!(format_counter(10.9, 100.1, true), "0:10 / -1:30");
+        assert_eq!(format_counter(100.5, 100.0, true), "1:40 / -0:00");
+        assert_eq!(format_counter(0.0, 0.0, true), "0:00 / -0:00");
+        assert_eq!(format_counter(3725.0, 7325.0, true), "1:02:05 / -1:00:00");
     }
 
     #[test]
@@ -684,6 +732,7 @@ mod tests {
         assert_eq!(hit(&l, l.play.left - 1, 580), Hit::Bar);
         assert_eq!(hit(&l, 10, 100), Hit::Outside);
         assert_eq!(hit(&l, (l.play.left + l.play.right) / 2, 580), Hit::Play);
+        assert_eq!(hit(&l, (l.time.left + l.time.right) / 2, 580), Hit::Time);
         match hit(&l, l.timeline.left, 580) {
             Hit::Timeline(f) => assert!(f < 0.01),
             other => panic!("{:?}", other),

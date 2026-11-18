@@ -56,6 +56,34 @@ pub fn save_volume(volume: f64) {
     }
 }
 
+/// Transport time counter mode left by the previous session (`false` = total duration,
+/// `true` = remaining time).
+pub fn load_time_remaining() -> bool {
+    load_time_remaining_from(&ini_path())
+}
+
+pub fn save_time_remaining(remaining: bool) {
+    save_time_remaining_to(remaining, &ini_path());
+}
+
+fn load_time_remaining_from(path: &Path) -> bool {
+    let ini = HSTRING::from(path.as_os_str());
+    unsafe { GetPrivateProfileIntW(SECTION, w!("TimeRemaining"), 0, &ini) != 0 }
+}
+
+fn save_time_remaining_to(remaining: bool, path: &Path) {
+    prepare_unicode(path);
+    let ini = HSTRING::from(path.as_os_str());
+    unsafe {
+        let _ = WritePrivateProfileStringW(
+            SECTION,
+            w!("TimeRemaining"),
+            if remaining { w!("1") } else { w!("0") },
+            &ini,
+        );
+    }
+}
+
 /// Readies `ini` for writing in UTF-16. `WritePrivateProfileStringW` writes the ANSI code page
 /// unless the file already starts with a UTF-16 byte order mark, and an editor path or an OSD
 /// template with a character outside that code page would come back as "?". A missing file is
@@ -527,6 +555,27 @@ mod tests {
                 .collect::<Vec<_>>()
         )
         .contains("Custom=keep"));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn time_remaining_round_trip_and_preserved_by_viewer_config_save() {
+        let path = std::env::temp_dir()
+            .join(format!("mediares_time_rem_{}.ini", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        assert!(!load_time_remaining_from(&path));
+
+        save_time_remaining_to(true, &path);
+        assert!(load_time_remaining_from(&path));
+
+        let before = ViewerConfig::default();
+        let mut after = before.clone();
+        after.wheel_zoom = !before.wheel_zoom;
+        assert!(after.save_to(&before, &path));
+        assert!(load_time_remaining_from(&path));
+
+        save_time_remaining_to(false, &path);
+        assert!(!load_time_remaining_from(&path));
         std::fs::remove_file(path).unwrap();
     }
 

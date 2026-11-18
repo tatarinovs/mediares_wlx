@@ -126,6 +126,7 @@ By default, the mouse wheel browses photos and Ctrl+wheel zooms. You can swap th
 |---|---|
 | Pause / play | Space, K, click video or cover art |
 | Seek | ← / → or playback timeline |
+| Total / remaining time | Click time counter on transport bar |
 | Next / previous keyframe; ±1 s in audio | ↑ / ↓ |
 | Previous / next frame | , / .; forward only for MPG/MPEG/VOB |
 | Video speed / reset | [ / ] / \ |

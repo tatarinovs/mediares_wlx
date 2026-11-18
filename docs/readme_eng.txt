@@ -148,6 +148,7 @@ settings.
   Play / pause ............. Space, K, click on the video
   Loupe while paused ....... hold the left mouse button on the video
   Seek ±5 seconds .......... ← / →, click on the progress bar
+  Total / remaining time ... click on the time counter on the bar
   Next / previous key frame  ↑ / ↓ (audio: ±1 second)
   Previous / next frame .... , / .
   Slower / faster .......... [ / ]  (normal speed — \)
