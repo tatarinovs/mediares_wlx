@@ -560,8 +560,8 @@ mod tests {
 
     #[test]
     fn time_remaining_round_trip_and_preserved_by_viewer_config_save() {
-        let path = std::env::temp_dir()
-            .join(format!("mediares_time_rem_{}.ini", std::process::id()));
+        let path =
+            std::env::temp_dir().join(format!("mediares_time_rem_{}.ini", std::process::id()));
         let _ = std::fs::remove_file(&path);
         assert!(!load_time_remaining_from(&path));
 

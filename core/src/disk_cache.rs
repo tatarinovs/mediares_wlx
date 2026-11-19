@@ -220,8 +220,7 @@ impl Store {
             "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
                     fingerprint, pcm_hash, sharpness, payload FROM entries
              WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
-               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)
-               AND (?7 IS NULL OR kind=?7)",
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
         )?;
         let insert_stmt = db.prepare(
             "INSERT OR REPLACE INTO entries
@@ -244,34 +243,15 @@ impl Store {
     }
 
     fn read_with_weight<T: DiskValue>(&self, key: &Key) -> Result<(T, usize)> {
-        let result = self.read_slot_with_weight(key, T::SLOT, None);
-        if T::LEGACY_AUDIO
-            && matches!(result, Err(Error::QueryReturnedNoRows | Error::TypeMismatch))
-        {
-            // Old audio entries already contain both hashes. Project only the requested
-            // value so upgrading does not force a collection-wide decode again.
-            self.read_slot_with_weight(key, 0, Some(3))
-        } else {
-            result
-        }
-    }
-
-    fn read_slot_with_weight<T: DiskValue>(
-        &self,
-        key: &Key,
-        slot: i32,
-        kind: Option<i32>,
-    ) -> Result<(T, usize)> {
         let modified: &[u8] = &key.modified;
         self.read_stmt.query_row(
             &[
                 &key.path,
-                &slot,
+                &T::SLOT,
                 &key.size,
                 &modified,
                 &VERSION,
                 &(MAX_PAYLOAD as i64),
-                &kind,
             ],
             |row| {
                 let payload_len = row.column_bytes(COL_PAYLOAD).unwrap_or(0);
@@ -281,13 +261,7 @@ impl Store {
         )
     }
 
-    fn write(
-        &mut self,
-        key: &Key,
-        slot: i32,
-        c: Columns<'_>,
-        allow_eviction: bool,
-    ) -> Result<()> {
+    fn write(&mut self, key: &Key, slot: i32, c: Columns<'_>, allow_eviction: bool) -> Result<()> {
         // Reject unbounded records before eviction (normal analysis strings are tiny).
         if c.payload.as_ref().map_or(0, String::len)
             + c.fingerprint.map_or(0, str::len)
@@ -439,7 +413,6 @@ const COL_PAYLOAD: usize = 10;
 
 pub(crate) trait DiskValue: Sized {
     const SLOT: i32;
-    const LEGACY_AUDIO: bool = false;
     fn from_row(row: &Row<'_>) -> Result<Self>;
     fn columns(&self) -> Option<Columns<'_>>;
 }
@@ -500,12 +473,13 @@ impl DiskValue for CachedMedia {
 
 // Combined sequential audio analysis (fingerprint + PCM hash) shares slot 10; seek-based
 // fast fingerprint uses slot 11 independently; decoded duration uses slot 12.
-// Old complete audio records in slot 0 remain readable.
 impl DiskValue for AudioAnalysis {
     const SLOT: i32 = 10;
-    const LEGACY_AUDIO: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<i32>(COL_KIND)? != Self::SLOT {
+            return Err(Error::TypeMismatch);
+        }
         Ok(Self {
             duration_sec: r.get(COL_DURATION)?,
             pcm_hash: r.get(COL_PCM_HASH)?,
@@ -515,7 +489,7 @@ impl DiskValue for AudioAnalysis {
 
     fn columns(&self) -> Option<Columns<'_>> {
         Some(Columns {
-            kind: 3,
+            kind: Self::SLOT,
             duration: Some(self.duration_sec),
             fingerprint: self.fingerprint.as_deref(),
             pcm_hash: Some(&self.pcm_hash),
@@ -528,6 +502,9 @@ impl DiskValue for AudioFastFingerprint {
     const SLOT: i32 = 11;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<i32>(COL_KIND)? != Self::SLOT {
+            return Err(Error::TypeMismatch);
+        }
         if r.get::<Option<String>>(COL_PCM_HASH)?.is_some() {
             return Err(Error::InvalidQuery);
         }
@@ -539,7 +516,7 @@ impl DiskValue for AudioFastFingerprint {
 
     fn columns(&self) -> Option<Columns<'_>> {
         Some(Columns {
-            kind: 3,
+            kind: Self::SLOT,
             duration: Some(self.duration_sec),
             fingerprint: self.fingerprint.as_deref(),
             ..Columns::default()
@@ -549,15 +526,17 @@ impl DiskValue for AudioFastFingerprint {
 
 impl DiskValue for AudioDuration {
     const SLOT: i32 = 12;
-    const LEGACY_AUDIO: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<i32>(COL_KIND)? != Self::SLOT {
+            return Err(Error::TypeMismatch);
+        }
         r.get(COL_DURATION).map(Self)
     }
 
     fn columns(&self) -> Option<Columns<'_>> {
         Some(Columns {
-            kind: 3,
+            kind: Self::SLOT,
             duration: Some(self.0),
             ..Columns::default()
         })
@@ -927,11 +906,17 @@ impl<'a> JsonParser<'a> {
     }
 
     fn parse_f64(&mut self) -> Option<f64> {
-        self.parse_num_str()?.parse::<f64>().ok().filter(|v| v.is_finite())
+        self.parse_num_str()?
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite())
     }
 
     fn parse_f32(&mut self) -> Option<f32> {
-        self.parse_num_str()?.parse::<f32>().ok().filter(|v| v.is_finite())
+        self.parse_num_str()?
+            .parse::<f32>()
+            .ok()
+            .filter(|v| v.is_finite())
     }
 
     fn parse_opt<T>(&mut self, f: impl FnOnce(&mut Self) -> Option<T>) -> Option<Option<T>> {
@@ -1008,7 +993,7 @@ fn static_lookup(value: &str, names: &[&'static str]) -> Option<&'static str> {
 }
 
 #[cfg(feature = "tags")]
-const AUDIO_CODECS: &[&'static str] = &[
+const AUDIO_CODECS: &[&str] = &[
     "PCM float",
     "PCM",
     "ADPCM",
@@ -1434,7 +1419,7 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("mediares-disk-{}-{stamp}", std::process::id()));
             std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("фото 🦊.jpg"), b"fixture").unwrap();
+            std::fs::write(dir.join("С„РѕС‚Рѕ рџ¦Љ.jpg"), b"fixture").unwrap();
             Self(dir)
         }
 
@@ -1442,7 +1427,7 @@ mod tests {
             self.0.join("cache.sqlite3")
         }
         fn key(&self) -> Key {
-            Key::new(&FileKey::stat(&self.0.join("фото 🦊.jpg")).unwrap()).unwrap()
+            Key::new(&FileKey::stat(&self.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg")).unwrap()).unwrap()
         }
     }
 
@@ -1472,7 +1457,7 @@ mod tests {
         roundtrip(
             &fixture,
             &crate::exif::ExifInfo {
-                make: Some("Камера 🦊".into()),
+                make: Some("РљР°РјРµСЂР° рџ¦Љ".into()),
                 model: Some("Model".into()),
                 date_time: Some("2020:01:02 03:04:05".into()),
                 date_time_original: None,
@@ -1522,14 +1507,14 @@ mod tests {
         roundtrip(
             &fixture,
             &crate::video_tags::VideoTags {
-                title: Some("Название".into()),
+                title: Some("РќР°Р·РІР°РЅРёРµ".into()),
                 artist: Some("Artist".into()),
                 director: Some("Director".into()),
                 date: Some("2026-11-12".into()),
                 genre: None,
                 comment: Some("Text\nline".into()),
                 transfer: Some(u64::MAX),
-                chapters: vec![(0.0, "Старт".into()), (60.125, "".into())],
+                chapters: vec![(0.0, "РЎС‚Р°СЂС‚".into()), (60.125, "".into())],
             },
         );
         roundtrip(&fixture, &(6000u32, 4000u32));
@@ -1565,8 +1550,8 @@ mod tests {
         use crate::audio_tags::AudioTags;
         let fixture = Fixture::new();
         let mut tags = AudioTags {
-            title: Some("Песня".into()),
-            artist: Some("Артист".into()),
+            title: Some("РџРµСЃРЅСЏ".into()),
+            artist: Some("РђСЂС‚РёСЃС‚".into()),
             album: Some("Album".into()),
             album_artist: Some("Group".into()),
             genre: Some("Rock".into()),
@@ -1682,58 +1667,6 @@ mod tests {
         };
         put(&mut store, &fixture.key(), &unknown);
         assert!(store.read::<VideoMeta>(&fixture.key()).is_err());
-    }
-
-    #[test]
-    fn old_complete_audio_records_remain_readable_without_rehashing() {
-        let fixture = Fixture::new();
-        let key = fixture.key();
-        let mut store = Store::open(&fixture.path()).unwrap();
-        store
-            .write(
-                &key,
-                0,
-                Columns {
-                    kind: 3,
-                    duration: Some(180),
-                    fingerprint: Some("180s_12_34_56"),
-                    pcm_hash: Some("0123456789abcdef"),
-                    ..Columns::default()
-                },
-                true,
-            )
-            .unwrap();
-        let analysis = store.read::<AudioAnalysis>(&key).unwrap();
-        assert_eq!(analysis.duration_sec, 180);
-        assert_eq!(analysis.fingerprint.as_deref(), Some("180s_12_34_56"));
-        assert_eq!(analysis.pcm_hash, "0123456789abcdef");
-        assert_eq!(
-            store.read::<AudioDuration>(&key).unwrap(),
-            AudioDuration(180)
-        );
-        put(
-            &mut store,
-            &key,
-            &AudioAnalysis {
-                duration_sec: 181,
-                pcm_hash: "fedcba9876543210".into(),
-                fingerprint: None,
-            },
-        );
-        let updated = store.read::<AudioAnalysis>(&key).unwrap();
-        assert_eq!(updated.fingerprint, None);
-        assert_eq!(updated.pcm_hash, "fedcba9876543210");
-        // An image/video record in slot 0 must never be mistaken for legacy audio.
-        store
-            .db
-            .execute("DELETE FROM entries WHERE slot=10", &[])
-            .unwrap();
-        store
-            .db
-            .execute("UPDATE entries SET kind=2 WHERE slot=0", &[])
-            .unwrap();
-        assert!(store.read::<AudioAnalysis>(&key).is_err());
-        assert!(store.read::<AudioDuration>(&key).is_err());
     }
 
     #[test]
@@ -1985,7 +1918,7 @@ mod tests {
         assert!(Store::open(&unknown).is_err());
         assert_eq!(db.pragma_query_i64("user_version").unwrap(), 99);
         assert!(Store::open(&fixture.0).is_err());
-        assert!(Store::open(&fixture.0.join("фото 🦊.jpg/cache.sqlite3")).is_err());
+        assert!(Store::open(&fixture.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg/cache.sqlite3")).is_err());
     }
 
     #[test]
@@ -2026,7 +1959,7 @@ mod tests {
     #[test]
     fn missing_timestamps_and_relative_paths_are_not_persisted() {
         let fixture = Fixture::new();
-        let mut key = FileKey::stat(&fixture.0.join("фото 🦊.jpg")).unwrap();
+        let mut key = FileKey::stat(&fixture.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg")).unwrap();
         key.modified = None;
         assert!(Key::new(&key).is_none());
         key.modified = Some(UNIX_EPOCH);

@@ -314,7 +314,7 @@ fn write_wav_tagged(
 #[test]
 fn test_audio_fields() {
     use std::os::windows::ffi::OsStrExt;
-    let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
+    let dir = std::env::temp_dir().join(format!("mediares_wdx_test_audio_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let (a, padded, other) = (
         dir.join("a.wav"),
@@ -370,7 +370,10 @@ fn test_audio_fields() {
     );
     assert_eq!(read(&a, field("Media_Type")).1, "Audio");
     // Leading silence changes neither the PCM hash nor either fingerprint.
-    assert_eq!(read(&padded, field("Audio_Fingerprint")), (FT_STRINGW, fp.clone()));
+    assert_eq!(
+        read(&padded, field("Audio_Fingerprint")),
+        (FT_STRINGW, fp.clone())
+    );
     assert_eq!(
         read(&padded, field("Audio_Fast_Fingerprint")),
         (FT_STRINGW, fast_fp.clone())
@@ -387,12 +390,16 @@ fn test_audio_fields() {
     assert_ne!(fast_fp, read(&other, field("Audio_Fast_Fingerprint")).1);
     // Untagged: no artist/title.
     assert_eq!(read(&a, field("Audio_Artist_Title")).0, FT_FIELDEMPTY);
+    for file in [a, padded, other] {
+        let _ = std::fs::remove_file(file);
+    }
+    let _ = std::fs::remove_dir(dir);
 }
 
 #[test]
 fn test_audio_tag_fields() {
     use std::os::windows::ffi::OsStrExt;
-    let dir = std::env::temp_dir().join("mediares_wdx_test_audio");
+    let dir = std::env::temp_dir().join(format!("mediares_wdx_test_tags_{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let path = dir.join("tagged.wav");
     let info: &[(&[u8; 4], &str)] = &[
@@ -520,6 +527,8 @@ fn test_audio_tag_fields() {
         },
         FT_FIELDEMPTY
     );
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_dir(dir);
 }
 
 /// Little-endian TIFF from IFDs of (tag, type, value bytes). IFD0 is written first; tag 0x8769

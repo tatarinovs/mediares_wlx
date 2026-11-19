@@ -216,9 +216,7 @@ pub fn decode_gray_fitted(input: Input<'_>, fit: (u32, u32)) -> Option<(GrayImag
                 WICBitmapPaletteTypeCustom,
             )
             .ok()?;
-        converter
-            .CopyPixels(std::ptr::null(), tw, &mut gray)
-            .ok()?;
+        converter.CopyPixels(std::ptr::null(), tw, &mut gray).ok()?;
     }
     let img = GrayImage::from_raw(tw, th, gray)?;
     Some((img, (w, h)))

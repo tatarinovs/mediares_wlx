@@ -534,34 +534,17 @@ fn audio_result<T: crate::disk_cache::DiskValue + Clone>(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
     analyze: impl FnOnce() -> Result<T, crate::audio_fingerprint::AudioError>,
-    empty: fn() -> T,
 ) -> Option<T> {
     cache.get_or_compute(path, |path| {
-        persistent_result(path, cancelled, || match analyze() {
-            Ok(v) => Some(v),
-            Err(crate::audio_fingerprint::AudioError::Cancelled) => None,
-            Err(
-                crate::audio_fingerprint::AudioError::Unsupported
-                | crate::audio_fingerprint::AudioError::Invalid,
-            ) => Some(empty()),
-        })
-        .map(|(value, _)| value)
+        persistent_result(path, cancelled, || analyze().ok()).map(|(value, _)| value)
     })
 }
 
 #[cfg(feature = "audio-decode")]
 pub fn get_audio_analysis(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<AudioAnalysis> {
-    audio_result(
-        audio_analysis_cache(),
-        path,
-        cancelled,
-        || crate::audio_fingerprint::analyze_audio(path, cancelled),
-        || AudioAnalysis {
-            duration_sec: u32::MAX,
-            pcm_hash: String::new(),
-            fingerprint: None,
-        },
-    )
+    audio_result(audio_analysis_cache(), path, cancelled, || {
+        crate::audio_fingerprint::analyze_audio(path, cancelled)
+    })
 }
 
 #[cfg(feature = "audio-decode")]
@@ -569,16 +552,9 @@ pub fn get_audio_fast_fingerprint(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<AudioFastFingerprint> {
-    audio_result(
-        audio_fast_fingerprint_cache(),
-        path,
-        cancelled,
-        || crate::audio_fingerprint::fast_fingerprint_audio(path, cancelled),
-        || AudioFastFingerprint {
-            duration_sec: u32::MAX,
-            fingerprint: None,
-        },
-    )
+    audio_result(audio_fast_fingerprint_cache(), path, cancelled, || {
+        crate::audio_fingerprint::fast_fingerprint_audio(path, cancelled)
+    })
 }
 
 #[cfg(feature = "audio-decode")]
@@ -591,22 +567,16 @@ pub fn get_audio_duration(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<A
     if let Some(duration) = audio_analysis_cache().cached(path).map(|a| a.duration_sec) {
         return Some(AudioDuration(duration));
     }
-    audio_result(
-        audio_duration_cache(),
-        path,
-        cancelled,
-        || {
-            let key =
-                FileKey::for_path(path).ok_or(crate::audio_fingerprint::AudioError::Unsupported)?;
-            if let Some(duration) =
-                crate::disk_cache::read::<AudioAnalysis>(&key).map(|(a, _)| a.duration_sec)
-            {
-                return Ok(AudioDuration(duration));
-            }
-            crate::audio_fingerprint::decoded_duration(path, cancelled)
-        },
-        || AudioDuration(u32::MAX),
-    )
+    audio_result(audio_duration_cache(), path, cancelled, || {
+        let key =
+            FileKey::for_path(path).ok_or(crate::audio_fingerprint::AudioError::Unsupported)?;
+        if let Some(duration) =
+            crate::disk_cache::read::<AudioAnalysis>(&key).map(|(a, _)| a.duration_sec)
+        {
+            return Ok(AudioDuration(duration));
+        }
+        crate::audio_fingerprint::decoded_duration(path, cancelled)
+    })
 }
 
 /// Cheap per-file metadata (tags, EXIF, stream properties) keyed by file version: TC asks for

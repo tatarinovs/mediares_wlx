@@ -392,14 +392,28 @@ impl ViewerState {
 
     /// The bar's previous / next track and media keys: the adjacent audio/video file.
     pub fn skip_track(&mut self, forward: bool) -> bool {
-        let candidates = playlist::candidates(
-            &self.dir_files,
-            self.current_idx,
-            forward,
-            true,
-            forward && self.config.queue.shuffle,
-        );
-        self.show_first(candidates)
+        let start = self.current_idx;
+        let total = self.dir_files.len();
+        if forward && self.config.queue.shuffle {
+            return self.show_first(playlist::candidates(
+                &self.dir_files,
+                start,
+                true,
+                true,
+                true,
+            ));
+        }
+        for offset in 1..total {
+            let idx = if forward {
+                (start + offset) % total
+            } else {
+                (start + total - offset) % total
+            };
+            if probe_file(&self.dir_files[idx]).is_playable() && self.go_to(idx) {
+                return true;
+            }
+        }
+        self.current_idx != start
     }
 
     /// A failed attempt changes the view too: repaint its error if no candidate opens.
@@ -442,20 +456,26 @@ impl ViewerState {
                 }
                 false
             }
-            EndAction::Play(_) => {
+            EndAction::Play(first) => {
+                let start = self.current_idx;
+                if self.go_to(first) {
+                    return true;
+                }
                 let wrap = self.config.queue.repeat == playlist::Repeat::All;
                 let mut candidates = playlist::candidates(
                     &self.dir_files,
-                    self.current_idx,
+                    start,
                     true,
-                    wrap,
+                    wrap || self.config.queue.shuffle,
                     self.config.queue.shuffle,
                 );
                 // "Repeat list" still loops the current track when all other files fail.
+                candidates.retain(|&idx| idx != first);
                 if wrap {
-                    candidates.push(self.current_idx);
+                    candidates.push(start);
                 }
-                self.show_first(candidates)
+                self.show_first(candidates);
+                true
             }
             EndAction::Stop => false,
         }

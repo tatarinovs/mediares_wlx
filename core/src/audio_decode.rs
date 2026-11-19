@@ -16,7 +16,7 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 /// Consecutive undecodable packets tolerated during playback (analysis rejects the first).
 const MAX_BAD_PACKETS: u32 = 64;
 /// Read-ahead buffer cap for sequential full-file analysis (fingerprinting / PCM hashing).
-const SCAN_READ_BUF: usize = 16 * 1024 * 1024;
+pub(crate) const SCAN_READ_BUF: usize = 16 * 1024 * 1024;
 const MIN_SCAN_READ_BUF: usize = 64 * 1024;
 
 /// Sequential decoder of the default audio track of a file.
@@ -48,7 +48,7 @@ impl AudioDecoder {
         Self::open_with(path, None)
     }
 
-    /// Opens the file with a 1 MiB read-ahead buffer for sequential full-file analysis.
+    /// Opens the file with a bounded read-ahead buffer for sequential full-file analysis.
     pub fn open_sequential(path: &Path) -> Option<Self> {
         Self::open_with(path, Some(SCAN_READ_BUF))
     }

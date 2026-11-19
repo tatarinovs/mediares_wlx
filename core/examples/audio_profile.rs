@@ -548,7 +548,7 @@ fn run_wdx_mode(args: &Args, files: &[PathBuf]) {
         };
 
         let _ = writeln!(w, "{i}\t{call_ms:.3}\t{kind}\t{val}\t{}", path.display());
-        if i % 25 == 0 {
+        if i.is_multiple_of(25) {
             let _ = w.flush();
         }
 
@@ -722,7 +722,7 @@ fn main() {
                         rec.pcm_hash,
                         rec.path
                     );
-                    if i % 25 == 0 {
+                    if i.is_multiple_of(25) {
                         let _ = w.flush();
                     }
                 }

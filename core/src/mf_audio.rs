@@ -130,8 +130,8 @@ impl MfAudioReader {
                 }
                 let _ = buffer.Unlock();
                 if !self.out.is_empty() {
-                    let start =
-                        (timestamp >= 0).then_some(timestamp as f64 / crate::video_frame::HNS_PER_SEC);
+                    let start = (timestamp >= 0)
+                        .then_some(timestamp as f64 / crate::video_frame::HNS_PER_SEC);
                     return Ok(Some((start, &self.out)));
                 }
                 if self.ended {

@@ -232,9 +232,8 @@ mod tests {
         assert_eq!(h1, h2);
         assert_ne!(h1, 0);
         // Exact 2x uniform scaling preserves DCT median comparisons.
-        let scaled = GrayImage::from_fn(64, 64, |x, y| {
-            image::Luma([pattern.get_pixel(x, y)[0] * 2])
-        });
+        let scaled =
+            GrayImage::from_fn(64, 64, |x, y| image::Luma([pattern.get_pixel(x, y)[0] * 2]));
         assert_eq!(h1, compute_phash(&scaled));
     }
 

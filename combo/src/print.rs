@@ -851,9 +851,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                     AUTO_CROP | AUTO_ROTATE => validate(hwnd, &*ptr),
                     PRINTER_REFRESH => refresh_printers(hwnd, &mut *ptr),
                     id if id == PAPER_INFO as usize && code == CBN_SELCHANGE => {
-                        let sel =
-                            SendDlgItemMessageW(hwnd, PAPER_INFO, CB_GETCURSEL, WPARAM(0), LPARAM(0))
-                                .0;
+                        let sel = SendDlgItemMessageW(
+                            hwnd,
+                            PAPER_INFO,
+                            CB_GETCURSEL,
+                            WPARAM(0),
+                            LPARAM(0),
+                        )
+                        .0;
                         if sel >= 0 {
                             let papers = &(*ptr).papers;
                             if let Some(paper) = papers.get(sel as usize).cloned() {

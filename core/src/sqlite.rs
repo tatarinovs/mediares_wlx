@@ -60,18 +60,21 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 /// Entry points resolved from `System32\winsqlite3.dll` (kept loaded for process lifetime).
 struct Api {
-    open_v2: unsafe extern "system" fn(
-        *const c_char,
-        *mut *mut sqlite3,
-        c_int,
-        *const c_char,
-    ) -> c_int,
+    open_v2:
+        unsafe extern "system" fn(*const c_char, *mut *mut sqlite3, c_int, *const c_char) -> c_int,
     close_v2: unsafe extern "system" fn(*mut sqlite3) -> c_int,
     busy_timeout: unsafe extern "system" fn(*mut sqlite3, c_int) -> c_int,
     exec: unsafe extern "system" fn(
         *mut sqlite3,
         *const c_char,
-        Option<unsafe extern "system" fn(*mut c_void, c_int, *mut *mut c_char, *mut *mut c_char) -> c_int>,
+        Option<
+            unsafe extern "system" fn(
+                *mut c_void,
+                c_int,
+                *mut *mut c_char,
+                *mut *mut c_char,
+            ) -> c_int,
+        >,
         *mut c_void,
         *mut *mut c_char,
     ) -> c_int,
@@ -86,12 +89,24 @@ struct Api {
     finalize: unsafe extern "system" fn(*mut sqlite3_stmt) -> c_int,
     reset: unsafe extern "system" fn(*mut sqlite3_stmt) -> c_int,
     clear_bindings: unsafe extern "system" fn(*mut sqlite3_stmt) -> c_int,
-    bind_blob: unsafe extern "system" fn(*mut sqlite3_stmt, c_int, *const c_void, c_int, Destructor) -> c_int,
+    bind_blob: unsafe extern "system" fn(
+        *mut sqlite3_stmt,
+        c_int,
+        *const c_void,
+        c_int,
+        Destructor,
+    ) -> c_int,
     bind_double: unsafe extern "system" fn(*mut sqlite3_stmt, c_int, f64) -> c_int,
     bind_int: unsafe extern "system" fn(*mut sqlite3_stmt, c_int, c_int) -> c_int,
     bind_int64: unsafe extern "system" fn(*mut sqlite3_stmt, c_int, i64) -> c_int,
     bind_null: unsafe extern "system" fn(*mut sqlite3_stmt, c_int) -> c_int,
-    bind_text: unsafe extern "system" fn(*mut sqlite3_stmt, c_int, *const c_char, c_int, Destructor) -> c_int,
+    bind_text: unsafe extern "system" fn(
+        *mut sqlite3_stmt,
+        c_int,
+        *const c_char,
+        c_int,
+        Destructor,
+    ) -> c_int,
     column_type: unsafe extern "system" fn(*mut sqlite3_stmt, c_int) -> c_int,
     column_int64: unsafe extern "system" fn(*mut sqlite3_stmt, c_int) -> i64,
     column_double: unsafe extern "system" fn(*mut sqlite3_stmt, c_int) -> f64,

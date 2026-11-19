@@ -83,7 +83,7 @@ echo [2/4] Building MinGW release binaries as cdylib-only...
 :: Force symbol stripping for these cdylib-only artifacts as well.
 set "RUSTFLAGS=-C link-args=-Wl,--dynamicbase -C link-args=-Wl,--high-entropy-va -C link-args=-Wl,--nxcompat -C link-args=-Wl,--gc-sections"
 for %%P in (mediares_combo mediares_wdx) do (
-    cargo +%TOOLCHAIN% rustc --locked --release --target %TARGET% -p %%P --lib --crate-type cdylib -- -C strip=symbols
+    cargo +%TOOLCHAIN% rustc --target-dir "%~dp0target" --locked --release --target %TARGET% -p %%P --lib --crate-type cdylib -- -C strip=symbols
     if errorlevel 1 (
         echo [ERROR] Cargo build of %%P failed!
         exit /b 1

@@ -202,7 +202,12 @@ fn main() {
         args.field
     );
     let mut files = Vec::new();
-    collect_files(&args.root, target_kind, &mut files, args.limit.unwrap_or(usize::MAX));
+    collect_files(
+        &args.root,
+        target_kind,
+        &mut files,
+        args.limit.unwrap_or(usize::MAX),
+    );
     if let Some(limit) = args.limit {
         files.truncate(limit);
     }

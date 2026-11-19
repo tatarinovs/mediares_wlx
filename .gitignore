@@ -7,3 +7,4 @@
 *.wlx64
 dist/
 /libmpv-2.dll
+docs/benchmarks

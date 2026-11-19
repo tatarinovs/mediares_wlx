@@ -230,7 +230,7 @@ fn fast_fingerprint_audio_with(
             Err(e) => return Err(e),
         }
     }
-    if let Some(p) = prof.as_deref_mut() {
+    if let Some(p) = prof {
         p.backend = "mf";
         p.mode = "short";
     }
@@ -245,7 +245,48 @@ pub fn decoded_duration(
     analyze_sequential::<()>(path, cancelled)
 }
 
+// Estimate the mono working set before allocating. A single very long recording
+// may exceed the budget on its own; let it finish without competing scans.
+const SCAN_BUDGET: usize = 384 * 1024 * 1024;
+static SCAN_BYTES: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+static SCAN_READY: std::sync::Condvar = std::sync::Condvar::new();
+
+struct ScanReservation(usize);
+
+impl ScanReservation {
+    fn acquire(duration: Option<f64>, cancelled: &dyn Fn() -> bool) -> Result<Self, AudioError> {
+        let bytes = duration
+            .filter(|d| d.is_finite() && *d > 0.0)
+            .map_or(SCAN_BUDGET, |d| {
+                // Include mono samples, per-hop energy, and the sequential input buffer.
+                ((d * f64::from(ANALYSIS_RATE) * 4.02) as usize)
+                    .saturating_add(crate::audio_decode::SCAN_READ_BUF)
+                    .min(SCAN_BUDGET)
+            });
+        let mut used = SCAN_BYTES.lock().unwrap_or_else(|e| e.into_inner());
+        while *used + bytes > SCAN_BUDGET {
+            if cancelled() {
+                return Err(AudioError::Cancelled);
+            }
+            used = SCAN_READY
+                .wait_timeout(used, std::time::Duration::from_millis(100))
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *used += bytes;
+        Ok(Self(bytes))
+    }
+}
+
+impl Drop for ScanReservation {
+    fn drop(&mut self) {
+        *SCAN_BYTES.lock().unwrap_or_else(|e| e.into_inner()) -= self.0;
+        SCAN_READY.notify_all();
+    }
+}
+
 trait SampleAnalysis {
+    const STORES_MONO: bool = true;
     type Output;
     fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self;
     fn samples(&mut self, samples: &[f32], channels: usize);
@@ -253,6 +294,7 @@ trait SampleAnalysis {
 }
 
 impl SampleAnalysis for () {
+    const STORES_MONO: bool = false;
     type Output = AudioDuration;
 
     fn start(_: u32, _: usize, _: Option<f64>) -> Self {}
@@ -279,8 +321,12 @@ impl SampleAnalysis for (BandAnalyzer, PcmHash) {
 
     fn result(self, duration: f64) -> Self::Output {
         let pcm_hash = self.1.finish();
-        let fingerprint =
-            fingerprint_with_window(&self.0.mono, &self.0.hop_sq, WINDOW_SEC, Some(&pcm_hash));
+        let fingerprint = fingerprint_with_window(
+            &self.0.mono,
+            &self.0.hop_sq,
+            WINDOW_SEC,
+            self.1.started.then_some(pcm_hash.as_str()),
+        );
         AudioAnalysis {
             duration_sec: duration.round() as u32,
             pcm_hash,
@@ -312,7 +358,7 @@ impl SampleAnalysis for FastSequential {
             &self.0.mono,
             &self.0.hop_sq,
             FAST_WINDOW_SEC,
-            Some(&pcm_hash),
+            self.1.started.then_some(pcm_hash.as_str()),
         );
         AudioFastFingerprint {
             duration_sec: duration.round() as u32,
@@ -423,6 +469,9 @@ fn analyze_source_with<A: SampleAnalysis, P: Profiler>(
         return Err(AudioError::Invalid);
     }
     let expected = source.duration();
+    let _reservation = A::STORES_MONO
+        .then(|| ScanReservation::acquire(expected, cancelled))
+        .transpose()?;
     let mut analysis = A::start(rate, channels, expected);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
@@ -647,24 +696,22 @@ struct PcmHash {
     hash: u64,
     channels: usize,
     started: bool,
-    /// Silent frames seen since the last audible one; hashed once audio resumes.
-    pending: Vec<f32>,
+    last_audible_hash: u64,
 }
 
 impl PcmHash {
     const PRIME: u64 = 0x0000_0100_0000_01B3;
-    /// A longer silence inside the track is hashed right away (bounds memory).
-    const MAX_PENDING: usize = 1 << 22;
 
     fn new(rate: u32, channels: usize) -> Self {
         let mut h = Self {
             hash: 0xCBF2_9CE4_8422_2325,
             channels,
             started: false,
-            pending: Vec::new(),
+            last_audible_hash: 0,
         };
         h.mix(rate as i64);
         h.mix(channels as i64);
+        h.last_audible_hash = h.hash;
         h
     }
 
@@ -678,15 +725,6 @@ impl PcmHash {
             h = (h ^ quantize(s) as u64).wrapping_mul(Self::PRIME);
         }
         self.hash = h;
-    }
-
-    fn flush_pending(&mut self) {
-        let mut h = self.hash;
-        for &s in &self.pending {
-            h = (h ^ quantize(s) as u64).wrapping_mul(Self::PRIME);
-        }
-        self.hash = h;
-        self.pending.clear();
     }
 
     fn update(&mut self, samples: &[f32]) {
@@ -706,28 +744,16 @@ impl PcmHash {
         }
         if let Some(last_sample) = samples.iter().rposition(is_audible) {
             let last = last_sample / self.channels;
-            if !self.pending.is_empty() {
-                self.flush_pending();
-            }
-            let active_end = (last + 1) * self.channels;
-            self.mix_samples(&samples[..active_end]);
-            let tail = &samples[active_end..];
-            if !tail.is_empty() {
-                self.pending.extend_from_slice(tail);
-                if self.pending.len() > Self::MAX_PENDING {
-                    self.flush_pending();
-                }
-            }
-        } else {
-            self.pending.extend_from_slice(samples);
-            if self.pending.len() > Self::MAX_PENDING {
-                self.flush_pending();
-            }
+            let end = (last + 1) * self.channels;
+            self.mix_samples(&samples[..end]);
+            self.last_audible_hash = self.hash;
+            samples = &samples[end..];
         }
+        self.mix_samples(samples);
     }
 
     fn finish(&self) -> String {
-        format!("{:016x}", self.hash)
+        format!("{:016x}", self.last_audible_hash)
     }
 }
 
@@ -880,11 +906,13 @@ impl BandAnalyzer {
         self.count += 1;
         self.phase += ANALYSIS_RATE;
         // One averaged sample per analysis period (repeated when upsampling).
-        while self.phase >= self.rate {
-            self.phase -= self.rate;
-            let v = self.sum / self.count.max(1) as f32;
+        if self.phase >= self.rate {
+            let v = self.sum / self.count as f32;
             (self.sum, self.count) = (0.0, 0);
-            self.push_resampled(v);
+            while self.phase >= self.rate {
+                self.phase -= self.rate;
+                self.push_resampled(v);
+            }
         }
     }
 
@@ -1015,7 +1043,7 @@ fn fingerprint_with_window(
 ) -> Option<String> {
     let n = hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
     if n == 0 {
-        return None;
+        return pcm_fallback.map(|h| format!("1s_pcm_{h}"));
     }
     let max_sq = max_frame_sq(hop_sq, n);
     if max_sq <= SILENCE_FLOOR_SQ {
@@ -1312,6 +1340,23 @@ mod tests {
     }
 
     #[test]
+    fn low_rate_constant_stays_constant() {
+        let mut analyzer = BandAnalyzer::new(8000);
+        analyzer.push_samples(&[1.0; 8000], 1);
+        assert_eq!(analyzer.mono, vec![1.0; 11025]);
+    }
+
+    #[test]
+    fn audible_clip_shorter_than_fft_uses_pcm() {
+        let path = crate::test_util::pcm16_wav("subfft", 22050, 1, 1102, |_| 9000);
+        let full = analyze_audio(&path, &|| false).unwrap();
+        let fast = fast_fingerprint_audio(&path, &|| false).unwrap();
+        assert_eq!(full.fingerprint, Some(format!("1s_pcm_{}", full.pcm_hash)));
+        assert_eq!(full.fingerprint, fast.fingerprint);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn pcm_hash_ignores_edge_silence_only() {
         let audio = [0.5, -0.25, 0.0, 0.125];
         let padded = [0.0, 0.0, 0.5, -0.25, 0.0, 0.125, 0.0];
@@ -1320,6 +1365,11 @@ mod tests {
         assert_ne!(pcm_hash(&audio), pcm_hash(&[0.5, -0.25, 0.0, 0.126]));
         let mut stereo = PcmHash::new(44100, 2);
         stereo.update(&audio);
+        let before = stereo.finish();
+        for _ in 0..1025 {
+            stereo.update(&[0.0; 4096]);
+        }
+        assert_eq!(stereo.finish(), before);
         assert_ne!(stereo.finish(), pcm_hash(&audio));
     }
 }

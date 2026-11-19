@@ -105,7 +105,6 @@ def worker(dll_path, paths):
 
 def transient_worker(dll_path, path):
     """A sharing violation must not poison an unchanged file's RAM metadata entry."""
-    os.environ["MEDIARES_CONTENT_CACHE"] = "off"
     dll, fields = content_plugin(dll_path)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
@@ -115,14 +114,22 @@ def transient_worker(dll_path, path):
     lock = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)
     assert lock != ctypes.c_void_p(-1).value, ctypes.get_last_error()
     buf = ctypes.create_string_buffer(128)
-    field = fields["Image_Width"][0]
+    names = (["Audio_Duration_Sec", "Audio_PCM_Hash", "Audio_Fingerprint", "Audio_Fast_Fingerprint"]
+             if path.suffix == ".wav" else ["Image_Width"])
+
+    def query(name):
+        return dll.ContentGetValueW(str(path), fields[name][0], 0, buf, len(buf), 0)
+
     try:
-        assert dll.ContentGetValueW(str(path), field, 0, buf, len(buf), 0) == -3
+        for name in names:
+            assert query(name) == -3, name
     finally:
         kernel.CloseHandle(lock)
     try:
-        assert dll.ContentGetValueW(str(path), field, 0, buf, len(buf), 0) == 1
-        assert ctypes.c_int.from_buffer(buf).value == 1600
+        for name in names:
+            assert query(name) == fields[name][1], name
+            if name == "Image_Width":
+                assert ctypes.c_int.from_buffer(buf).value == 1600
     finally:
         dll.ContentPluginUnloading()
     print(json.dumps({"transient_read_recovered": True}))
@@ -294,11 +301,12 @@ def run_check(dll, baseline, viewer_dll, stress):
     make_video_tags(paths[4])
     paths[5].write_bytes(b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff\xd9")
     paths[6].write_bytes(struct.pack(">I4s4sI4s", 12, b"ftyp", b"isom", 8, b"moov"))
-    recovery = subprocess.run(
-        [sys.executable, str(Path(__file__).resolve()), "--transient-worker", "--dll", str(dll), str(paths[0])],
-        env=dict(os.environ, MEDIARES_CONTENT_CACHE="off"), capture_output=True, text=True,
-        timeout=30, check=True)
-    assert json.loads(recovery.stdout)["transient_read_recovered"]
+    for path in paths[:2]:
+        recovery = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--transient-worker", "--dll", str(dll), str(path)],
+            env=dict(os.environ, MEDIARES_CONTENT_CACHE=str(work / "retry.sqlite3")),
+            capture_output=True, text=True, timeout=30, check=True)
+        assert json.loads(recovery.stdout)["transient_read_recovered"]
     db = work / "cache.sqlite3"
 
     def run(cache, library=dll):

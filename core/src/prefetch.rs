@@ -154,7 +154,11 @@ impl Pool {
         }) {
             if pending.last != path && !pending.exhausted {
                 pending.last = path.into();
+                let wake = pending.allowance < LOOKAHEAD;
                 pending.allowance = LOOKAHEAD;
+                if wake {
+                    self.shared.wake.notify_all();
+                }
             }
         } else {
             let workload = Workload::new(parent, field.source(), kind, extension.clone());
@@ -178,8 +182,8 @@ impl Pool {
                 last: path.into(),
                 exhausted: false,
             });
+            self.shared.wake.notify_all();
         }
-        self.shared.wake.notify_all();
         let controller = state.controller.as_mut().filter(|c| c.enabled())?;
         let now = Instant::now();
         controller.resume(now);
