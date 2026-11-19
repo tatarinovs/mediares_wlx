@@ -286,8 +286,8 @@ unsafe fn get_value(
         }
         .value(compute(&path, field, kind));
     }
-    crate::prefetch::request(&path, field, kind);
-    crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
+    let sample = crate::prefetch::request(&path, field, kind);
+    let result = crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
         crate::cache::with_row_file_key(&path, field as u32, flags, || {
             if (flags & CONTENT_DELAYIFSLOW) != 0 && is_slow(&path, field, kind) {
                 return FT_DELAYED;
@@ -299,7 +299,13 @@ unsafe fn get_value(
             };
             out.value(compute(&path, field, kind))
         })
-    })
+    });
+    if result != FT_DELAYED && !is_stop_requested() {
+        if let Some(sample) = sample {
+            sample.complete_foreground();
+        }
+    }
+    result
 }
 
 impl Output {

@@ -63,14 +63,23 @@ const MAX_PREFETCH_THREADS: usize = 16;
 
 pub(crate) fn default_prefetch_threads() -> usize {
     let available = std::thread::available_parallelism().map_or(1, usize::from);
-    available.saturating_sub(1).clamp(1, 8)
+    available.saturating_sub(1).min(MAX_PREFETCH_THREADS)
 }
 
 pub(crate) fn prefetch_threads() -> usize {
-    read_prefetch_threads(&ini_path())
+    read_prefetch_override(&ini_path()).unwrap_or_else(default_prefetch_threads)
 }
 
+pub(crate) fn fixed_prefetch_threads() -> Option<usize> {
+    read_prefetch_override(&ini_path())
+}
+
+#[cfg(test)]
 fn read_prefetch_threads(path: &Path) -> usize {
+    read_prefetch_override(path).unwrap_or_else(default_prefetch_threads)
+}
+
+fn read_prefetch_override(path: &Path) -> Option<usize> {
     let mut buf = [0u16; 32];
     let len = unsafe {
         GetPrivateProfileStringW(
@@ -84,8 +93,8 @@ fn read_prefetch_threads(path: &Path) -> usize {
     String::from_utf16_lossy(&buf[..len as usize])
         .trim()
         .parse::<usize>()
-        .unwrap_or_else(|_| default_prefetch_threads())
-        .min(MAX_PREFETCH_THREADS)
+        .ok()
+        .map(|n| n.min(MAX_PREFETCH_THREADS))
 }
 
 #[cfg(test)]

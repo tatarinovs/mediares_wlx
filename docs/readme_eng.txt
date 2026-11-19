@@ -238,9 +238,12 @@ instead of off. Media files themselves may reside on a network drive.
 Hash, fingerprint and sharpness requests in columns or duplicate search also
 prepare the requested family for nearby files in the current folder.
 Metadata and duration are read and cached only when TC requests them, without
-prefetching neighboring files. By default, the number of worker threads is chosen
-automatically based on CPU cores (up to 8). Read-ahead is limited to 32 directory
-entries per family, replenished by further TC requests; no subfolder traversal.
+prefetching neighboring files. Prefetch starts with up to four tasks within the available pool and adjusts concurrency based
+on analysis throughput and TC request latency. Measurements carry over between
+folders on the same drive when the analysis type and extension match.
+The ceiling is the available logical CPU count minus one, capped at 16.
+Media types have no separate limits; short scans may not provide enough samples.
+Read-ahead is limited to 32 directory entries per family, replenished by further TC requests; no subfolder traversal.
 If needed, set the worker count manually in mediares.ini:
 
 [Settings]

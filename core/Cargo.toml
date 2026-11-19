@@ -38,7 +38,16 @@ audio-decode = ["dep:symphonia"]
 tags = ["audio-decode"]
 # OpenEXR: about +0.5 MB to the binary, so off unless asked for.
 exr = ["image/exr"]
+profile-stats = []
 
 [[example]]
 name = "audio_fp"
 required-features = ["audio-decode", "tags"]
+
+[[example]]
+name = "audio_profile"
+required-features = ["audio-decode", "tags", "profile-stats"]
+
+[[example]]
+name = "wdx_profile"
+required-features = ["audio-decode", "tags", "profile-stats"]

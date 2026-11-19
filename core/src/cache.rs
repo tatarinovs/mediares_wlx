@@ -7,6 +7,86 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
+#[cfg(feature = "profile-stats")]
+pub mod stats {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Mutex, OnceLock};
+
+    pub static RAM_HITS_FG: AtomicUsize = AtomicUsize::new(0);
+    pub static RAM_HITS_BG: AtomicUsize = AtomicUsize::new(0);
+    pub static DISK_HITS_FG: AtomicUsize = AtomicUsize::new(0);
+    pub static DISK_HITS_BG: AtomicUsize = AtomicUsize::new(0);
+    pub static FLIGHT_WAITS: AtomicUsize = AtomicUsize::new(0);
+    pub static FLIGHT_SKIPS: AtomicUsize = AtomicUsize::new(0);
+    pub static COMPUTES_FG: AtomicUsize = AtomicUsize::new(0);
+    pub static COMPUTES_BG: AtomicUsize = AtomicUsize::new(0);
+    pub static COMPUTE_CANCELLED: AtomicUsize = AtomicUsize::new(0);
+    pub static DUPLICATE_COMPUTES: AtomicUsize = AtomicUsize::new(0);
+
+    static SEEN: OnceLock<Mutex<HashMap<PathBuf, usize>>> = OnceLock::new();
+    static DUP_PATHS: OnceLock<Mutex<Vec<PathBuf>>> = OnceLock::new();
+
+    pub fn record_compute(path: &Path, bg: bool) {
+        if bg {
+            COMPUTES_BG.fetch_add(1, Ordering::Relaxed);
+        } else {
+            COMPUTES_FG.fetch_add(1, Ordering::Relaxed);
+        }
+        let seen = SEEN.get_or_init(|| Mutex::new(HashMap::new()));
+        let count = {
+            let mut map = seen.lock().unwrap_or_else(|e| e.into_inner());
+            let c = map.entry(path.to_path_buf()).or_insert(0);
+            *c += 1;
+            *c
+        };
+        if count > 1 {
+            DUPLICATE_COMPUTES.fetch_add(1, Ordering::Relaxed);
+            let dups = DUP_PATHS.get_or_init(|| Mutex::new(Vec::new()));
+            let mut list = dups.lock().unwrap_or_else(|e| e.into_inner());
+            if list.len() < 100 {
+                list.push(path.to_path_buf());
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Snapshot {
+        pub ram_hits_fg: usize,
+        pub ram_hits_bg: usize,
+        pub disk_hits_fg: usize,
+        pub disk_hits_bg: usize,
+        pub flight_waits: usize,
+        pub flight_skips: usize,
+        pub computes_fg: usize,
+        pub computes_bg: usize,
+        pub compute_cancelled: usize,
+        pub duplicate_computes: usize,
+        pub duplicate_paths: Vec<PathBuf>,
+    }
+
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            ram_hits_fg: RAM_HITS_FG.load(Ordering::Relaxed),
+            ram_hits_bg: RAM_HITS_BG.load(Ordering::Relaxed),
+            disk_hits_fg: DISK_HITS_FG.load(Ordering::Relaxed),
+            disk_hits_bg: DISK_HITS_BG.load(Ordering::Relaxed),
+            flight_waits: FLIGHT_WAITS.load(Ordering::Relaxed),
+            flight_skips: FLIGHT_SKIPS.load(Ordering::Relaxed),
+            computes_fg: COMPUTES_FG.load(Ordering::Relaxed),
+            computes_bg: COMPUTES_BG.load(Ordering::Relaxed),
+            compute_cancelled: COMPUTE_CANCELLED.load(Ordering::Relaxed),
+            duplicate_computes: DUPLICATE_COMPUTES.load(Ordering::Relaxed),
+            duplicate_paths: DUP_PATHS
+                .get_or_init(|| Mutex::new(Vec::new()))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        }
+    }
+}
+
 use crate::hashing::ImageAnalysis;
 use crate::image_decode::decode_for_gray_analysis;
 use crate::probe::{probe_file, MediaType};
@@ -224,6 +304,15 @@ impl<V: Clone> FileCache<V> {
                 *used = next_tick;
                 let value = value.clone();
                 lru.clock = next_tick;
+                #[cfg(feature = "profile-stats")]
+                {
+                    use std::sync::atomic::Ordering;
+                    if NON_BLOCKING_FLIGHT.get() {
+                        stats::RAM_HITS_BG.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        stats::RAM_HITS_FG.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 return Some(value);
             }
         }
@@ -232,8 +321,12 @@ impl<V: Clone> FileCache<V> {
         let mut flights = self.flights.lock().unwrap_or_else(|e| e.into_inner());
         while flights.contains(&key) {
             if NON_BLOCKING_FLIGHT.get() {
+                #[cfg(feature = "profile-stats")]
+                stats::FLIGHT_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 return None;
             }
+            #[cfg(feature = "profile-stats")]
+            stats::FLIGHT_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             flights = self.ready.wait(flights).unwrap_or_else(|e| e.into_inner());
         }
         flights.insert(key.clone());
@@ -359,15 +452,34 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
         if cancelled() {
             return None;
         }
+        #[cfg(feature = "profile-stats")]
+        {
+            use std::sync::atomic::Ordering;
+            if NON_BLOCKING_FLIGHT.get() {
+                stats::DISK_HITS_BG.fetch_add(1, Ordering::Relaxed);
+            } else {
+                stats::DISK_HITS_FG.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
         return Some(value);
     }
-    let value = compute()?;
+    #[cfg(feature = "profile-stats")]
+    stats::record_compute(path, NON_BLOCKING_FLIGHT.get());
+    let sample = crate::prefetch::begin_sample(path, T::SLOT);
+    let Some(value) = compute() else {
+        #[cfg(feature = "profile-stats")]
+        stats::COMPUTE_CANCELLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return None;
+    };
     if cancelled() || FileKey::stat(path).as_ref() != Some(&key) {
         clear_row_key();
         return None;
     }
     let bytes = crate::disk_cache::write(&key, &value);
+    if let Some(sample) = sample {
+        sample.complete();
+    }
     VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
     Some((value, bytes))
 }
@@ -476,10 +588,7 @@ pub fn get_audio_duration(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<A
     }
     // Full audio analysis already counts decoded frames. Reuse that byproduct without doing
     // SQLite work on a RAM hit.
-    if let Some(duration) = audio_analysis_cache()
-        .cached(path)
-        .map(|a| a.duration_sec)
-    {
+    if let Some(duration) = audio_analysis_cache().cached(path).map(|a| a.duration_sec) {
         return Some(AudioDuration(duration));
     }
     audio_result(
