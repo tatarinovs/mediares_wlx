@@ -15,8 +15,9 @@ use symphonia::core::units::{Time, TimeBase, Timestamp};
 
 /// Consecutive undecodable packets tolerated during playback (analysis rejects the first).
 const MAX_BAD_PACKETS: u32 = 64;
-/// Read-ahead buffer for sequential full-file analysis (fingerprinting / PCM hashing).
-const SCAN_READ_BUF: usize = 1024 * 1024;
+/// Read-ahead buffer cap for sequential full-file analysis (fingerprinting / PCM hashing).
+const SCAN_READ_BUF: usize = 16 * 1024 * 1024;
+const MIN_SCAN_READ_BUF: usize = 64 * 1024;
 
 /// Sequential decoder of the default audio track of a file.
 pub struct AudioDecoder {
@@ -221,7 +222,14 @@ fn open_format_with(path: &Path, read_buf: Option<usize>) -> Option<Box<dyn Form
         }
     };
     let source: Box<dyn MediaSource> = match read_buf {
-        Some(cap) => Box::new(BufferedSource::new(source, byte_len, cap)),
+        Some(max_cap) => {
+            let cap = byte_len.map_or(max_cap, |len| {
+                usize::try_from(len)
+                    .unwrap_or(max_cap)
+                    .clamp(MIN_SCAN_READ_BUF, max_cap)
+            });
+            Box::new(BufferedSource::new(source, byte_len, cap))
+        }
         None => source,
     };
     let mss = MediaSourceStream::new(source, Default::default());

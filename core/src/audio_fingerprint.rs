@@ -108,9 +108,61 @@ pub fn analyze_audio(
     analyze_sequential::<(BandAnalyzer, PcmHash)>(path, cancelled)
 }
 
+#[derive(Debug, Default, Clone)]
+pub struct AudioProfile {
+    pub backend: &'static str,
+    pub open_us: u64,
+    pub decode_us: u64,
+    pub math_us: u64,
+    pub sample_rate: u32,
+    pub channels: usize,
+    pub chunks: u32,
+    pub frames: u64,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct FastProfile {
+    pub backend: &'static str,
+    pub mode: &'static str,
+}
+
+pub fn analyze_audio_profiled(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> (Result<AudioAnalysis, AudioError>, AudioProfile) {
+    let mut prof = AudioProfile {
+        backend: "none",
+        ..Default::default()
+    };
+    let res = analyze_sequential_with::<(BandAnalyzer, PcmHash), AudioProfile>(
+        path, cancelled, &mut prof,
+    );
+    (res, prof)
+}
+
+pub fn fast_fingerprint_audio_profiled(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+) -> (Result<AudioFastFingerprint, AudioError>, FastProfile) {
+    let mut prof = FastProfile {
+        backend: "none",
+        mode: "error",
+    };
+    let res = fast_fingerprint_audio_with(path, cancelled, Some(&mut prof));
+    (res, prof)
+}
+
 pub fn fast_fingerprint_audio(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
+) -> Result<AudioFastFingerprint, AudioError> {
+    fast_fingerprint_audio_with(path, cancelled, None)
+}
+
+fn fast_fingerprint_audio_with(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+    mut prof: Option<&mut FastProfile>,
 ) -> Result<AudioFastFingerprint, AudioError> {
     if cancelled() {
         return Err(AudioError::Cancelled);
@@ -122,18 +174,30 @@ pub fn fast_fingerprint_audio(
         {
             match analyze_source_seek(&mut decoder, expected, cancelled) {
                 Ok(SeekProbe::Done(fingerprint)) => {
+                    if let Some(p) = prof.as_deref_mut() {
+                        p.backend = "symphonia";
+                        p.mode = "seek";
+                    }
                     return Ok(AudioFastFingerprint {
                         duration_sec: expected.round() as u32,
                         fingerprint,
                     });
                 }
                 Ok(SeekProbe::FallbackSequential) => {
+                    if let Some(p) = prof.as_deref_mut() {
+                        p.backend = "symphonia";
+                        p.mode = "fallback_seq";
+                    }
                     return analyze_sequential::<FastSequential>(path, cancelled);
                 }
                 Err(AudioError::Unsupported) => {}
                 Err(e) => return Err(e),
             }
         } else {
+            if let Some(p) = prof.as_deref_mut() {
+                p.backend = "symphonia";
+                p.mode = "short";
+            }
             drop(decoder);
             return analyze_sequential::<FastSequential>(path, cancelled);
         }
@@ -145,18 +209,30 @@ pub fn fast_fingerprint_audio(
     {
         match analyze_source_seek(&mut reader, expected, cancelled) {
             Ok(SeekProbe::Done(fingerprint)) => {
+                if let Some(p) = prof.as_deref_mut() {
+                    p.backend = "mf";
+                    p.mode = "seek";
+                }
                 return Ok(AudioFastFingerprint {
                     duration_sec: expected.round() as u32,
                     fingerprint,
                 });
             }
             Ok(SeekProbe::FallbackSequential) => {
+                if let Some(p) = prof.as_deref_mut() {
+                    p.backend = "mf";
+                    p.mode = "fallback_seq";
+                }
                 drop(reader);
                 let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
                 return analyze_source::<FastSequential>(&mut reader, cancelled);
             }
             Err(e) => return Err(e),
         }
+    }
+    if let Some(p) = prof.as_deref_mut() {
+        p.backend = "mf";
+        p.mode = "short";
     }
     analyze_source::<FastSequential>(&mut reader, cancelled)
 }
@@ -245,6 +321,57 @@ impl SampleAnalysis for FastSequential {
     }
 }
 
+trait Profiler {
+    type Mark;
+    fn mark(&self) -> Self::Mark;
+    fn record_open(&mut self, start: Self::Mark, backend: &'static str);
+    fn record_decode(&mut self, start: Self::Mark);
+    fn record_math(&mut self, start: Self::Mark);
+    fn record_format(&mut self, rate: u32, channels: usize, chunks: u32, frames: u64);
+}
+
+impl Profiler for () {
+    type Mark = ();
+    #[inline]
+    fn mark(&self) {}
+    #[inline]
+    fn record_open(&mut self, _: (), _: &'static str) {}
+    #[inline]
+    fn record_decode(&mut self, _: ()) {}
+    #[inline]
+    fn record_math(&mut self, _: ()) {}
+    #[inline]
+    fn record_format(&mut self, _: u32, _: usize, _: u32, _: u64) {}
+}
+
+impl Profiler for AudioProfile {
+    type Mark = std::time::Instant;
+    #[inline]
+    fn mark(&self) -> Self::Mark {
+        std::time::Instant::now()
+    }
+    #[inline]
+    fn record_open(&mut self, start: Self::Mark, backend: &'static str) {
+        self.open_us += start.elapsed().as_micros() as u64;
+        self.backend = backend;
+    }
+    #[inline]
+    fn record_decode(&mut self, start: Self::Mark) {
+        self.decode_us += start.elapsed().as_micros() as u64;
+    }
+    #[inline]
+    fn record_math(&mut self, start: Self::Mark) {
+        self.math_us += start.elapsed().as_micros() as u64;
+    }
+    #[inline]
+    fn record_format(&mut self, rate: u32, channels: usize, chunks: u32, frames: u64) {
+        self.sample_rate = rate;
+        self.channels = channels;
+        self.chunks = chunks;
+        self.frames = frames;
+    }
+}
+
 /// Decodes with symphonia; files it can't open or decode go through Media Foundation, whose
 /// results depend on the system's decoders (still stable on one machine, which is what TC's
 /// duplicate search compares).
@@ -252,22 +379,44 @@ fn analyze_sequential<A: SampleAnalysis>(
     path: &Path,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<A::Output, AudioError> {
+    let mut noop = ();
+    analyze_sequential_with::<A, ()>(path, cancelled, &mut noop)
+}
+
+fn analyze_sequential_with<A: SampleAnalysis, P: Profiler>(
+    path: &Path,
+    cancelled: &dyn Fn() -> bool,
+    prof: &mut P,
+) -> Result<A::Output, AudioError> {
     if cancelled() {
         return Err(AudioError::Cancelled);
     }
+    let m = prof.mark();
     if let Some(mut decoder) = AudioDecoder::open_sequential(path) {
-        match analyze_source::<A>(&mut decoder, cancelled) {
+        prof.record_open(m, "symphonia");
+        match analyze_source_with::<A, P>(&mut decoder, cancelled, prof) {
             Err(AudioError::Unsupported) => {}
             result => return result,
         }
     }
+    let m = prof.mark();
     let mut reader = MfAudioReader::open(path).ok_or(AudioError::Unsupported)?;
-    analyze_source::<A>(&mut reader, cancelled)
+    prof.record_open(m, "mf");
+    analyze_source_with::<A, P>(&mut reader, cancelled, prof)
 }
 
 fn analyze_source<A: SampleAnalysis>(
     source: &mut dyn PcmSource,
     cancelled: &dyn Fn() -> bool,
+) -> Result<A::Output, AudioError> {
+    let mut noop = ();
+    analyze_source_with::<A, ()>(source, cancelled, &mut noop)
+}
+
+fn analyze_source_with<A: SampleAnalysis, P: Profiler>(
+    source: &mut dyn PcmSource,
+    cancelled: &dyn Fn() -> bool,
+    prof: &mut P,
 ) -> Result<A::Output, AudioError> {
     let (rate, channels) = source.format();
     if rate == 0 || channels == 0 {
@@ -278,18 +427,24 @@ fn analyze_source<A: SampleAnalysis>(
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
-    while let Some((_, samples)) = source.next_timed_samples().map_err(|_| {
-        if frames_total == 0 {
-            AudioError::Unsupported
-        } else {
-            AudioError::Invalid
-        }
-    })? {
+    loop {
+        let m_dec = prof.mark();
+        let next = source.next_timed_samples().map_err(|_| {
+            if frames_total == 0 {
+                AudioError::Unsupported
+            } else {
+                AudioError::Invalid
+            }
+        })?;
+        prof.record_decode(m_dec);
+        let Some((_, samples)) = next else { break };
         chunks += 1;
         if chunks.is_multiple_of(CANCEL_CHECK_EVERY) && cancelled() {
             return Err(AudioError::Cancelled);
         }
+        let m_math = prof.mark();
         analysis.samples(samples, channels);
+        prof.record_math(m_math);
         frames_total += (samples.len() / channels) as u64;
     }
     if frames_total == 0 {
@@ -304,7 +459,11 @@ fn analyze_source<A: SampleAnalysis>(
     if cancelled() {
         return Err(AudioError::Cancelled);
     }
-    Ok(analysis.result(duration))
+    let m_math = prof.mark();
+    let result = analysis.result(duration);
+    prof.record_math(m_math);
+    prof.record_format(rate, channels, chunks, frames_total);
+    Ok(result)
 }
 
 enum SeekProbe {
@@ -402,10 +561,7 @@ fn analyze_source_seek(
         cancelled,
         false,
     )?;
-    if tail_frames == 0
-        || tail_frames >= max_tail_frames
-        || tail_start < tail_target_sec - 15.0
-    {
+    if tail_frames == 0 || tail_frames >= max_tail_frames || tail_start < tail_target_sec - 15.0 {
         return Ok(SeekProbe::FallbackSequential);
     }
 
@@ -444,7 +600,8 @@ fn analyze_source_seek(
 
     for &at in &WINDOW_AT {
         let center = audible_start_sec + span_sec * at as f64;
-        let win_start = (center - win_sec * 0.5).clamp(audible_start_sec, audible_end_sec - win_sec);
+        let win_start =
+            (center - win_sec * 0.5).clamp(audible_start_sec, audible_end_sec - win_sec);
         let Some(seek_sec) = source.seek(win_start) else {
             return Ok(SeekProbe::FallbackSequential);
         };
@@ -844,7 +1001,9 @@ fn frame_sum_sq(hop_sq: &[f32], i: usize) -> f32 {
 }
 
 fn max_frame_sq(hop_sq: &[f32], n: usize) -> f32 {
-    (0..n).map(|i| frame_sum_sq(hop_sq, i)).fold(0.0f32, f32::max)
+    (0..n)
+        .map(|i| frame_sum_sq(hop_sq, i))
+        .fold(0.0f32, f32::max)
 }
 
 /// `None` when there is too little audible audio to describe (falls back to PCM hash if `< 3` s).
@@ -913,7 +1072,10 @@ fn window_bits(frames: &[[f32; BANDS]]) -> u32 {
     let mut energy = [[0.0f32; BANDS]; SLICES];
     for (t, slice) in split_even(frames, SLICES).enumerate() {
         for (b, e) in energy[t].iter_mut().enumerate() {
-            *e = slice.iter().map(|bands| (bands[b] + 1e-3).ln()).sum::<f32>()
+            *e = slice
+                .iter()
+                .map(|bands| (bands[b] + 1e-3).ln())
+                .sum::<f32>()
                 / slice.len().max(1) as f32;
         }
     }
