@@ -104,7 +104,7 @@ def worker(dll_path, paths):
 
 
 def transient_worker(dll_path, path):
-    """A sharing violation must not poison an unchanged file's RAM metadata entry."""
+    """Read the same fields before and after releasing an exclusive file handle."""
     dll, fields = content_plugin(dll_path)
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
@@ -114,8 +114,11 @@ def transient_worker(dll_path, path):
     lock = kernel.CreateFileW(str(path), 0x80000000, 0, None, 3, 0x80, None)
     assert lock != ctypes.c_void_p(-1).value, ctypes.get_last_error()
     buf = ctypes.create_string_buffer(128)
-    names = (["Audio_Duration_Sec", "Audio_PCM_Hash", "Audio_Fingerprint", "Audio_Fast_Fingerprint"]
-             if path.suffix == ".wav" else ["Image_Width"])
+    names = {
+        ".bmp": ["Image_Width", "Image_pHash", "Image_dHash"],
+        ".wav": ["Audio_Duration_Sec", "Audio_PCM_Hash", "Audio_Fingerprint", "Audio_Fast_Fingerprint"],
+        ".avi": ["Video_Fingerprint"],
+    }[path.suffix]
 
     def query(name):
         return dll.ContentGetValueW(str(path), fields[name][0], 0, buf, len(buf), 0)
@@ -301,7 +304,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     make_video_tags(paths[4])
     paths[5].write_bytes(b"\xff\xd8\xff\xe0\x00\x04\x00\x00\xff\xd9")
     paths[6].write_bytes(struct.pack(">I4s4sI4s", 12, b"ftyp", b"isom", 8, b"moov"))
-    for path in paths[:2]:
+    for path in paths[:3]:
         recovery = subprocess.run(
             [sys.executable, str(Path(__file__).resolve()), "--transient-worker", "--dll", str(dll), str(path)],
             env=dict(os.environ, MEDIARES_CONTENT_CACHE=str(work / "retry.sqlite3")),

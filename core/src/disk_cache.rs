@@ -1419,7 +1419,7 @@ mod tests {
             let dir =
                 std::env::temp_dir().join(format!("mediares-disk-{}-{stamp}", std::process::id()));
             std::fs::create_dir(&dir).unwrap();
-            std::fs::write(dir.join("С„РѕС‚Рѕ рџ¦Љ.jpg"), b"fixture").unwrap();
+            std::fs::write(dir.join("фото 🦊.jpg"), b"fixture").unwrap();
             Self(dir)
         }
 
@@ -1427,7 +1427,7 @@ mod tests {
             self.0.join("cache.sqlite3")
         }
         fn key(&self) -> Key {
-            Key::new(&FileKey::stat(&self.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg")).unwrap()).unwrap()
+            Key::new(&FileKey::stat(&self.0.join("фото 🦊.jpg")).unwrap()).unwrap()
         }
     }
 
@@ -1457,7 +1457,7 @@ mod tests {
         roundtrip(
             &fixture,
             &crate::exif::ExifInfo {
-                make: Some("РљР°РјРµСЂР° рџ¦Љ".into()),
+                make: Some("Камера 🦊".into()),
                 model: Some("Model".into()),
                 date_time: Some("2020:01:02 03:04:05".into()),
                 date_time_original: None,
@@ -1507,14 +1507,14 @@ mod tests {
         roundtrip(
             &fixture,
             &crate::video_tags::VideoTags {
-                title: Some("РќР°Р·РІР°РЅРёРµ".into()),
+                title: Some("Название".into()),
                 artist: Some("Artist".into()),
                 director: Some("Director".into()),
                 date: Some("2026-11-12".into()),
                 genre: None,
                 comment: Some("Text\nline".into()),
                 transfer: Some(u64::MAX),
-                chapters: vec![(0.0, "РЎС‚Р°СЂС‚".into()), (60.125, "".into())],
+                chapters: vec![(0.0, "Старт".into()), (60.125, "".into())],
             },
         );
         roundtrip(&fixture, &(6000u32, 4000u32));
@@ -1550,8 +1550,8 @@ mod tests {
         use crate::audio_tags::AudioTags;
         let fixture = Fixture::new();
         let mut tags = AudioTags {
-            title: Some("РџРµСЃРЅСЏ".into()),
-            artist: Some("РђСЂС‚РёСЃС‚".into()),
+            title: Some("Песня".into()),
+            artist: Some("Артист".into()),
             album: Some("Album".into()),
             album_artist: Some("Group".into()),
             genre: Some("Rock".into()),
@@ -1918,7 +1918,7 @@ mod tests {
         assert!(Store::open(&unknown).is_err());
         assert_eq!(db.pragma_query_i64("user_version").unwrap(), 99);
         assert!(Store::open(&fixture.0).is_err());
-        assert!(Store::open(&fixture.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg/cache.sqlite3")).is_err());
+        assert!(Store::open(&fixture.0.join("фото 🦊.jpg/cache.sqlite3")).is_err());
     }
 
     #[test]
@@ -1959,7 +1959,7 @@ mod tests {
     #[test]
     fn missing_timestamps_and_relative_paths_are_not_persisted() {
         let fixture = Fixture::new();
-        let mut key = FileKey::stat(&fixture.0.join("С„РѕС‚Рѕ рџ¦Љ.jpg")).unwrap();
+        let mut key = FileKey::stat(&fixture.0.join("фото 🦊.jpg")).unwrap();
         key.modified = None;
         assert!(Key::new(&key).is_none());
         key.modified = Some(UNIX_EPOCH);

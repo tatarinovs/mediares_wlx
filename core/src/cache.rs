@@ -90,7 +90,7 @@ pub mod stats {
 use crate::hashing::ImageAnalysis;
 use crate::image_decode::decode_for_gray_analysis;
 use crate::probe::{probe_file, MediaType};
-use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoError, VideoMeta};
+use crate::video_frame::{analyze_video, probe_video_meta, VideoAnalysis, VideoMeta};
 
 /// Analysis results are small (hashes); a folder of thousands of files stays cached while TC
 /// sorts and re-sorts it.
@@ -484,23 +484,21 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
     Some((value, bytes))
 }
 
-/// `None` if the host cancelled the analysis.
+/// A failed or cancelled decode leaves the file eligible for a later request.
 fn analyze_file(path: &Path, cancelled: &dyn Fn() -> bool) -> Option<CachedMedia> {
-    Some(match probe_file(path) {
+    match probe_file(path) {
         kind if kind.is_image_kind() => {
-            decode_for_gray_analysis(path, kind, crate::hashing::WORKING_SIZE)
-                .map(|(gray, (w, h))| {
+            decode_for_gray_analysis(path, kind, crate::hashing::WORKING_SIZE).map(
+                |(gray, (w, h))| {
                     CachedMedia::Image(Arc::new(crate::hashing::analyze_gray(&gray, w, h)))
-                })
-                .unwrap_or(CachedMedia::Unsupported)
+                },
+            )
         }
-        MediaType::Video => match analyze_video(path, cancelled) {
-            Ok(v) => CachedMedia::Video(Arc::new(v)),
-            Err(VideoError::Cancelled) => return None,
-            Err(VideoError::Failed(_)) => CachedMedia::Unsupported,
-        },
-        _ => CachedMedia::Unsupported,
-    })
+        MediaType::Video => analyze_video(path, cancelled)
+            .ok()
+            .map(|v| CachedMedia::Video(Arc::new(v))),
+        _ => Some(CachedMedia::Unsupported),
+    }
 }
 
 fn audio_analysis_cache() -> &'static FileCache<AudioAnalysis> {

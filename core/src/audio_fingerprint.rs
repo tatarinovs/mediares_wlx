@@ -322,8 +322,7 @@ impl SampleAnalysis for (BandAnalyzer, PcmHash) {
     fn result(self, duration: f64) -> Self::Output {
         let pcm_hash = self.1.finish();
         let fingerprint = fingerprint_with_window(
-            &self.0.mono,
-            &self.0.hop_sq,
+            &self.0,
             WINDOW_SEC,
             self.1.started.then_some(pcm_hash.as_str()),
         );
@@ -355,8 +354,7 @@ impl SampleAnalysis for FastSequential {
     fn result(self, duration: f64) -> Self::Output {
         let pcm_hash = self.1.finish();
         let fingerprint = fingerprint_with_window(
-            &self.0.mono,
-            &self.0.hop_sq,
+            &self.0,
             FAST_WINDOW_SEC,
             self.1.started.then_some(pcm_hash.as_str()),
         );
@@ -1036,17 +1034,25 @@ fn max_frame_sq(hop_sq: &[f32], n: usize) -> f32 {
 
 /// `None` when there is too little audible audio to describe (falls back to PCM hash if `< 3` s).
 fn fingerprint_with_window(
-    mono: &[f32],
-    hop_sq: &[f32],
+    analyzer: &BandAnalyzer,
     window_sec: f32,
     pcm_fallback: Option<&str>,
 ) -> Option<String> {
+    let mono = &analyzer.mono;
+    let hop_sq = &analyzer.hop_sq;
     let n = hop_sq.len().saturating_sub(BLOCKS_PER_FRAME - 1);
     if n == 0 {
         return pcm_fallback.map(|h| format!("1s_pcm_{h}"));
     }
     let max_sq = max_frame_sq(hop_sq, n);
     if max_sq <= SILENCE_FLOOR_SQ {
+        // The last, incomplete FFT frame may contain the only sound in the file.
+        // Include any input samples still waiting in the resampler.
+        let pending = analyzer.sum / analyzer.count.max(1) as f32;
+        let tail_sq = hop_sq[n..].iter().sum::<f32>() + analyzer.cur_hop_sq + pending * pending;
+        if tail_sq > SILENCE_FLOOR_SQ {
+            return pcm_fallback.map(|h| format!("1s_pcm_{h}"));
+        }
         return None;
     }
     let threshold_sq = max_sq * 10f32.powf(AUDIBLE_DB / 10.0);
@@ -1320,10 +1326,7 @@ mod tests {
         for _ in 0..(120 * ANALYSIS_RATE as usize) {
             analyzer.push_resampled(0.0);
         }
-        assert_eq!(
-            fingerprint_with_window(&analyzer.mono, &analyzer.hop_sq, WINDOW_SEC, None),
-            None
-        );
+        assert_eq!(fingerprint_with_window(&analyzer, WINDOW_SEC, None), None);
     }
 
     #[test]
@@ -1354,6 +1357,34 @@ mod tests {
         assert_eq!(full.fingerprint, Some(format!("1s_pcm_{}", full.pcm_hash)));
         assert_eq!(full.fingerprint, fast.fingerprint);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn brief_impulse_has_the_same_fingerprints_with_edge_silence() {
+        for length in [1, 30] {
+            let mut reference = None;
+            for (lead, tail) in [(0, 0), (0, 22050), (22050, 0)] {
+                let path = crate::test_util::pcm16_wav(
+                    "edge-impulse",
+                    22050,
+                    1,
+                    lead + length + tail,
+                    |i| {
+                        if (lead..lead + length).contains(&i) {
+                            20000
+                        } else {
+                            0
+                        }
+                    },
+                );
+                let full = analyze_audio(&path, &|| false).unwrap();
+                let fast = fast_fingerprint_audio(&path, &|| false).unwrap();
+                std::fs::remove_file(path).unwrap();
+                let expected = reference.get_or_insert_with(|| format!("1s_pcm_{}", full.pcm_hash));
+                assert_eq!(full.fingerprint.as_deref(), Some(expected.as_str()));
+                assert_eq!(fast.fingerprint, full.fingerprint);
+            }
+        }
     }
 
     #[test]
