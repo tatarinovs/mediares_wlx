@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use mediares_core::cache::{get_video_meta, get_video_tags, is_video_meta_cached};
 use mediares_core::keyframes::{KeyFrame, KeyframeIndex};
-use mediares_core::video_frame::{probe_video_meta, VideoMeta};
+use mediares_core::video_frame::{probe_video_source, VideoMeta};
 use mediares_core::video_tags::VideoTags;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -144,29 +144,30 @@ impl Player {
         VideoPlayer::new(surface, viewer).ok().map(Self::Mf)
     }
 
-    unsafe fn open(&self, path: &Path) -> bool {
+    unsafe fn open(&self, path: &Path, write_sharing: bool) -> bool {
         match self {
-            Self::Mf(p) => p.open(path).is_ok(),
+            Self::Mf(p) => p.open(path, write_sharing).is_ok(),
             Self::Mpv(p) => p.open(path),
         }
     }
 
     /// MF must reject unreadable sources before returning from ListLoad(W)/ListLoadNext(W),
     /// so Total Commander can try the next plugin. mpv supplies uncached metadata itself.
-    fn probe_meta(path: &Path) -> Option<VideoMeta> {
+    fn probe_meta(path: &Path) -> Option<(VideoMeta, bool)> {
         if playback_mpv::available() {
             if is_video_meta_cached(path) {
-                Some(
+                Some((
                     get_video_meta(path)
                         .map(|m| (*m).clone())
                         .unwrap_or_default(),
-                )
+                    false,
+                ))
             } else {
-                Some(VideoMeta::default())
+                Some((VideoMeta::default(), false))
             }
         } else {
             // Cached properties do not prove that MF can open the source now.
-            probe_video_meta(path)
+            probe_video_source(path)
         }
     }
 
@@ -475,14 +476,14 @@ impl VideoView {
         resume: bool,
         resume_threshold: f64,
     ) -> Option<Self> {
-        let mut info = Player::probe_meta(path)?;
+        let (mut info, mut write_sharing) = Player::probe_meta(path)?;
         let surface = Surface::new(viewer, true)?;
         let player = Player::new(surface.0, viewer)?;
         if matches!(player, Player::Mf(_)) && playback_mpv::available() {
-            info = probe_video_meta(path)?;
+            (info, write_sharing) = probe_video_source(path)?;
         }
         transport_bar::restore_audio_level(&*player);
-        if !player.open(path) {
+        if !player.open(path, write_sharing) {
             return None;
         }
         player.set_frame_rate(info.frame_rate);
@@ -523,7 +524,7 @@ impl VideoView {
         // Neither engine identifies the source of every callback. Give each file its own
         // engine/mailbox, so even a callback delivered late cannot acquire the next file's token.
         // A flip-model swap chain is exclusive to its HWND while the old engine shuts down.
-        let Some(mut info) = Player::probe_meta(path) else {
+        let Some((mut info, mut write_sharing)) = Player::probe_meta(path) else {
             return false;
         };
         let Some(surface) = Surface::new(self.viewer, true) else {
@@ -533,10 +534,10 @@ impl VideoView {
             return false;
         };
         if matches!(player, Player::Mf(_)) && playback_mpv::available() {
-            let Some(mf_info) = probe_video_meta(path) else {
+            let Some(source) = probe_video_source(path) else {
                 return false;
             };
-            info = mf_info;
+            (info, write_sharing) = source;
         }
         self.remember_position();
         self.loupe_end();
@@ -546,7 +547,7 @@ impl VideoView {
         player.set_volume(self.player.volume());
         player.set_muted(self.player.is_muted());
         player.set_rate(self.rate);
-        if !player.open(path) {
+        if !player.open(path, write_sharing) {
             return false;
         }
         player.set_frame_rate(info.frame_rate);

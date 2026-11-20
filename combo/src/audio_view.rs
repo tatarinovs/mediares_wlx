@@ -83,7 +83,7 @@ impl Backend {
         let surface = Surface::new(viewer, false)?;
         let player = VideoPlayer::new(surface.0, viewer).ok()?;
         transport_bar::restore_audio_level(&player);
-        player.open(path).ok()?;
+        player.open(path, false).ok()?;
         Some(Backend::Engine {
             player,
             _surface: surface,

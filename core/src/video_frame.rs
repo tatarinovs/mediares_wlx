@@ -4,14 +4,17 @@
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
-use windows::core::{Interface, GUID, PCWSTR};
+use windows::core::{Interface, GUID, HSTRING, PCWSTR};
+use windows::Win32::Foundation::{ERROR_SHARING_VIOLATION, E_FAIL};
 use windows::Win32::Media::MediaFoundation::{
-    IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFSample, IMFSourceReader,
-    MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType, MFCreateSourceReaderFromURL,
-    MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_MT_AUDIO_NUM_CHANNELS,
-    MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
-    MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION,
-    MF_MT_VIDEO_ROTATION, MF_PD_DURATION, MF_SOURCE_READERF_ENDOFSTREAM,
+    IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSourceReader,
+    MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType,
+    MFCreateSourceReaderFromMediaSource, MFCreateSourceReaderFromURL, MFCreateSourceResolver,
+    MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_E_UNSUPPORTED_BYTESTREAM_TYPE,
+    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
+    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
+    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_ROTATION, MF_OBJECT_INVALID, MF_PD_DURATION,
+    MF_RESOLUTION_MEDIASOURCE, MF_RESOLUTION_READ, MF_SOURCE_READERF_ENDOFSTREAM,
     MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
     MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
     MF_SOURCE_READER_MEDIASOURCE,
@@ -19,7 +22,7 @@ use windows::Win32::Media::MediaFoundation::{
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
 
-use crate::mf_init::{mf_scope, PropVariant};
+use crate::mf_init::{mf_scope, open_shared_stream, PropVariant};
 
 #[derive(Debug, Clone)]
 pub struct VideoAnalysis {
@@ -104,18 +107,61 @@ pub(crate) unsafe fn open_reader_for(
     stream: u32,
     video_processing: bool,
 ) -> windows::core::Result<IMFSourceReader> {
+    open_reader_with_sharing(path, stream, video_processing).map(|(reader, _)| reader)
+}
+
+unsafe fn open_reader_with_sharing(
+    path: &Path,
+    stream: u32,
+    video_processing: bool,
+) -> windows::core::Result<(IMFSourceReader, bool)> {
     let path_wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let mut attributes: Option<IMFAttributes> = None;
     MFCreateAttributes(&mut attributes, 1)?;
-    let attributes =
-        attributes.ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+    let attributes = attributes.ok_or_else(|| windows::core::Error::from(E_FAIL))?;
     if video_processing {
         attributes.SetUINT32(&MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1)?;
     }
-    let reader = MFCreateSourceReaderFromURL(PCWSTR(path_wide.as_ptr()), Some(&attributes))?;
+    let (reader, write_sharing) =
+        match MFCreateSourceReaderFromURL(PCWSTR(path_wide.as_ptr()), Some(&attributes)) {
+            Ok(reader) => (reader, false),
+            // The URL resolver can report an unsupported stream when the default file open
+            // conflicts with a writer. Retry through a stream we opened with write sharing.
+            Err(err)
+                if stream == STREAM
+                    && (err.code() == ERROR_SHARING_VIOLATION.to_hresult()
+                        || err.code() == MF_E_UNSUPPORTED_BYTESTREAM_TYPE) =>
+            {
+                (open_shared_reader(path, &attributes)?, true)
+            }
+            Err(err) => return Err(err),
+        };
     let _ = reader.SetStreamSelection(MF_SOURCE_READER_ALL_STREAMS.0 as u32, false);
     reader.SetStreamSelection(stream, true)?;
-    Ok(reader)
+    Ok((reader, write_sharing))
+}
+
+unsafe fn open_shared_reader(
+    path: &Path,
+    attributes: &IMFAttributes,
+) -> windows::core::Result<IMFSourceReader> {
+    let stream = open_shared_stream(path)?;
+    let name = HSTRING::from(path.file_name().unwrap_or(path.as_os_str()));
+    let resolver = MFCreateSourceResolver()?;
+    let mut kind = MF_OBJECT_INVALID;
+    let mut object = None;
+    resolver.CreateObjectFromByteStream(
+        &stream,
+        &name,
+        (MF_RESOLUTION_MEDIASOURCE | MF_RESOLUTION_READ).0 as u32,
+        None,
+        &mut kind,
+        &mut object,
+    )?;
+    let source: IMFMediaSource = object
+        .ok_or_else(|| windows::core::Error::from(E_FAIL))?
+        .cast()?;
+    MFCreateSourceReaderFromMediaSource(&source, Some(attributes))
 }
 
 pub(crate) unsafe fn duration_hns(reader: &IMFSourceReader) -> u64 {
@@ -138,11 +184,15 @@ pub(crate) fn file_bitrate_kbps(path: &Path, duration_sec: f64) -> Option<u32> {
 }
 
 /// Reads [`VideoMeta`] from the native media types of the first video and audio streams.
-/// Also the check that Media Foundation can open the file and has a video stream.
 pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
+    probe_video_source(path).map(|(meta, _)| meta)
+}
+
+/// Checks that Media Foundation can open the video and reports whether it needed write sharing.
+pub fn probe_video_source(path: &Path) -> Option<(VideoMeta, bool)> {
     let _com = mf_scope()?;
     unsafe {
-        let reader = open_reader(path, false).ok()?;
+        let (reader, write_sharing) = open_reader_with_sharing(path, STREAM, false).ok()?;
         let video = reader.GetNativeMediaType(STREAM, 0).ok()?;
         let frame_size = video.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
         // Packed as numerator << 32 | denominator.
@@ -153,7 +203,7 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
             .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
             .ok();
         let positive = |v: windows::core::Result<u32>| v.ok().filter(|&v| v > 0);
-        Some(VideoMeta {
+        let meta = VideoMeta {
             width: (frame_size >> 32) as u32,
             height: frame_size as u32,
             duration_sec,
@@ -182,7 +232,8 @@ pub fn probe_video_meta(path: &Path) -> Option<VideoMeta> {
                 .GetUINT32(&MF_MT_TRANSFER_FUNCTION)
                 .ok()
                 .and_then(dynamic_range_name),
-        })
+        };
+        Some((meta, write_sharing))
     }
 }
 

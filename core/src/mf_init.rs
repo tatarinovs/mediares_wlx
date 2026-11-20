@@ -3,13 +3,30 @@
 //! COM is initialized per call and balanced on drop, so plugin calls never leave a host thread
 //! in an apartment it did not choose. `MFStartup` is process-wide and happens once.
 
+use std::path::Path;
 use std::sync::Mutex;
 
-use windows::core::GUID;
-use windows::Win32::Media::MediaFoundation::{MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION};
+use windows::core::{GUID, HSTRING};
+use windows::Win32::Media::MediaFoundation::{
+    IMFByteStream, MFCreateMFByteStreamOnStream, MFStartup, MFSTARTUP_NOSOCKET, MF_VERSION,
+};
 use windows::Win32::System::Com::StructuredStorage::{PropVariantClear, PROPVARIANT};
-use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED};
+use windows::Win32::System::Com::{
+    CoInitializeEx, CoUninitialize, COINIT_MULTITHREADED, STGM_READ, STGM_SHARE_DENY_NONE,
+};
 use windows::Win32::System::Variant::{VT_CLSID, VT_I8, VT_LPWSTR, VT_UI2, VT_UI4, VT_UI8};
+use windows::Win32::UI::Shell::SHCreateStreamOnFileEx;
+
+/// Opens a local file for reading while allowing another process to keep it open for writing.
+/// The calling thread must have initialized COM and Media Foundation.
+pub fn open_shared_stream(path: &Path) -> windows::core::Result<IMFByteStream> {
+    let name = HSTRING::from(path);
+    unsafe {
+        let stream =
+            SHCreateStreamOnFileEx(&name, (STGM_READ | STGM_SHARE_DENY_NONE).0, 0, false, None)?;
+        MFCreateMFByteStreamOnStream(&stream)
+    }
+}
 
 /// Initializes COM on the current thread for the lifetime of the value.
 /// If the thread already has a different apartment, COM is usable as-is and nothing is undone.

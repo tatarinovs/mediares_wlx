@@ -504,7 +504,7 @@ impl VideoPlayer {
     }
 
     /// Opens `path` and starts playback (asynchronous; errors arrive as an ERROR event).
-    pub unsafe fn open(&self, path: &Path) -> windows::core::Result<()> {
+    pub unsafe fn open(&self, path: &Path, write_sharing: bool) -> windows::core::Result<()> {
         self.events.begin_file();
         {
             let mut screen = self.screen();
@@ -512,8 +512,16 @@ impl VideoPlayer {
             screen.hold = None;
             screen.preview = None;
         }
-        self.engine
-            .SetSource(&BSTR::from(path.as_os_str().to_string_lossy().as_ref()))?;
+        let source = BSTR::from(path.as_os_str().to_string_lossy().as_ref());
+        if write_sharing {
+            let engine = self.engine_ex.as_ref().ok_or_else(|| {
+                windows::core::Error::from(windows::Win32::Foundation::E_NOINTERFACE)
+            })?;
+            let stream = mediares_core::mf_init::open_shared_stream(path)?;
+            engine.SetSourceFromByteStream(&stream, &source)?;
+        } else {
+            self.engine.SetSource(&source)?;
+        }
         self.engine.Play()
     }
 
