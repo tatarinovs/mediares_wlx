@@ -331,20 +331,22 @@ def run_check(dll, baseline, viewer_dll, stress):
     original = rows()
     assert len(original) == 13, original  # Combined audio analysis + fast fingerprint; empty EXIF/video tags.
     with closing(sqlite3.connect(db)) as conn:
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
         assert slots == {0, 1, 2, 3, 4, 6, 7, 8, 10, 11}, slots
     warm = run(db)
     assert cold["values"] == warm["values"]
     assert rows() == original, "A fresh process recomputed cached results"
-    analysis_rows = [row for row in original if row[1] < 2]
     with sqlite3.connect(db) as conn:
-        conn.execute("DELETE FROM entries WHERE slot >= 2")
-        conn.execute("ALTER TABLE entries DROP COLUMN payload")
-        conn.execute("PRAGMA user_version=1")
+        conn.execute("UPDATE entries SET version=99 WHERE slot=11")
     conn.close()
-    assert run(db)["values"] == warm["values"], "The old schema was not upgraded"
-    original = rows()
-    assert [row for row in original if row[1] < 2] == analysis_rows, "Upgrading recomputed hashes"
+    assert run(db)["values"] == warm["values"]
+    refreshed = rows()
+    assert len(refreshed) == len(original)
+    assert all((before != after) == (before[1] == 11)
+               for before, after in zip(original, refreshed)), "Version change affected other families"
+    assert all(row[-1] == 1 for row in refreshed)
+    original = refreshed
     # A malformed individual metadata record must fall back and repair only that record.
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE entries SET payload='broken JSON' WHERE slot=2 AND path=?",
@@ -357,8 +359,15 @@ def run_check(dll, baseline, viewer_dll, stress):
     disabled = run("off")
     assert disabled["values"] == warm["values"]
     assert not (work / "local").exists(), "Disabling created the default cache"
+    prerelease_db = work / "local/mediares/content-cache-v1.sqlite3"
+    prerelease_db.parent.mkdir(parents=True)
+    with closing(sqlite3.connect(prerelease_db)) as conn:
+        conn.execute("PRAGMA user_version=2")
+    prerelease_bytes = prerelease_db.read_bytes()
+    assert run(prerelease_db)["values"] == warm["values"]
     assert run(None)["values"] == warm["values"]
-    default_db = work / "local/mediares/content-cache-v1.sqlite3"
+    assert prerelease_db.read_bytes() == prerelease_bytes
+    default_db = work / "local/mediares/content-cache.sqlite3"
     assert default_db.is_file(), "The default cache was not created"
     with closing(sqlite3.connect(default_db)) as conn:
         default_rows = conn.execute("SELECT rowid,* FROM entries ORDER BY rowid").fetchall()
@@ -406,7 +415,8 @@ def run_check(dll, baseline, viewer_dll, stress):
     report = {"dll": str(dll), "cold_ms": cold["ms"], "warm_ms": warm["ms"],
               "disabled_ms": disabled["ms"], "database_bytes": db.stat().st_size,
               "dll_bytes": dll.stat().st_size,
-              "checks": ["transient read recovery", "fresh-process hits", "metadata hits", "metadata edit", "schema upgrade",
+              "checks": ["transient read recovery", "fresh-process hits", "metadata hits", "metadata edit",
+                         "release schema v1", "prerelease cache isolation", "per-family versioning",
                          "malformed metadata", "default path", "RAM/UI delay", "Unicode paths", "file edit",
                          "algorithm version", "disabled", "unavailable", "corrupt", "locked",
                          "empty EXIF", "empty video tags"]}

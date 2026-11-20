@@ -218,7 +218,7 @@ Audio hashes are withheld on decoding errors or detected truncation.
 
 Image hashes, video/audio fingerprints, PCM hashes, sharpness and metadata survive
 Total Commander restarts in a local SQLite database:
-  %LOCALAPPDATA%\mediares\content-cache-v1.sqlite3
+  %LOCALAPPDATA%\mediares\content-cache.sqlite3
 
 Metadata includes EXIF, audio/video tags, stream properties, image
 dimensions and pixel format, and the TIFF page list. Data is saved on
@@ -226,9 +226,10 @@ demand; cover images and lyrics are excluded. A change in file size, modificatio
 time or algorithm version triggers a fresh read. Renamed files are also
 read again. Content changes preserving both size and time cannot be detected.
 
-Caching is enabled by default, with a 256 MiB limit and about 500,000
-records; old records are removed automatically. Adjacent -wal and -shm
-files may appear. If the database is unavailable, corrupt or busy, the
+Caching is enabled by default. The main database is limited to 256 MiB.
+Background maintenance removes the oldest records to keep the count
+around 500,000. Adjacent -wal and -shm files may appear.
+If the database is unavailable, corrupt or busy, the
 plugin reads the source file. To clear it, close all TC instances and
 delete the database. To disable it, set MEDIARES_CONTENT_CACHE=off before
 starting TC; an absolute database path on a local drive can be used

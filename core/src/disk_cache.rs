@@ -13,10 +13,7 @@ use crate::hashing::ImageAnalysis;
 use crate::sqlite::{Connection, Error, Result, Row, Statement};
 use crate::video_frame::VideoAnalysis;
 
-// Schema upgrades preserve existing analysis records; record versions invalidate stale results.
-const SCHEMA_VERSION: i32 = 2;
-// Bump when a cached analysis algorithm or payload representation changes.
-const VERSION: i32 = 1;
+const SCHEMA_VERSION: i64 = 1;
 const MAX_PAYLOAD: usize = 1024 * 1024;
 const MAX_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 500_000;
@@ -89,7 +86,7 @@ fn cache_path() -> Option<PathBuf> {
     }
     let path = PathBuf::from(std::env::var_os("LOCALAPPDATA")?)
         .join("mediares")
-        .join("content-cache-v1.sqlite3");
+        .join("content-cache.sqlite3");
     path.is_absolute().then_some(path)
 }
 
@@ -121,7 +118,7 @@ pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) -> usize {
     };
     let bytes = columns.memory_bytes();
     if let Some(key) = Key::new(key) {
-        with_store(|store| store.write(&key, T::SLOT, columns, MAINTENANCE_ALLOWED.get()));
+        with_store(|store| store.write::<T>(&key, columns, MAINTENANCE_ALLOWED.get()));
     }
     bytes
 }
@@ -176,12 +173,26 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|_| Error::InvalidPath)?;
         }
-        let db = Connection::open(path)?;
+        let mut db = Connection::open(path)?;
         db.busy_timeout(Duration::ZERO)?;
         let version = db.pragma_query_i64("user_version")?;
-        if !(0..=SCHEMA_VERSION as i64).contains(&version) {
-            return Err(Error::InvalidQuery);
+        match version {
+            0 => Self::create_schema(&mut db)?,
+            SCHEMA_VERSION => {}
+            _ => return Err(Error::InvalidQuery),
         }
+        let read_stmt = db.prepare(
+            "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
+                    fingerprint, pcm_hash, sharpness, payload FROM entries
+             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
+        )?;
+        let insert_stmt = db.prepare(
+            "INSERT OR REPLACE INTO entries
+             (path, slot, size, modified, version, kind, width, height, duration,
+              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )?;
         // Bound the main database and SQLite's RAM. WAL is checkpointed every ~1 MiB and
         // truncated after checkpoints; only short transactions are used by this plugin.
         let page_size = db.pragma_query_i64("page_size")?;
@@ -200,34 +211,6 @@ impl Store {
              PRAGMA wal_autocheckpoint=2048;
              PRAGMA journal_size_limit=8388608;",
         )?;
-        if version < SCHEMA_VERSION as i64 {
-            db.execute_batch(
-                "BEGIN IMMEDIATE;
-                 CREATE TABLE IF NOT EXISTS entries (
-                    path BLOB NOT NULL, slot INTEGER NOT NULL,
-                    size INTEGER NOT NULL, modified BLOB NOT NULL, version INTEGER NOT NULL,
-                    kind INTEGER NOT NULL, width INTEGER, height INTEGER, duration INTEGER,
-                    hash_a INTEGER, hash_b INTEGER, coarse INTEGER,
-                    fingerprint TEXT, pcm_hash TEXT, sharpness INTEGER,
-                    PRIMARY KEY(path, slot)
-                 );
-                 ALTER TABLE entries ADD COLUMN payload TEXT;
-                 PRAGMA user_version=2;
-                 COMMIT;",
-            )?;
-        }
-        let read_stmt = db.prepare(
-            "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
-                    fingerprint, pcm_hash, sharpness, payload FROM entries
-             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
-               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
-        )?;
-        let insert_stmt = db.prepare(
-            "INSERT OR REPLACE INTO entries
-             (path, slot, size, modified, version, kind, width, height, duration,
-              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        )?;
         // First maintenance is due, but opening for a quick read must not scan the database.
         Ok(Self {
             read_stmt,
@@ -235,6 +218,37 @@ impl Store {
             db,
             writes: MAINTENANCE_INTERVAL,
         })
+    }
+
+    fn create_schema(db: &mut Connection) -> Result<()> {
+        let tx = db.transaction_immediate()?;
+        // Another process may have initialized the file before we acquired the write lock.
+        match tx.query_row("PRAGMA user_version", &[], |r| r.get(0))? {
+            SCHEMA_VERSION => return tx.commit(),
+            0 => {}
+            _ => return Err(Error::InvalidQuery),
+        }
+        let has_objects: i64 = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT GLOB 'sqlite_*')",
+            &[],
+            |r| r.get(0),
+        )?;
+        if has_objects != 0 {
+            return Err(Error::InvalidQuery);
+        }
+        tx.execute(
+            "CREATE TABLE entries (
+                path BLOB NOT NULL, slot INTEGER NOT NULL,
+                size INTEGER NOT NULL, modified BLOB NOT NULL, version INTEGER NOT NULL,
+                kind INTEGER NOT NULL, width INTEGER, height INTEGER, duration INTEGER,
+                hash_a INTEGER, hash_b INTEGER, coarse INTEGER,
+                fingerprint TEXT, pcm_hash TEXT, sharpness INTEGER, payload TEXT,
+                PRIMARY KEY(path, slot)
+             )",
+            &[],
+        )?;
+        tx.execute(&format!("PRAGMA user_version={SCHEMA_VERSION}"), &[])?;
+        tx.commit()
     }
 
     #[cfg(test)]
@@ -250,7 +264,7 @@ impl Store {
                 &T::SLOT,
                 &key.size,
                 &modified,
-                &VERSION,
+                &T::VERSION,
                 &(MAX_PAYLOAD as i64),
             ],
             |row| {
@@ -261,7 +275,12 @@ impl Store {
         )
     }
 
-    fn write(&mut self, key: &Key, slot: i32, c: Columns<'_>, allow_eviction: bool) -> Result<()> {
+    fn write<T: DiskValue>(
+        &mut self,
+        key: &Key,
+        c: Columns<'_>,
+        allow_eviction: bool,
+    ) -> Result<()> {
         // Reject unbounded records before eviction (normal analysis strings are tiny).
         if c.payload.as_ref().map_or(0, String::len)
             + c.fingerprint.map_or(0, str::len)
@@ -270,25 +289,13 @@ impl Store {
         {
             return Err(Error::InvalidQuery);
         }
-        if !allow_eviction && self.writes >= MAINTENANCE_INTERVAL {
-            // max(rowid) is an indexed endpoint lookup, not a count scan. Once this
-            // conservative bound is reached, leave new writes to a background request.
-            let newest: i64 =
-                self.db
-                    .query_row("SELECT coalesce(max(rowid), 0) FROM entries", &[], |r| {
-                        r.get(0)
-                    })?;
-            if newest >= MAX_ENTRIES {
-                return Ok(());
-            }
-        }
-        if let Err(error) = self.insert(key, slot, &c) {
+        if let Err(error) = self.insert::<T>(key, &c) {
             if !allow_eviction || !error.is_full() {
                 return Err(error);
             }
             // Also handles a larger replacement or another process filling our reserved room.
             self.make_room()?;
-            self.insert(key, slot, &c)?;
+            self.insert::<T>(key, &c)?;
         }
         self.writes = self.writes.saturating_add(1);
         Ok(())
@@ -303,14 +310,14 @@ impl Store {
         Ok(())
     }
 
-    fn insert(&self, key: &Key, slot: i32, c: &Columns<'_>) -> Result<()> {
+    fn insert<T: DiskValue>(&self, key: &Key, c: &Columns<'_>) -> Result<()> {
         let modified: &[u8] = &key.modified;
         self.insert_stmt.execute(&[
             &key.path,
-            &slot,
+            &T::SLOT,
             &key.size,
             &modified,
-            &VERSION,
+            &T::VERSION,
             &c.kind,
             &c.width,
             &c.height,
@@ -413,12 +420,15 @@ const COL_PAYLOAD: usize = 10;
 
 pub(crate) trait DiskValue: Sized {
     const SLOT: i32;
+    // Bump this family's version when its algorithm or payload changes.
+    const VERSION: i32;
     fn from_row(row: &Row<'_>) -> Result<Self>;
     fn columns(&self) -> Option<Columns<'_>>;
 }
 
 impl DiskValue for CachedMedia {
     const SLOT: i32 = 0;
+    const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         Ok(match r.get::<i32>(COL_KIND)? {
@@ -475,6 +485,7 @@ impl DiskValue for CachedMedia {
 // fast fingerprint uses slot 11 independently; decoded duration uses slot 12.
 impl DiskValue for AudioAnalysis {
     const SLOT: i32 = 10;
+    const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -500,6 +511,7 @@ impl DiskValue for AudioAnalysis {
 
 impl DiskValue for AudioFastFingerprint {
     const SLOT: i32 = 11;
+    const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -526,6 +538,7 @@ impl DiskValue for AudioFastFingerprint {
 
 impl DiskValue for AudioDuration {
     const SLOT: i32 = 12;
+    const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -545,6 +558,7 @@ impl DiskValue for AudioDuration {
 
 impl DiskValue for u32 {
     const SLOT: i32 = 1;
+    const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         r.get(COL_SHARPNESS)
@@ -567,9 +581,10 @@ trait JsonCodec: Sized {
 }
 
 macro_rules! metadata {
-    ($ty:ty, $slot:expr) => {
+    ($ty:ty, $slot:expr, $version:expr) => {
         impl DiskValue for $ty {
             const SLOT: i32 = $slot;
+            const VERSION: i32 = $version;
 
             fn from_row(row: &Row<'_>) -> Result<Self> {
                 let payload: String = row.get(COL_PAYLOAD)?;
@@ -588,15 +603,15 @@ macro_rules! metadata {
     };
 }
 
-metadata!(crate::exif::ExifInfo, 2);
+metadata!(crate::exif::ExifInfo, 2, 1);
 #[cfg(feature = "tags")]
-metadata!(crate::audio_tags::AudioTags, 3);
-metadata!(crate::video_frame::VideoMeta, 4);
-metadata!(crate::mf_audio::AudioStreamMeta, 5);
-metadata!(crate::video_tags::VideoTags, 6);
-metadata!((u32, u32), 7);
-metadata!(crate::image_decode::PixelFormat, 8);
-metadata!(Vec<crate::wic_decode::TiffPage>, 9);
+metadata!(crate::audio_tags::AudioTags, 3, 1);
+metadata!(crate::video_frame::VideoMeta, 4, 1);
+metadata!(crate::mf_audio::AudioStreamMeta, 5, 1);
+metadata!(crate::video_tags::VideoTags, 6, 1);
+metadata!((u32, u32), 7, 1);
+metadata!(crate::image_decode::PixelFormat, 8, 1);
+metadata!(Vec<crate::wic_decode::TiffPage>, 9, 1);
 
 fn write_json_str(out: &mut String, s: &str) {
     out.push('"');
@@ -1439,7 +1454,7 @@ mod tests {
 
     fn put<T: DiskValue>(store: &mut Store, key: &Key, value: &T) {
         store
-            .write(key, T::SLOT, value.columns().unwrap(), true)
+            .write::<T>(key, value.columns().unwrap(), true)
             .unwrap();
     }
 
@@ -1590,47 +1605,16 @@ mod tests {
     }
 
     #[test]
-    fn schema_upgrade_preserves_existing_analysis_and_sharpness() {
+    fn release_schema_can_be_reopened_after_concurrent_initialization() {
         let fixture = Fixture::new();
         let mut store = Store::open(&fixture.path()).unwrap();
-        let analysis = CachedMedia::Image(Arc::new(ImageAnalysis {
-            width: 2,
-            height: 1,
-            dhash: u64::MAX,
-            phash: 1 << 63,
-            coarse_hash: 123,
-        }));
-        put(&mut store, &fixture.key(), &analysis);
         put(&mut store, &fixture.key(), &42u32);
-        let rows_before: Vec<i64> = store
-            .db
-            .prepare("SELECT rowid FROM entries ORDER BY rowid")
-            .unwrap()
-            .query_map(&[], |r| r.get(0))
-            .unwrap();
-        // This is exactly the previous schema: metadata payloads did not exist yet.
-        store
-            .db
-            .execute_batch("ALTER TABLE entries DROP COLUMN payload; PRAGMA user_version=1;")
-            .unwrap();
-        drop(store);
-        let store = Store::open(&fixture.path()).unwrap();
-        assert_eq!(store.read::<u32>(&fixture.key()).unwrap(), 42);
-        assert_eq!(
-            format!("{:?}", store.read::<CachedMedia>(&fixture.key()).unwrap()),
-            format!("{analysis:?}")
-        );
-        let rows_after: Vec<i64> = store
-            .db
-            .prepare("SELECT rowid FROM entries ORDER BY rowid")
-            .unwrap()
-            .query_map(&[], |r| r.get(0))
-            .unwrap();
-        assert_eq!(rows_before, rows_after);
-        assert_eq!(
-            store.db.pragma_query_i64("user_version").unwrap(),
-            SCHEMA_VERSION as i64
-        );
+        // Simulate a second opener that already saw version zero before the first committed.
+        let mut other = Connection::open(fixture.path()).unwrap();
+        Store::create_schema(&mut other).unwrap();
+        assert_eq!(other.pragma_query_i64("user_version").unwrap(), 1);
+        let reopened = Store::open(&fixture.path()).unwrap();
+        assert_eq!(reopened.read::<u32>(&fixture.key()).unwrap(), 42);
     }
 
     #[test]
@@ -1791,7 +1775,7 @@ mod tests {
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         let start = Instant::now();
         assert!(store
-            .write(&key, u32::SLOT, 43u32.columns().unwrap(), true)
+            .write::<u32>(&key, 43u32.columns().unwrap(), true)
             .is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(store.read::<u32>(&key).unwrap(), 42);
@@ -1832,12 +1816,7 @@ mod tests {
         for i in 0u32..150 {
             key.path = i.to_le_bytes().to_vec();
             if store
-                .write(
-                    &key,
-                    <crate::exif::ExifInfo as DiskValue>::SLOT,
-                    tags.columns().unwrap(),
-                    false,
-                )
+                .write::<crate::exif::ExifInfo>(&key, tags.columns().unwrap(), false)
                 .is_err()
             {
                 failed = true;
@@ -1854,12 +1833,11 @@ mod tests {
     }
 
     #[test]
-    fn quick_writes_defer_at_the_conservative_row_bound_without_scanning() {
+    fn quick_writes_accept_sparse_high_rowids_without_maintenance() {
         let fixture = Fixture::new();
         let mut store = Store::open(&fixture.path()).unwrap();
         let key = fixture.key();
         put(&mut store, &key, &42u32);
-        // Sparse rowids can overestimate the count: defer rather than scan from a quick call.
         store
             .db
             .execute("UPDATE entries SET rowid=?1", &[&MAX_ENTRIES])
@@ -1867,14 +1845,11 @@ mod tests {
         let mut next = fixture.key();
         next.path.push(1);
         store
-            .write(&next, u32::SLOT, 43u32.columns().unwrap(), false)
+            .write::<u32>(&next, 43u32.columns().unwrap(), false)
             .unwrap();
-        assert!(store.read::<u32>(&next).is_err());
-        assert_eq!(store.read::<u32>(&key).unwrap(), 42);
-        put(&mut store, &next, &43u32);
-        store.maintain().unwrap();
         assert_eq!(store.read::<u32>(&next).unwrap(), 43);
-        assert_eq!(store.writes, 0);
+        assert_eq!(store.read::<u32>(&key).unwrap(), 42);
+        assert!(store.writes > MAINTENANCE_INTERVAL);
     }
 
     #[test]
@@ -1914,9 +1889,17 @@ mod tests {
         );
         let unknown = fixture.0.join("future.sqlite3");
         let db = Connection::open(&unknown).unwrap();
-        db.pragma_update_i64("user_version", 99).unwrap();
-        assert!(Store::open(&unknown).is_err());
-        assert_eq!(db.pragma_query_i64("user_version").unwrap(), 99);
+        for version in [2, 99] {
+            db.pragma_update_i64("user_version", version).unwrap();
+            assert!(Store::open(&unknown).is_err());
+            assert_eq!(db.pragma_query_i64("user_version").unwrap(), version);
+        }
+        let unversioned = fixture.0.join("other.sqlite3");
+        let db = Connection::open(&unversioned).unwrap();
+        db.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)", &[])
+            .unwrap();
+        assert!(Store::open(&unversioned).is_err());
+        assert_eq!(db.pragma_query_i64("user_version").unwrap(), 0);
         assert!(Store::open(&fixture.0).is_err());
         assert!(Store::open(&fixture.0.join("фото 🦊.jpg/cache.sqlite3")).is_err());
     }
@@ -1951,7 +1934,7 @@ mod tests {
             fingerprint: None,
         };
         assert!(store
-            .write(&key, AudioAnalysis::SLOT, value.columns().unwrap(), true)
+            .write::<AudioAnalysis>(&key, value.columns().unwrap(), true)
             .is_err());
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
     }

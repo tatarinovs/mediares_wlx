@@ -849,6 +849,7 @@ mod tests {
         struct Counted;
         impl DiskValue for Counted {
             const SLOT: i32 = 99;
+            const VERSION: i32 = 1;
 
             fn from_row(_: &crate::sqlite::Row<'_>) -> crate::sqlite::Result<Self> {
                 unreachable!("relative paths never enter SQLite")

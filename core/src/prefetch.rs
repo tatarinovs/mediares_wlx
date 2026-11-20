@@ -12,6 +12,8 @@ use std::time::Instant;
 mod adaptive;
 use adaptive::Controller;
 
+use crate::cache::{AudioAnalysis, AudioFastFingerprint, CachedMedia};
+use crate::disk_cache::DiskValue;
 use crate::probe::{probe_file, MediaType};
 use crate::wdx_api::{prefetch_value, Field, Source};
 
@@ -260,10 +262,10 @@ pub(crate) fn begin_sample(path: &Path, slot: i32) -> Option<Sample> {
     let extension = extension(path)?;
     if !state.lanes.iter().any(|p| {
         let source_slot = match p.lane.field.source() {
-            Source::Analysis => 0,
-            Source::Sharpness => 1,
-            Source::AudioAnalysis => 10,
-            Source::AudioFastFingerprint => 11,
+            Source::Analysis => CachedMedia::SLOT,
+            Source::Sharpness => u32::SLOT,
+            Source::AudioAnalysis => AudioAnalysis::SLOT,
+            Source::AudioFastFingerprint => AudioFastFingerprint::SLOT,
             _ => return false,
         };
         source_slot == slot

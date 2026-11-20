@@ -312,6 +312,15 @@ impl Transaction<'_> {
         self.conn.execute(sql, params)
     }
 
+    pub(crate) fn query_row<T>(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSql],
+        f: impl FnOnce(&Row<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.conn.query_row(sql, params, f)
+    }
+
     pub fn commit(mut self) -> Result<()> {
         self.conn.execute_batch("COMMIT;")?;
         self.committed = true;
