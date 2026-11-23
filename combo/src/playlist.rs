@@ -11,6 +11,7 @@ use mediares_core::ffi::ansi_to_os_string;
 use mediares_core::probe::probe_file;
 
 use crate::i18n::tr;
+use crate::shortcut::MediaEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Repeat {
@@ -69,18 +70,18 @@ pub enum EndAction {
     Stop,
 }
 
-fn is_playable(path: &Path) -> bool {
-    probe_file(path).is_playable()
+fn is_playable(entry: &MediaEntry) -> bool {
+    probe_file(&entry.target).is_playable()
 }
 
 /// Nearest playable file after (`forward`) or before `current`, wrapping around if `wrap`.
 /// Photos in between are skipped.
-pub fn step(files: &[PathBuf], current: usize, forward: bool, wrap: bool) -> Option<usize> {
+pub fn step(files: &[MediaEntry], current: usize, forward: bool, wrap: bool) -> Option<usize> {
     following(files, current, forward, wrap).next()
 }
 
 fn following(
-    files: &[PathBuf],
+    files: &[MediaEntry],
     current: usize,
     forward: bool,
     wrap: bool,
@@ -101,7 +102,7 @@ fn following(
 
 /// Try each successor at most once; opening, rather than a directory probe, decides availability.
 pub fn candidates(
-    files: &[PathBuf],
+    files: &[MediaEntry],
     current: usize,
     forward: bool,
     wrap: bool,
@@ -117,14 +118,14 @@ pub fn candidates(
 }
 
 /// A random playable file other than `current`.
-pub fn random(files: &[PathBuf], current: usize) -> Option<usize> {
+pub fn random(files: &[MediaEntry], current: usize) -> Option<usize> {
     let candidates: Vec<usize> = (0..files.len())
         .filter(|&i| i != current && is_playable(&files[i]))
         .collect();
     (!candidates.is_empty()).then(|| candidates[next_random() as usize % candidates.len()])
 }
 
-pub fn on_end(files: &[PathBuf], current: usize, options: &QueueOptions) -> EndAction {
+pub fn on_end(files: &[MediaEntry], current: usize, options: &QueueOptions) -> EndAction {
     if options.repeat == Repeat::One {
         return EndAction::Replay;
     }
@@ -184,7 +185,7 @@ fn read_m3u(path: &Path) -> Vec<PathBuf> {
 
 /// Entries that the viewer can open automatically. A playlist may refer to files on
 /// its own network share, but it cannot cause a connection to a different one.
-pub fn media_entries(path: &Path) -> Vec<PathBuf> {
+pub fn media_entries(path: &Path) -> Vec<MediaEntry> {
     use std::collections::HashMap;
     use std::path::{Component, Prefix};
     use windows::Win32::Storage::FileSystem::GetDriveTypeW;
@@ -200,28 +201,36 @@ pub fn media_entries(path: &Path) -> Vec<PathBuf> {
     }
     let mut local_drives = HashMap::new();
     let playlist_prefix = prefix(path);
+    let mut allowed = |entry: &Path| {
+        entry.is_absolute()
+            && match prefix(entry) {
+                Some(Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) => {
+                    if matches!(playlist_prefix, Some(Prefix::Disk(d) | Prefix::VerbatimDisk(d)) if d == drive)
+                    {
+                        return true;
+                    }
+                    *local_drives.entry(drive).or_insert_with(|| {
+                        let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
+                        let kind = unsafe { GetDriveTypeW(windows::core::PCWSTR(root.as_ptr())) };
+                        matches!(
+                            kind,
+                            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK
+                        )
+                    })
+                }
+                Some(Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share)) => {
+                    matches!(playlist_prefix, Some(Prefix::UNC(base_server, base_share) | Prefix::VerbatimUNC(base_server, base_share))
+                    if crate::state::same_name(server, base_server) && crate::state::same_name(share, base_share))
+                }
+                _ => false,
+            }
+    };
     read_m3u(path)
         .into_iter()
+        .filter_map(|p| MediaEntry::resolve_allowed(p, &mut allowed))
         .filter(|entry| {
-            let kind = probe_file(entry);
-            entry.is_absolute() && (kind.is_image_kind() || kind.is_playable())
-        })
-        .filter(|entry| match prefix(entry) {
-            Some(Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) => {
-                if matches!(playlist_prefix, Some(Prefix::Disk(d) | Prefix::VerbatimDisk(d)) if d == drive) {
-                    return true;
-                }
-                *local_drives.entry(drive).or_insert_with(|| {
-                    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
-                    let kind = unsafe { GetDriveTypeW(windows::core::PCWSTR(root.as_ptr())) };
-                    matches!(kind, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK)
-                })
-            }
-            Some(Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share)) => {
-                matches!(playlist_prefix, Some(Prefix::UNC(base_server, base_share) | Prefix::VerbatimUNC(base_server, base_share))
-                    if crate::state::same_name(server, base_server) && crate::state::same_name(share, base_share))
-            }
-            _ => false,
+            let kind = probe_file(&entry.target);
+            kind.is_image_kind() || kind.is_playable()
         })
         .collect()
 }
@@ -293,8 +302,11 @@ fn percent_decoded(s: &str) -> String {
 mod tests {
     use super::*;
 
-    fn files(names: &[&str]) -> Vec<PathBuf> {
-        names.iter().map(PathBuf::from).collect()
+    fn files(names: &[&str]) -> Vec<MediaEntry> {
+        names
+            .iter()
+            .filter_map(|p| MediaEntry::resolve(PathBuf::from(p)))
+            .collect()
     }
 
     #[test]
@@ -371,7 +383,8 @@ file://external.invalid/share/other.wav
         .unwrap();
         let entries = media_entries(&path);
         let _ = std::fs::remove_file(&path);
-        assert_eq!(entries, [path.with_file_name("local.wav")]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].target, path.with_file_name("local.wav"));
     }
 
     #[test]

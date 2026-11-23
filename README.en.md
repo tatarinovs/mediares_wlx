@@ -46,6 +46,8 @@ You can also register them manually: **Configuration → Options → Plugins →
 
 ## Viewer
 
+Press F3 or Ctrl+Q on a Windows shortcut (`.lnk`) to view its target media file. Browse files and shortcuts in filename order in the shortcut's folder. M3U and M3U8 playlists can also contain shortcuts. Thumbnails also come from the target. Del moves the shortcut to the Recycle Bin. Saving a rotation updates the original file.
+
 Temporary PNGs of copied frames and cover art in `%TEMP%\Mediares` are cleaned up on viewer startup or another copy, once at least 24 hours old. The current file clipboard and files opened by other applications are kept.
 
 ### Photos

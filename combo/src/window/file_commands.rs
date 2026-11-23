@@ -12,7 +12,10 @@ pub(crate) unsafe fn leave_fullscreen(hwnd: HWND) {
 /// is left). State is re-fetched after each call that may show a dialog.
 pub(crate) unsafe fn delete_current(hwnd: HWND) {
     let Some(state) = get_state(hwnd) else { return };
-    let (path, confirm) = (state.file_path.clone(), state.config.confirm_delete);
+    let Some(path) = state.deletion_path().map(Path::to_owned) else {
+        return;
+    };
+    let confirm = state.config.confirm_delete;
     if !path.is_file() {
         return;
     }
@@ -36,7 +39,7 @@ pub(crate) unsafe fn delete_current(hwnd: HWND) {
         }
         return;
     }
-    if state.remove_current() {
+    if state.remove_deleted(&path) {
         refresh(state);
     } else if !state.lister.is_invalid() {
         let _ = PostMessageW(

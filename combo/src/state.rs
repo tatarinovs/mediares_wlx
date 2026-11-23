@@ -18,6 +18,7 @@ use crate::image_cache::{self, DecodeOptions, DecodedImage, Request, Ticket};
 use crate::media_view::MediaView;
 use crate::overlay::Fullscreen;
 use crate::playlist::{self, EndAction};
+use crate::shortcut::MediaEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ZoomMode {
@@ -85,7 +86,7 @@ pub struct ViewerState {
     /// The photo the one on screen is compared with, side by side.
     pub compare: Option<Compare>,
     /// The files navigated through: the folder's viewable files, or an M3U playlist's entries.
-    pub dir_files: Vec<PathBuf>,
+    pub dir_files: Vec<MediaEntry>,
     pub current_idx: usize,
     /// Direction of the last move through the list (prefetching looks further that way).
     forward: bool,
@@ -163,15 +164,25 @@ impl ViewerState {
     /// Switches to `path`, resetting the view. Returns whether it could be displayed. An M3U
     /// playlist replaces the file list with its entries and shows the first one.
     pub fn set_file(&mut self, path: &Path) -> bool {
-        if probe_file(path) == MediaType::Playlist {
-            return self.open_playlist(path);
+        let Some(entry) = MediaEntry::resolve(path.to_path_buf()) else {
+            return false;
+        };
+        if probe_file(&entry.target) == MediaType::Playlist {
+            return self.open_playlist(entry);
         }
-        match self.dir_files.iter().position(|p| same_path(p, path)) {
-            Some(pos) => self.current_idx = pos,
+        match self
+            .dir_files
+            .iter()
+            .position(|e| same_path(e.source(), path))
+        {
+            Some(pos) => {
+                self.dir_files[pos] = entry;
+                self.current_idx = pos;
+            }
             None => {
                 // The file is shown first; the folder (thousands of files, maybe on a network
                 // drive) is listed meanwhile.
-                (self.dir_files, self.current_idx) = (vec![path.to_path_buf()], 0);
+                (self.dir_files, self.current_idx) = (vec![entry], 0);
                 self.playlist = None;
                 // Stepping on while the folder is still being listed: that listing will have the
                 // new file too, so it is not started over (one full listing per keypress on a
@@ -182,14 +193,15 @@ impl ViewerState {
                 }
             }
         }
-        self.show(path)
+        self.go_to(self.current_idx)
     }
 
-    fn open_playlist(&mut self, path: &Path) -> bool {
+    fn open_playlist(&mut self, playlist_file: MediaEntry) -> bool {
         // Bound the number of synchronous opens. The rest of the list is available on navigation.
         const MAX_INITIAL_OPENS: usize = 32;
-        let entries = playlist::media_entries(path);
-        for (idx, file) in entries.iter().take(MAX_INITIAL_OPENS).enumerate() {
+        let entries = playlist::media_entries(&playlist_file.target);
+        for (idx, entry) in entries.iter().take(MAX_INITIAL_OPENS).enumerate() {
+            let file = &entry.target;
             let kind = probe_file(file);
             let prepared = if kind.is_playable() {
                 unsafe { MediaView::open(self.hwnd, None, file, kind, self.open_options()) }
@@ -211,7 +223,7 @@ impl ViewerState {
                 self.pages_known = !may_have_pages(file, kind);
                 self.current_idx = idx;
                 self.dir_files = entries;
-                self.playlist = Some(path.to_path_buf());
+                self.playlist = Some(playlist_file.source().to_path_buf());
                 self.scan = None;
                 return self.show_page_prepared(Some(prepared));
             }
@@ -225,9 +237,21 @@ impl ViewerState {
             return false;
         };
         self.scan = None;
-        let Some(idx) = files.iter().position(|p| same_path(p, &self.file_path)) else {
+        let Some(current) = self.dir_files.get(self.current_idx) else {
             return false;
         };
+        let Some(idx) = files
+            .iter()
+            .position(|e| same_path(e.source(), current.source()))
+        else {
+            return false;
+        };
+        self.preloaded = self.preloaded.and_then(|i| {
+            let queued = self.dir_files.get(i)?;
+            files.iter().position(|e| {
+                same_path(e.source(), queued.source()) && same_path(&e.target, &queued.target)
+            })
+        });
         (self.dir_files, self.current_idx) = (files, idx);
         let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
         if let Some(media) = self.media.as_mut() {
@@ -396,7 +420,7 @@ impl ViewerState {
 
     /// Shows the file at `idx` of the list; false if it can't be displayed.
     fn go_to(&mut self, idx: usize) -> bool {
-        let Some(path) = self.dir_files.get(idx).cloned() else {
+        let Some(path) = self.dir_files.get(idx).map(|e| e.target.clone()) else {
             return false;
         };
         self.current_idx = idx;
@@ -408,7 +432,7 @@ impl ViewerState {
         let n = self.dir_files.len();
         let next = (1..n)
             .map(|k| (self.current_idx + k) % n)
-            .find(|&i| probe_file(&self.dir_files[i]).is_image_kind());
+            .find(|&i| probe_file(&self.dir_files[i].target).is_image_kind());
         match next {
             Some(idx) => {
                 self.forward = true;
@@ -437,7 +461,7 @@ impl ViewerState {
             } else {
                 (start + total - offset) % total
             };
-            if probe_file(&self.dir_files[idx]).is_playable() && self.go_to(idx) {
+            if probe_file(&self.dir_files[idx].target).is_playable() && self.go_to(idx) {
                 return true;
             }
         }
@@ -462,7 +486,7 @@ impl ViewerState {
         else {
             return;
         };
-        let path = self.dir_files[idx].clone();
+        let path = self.dir_files[idx].target.clone();
         if probe_file(&path) != MediaType::Audio {
             return;
         }
@@ -587,11 +611,10 @@ impl ViewerState {
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
         if config.skip_raw_twins != self.config.skip_raw_twins && self.playlist.is_none() {
-            self.scan = Some(DirScan::start(
-                &self.file_path,
-                config.skip_raw_twins,
-                self.hwnd,
-            ));
+            self.scan = self
+                .dir_files
+                .get(self.current_idx)
+                .map(|e| DirScan::start(e.source(), config.skip_raw_twins, self.hwnd));
         }
         self.set_queue(config.queue);
         if config.replay_gain != self.config.replay_gain {
@@ -641,13 +664,33 @@ impl ViewerState {
         true
     }
 
+    pub fn deletion_path(&self) -> Option<&Path> {
+        let entry = self.dir_files.get(self.current_idx)?;
+        Some(
+            self.playlist
+                .as_deref()
+                .filter(|p| crate::shortcut::is_shortcut(p))
+                .unwrap_or_else(|| entry.source()),
+        )
+    }
+
     /// The current file was deleted: drops it from the list and shows the one that took its
     /// place (or the new last one). False if nothing is left; a next file that can't be shown
     /// still keeps the viewer open, so the user can move on from it.
-    pub fn remove_current(&mut self) -> bool {
-        if self.current_idx < self.dir_files.len() {
-            self.dir_files.remove(self.current_idx);
+    pub fn remove_deleted(&mut self, path: &Path) -> bool {
+        if self.playlist.as_deref().is_some_and(|p| same_path(p, path)) {
+            self.dir_files.clear();
         }
+        let survives = |entry: &MediaEntry| {
+            !same_path(entry.source(), path) && !same_path(&entry.target, path)
+        };
+        let next = self
+            .dir_files
+            .iter()
+            .take(self.current_idx)
+            .filter(|entry| survives(entry))
+            .count();
+        self.dir_files.retain(survives);
         self.image = None;
         self.whole = None;
         self.whole_upright = None;
@@ -657,7 +700,7 @@ impl ViewerState {
             self.media = None;
             return false;
         }
-        self.go_to(self.current_idx.min(self.dir_files.len() - 1));
+        self.go_to(next.min(self.dir_files.len() - 1));
         true
     }
 
@@ -765,7 +808,7 @@ impl ViewerState {
         pictures.extend(
             indices
                 .into_iter()
-                .map(|i| self.dir_files[i].clone())
+                .map(|i| self.dir_files[i].target.clone())
                 .filter(|p| probe_file(p).is_image_kind())
                 .map(|p| (p, first_page)),
         );
@@ -862,7 +905,7 @@ pub const WM_DIR_SCANNED: u32 = WM_APP + 0x13;
 struct DirScan {
     file: PathBuf,
     skip_raw_twins: bool,
-    files: Mutex<Option<Vec<PathBuf>>>,
+    files: Mutex<Option<Vec<MediaEntry>>>,
 }
 
 impl DirScan {
@@ -877,7 +920,7 @@ impl DirScan {
             let (result, file) = (Arc::downgrade(&scan), file.to_path_buf());
             move || {
                 let cancelled = || result.strong_count() == 0;
-                let (files, _) = scan_directory_media(&file, skip_raw_twins, &cancelled);
+                let files = scan_directory_media(&file, skip_raw_twins, &cancelled);
                 let Some(result) = result.upgrade() else {
                     return;
                 };
@@ -908,7 +951,7 @@ impl DirScan {
             }
     }
 
-    fn take(&self) -> Option<Vec<PathBuf>> {
+    fn take(&self) -> Option<Vec<MediaEntry>> {
         self.files.lock().unwrap_or_else(|e| e.into_inner()).take()
     }
 }
@@ -921,52 +964,47 @@ fn scan_directory_media(
     current_file: &Path,
     skip_raw_twins: bool,
     cancelled: &dyn Fn() -> bool,
-) -> (Vec<PathBuf>, usize) {
-    let single = || (vec![current_file.to_path_buf()], 0);
+) -> Vec<MediaEntry> {
     let Some(entries) = current_file
         .parent()
         .and_then(|p| std::fs::read_dir(p).ok())
     else {
-        return single();
+        return Vec::new();
     };
 
-    let mut files: Vec<PathBuf> = entries
+    let mut files: Vec<MediaEntry> = entries
         .take_while(|_| !cancelled())
         .flatten()
         .filter(|e| {
             e.file_type()
                 .is_ok_and(|t| t.is_file() || t.is_symlink() && e.path().is_file())
         })
-        .map(|e| e.path())
-        .filter(|p| is_viewable(probe_file(p)))
+        .filter_map(|e| MediaEntry::resolve(e.path()))
+        .filter(|e| is_viewable(probe_file(&e.target)))
         .collect();
     if cancelled() {
-        return single();
+        return Vec::new();
     }
     if skip_raw_twins {
         drop_raw_twins(&mut files, current_file);
     }
-    if files.is_empty() {
-        return single();
-    }
 
-    files.sort_by_cached_key(|p| natural_key(&p.file_name().unwrap_or_default().to_string_lossy()));
-    let idx = files
-        .iter()
-        .position(|p| same_path(p, current_file))
-        .unwrap_or(0);
-    (files, idx)
+    files.sort_by_cached_key(|p| {
+        natural_key(&p.source().file_name().unwrap_or_default().to_string_lossy())
+    });
+    files
 }
 
 /// Removes the RAW files whose name (without extension, any case) a standard image shares.
-fn drop_raw_twins(files: &mut Vec<PathBuf>, keep: &Path) {
+fn drop_raw_twins(files: &mut Vec<MediaEntry>, keep: &Path) {
     let stem = |p: &Path| p.file_stem().map(|s| s.to_string_lossy().to_lowercase());
     let developed: std::collections::HashSet<String> = files
         .iter()
-        .filter(|p| probe_file(p) == MediaType::StandardImage)
-        .filter_map(|p| stem(p))
+        .filter(|p| probe_file(p.source()) == MediaType::StandardImage)
+        .filter_map(|p| stem(p.source()))
         .collect();
-    files.retain(|p| {
+    files.retain(|entry| {
+        let p = entry.source();
         probe_file(p) != MediaType::RawImage
             || same_path(p, keep)
             || !stem(p).is_some_and(|s| developed.contains(&s))
@@ -1034,7 +1072,12 @@ mod tests {
 
     #[test]
     fn raw_twins_are_skipped_but_not_the_file_opened() {
-        let paths = |names: &[&str]| names.iter().map(PathBuf::from).collect::<Vec<_>>();
+        let paths = |names: &[&str]| {
+            names
+                .iter()
+                .filter_map(|p| MediaEntry::resolve(PathBuf::from(p)))
+                .collect::<Vec<_>>()
+        };
         let mut files = paths(&["a.ARW", "A.jpg", "b.arw", "c.cr2", "c.heic", "d.mp4"]);
         drop_raw_twins(&mut files, Path::new("c.cr2"));
         assert_eq!(

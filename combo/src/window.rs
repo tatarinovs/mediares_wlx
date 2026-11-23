@@ -74,7 +74,6 @@ unsafe fn register_class() {
 /// Creates the viewer for `path`, or returns `None` (so TC tries other plugins) if it can't be
 /// displayed.
 pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Option<HWND> {
-    snapshot::cleanup_on_start(path);
     register_class();
 
     let mut rc = RECT::default();
@@ -102,6 +101,7 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
         let _ = DestroyWindow(hwnd);
         return None;
     };
+    snapshot::cleanup_on_start(&state.file_path);
     state.show_flags = show_flags;
     // Only the standalone Lister (F3) starts fullscreen, not the Quick View panel (Ctrl+Q).
     let start_fullscreen = state.config.start_fullscreen && !is_quick_view(lister);

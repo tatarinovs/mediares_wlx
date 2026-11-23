@@ -29,6 +29,7 @@ mod resume;
 mod save_as;
 mod seek_preview;
 mod settings_dialog;
+mod shortcut;
 mod smooth;
 mod snapshot;
 mod state;
@@ -122,7 +123,7 @@ fn wlx_detect_string() -> &'static str {
             MediaType::Audio,
             MediaType::Playlist,
         ]);
-        format!("MULTIMEDIA & ({})", exts)
+        format!("MULTIMEDIA & (EXT=\"LNK\" | {})", exts)
     })
 }
 
@@ -294,11 +295,15 @@ pub unsafe extern "system" fn ListGetPreviewBitmap(
 }
 
 unsafe fn preview_bitmap(path: Option<PathBuf>, width: c_int, height: c_int) -> HBITMAP {
-    let (Some(path), Ok(w), Ok(h)) = (path, u32::try_from(width), u32::try_from(height)) else {
+    let (Some(path), Ok(w), Ok(h)) = (
+        path.and_then(shortcut::MediaEntry::resolve),
+        u32::try_from(width),
+        u32::try_from(height),
+    ) else {
         return HBITMAP::default();
     };
     init_formats();
-    snapshot::thumbnail(&path, w, h)
+    snapshot::thumbnail(&path.target, w, h)
         .and_then(|img| snapshot::to_hbitmap(&img))
         .unwrap_or_default()
 }
