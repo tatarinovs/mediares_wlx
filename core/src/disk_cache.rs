@@ -93,12 +93,15 @@ fn cache_path() -> Option<PathBuf> {
 fn with_store<R>(f: impl FnOnce(&mut Store) -> Result<R>) -> Option<R> {
     // Serialize short background operations so parallel prefetch writes are not lost. Quick
     // UI reads still treat a busy connection as a miss. Never wait on an external DB lock.
-    let mut state = if MAINTENANCE_ALLOWED.get() {
+    let background = MAINTENANCE_ALLOWED.get();
+    let mut state = if background {
         CACHE.lock().ok()?
     } else {
         CACHE.try_lock().ok()?
     };
-    state.open_if_needed(cache_path, Instant::now());
+    if background {
+        state.open_if_needed(cache_path, Instant::now());
+    }
     match &mut *state {
         State::Open(store) => f(store).ok(),
         _ => None,
@@ -124,9 +127,9 @@ pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) -> usize {
 }
 
 pub(crate) fn close() {
-    if let Ok(mut state) = CACHE.lock() {
-        *state = State::Unopened;
-    }
+    let mut state = CACHE.lock().unwrap_or_else(|err| err.into_inner());
+    *state = State::Unopened;
+    CACHE.clear_poison();
 }
 
 struct Key {

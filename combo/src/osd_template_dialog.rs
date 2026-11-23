@@ -31,7 +31,7 @@ const FIELDS_PER_GROUP: usize = 100;
 struct Context {
     fields: FieldGroups,
     default: &'static str,
-    result: Option<String>,
+    result: std::cell::RefCell<Option<String>>,
 }
 
 /// Edits `current`; the new template if the user pressed OK.
@@ -47,7 +47,7 @@ pub unsafe fn show(
     let ctx = Box::into_raw(Box::new(Context {
         fields,
         default,
-        result: None,
+        result: std::cell::RefCell::default(),
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
 
@@ -104,7 +104,7 @@ pub unsafe fn show(
 
     dialog::run_modal(dlg, edit);
     // run_modal returns only after the window is destroyed, so nothing references `ctx` anymore.
-    Box::from_raw(ctx).result
+    Box::from_raw(ctx).result.into_inner()
 }
 
 /// The edit control wants CR LF line breaks; templates keep plain LF.
@@ -130,8 +130,9 @@ unsafe fn add_field(dlg: HWND, ctx: &Context) {
                 &label,
             );
         }
-        // The submenu is destroyed with its parent.
-        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, &HSTRING::from(tr(group)));
+        if AppendMenuW(menu, MF_POPUP, sub.0 as usize, &HSTRING::from(tr(group))).is_err() {
+            let _ = DestroyMenu(sub);
+        }
     }
 
     let mut rc = RECT::default();
@@ -184,7 +185,7 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
-        let Some(ctx) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Context).as_mut() else {
+        let Some(ctx) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Context).as_ref() else {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
         match msg {
@@ -201,11 +202,11 @@ unsafe extern "system" fn wnd_proc(
                     }
                     id if id == IDOK.0 => {
                         let text = edit_text(hwnd);
-                        ctx.result = Some(if text.trim().is_empty() {
+                        ctx.result.replace(Some(if text.trim().is_empty() {
                             ctx.default.to_string()
                         } else {
                             text
-                        });
+                        }));
                         dialog::close(hwnd);
                     }
                     id if id == IDCANCEL.0 => dialog::close(hwnd),

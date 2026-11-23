@@ -124,17 +124,21 @@ fn item_extent(iloc: &[u8], id: u32) -> Option<(u64, u64)> {
         r.uint(2)?; // data reference index
         let base = r.uint(base_size)?;
         let extents = r.uint(2)?;
-        let mut first = None;
-        for _ in 0..extents {
+        let bytes = (index_size + offset_size + length_size).checked_mul(extents as usize)?;
+        let end = r.pos.checked_add(bytes)?;
+        if end > r.data.len() {
+            return None;
+        }
+        if item == u64::from(id) {
+            if method != 0 || extents == 0 {
+                return None;
+            }
             r.uint(index_size)?;
             let offset = r.uint(offset_size)?;
             let length = r.uint(length_size)?;
-            first.get_or_insert((offset, length));
+            return Some((base.checked_add(offset)?, length));
         }
-        if item == u64::from(id) {
-            let (offset, length) = first?;
-            return (method == 0).then_some((base.checked_add(offset)?, length));
-        }
+        r.pos = end;
     }
     None
 }

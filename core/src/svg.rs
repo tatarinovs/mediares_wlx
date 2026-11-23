@@ -159,9 +159,15 @@ fn render_size((w, h): (f32, f32)) -> Option<(u32, u32, f32)> {
     if !(longer > 0.0 && longer.is_finite()) {
         return None;
     }
-    let scale = longer.clamp(MIN_RENDER_SIDE, MAX_RENDER_SIDE) / longer;
-    let px = |v: f32| ((v * scale).round() as u32).max(1);
-    Some((px(w), px(h), scale))
+    let mut scale = longer.clamp(MIN_RENDER_SIDE, MAX_RENDER_SIDE) / longer;
+    let px = |v: f32| (v as u32).max(1);
+    let (width, height) = (px((w * scale).round()), px((h * scale).round()));
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > crate::image_decode::MAX_PIXELS {
+        scale *= (crate::image_decode::MAX_PIXELS as f32 / pixels as f32).sqrt();
+        return Some((px((w * scale).floor()), px((h * scale).floor()), scale));
+    }
+    Some((width, height, scale))
 }
 
 /// Parses the document on a 1×1 canvas: enough to read its size.
@@ -176,6 +182,9 @@ pub fn dimensions(path: &Path) -> Option<(u32, u32)> {
     let xml = read_xml(path)?;
     let _d2d = D2D_SVG.lock().unwrap_or_else(|e| e.into_inner());
     let (w, h) = parsed_size(&xml)?;
+    if !w.is_finite() || !h.is_finite() {
+        return None;
+    }
     Some(((w.round() as u32).max(1), (h.round() as u32).max(1)))
 }
 
@@ -185,6 +194,9 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
     let _d2d = D2D_SVG.lock().unwrap_or_else(|e| e.into_inner());
     let size = parsed_size(&xml)?;
     let (w, h, scale) = render_size(size)?;
+    if !crate::image_decode::valid_dimensions(w, h) {
+        return None;
+    }
     let canvas = Canvas::new(w, h)?;
     let doc = canvas.document(&xml)?;
     unsafe {
@@ -201,7 +213,7 @@ pub fn decode(path: &Path) -> Option<DynamicImage> {
         dc.EndDraw(None, None).ok()?;
     }
     let stride = w * 4;
-    let mut pixels = vec![0u8; stride as usize * h as usize];
+    let mut pixels = crate::image_decode::zeroed_bytes(stride as usize * h as usize)?;
     unsafe {
         canvas
             .bitmap
@@ -255,6 +267,13 @@ mod tests {
         assert_eq!(img.dimensions(), (1024, 512));
         assert_eq!(img.get_pixel(100, 100).0, [255, 0, 0, 255]);
         assert_eq!(img.get_pixel(900, 100).0[3], 0);
+    }
+
+    #[test]
+    fn large_square_fits_the_pixel_budget() {
+        let (w, h, _) = render_size((10_000.0, 10_000.0)).unwrap();
+        assert_eq!(w, h);
+        assert!(crate::image_decode::valid_dimensions(w, h));
     }
 
     #[test]

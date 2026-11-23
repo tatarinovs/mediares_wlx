@@ -9,7 +9,7 @@ pub(super) unsafe fn build_controls(
     ctx: &Context,
     font: windows::Win32::Graphics::Gdi::HFONT,
 ) -> (HWND, Pages) {
-    let cfg = &ctx.config;
+    let cfg = &ctx.initial;
     let tab = WS_TABSTOP.0;
 
     let tabs = dialog::control(
@@ -568,7 +568,11 @@ pub(super) unsafe fn build_controls(
         (GROUPED, row(wdx, 0) + 3, GROUPED_W, 36),
         0,
     );
-    let registered = ctx.registration.as_ref().is_some_and(|r| r.registered);
+    let registered = ctx
+        .registration
+        .borrow()
+        .as_ref()
+        .is_some_and(|r| r.registered);
     let wdx_label = if registered {
         registered_label()
     } else {

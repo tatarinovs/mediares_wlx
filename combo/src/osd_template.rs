@@ -317,7 +317,8 @@ enum Node {
 }
 
 /// Parses until the end or, inside a block, its closing `>`.
-fn parse(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, in_block: bool) -> Vec<Node> {
+fn parse(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, depth: usize) -> Vec<Node> {
+    const MAX_DEPTH: usize = 32;
     let mut nodes = Vec::new();
     let mut text = String::new();
     let flush = |text: &mut String, nodes: &mut Vec<Node>| {
@@ -358,11 +359,11 @@ fn parse(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, in_block: bool) -
                     }
                 }
             }
-            '<' => {
+            '<' if depth < MAX_DEPTH => {
                 flush(&mut text, &mut nodes);
-                nodes.push(Node::Block(parse(chars, true)));
+                nodes.push(Node::Block(parse(chars, depth + 1)));
             }
-            '>' if in_block => break,
+            '>' if depth > 0 => break,
             _ => text.push(c),
         }
     }
@@ -404,7 +405,7 @@ pub struct Template(Vec<Node>);
 
 impl Template {
     pub fn parse(template: &str) -> Self {
-        Template(parse(&mut template.chars().peekable(), false))
+        Template(parse(&mut template.chars().peekable(), 0))
     }
 
     /// `lookup(key)`: the value (`""` if the file has none), `None` for an unknown key.
@@ -429,7 +430,7 @@ pub fn uses_any(template: &str, keys: &[&str]) -> bool {
             Node::Text(_) => false,
         })
     }
-    walk(&parse(&mut template.chars().peekable(), false), keys)
+    walk(&parse(&mut template.chars().peekable(), 0), keys)
 }
 
 /// One INI line: `\` → `\\`, line break → `\n`.

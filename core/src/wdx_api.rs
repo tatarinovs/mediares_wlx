@@ -336,9 +336,11 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
         }
         Source::Tags => {
             kind == MediaType::Audio
-                && (!tags_cached(path)
-                    || needs_audio_meta(path, field, kind)
-                        && !crate::cache::is_audio_meta_cached(path))
+                && if field.is_audio_stream_property() && crate::cache::is_audio_meta_cached(path) {
+                    false
+                } else {
+                    !tags_cached(path) || needs_audio_meta(path, field, kind)
+                }
         }
         Source::VideoTags => {
             kind == MediaType::Video
@@ -359,6 +361,13 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
             kind != MediaType::StandardImage
                 && analysis_pending()
                 && header_size(path, kind).is_none()
+        }
+        Source::VideoMeta if field == Field::VideoDynamicRange && kind == MediaType::Video => {
+            crate::cache::cached_video_meta(path).is_none_or(|meta| {
+                meta.dynamic_range.is_none()
+                    && crate::video_tags::has_tag_reader(path)
+                    && !crate::cache::is_video_tags_cached(path)
+            })
         }
         Source::VideoMeta => kind == MediaType::Video && !crate::cache::is_video_meta_cached(path),
         Source::AudioAnalysis | Source::AudioFastFingerprint | Source::AudioDuration => {
@@ -693,7 +702,10 @@ fn tag_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
     if kind != MediaType::Audio {
         return None;
     }
-    if needs_audio_meta(path, field, MediaType::Audio) {
+    if field.is_audio_stream_property()
+        && ((!tags_cached(path) && crate::cache::is_audio_meta_cached(path))
+            || needs_audio_meta(path, field, MediaType::Audio))
+    {
         return audio_meta_value(path, field);
     }
     tags_value(path, field)

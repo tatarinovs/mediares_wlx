@@ -110,6 +110,11 @@ pub struct ViewerState {
     _cache_hold: image_cache::ViewerHold,
 }
 
+enum Prepared {
+    Media(Box<MediaView>),
+    Image(Request),
+}
+
 impl ViewerState {
     /// Loads `path` into the viewer window `hwnd`; `None` if it cannot be displayed.
     pub fn new(hwnd: HWND, lister: HWND, path: &Path, config: ViewerConfig) -> Option<Self> {
@@ -159,22 +164,7 @@ impl ViewerState {
     /// playlist replaces the file list with its entries and shows the first one.
     pub fn set_file(&mut self, path: &Path) -> bool {
         if probe_file(path) == MediaType::Playlist {
-            let entries: Vec<PathBuf> = playlist::read_m3u(path)
-                .into_iter()
-                .filter(|p| is_viewable(probe_file(p)))
-                .collect();
-            self.dir_files = entries;
-            self.playlist = Some(path.to_path_buf());
-            self.scan = None;
-            // Validate only until one opens; later entries are checked on navigation.
-            for idx in 0..self.dir_files.len() {
-                self.current_idx = idx;
-                let file = self.dir_files[idx].clone();
-                if self.show(&file) {
-                    return true;
-                }
-            }
-            return false;
+            return self.open_playlist(path);
         }
         match self.dir_files.iter().position(|p| same_path(p, path)) {
             Some(pos) => self.current_idx = pos,
@@ -193,6 +183,40 @@ impl ViewerState {
             }
         }
         self.show(path)
+    }
+
+    fn open_playlist(&mut self, path: &Path) -> bool {
+        // Bound the number of synchronous opens. The rest of the list is available on navigation.
+        const MAX_INITIAL_OPENS: usize = 32;
+        let entries = playlist::media_entries(path);
+        for (idx, file) in entries.iter().take(MAX_INITIAL_OPENS).enumerate() {
+            let kind = probe_file(file);
+            let prepared = if kind.is_playable() {
+                unsafe { MediaView::open(self.hwnd, None, file, kind, self.open_options()) }
+                    .map(|view| Prepared::Media(Box::new(view)))
+            } else {
+                let options = DecodeOptions {
+                    page: 0,
+                    ..self.decode_options()
+                };
+                header_looks_decodable(file, kind)
+                    .then(|| image_cache::request(file, kind, options, self.hwnd))
+                    .flatten()
+                    .map(Prepared::Image)
+            };
+            if let Some(prepared) = prepared {
+                self.file_path = file.clone();
+                self.page = 0;
+                self.pages = 1;
+                self.pages_known = !may_have_pages(file, kind);
+                self.current_idx = idx;
+                self.dir_files = entries;
+                self.playlist = Some(path.to_path_buf());
+                self.scan = None;
+                return self.show_page_prepared(Some(prepared));
+            }
+        }
+        false
     }
 
     /// Takes the folder listing that arrived ([`WM_DIR_SCANNED`]). False if it is stale.
@@ -223,6 +247,10 @@ impl ViewerState {
 
     /// Shows page `self.page` of `self.file_path`, resetting the view.
     fn show_page(&mut self) -> bool {
+        self.show_page_prepared(None)
+    }
+
+    fn show_page_prepared(&mut self, prepared: Option<Prepared>) -> bool {
         // Comparing a series: the next photo opens zoomed in on the same place.
         let keep = self.config.keep_zoom || self.compare.is_some();
         let kept = keep
@@ -242,7 +270,7 @@ impl ViewerState {
         self.drag = None;
         self.loupe = None;
         self.quarter_turns = 0;
-        self.load_media();
+        self.load_media_prepared(prepared);
         self.has_content()
     }
 
@@ -639,6 +667,10 @@ impl ViewerState {
     }
 
     fn load_media(&mut self) {
+        self.load_media_prepared(None);
+    }
+
+    fn load_media_prepared(&mut self, prepared: Option<Prepared>) {
         let options = self.decode_options();
         let kind = probe_file(&self.file_path);
         self.file_size = std::fs::metadata(&self.file_path)
@@ -656,7 +688,13 @@ impl ViewerState {
             // The player is reused when going from one file of the same kind to the next.
             let options = self.open_options();
             self.media = unsafe {
-                MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
+                if let Some(Prepared::Media(view)) = prepared {
+                    self.media = None;
+                    view.restart_timer();
+                    Some(*view)
+                } else {
+                    MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
+                }
             };
             let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
             match self.media.as_mut() {
@@ -668,9 +706,13 @@ impl ViewerState {
             self.media = None;
             if kind.is_image_kind() {
                 // Checked before queueing: a file that fails it would be decoded for nothing.
-                let request = header_looks_decodable(&self.file_path, kind)
-                    .then(|| image_cache::request(&self.file_path, kind, options, self.hwnd))
-                    .flatten();
+                let request = if let Some(Prepared::Image(request)) = prepared {
+                    Some(request)
+                } else {
+                    header_looks_decodable(&self.file_path, kind)
+                        .then(|| image_cache::request(&self.file_path, kind, options, self.hwnd))
+                        .flatten()
+                };
                 match request {
                     Some(Request::Ready(img)) => {
                         self.image = Some(img.clone());
@@ -779,6 +821,9 @@ fn screen_side(hwnd: HWND) -> u32 {
 
 impl Drop for ViewerState {
     fn drop(&mut self) {
+        if self.fullscreen.is_some() {
+            unsafe { crate::fullscreen::set_lister_transitions(self.lister, true) };
+        }
         // Stop playback before the surface window goes away.
         self.overlay = None;
         self.media = None;
@@ -798,7 +843,7 @@ pub fn same_path(a: &Path, b: &Path) -> bool {
 }
 
 /// Case-insensitive name comparison, Unicode included (NTFS ignores the case of Cyrillic too).
-fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
+pub(crate) fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
     // Valid names are borrowed, not copied: no allocation per compared file.
     a.eq_ignore_ascii_case(b)
         || (!a.is_ascii() && {
@@ -888,7 +933,10 @@ fn scan_directory_media(
     let mut files: Vec<PathBuf> = entries
         .take_while(|_| !cancelled())
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.file_type()
+                .is_ok_and(|t| t.is_file() || t.is_symlink() && e.path().is_file())
+        })
         .map(|e| e.path())
         .filter(|p| is_viewable(probe_file(p)))
         .collect();

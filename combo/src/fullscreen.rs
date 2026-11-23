@@ -129,7 +129,7 @@ unsafe fn exit(state: &mut ViewerState) {
 }
 
 /// Turns the DWM animations of the Lister's top-level window on or off.
-unsafe fn set_lister_transitions(lister: HWND, enabled: bool) {
+pub(crate) unsafe fn set_lister_transitions(lister: HWND, enabled: bool) {
     let top = GetAncestor(lister, GA_ROOT);
     if top.is_invalid() {
         return;

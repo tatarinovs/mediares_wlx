@@ -23,8 +23,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND,
     WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN,
     WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
-    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
+    WM_NCACTIVATE, WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE,
+    WM_TIMER, WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
 use mediares_core::tc_api::{
@@ -957,7 +957,7 @@ unsafe fn show_context_menu(hwnd: HWND, screen: POINT) {
     );
     drop(menu);
 
-    if let Some(cmd) = Command::from_raw(id as usize) {
+    if let Some(cmd) = Command::from_raw(id as usize).filter(|_| get_live_state(hwnd).is_some()) {
         execute(hwnd, cmd);
     }
 }
@@ -974,6 +974,11 @@ unsafe extern "system" fn wnd_proc(
         match msg {
             WM_MEASUREITEM if menu_theme::measure_item(lparam) => return LRESULT(1),
             WM_DRAWITEM if menu_theme::draw_item(lparam) => return LRESULT(1),
+            // Deactivation during a modal loop must reach the default procedure. Returning
+            // zero here would leave the disabled fullscreen viewer active above its dialog.
+            WM_NCACTIVATE => {
+                return DefWindowProcW(hwnd, msg, wparam, lparam);
+            }
             _ => {}
         }
         if let Some(result) = access::nested(hwnd, msg, wparam, lparam) {
@@ -1431,6 +1436,36 @@ pub unsafe fn print_external(hwnd: HWND, printer: Option<&str>, margins: Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_viewer_handler_allows_windows_to_deactivate_the_popup() {
+        use windows::Win32::UI::WindowsAndMessaging::{SendMessageW, WS_POPUP};
+
+        unsafe {
+            register_class();
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                CLASS_NAME,
+                None,
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                None,
+                None,
+                Some(module()),
+                None,
+            )
+            .unwrap();
+            let can_deactivate = access::run(hwnd, false, || {
+                // FALSE wParam deactivates the viewer. FALSE return vetoes the change.
+                SendMessageW(hwnd, WM_NCACTIVATE, Some(WPARAM(0)), Some(LPARAM(-1))).0 != 0
+            });
+            DestroyWindow(hwnd).unwrap();
+            assert!(can_deactivate);
+        }
+    }
 
     #[test]
     fn ctrl_combinations_go_to_lister() {

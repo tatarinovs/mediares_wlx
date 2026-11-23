@@ -1,17 +1,20 @@
 //! Modal dialog showing EXIF metadata.
 
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 
 use mediares_core::exif::{read_exif, ExifInfo};
 use windows::core::HSTRING;
 use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
+use windows::Win32::System::Threading::GetCurrentThreadId;
+use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgItem, GetWindowLongPtrW, MessageBoxW, SetDlgItemTextW, SetWindowLongPtrW,
-    ShowWindow, BS_DEFPUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA,
-    IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2, MB_ICONWARNING, MB_YESNO, SW_HIDE, WM_CLOSE, WM_COMMAND,
-    WS_BORDER, WS_TABSTOP, WS_VSCROLL,
+    DefWindowProcW, GetDlgItem, GetWindowLongPtrW, MessageBoxW, PostMessageW, PostThreadMessageW,
+    SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, BS_DEFPUSHBUTTON, DC_HASDEFID, DM_GETDEFID,
+    ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
+    MB_ICONWARNING, MB_YESNO, SW_HIDE, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WS_BORDER, WS_TABSTOP,
+    WS_VSCROLL,
 };
 
 use crate::dialog;
@@ -21,16 +24,63 @@ const CLASS_NAME: PCWSTR = w!("MediaresExifDialogClass");
 const IDC_EXIF_TEXT: usize = 201;
 const IDC_OPEN_MAP: i32 = 202;
 const IDC_CLEAR: i32 = 203;
+const WM_EXIF_READY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 0x31;
 
 /// What the dialog's buttons work on; lives in the window until it is gone.
 struct Data {
     path: PathBuf,
-    place: Option<(f64, f64)>,
-    cleared: bool,
+    token: usize,
+    metadata: Option<Receiver<Metadata>>,
+    place: std::cell::Cell<Option<(f64, f64)>>,
+    cleared: std::cell::Cell<bool>,
+}
+
+#[derive(Default)]
+struct Metadata {
+    info: Option<ExifInfo>,
+    jpeg: bool,
+}
+
+fn load_metadata(
+    dlg: HWND,
+    token: usize,
+    path: PathBuf,
+    read: impl FnOnce(&Path) -> Metadata + Send + 'static,
+) -> Option<Receiver<Metadata>> {
+    let (send, receive) = mpsc::channel();
+    let window = dlg.0 as isize;
+    std::thread::Builder::new()
+        .name("mediares-exif".into())
+        .spawn(move || {
+            let metadata = mediares_core::ffi::guard(Metadata::default(), || read(&path));
+            if send.send(metadata).is_ok() {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(HWND(window as *mut _)),
+                        WM_EXIF_READY,
+                        WPARAM(token),
+                        LPARAM(0),
+                    );
+                }
+            }
+        })
+        .ok()?;
+    Some(receive)
 }
 
 /// Shows the dialog; true if the file's metadata was cleared from it.
 pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
+    show_with_reader(owner, file_path, |path| Metadata {
+        info: read_exif(path),
+        jpeg: mediares_core::image_decode::is_jpeg(path),
+    })
+}
+
+unsafe fn show_with_reader(
+    owner: HWND,
+    file_path: &Path,
+    read: impl FnOnce(&Path) -> Metadata + Send + 'static,
+) -> bool {
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
     let filename = file_path
         .file_name()
@@ -46,9 +96,13 @@ pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
         return false;
     };
 
-    let info = mediares_core::cache::get_exif(file_path)
-        .filter(|e| **e != ExifInfo::default())
-        .map(|e| (*e).clone());
+    let token = crate::media_events::next_token();
+    let metadata = load_metadata(dlg, token, file_path.to_path_buf(), read);
+    let initial_text = if metadata.is_some() {
+        tr("Reading EXIF metadata...").to_string()
+    } else {
+        exif_text(file_path, None)
+    };
     // Monospace so the label column lines up.
     let font = dialog::font(dlg, "Consolas", -13);
     let ui_font = dialog::font(dlg, "Segoe UI", -12);
@@ -56,10 +110,10 @@ pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
         | WS_VSCROLL.0
         | WS_BORDER.0
         | (ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL) as u32;
-    dialog::control(
+    let text = dialog::control(
         dlg,
         w!("EDIT"),
-        &exif_text(file_path, info.as_ref()),
+        &initial_text,
         edit_style,
         (15, 15, 495, 335),
         IDC_EXIF_TEXT,
@@ -75,44 +129,69 @@ pub unsafe fn show(owner: HWND, file_path: &Path) -> bool {
         ui_font.0,
     );
 
-    let place = info.as_ref().and_then(ExifInfo::gps);
-    if place.is_some() {
-        dialog::control(
+    for (id, label, rect) in [
+        (IDC_OPEN_MAP, tr("Open on map"), (15, 360, 150, 28)),
+        (IDC_CLEAR, tr("Clear EXIF"), (260, 360, 140, 28)),
+    ] {
+        let button = dialog::control(
             dlg,
             w!("BUTTON"),
-            tr("Open on map"),
+            label,
             WS_TABSTOP.0,
-            (15, 360, 150, 28),
-            IDC_OPEN_MAP as usize,
+            rect,
+            id as usize,
             ui_font.0,
         );
-    }
-    // Only JPEG can lose its metadata without re-encoding the picture.
-    if mediares_core::image_decode::is_jpeg(file_path) {
-        dialog::control(
-            dlg,
-            w!("BUTTON"),
-            tr("Clear EXIF"),
-            WS_TABSTOP.0,
-            (260, 360, 140, 28),
-            IDC_CLEAR as usize,
-            ui_font.0,
-        );
+        let _ = ShowWindow(button, SW_HIDE);
     }
     let data = Box::into_raw(Box::new(Data {
         path: file_path.to_path_buf(),
-        place,
-        cleared: false,
+        token,
+        metadata,
+        place: std::cell::Cell::new(None),
+        cleared: std::cell::Cell::new(false),
     }));
     SetWindowLongPtrW(dlg, GWLP_USERDATA, data as isize);
 
-    dialog::run_modal(dlg, close);
+    dialog::run_modal_with(dlg, close, |msg| {
+        // The multiline EDIT claims Enter even when its contents are read-only.
+        if msg.hwnd == text && msg.message == WM_KEYDOWN && msg.wParam.0 == usize::from(VK_RETURN.0)
+        {
+            dialog::close(dlg);
+            return true;
+        }
+        false
+    });
     // run_modal returns only after the window is destroyed, so nothing references `data` anymore.
-    Box::from_raw(data).cleared
+    Box::from_raw(data).cleared.get()
+}
+
+unsafe fn show_metadata(hwnd: HWND, data: &Data) {
+    let Some(metadata) = data
+        .metadata
+        .as_ref()
+        .and_then(|result| result.try_recv().ok())
+    else {
+        return;
+    };
+    let place = metadata.info.as_ref().and_then(ExifInfo::gps);
+    data.place.set(place);
+    let _ = SetDlgItemTextW(
+        hwnd,
+        IDC_EXIF_TEXT as i32,
+        &HSTRING::from(exif_text(&data.path, metadata.info.as_ref())),
+    );
+    for (id, visible) in [(IDC_OPEN_MAP, place.is_some()), (IDC_CLEAR, metadata.jpeg)] {
+        if visible {
+            if let Ok(button) = GetDlgItem(Some(hwnd), id) {
+                let _ = ShowWindow(button, windows::Win32::UI::WindowsAndMessaging::SW_SHOWNA);
+            }
+        }
+    }
 }
 
 /// Asks, then strips the file's metadata down to orientation and size and shows what is left.
-unsafe fn clear(dlg: HWND, data: &mut Data) {
+unsafe fn clear(dlg: HWND, data: &Data) {
     let answer = MessageBoxW(
         Some(dlg),
         &HSTRING::from(tr(
@@ -136,8 +215,8 @@ unsafe fn clear(dlg: HWND, data: &mut Data) {
         );
         return;
     }
-    data.cleared = true;
-    data.place = None;
+    data.cleared.set(true);
+    data.place.set(None);
     let info = read_exif(&data.path);
     let _ = SetDlgItemTextW(
         dlg,
@@ -263,22 +342,41 @@ unsafe extern "system" fn wnd_proc(
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
         let id = dialog::loword(wparam) as i32;
         match msg {
+            // This window is created with CreateWindowExW. IsDialogMessageW asks it for
+            // the default button when Enter is pressed in the read-only text control.
+            DM_GETDEFID => LRESULT(((DC_HASDEFID << 16) | IDOK.0 as u32) as isize),
             WM_COMMAND if id == IDOK.0 || id == IDCANCEL.0 => {
                 dialog::close(hwnd);
                 LRESULT(0)
             }
-            WM_COMMAND if id == IDC_OPEN_MAP || id == IDC_CLEAR => {
-                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Data;
-                match data.as_mut() {
-                    Some(data) if id == IDC_CLEAR => clear(hwnd, data),
-                    Some(Data {
-                        place: Some(place), ..
-                    }) => {
-                        crate::file_actions::open_map(hwnd, *place);
-                    }
-                    _ => {}
+            WM_EXIF_READY => {
+                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Data;
+                if let Some(data) = data.as_ref().filter(|data| data.token == wparam.0) {
+                    show_metadata(hwnd, data);
                 }
                 LRESULT(0)
+            }
+            WM_COMMAND if id == IDC_OPEN_MAP || id == IDC_CLEAR => {
+                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Data;
+                if let Some(data) = data.as_ref() {
+                    if id == IDC_CLEAR {
+                        clear(hwnd, data);
+                    } else if let Some(place) = data.place.get() {
+                        crate::file_actions::open_map(hwnd, place);
+                    }
+                }
+                LRESULT(0)
+            }
+            windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                // A sent message can destroy the window while GetMessageW waits for a post.
+                let _ = PostThreadMessageW(
+                    GetCurrentThreadId(),
+                    windows::Win32::UI::WindowsAndMessaging::WM_NULL,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+                DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             WM_CLOSE => {
                 dialog::close(hwnd);
@@ -292,6 +390,52 @@ unsafe extern "system" fn wnd_proc(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        FindWindowW, IsWindowVisible, SendMessageW, WM_QUIT,
+    };
+
+    #[test]
+    fn closes_while_the_exif_reader_is_still_waiting() {
+        let ui_thread = unsafe { GetCurrentThreadId() };
+        let file = format!("exif-close-test-{}-{ui_thread}.jpg", std::process::id());
+        let title = HSTRING::from(format!("{} - {file}", tr("EXIF metadata")));
+        let (reading, reader_started) = mpsc::channel();
+        let (release, reader_may_finish) = mpsc::channel();
+        let (closed, modal_returned) = mpsc::channel();
+        let close_window = std::thread::spawn(move || unsafe {
+            let timeout = Duration::from_secs(3);
+            let deadline = Instant::now() + timeout;
+            let ok = reader_started.recv_timeout(timeout).is_ok()
+                && loop {
+                    if let Ok(hwnd) = FindWindowW(CLASS_NAME, &title) {
+                        if IsWindowVisible(hwnd).as_bool() {
+                            SendMessageW(hwnd, WM_CLOSE, None, None);
+                            break modal_returned.recv_timeout(timeout).is_ok();
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+            if !ok {
+                let _ = PostThreadMessageW(ui_thread, WM_QUIT, WPARAM(0), LPARAM(0));
+            }
+            ok
+        });
+        let cleared = unsafe {
+            show_with_reader(HWND::default(), Path::new(&file), move |_| {
+                let _ = reading.send(());
+                let _ = reader_may_finish.recv_timeout(Duration::from_secs(10));
+                Metadata::default()
+            })
+        };
+        let _ = closed.send(());
+        let _ = release.send(());
+        assert!(close_window.join().unwrap());
+        assert!(!cleared);
+    }
 
     #[test]
     fn display_rows_format_values() {

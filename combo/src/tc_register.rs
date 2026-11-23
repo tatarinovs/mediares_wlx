@@ -92,7 +92,12 @@ pub fn wincmd_ini() -> Option<PathBuf> {
 
 /// Follows `RedirectSection=` (a shared install may keep the plugin list in another file).
 fn content_plugins_ini(wincmd: &Path) -> PathBuf {
-    let redirect = read_string(wincmd, "RedirectSection");
+    let redirect = read_string(wincmd, SECTION, "RedirectSection");
+    let redirect = match redirect.trim() {
+        "0" => return wincmd.to_path_buf(),
+        "1" => read_string(wincmd, w!("Configuration"), "AlternateUserIni"),
+        _ => redirect,
+    };
     if redirect.trim().is_empty() {
         return wincmd.to_path_buf();
     }
@@ -105,10 +110,10 @@ fn content_plugins_ini(wincmd: &Path) -> PathBuf {
     }
 }
 
-fn read_string(ini: &Path, key: &str) -> String {
+fn read_string(ini: &Path, section: PCWSTR, key: &str) -> String {
     let mut buf = [0u16; 2048];
     let (key, file) = (HSTRING::from(key), HSTRING::from(ini.as_os_str()));
-    let len = unsafe { GetPrivateProfileStringW(SECTION, &key, w!(""), Some(&mut buf), &file) };
+    let len = unsafe { GetPrivateProfileStringW(section, &key, w!(""), Some(&mut buf), &file) };
     String::from_utf16_lossy(&buf[..len as usize])
 }
 
@@ -131,7 +136,7 @@ fn read_section(ini: &Path) -> Vec<(String, String)> {
         .filter(|key| !key.is_empty())
         .map(|key| {
             let key = String::from_utf16_lossy(key);
-            let value = read_string(ini, &key);
+            let value = read_string(ini, SECTION, &key);
             (key, value)
         })
         .collect()
@@ -309,6 +314,10 @@ mod tests {
         assert!(entries.contains(&("1".to_string(), dll.to_string_lossy().into_owned())));
         assert!(!entries.iter().any(|(key, _)| key == "1_detect"));
         assert!(entries.iter().any(|(key, _)| key == "0_detect"));
+        for (setting, expected) in [(0, &wincmd), (1, &plugins)] {
+            std::fs::write(&wincmd, format!("[Configuration]\r\nAlternateUserIni=plugins.ini\r\n[ContentPlugins]\r\nRedirectSection={setting}\r\n")).unwrap();
+            assert_eq!(&content_plugins_ini(&wincmd), expected);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

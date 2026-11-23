@@ -99,7 +99,9 @@ pub fn replace(
         }
     };
     temp.write(encode)?;
-    std::fs::rename(&temp.path, path)
+    std::fs::rename(&temp.path, path)?;
+    temp.keep = true;
+    Ok(())
 }
 
 /// Creates a new file without overwriting an existing one; removes only our own failed output.

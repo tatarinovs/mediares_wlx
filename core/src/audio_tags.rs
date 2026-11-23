@@ -167,7 +167,7 @@ pub fn read_tags(path: &Path, with_cover: bool) -> Option<AudioTags> {
         let mut head = [0u8; 4];
         let kbps = mss.seek(SeekFrom::Start(start)).is_ok() && mss.read_exact(&mut head).is_ok();
         if let Some(kbps) = kbps.then(|| mpeg_frame_kbps(head)).flatten() {
-            tags.duration_sec = (len - start) as f64 * 8.0 / (kbps as f64 * 1000.0);
+            tags.duration_sec = len.saturating_sub(start) as f64 * 8.0 / (kbps as f64 * 1000.0);
         }
     }
     tags.bitrate_kbps = bitrate_kbps(&params, codec, tags.duration_sec, audio_span, pictures);
@@ -212,7 +212,10 @@ fn wav_trailing_info(path: &Path) -> Option<MetadataRevision> {
                 while items.len() >= 8 {
                     let id = [items[0], items[1], items[2], items[3]];
                     let n = u32::from_le_bytes([items[4], items[5], items[6], items[7]]) as usize;
-                    let Some(value) = items.get(8..8 + n) else {
+                    let Some(end) = 8usize.checked_add(n) else {
+                        break;
+                    };
+                    let Some(value) = items.get(8..end) else {
                         break;
                     };
                     let value = value.split(|&b| b == 0).next().unwrap_or_default();
@@ -223,7 +226,10 @@ fn wav_trailing_info(path: &Path) -> Option<MetadataRevision> {
                             .unwrap_or_default(),
                     };
                     found |= riff::parse_riff_info_chunk(id, text.as_bytes(), &mut builder).is_ok();
-                    items = items.get(8 + n + (n & 1)..).unwrap_or_default();
+                    items = end
+                        .checked_add(n & 1)
+                        .and_then(|next| items.get(next..))
+                        .unwrap_or_default();
                 }
             }
             _ => {}

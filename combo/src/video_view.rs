@@ -761,6 +761,14 @@ impl VideoView {
         }
     }
 
+    pub fn is_seeking(&self) -> bool {
+        unsafe { self.player.is_seeking() }
+    }
+
+    pub unsafe fn restart_timer(&self) {
+        SetTimer(Some(self.viewer), RENDER_TIMER_ID, RENDER_INTERVAL_MS, None);
+    }
+
     /// Tags of the current file (read once, then cached).
     pub fn tags(&self) -> Option<Arc<VideoTags>> {
         get_video_tags(&self.path)
@@ -772,19 +780,21 @@ impl VideoView {
             let template = crate::osd_template::Template::parse(&text.template);
             let fields = text.fields;
             let dpi = crate::image_view::osd_dpi(self.viewer);
-            match self.osd.take() {
-                Some(osd) if osd.style == style && osd.dpi == dpi => VideoOsd {
-                    template,
-                    fields,
-                    ..osd
-                },
-                _ => VideoOsd {
-                    font: crate::image_view::create_osd_font(&style.face, style.size_pt, dpi),
-                    style,
-                    dpi,
-                    template,
-                    fields,
-                },
+            let font = if self
+                .osd
+                .as_ref()
+                .is_some_and(|osd| osd.style == style && osd.dpi == dpi)
+            {
+                self.osd.take().unwrap().font
+            } else {
+                crate::image_view::create_osd_font(&style.face, style.size_pt, dpi)
+            };
+            VideoOsd {
+                font,
+                style,
+                dpi,
+                template,
+                fields,
             }
         });
         // The render thread draws with the font it was given last: it gets the new one before
@@ -1067,6 +1077,7 @@ impl VideoView {
     pub unsafe fn capture_frame(&self) -> Option<crate::image_cache::DecodedImage> {
         let (width, height, bgra) = self.player.capture_frame()?;
         Some(crate::image_cache::DecodedImage {
+            id: crate::image_cache::DecodedImage::next_id(),
             width,
             height,
             full: (width, height),

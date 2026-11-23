@@ -53,10 +53,11 @@ fn tiff_with_orientation(tiff: &[u8], orientation: u16) -> Option<Vec<u8>> {
         }
     };
     let ifd0 = rd.u32(tiff.get(4..8)?) as usize;
-    let count = rd.u16(tiff.get(ifd0..ifd0 + 2)?) as usize;
-    let entries_end = ifd0 + 2 + count * 12;
-    let entries = tiff.get(ifd0 + 2..entries_end)?;
-    let next_ifd = tiff.get(entries_end..entries_end + 4)?;
+    let entries_start = ifd0.checked_add(2)?;
+    let count = rd.u16(tiff.get(ifd0..entries_start)?) as usize;
+    let entries_end = entries_start.checked_add(count * 12)?;
+    let entries = tiff.get(entries_start..entries_end)?;
+    let next_ifd = tiff.get(entries_end..entries_end.checked_add(4)?)?;
 
     let mut out = tiff.to_vec();
     let tag_of = |e: &[u8]| rd.u16(&e[..2]);

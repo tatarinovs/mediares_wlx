@@ -79,19 +79,28 @@ impl PropVariant {
     /// A 64-bit value, signed or not (Media Foundation times and durations).
     pub fn u64(&self) -> Option<u64> {
         let inner = unsafe { &self.0.Anonymous.Anonymous };
-        (inner.vt == VT_UI8 || inner.vt == VT_I8).then(|| unsafe { inner.Anonymous.uhVal })
+        match inner.vt {
+            VT_UI8 => Some(unsafe { inner.Anonymous.uhVal }),
+            VT_I8 => u64::try_from(unsafe { inner.Anonymous.hVal }).ok(),
+            _ => None,
+        }
     }
 
     pub fn guid(&self) -> Option<GUID> {
         let inner = unsafe { &self.0.Anonymous.Anonymous };
-        let ptr = unsafe { inner.Anonymous.puuid };
-        (inner.vt == VT_CLSID && !ptr.is_null()).then(|| unsafe { *ptr })
+        if inner.vt != VT_CLSID {
+            return None;
+        }
+        unsafe { inner.Anonymous.puuid.as_ref().copied() }
     }
 
     pub fn string(&self) -> Option<String> {
         let inner = unsafe { &self.0.Anonymous.Anonymous };
+        if inner.vt != VT_LPWSTR {
+            return None;
+        }
         let ptr = unsafe { inner.Anonymous.pwszVal };
-        if inner.vt != VT_LPWSTR || ptr.is_null() {
+        if ptr.is_null() {
             return None;
         }
         unsafe { ptr.to_string() }.ok()

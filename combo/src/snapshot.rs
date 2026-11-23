@@ -25,7 +25,8 @@ use windows::Win32::Storage::FileSystem::{
     FILE_DISPOSITION_INFO, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
 };
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EmptyClipboard, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData,
+    CloseClipboard, EmptyClipboard, GetClipboardSequenceNumber, IsClipboardFormatAvailable,
+    OpenClipboard, SetClipboardData,
 };
 use windows::Win32::System::Memory::{
     GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE, GMEM_ZEROINIT,
@@ -117,16 +118,24 @@ pub fn cleanup_on_start(source: &Path) {
             }
             // Do not render or inspect another application's delayed file clipboard.
             // A later copy through this plugin can clean up with its exact protected filename.
-            if IsClipboardFormatAvailable(CF_HDROP).is_err() {
-                // A PNG being opened may not have a reader yet, or may already be decoded.
-                cleanup_exports(&temp_dir(), Some(&source), SystemTime::now());
-            }
+            let sequence = IsClipboardFormatAvailable(CF_HDROP)
+                .is_err()
+                .then(|| GetClipboardSequenceNumber());
             let _ = CloseClipboard();
+            if let Some(sequence) = sequence {
+                // A PNG being opened may not have a reader yet, or may already be decoded.
+                cleanup_exports(
+                    &temp_dir(),
+                    Some(&source),
+                    SystemTime::now(),
+                    Some(sequence),
+                );
+            }
         });
 }
 
-/// Caller holds the clipboard open, so its protected file cannot change during cleanup.
-fn cleanup_exports(dir: &Path, current: Option<&Path>, now: SystemTime) {
+/// Walk the filesystem outside the clipboard lock. Verify the clipboard at each deletion.
+fn cleanup_exports(dir: &Path, current: Option<&Path>, now: SystemTime, clipboard: Option<u32>) {
     let Ok(root) = std::fs::symlink_metadata(dir) else {
         return;
     };
@@ -181,12 +190,24 @@ fn cleanup_exports(dir: &Path, current: Option<&Path>, now: SystemTime) {
         }
         let disposition = FILE_DISPOSITION_INFO { DeleteFile: true };
         unsafe {
+            if let Some(sequence) = clipboard {
+                if sequence == 0 || OpenClipboard(None).is_err() {
+                    return;
+                }
+                if GetClipboardSequenceNumber() != sequence {
+                    let _ = CloseClipboard();
+                    return;
+                }
+            }
             let _ = SetFileInformationByHandle(
                 HANDLE(file.as_raw_handle()),
                 FileDispositionInfo,
                 &disposition as *const _ as *const _,
                 size_of::<FILE_DISPOSITION_INFO>() as u32,
             );
+            if clipboard.is_some() {
+                let _ = CloseClipboard();
+            }
         }
     }
 }
@@ -207,7 +228,12 @@ pub fn save_temp_png(img: &DecodedImage, source: &Path, suffix: &str) -> Option<
 /// Puts the picture on the clipboard as `CF_DIB` (bottom-up: top-down DIBs confuse many apps),
 /// and `file` as `CF_HDROP` so that pasting into a folder creates a file.
 pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&Path>) -> bool {
-    let row = img.width as usize * 4;
+    let Some(row) = (img.width as usize).checked_mul(4).filter(|&row| row > 0) else {
+        return false;
+    };
+    if img.height == 0 || row.checked_mul(img.height as usize) != Some(img.bgra.len()) {
+        return false;
+    }
     let head = crate::gdi::bitmap_info(img.width, img.height as i32).bmiHeader;
     let dib = global_block(
         size_of::<BITMAPINFOHEADER>() + row * img.height as usize,
@@ -241,10 +267,11 @@ pub unsafe fn copy_to_clipboard(owner: HWND, img: &DecodedImage, file: Option<&P
     if let Some(drop) = file.and_then(|f| file_drop(f)) {
         set_clipboard(CF_HDROP, drop);
     }
-    if ok {
-        cleanup_exports(&temp_dir(), file, SystemTime::now());
-    }
+    let sequence = ok.then(|| GetClipboardSequenceNumber());
     let _ = CloseClipboard();
+    if let Some(sequence) = sequence {
+        cleanup_exports(&temp_dir(), file, SystemTime::now(), Some(sequence));
+    }
     ok
 }
 
@@ -454,7 +481,7 @@ mod tests {
         // Rust's normal reader allows FILE_SHARE_DELETE: a plain remove_file would unlink it.
         let mut reader = std::fs::File::open(dir.join("busy.png")).unwrap();
         let protected = dir.join("ТЕКУЩИЙ.PNG");
-        cleanup_exports(&dir, Some(&protected), now);
+        cleanup_exports(&dir, Some(&protected), now, None);
         assert!(!dir.join("old.png").exists());
         for name in [
             "busy.png",
@@ -469,7 +496,7 @@ mod tests {
         reader.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"export");
         drop(reader);
-        cleanup_exports(&dir, None, now);
+        cleanup_exports(&dir, None, now, None);
         assert!(!dir.join("busy.png").exists());
         assert!(!dir.join("Текущий.png").exists());
         std::fs::remove_file(dir.join("recent.png")).unwrap();

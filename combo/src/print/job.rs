@@ -23,12 +23,14 @@ thread_local! {
 }
 
 unsafe extern "system" fn abort_proc(_: HDC, _: i32) -> BOOL {
-    BOOL::from(CANCEL.with(|slot| {
-        !slot
-            .borrow()
-            .as_ref()
-            .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
-    }))
+    mediares_core::ffi::guard(BOOL(0), || {
+        BOOL::from(CANCEL.with(|slot| {
+            !slot
+                .borrow()
+                .as_ref()
+                .is_some_and(|cancel| cancel.load(Ordering::Relaxed))
+        }))
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,6 +225,10 @@ fn blank_back(pages: u64, copy: u32, copies: u32, duplex: bool) -> bool {
 pub(super) unsafe fn draw_image(dc: HDC, image: &DecodedImage, placement: Placement) -> bool {
     if !nonempty(placement.image)
         || !nonempty(placement.clip)
+        || (image.width as usize)
+            .checked_mul(image.height as usize)
+            .and_then(|n| n.checked_mul(4))
+            != Some(image.bgra.len())
         || image.width == 0
         || image.height == 0
         || image.width > i32::MAX as u32
@@ -272,6 +278,7 @@ mod tests {
     use windows::Win32::Foundation::RECT;
     fn image() -> Arc<DecodedImage> {
         Arc::new(DecodedImage {
+            id: DecodedImage::next_id(),
             width: 100,
             height: 100,
             full: (100, 100),
@@ -313,8 +320,9 @@ mod tests {
     #[test]
     #[ignore = "requires Microsoft Print to PDF; creates PDF artifacts in target/print-check"]
     fn pdf_prints_real_jobs_in_both_orientations_and_checks_cancellation() {
-        let dir =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/print-check");
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../target/print-check")
+            .join(std::process::id().to_string());
         std::fs::create_dir_all(&dir).unwrap();
         for landscape in [false, true] {
             unsafe {

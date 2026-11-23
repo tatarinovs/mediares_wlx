@@ -60,7 +60,8 @@ pub fn store(video: &Path, position: f64, duration: f64, min_duration: f64) {
     if !video.is_absolute() || !duration.is_finite() || duration < min_duration {
         return;
     }
-    let keep = (EDGE_SEC..duration - EDGE_SEC)
+    let edge = EDGE_SEC.min(duration / 4.0);
+    let keep = (edge..duration - edge)
         .contains(&position)
         .then_some(position);
     if let Ok(mut db) = open(&config::local_path(FILE_NAME)) {

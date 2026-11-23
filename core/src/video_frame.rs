@@ -352,7 +352,11 @@ pub fn analyze_video(
         let mut hashes = [None; 3];
         for (hash, quarter) in hashes.iter_mut().zip([1u64, 2, 3]) {
             check()?;
-            *hash = grab_frame_dhash(&reader, duration_hns * quarter / 4, &geometry);
+            *hash = grab_frame_dhash(
+                &reader,
+                duration_hns / 4 * quarter + duration_hns % 4 * quarter / 4,
+                &geometry,
+            );
         }
         let [dhash_25, dhash_mid, dhash_75] = hashes;
         let fingerprint = match (dhash_25, dhash_mid, dhash_75) {
@@ -369,7 +373,10 @@ pub fn analyze_video(
 
         Ok(VideoAnalysis {
             // Rounded like `Video_Duration` shows it.
-            duration_sec: ((duration_hns + 5_000_000) / 10_000_000) as u32,
+            duration_sec: u32::try_from(
+                duration_hns / 10_000_000 + u64::from(duration_hns % 10_000_000 >= 5_000_000),
+            )
+            .unwrap_or(u32::MAX),
             width: geometry.width,
             height: geometry.height,
             dhash_mid,
@@ -588,10 +595,14 @@ impl FrameGeometry {
     /// Size and stride of the reader's current output type.
     unsafe fn current(reader: &IMFSourceReader, format: PixelFormat) -> Option<Self> {
         let current = reader.GetCurrentMediaType(STREAM).ok()?;
-        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).unwrap_or(0);
+        let frame_size = current.GetUINT64(&MF_MT_FRAME_SIZE).ok()?;
+        let (width, height) = ((frame_size >> 32) as u32, frame_size as u32);
+        if !crate::image_decode::valid_dimensions(width, height) {
+            return None;
+        }
         Some(Self {
-            width: (frame_size >> 32) as u32,
-            height: frame_size as u32,
+            width,
+            height,
             // MF_MT_DEFAULT_STRIDE is a signed value stored as UINT32; negative means bottom-up.
             default_stride: current
                 .GetUINT32(&MF_MT_DEFAULT_STRIDE)
@@ -631,7 +642,7 @@ unsafe fn grab_frame_dhash(
                 None
             } else {
                 let data = std::slice::from_raw_parts(start, len as usize);
-                let top = scanline0.offset_from(start) as usize;
+                let top = scanline0 as usize - start as usize;
                 FrameView {
                     data,
                     top,
@@ -713,8 +724,10 @@ impl image::GenericImageView for BgraView<'_, '_> {
 impl FrameView<'_> {
     /// Row `y` (0 = top) of `width` pixels.
     fn row(&self, y: u32) -> Option<&[u8]> {
-        let start = usize::try_from(self.top as isize + y as isize * self.pitch).ok()?;
-        let len = self.geo.width as usize * self.geo.format.bytes_per_pixel();
+        let start = self
+            .top
+            .checked_add_signed(isize::try_from(y).ok()?.checked_mul(self.pitch)?)?;
+        let len = (self.geo.width as usize).checked_mul(self.geo.format.bytes_per_pixel())?;
         self.data.get(start..start.checked_add(len)?)
     }
 

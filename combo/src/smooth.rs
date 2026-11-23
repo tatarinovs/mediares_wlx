@@ -35,9 +35,7 @@ thread_local! {
 }
 
 struct CachedBitmap {
-    data_ptr: usize,
-    width: u32,
-    height: u32,
+    image_id: u64,
     bitmap: ID2D1Bitmap,
 }
 
@@ -155,11 +153,7 @@ unsafe fn render(
     cached.rt.BeginDraw();
     let temp;
     let (bitmap, src_rect): (Option<&ID2D1Bitmap>, Option<D2D_RECT_F>) = if can_cache {
-        let ptr = img.bgra.as_ptr() as usize;
-        let hit = cached
-            .bitmap
-            .as_ref()
-            .is_some_and(|b| b.data_ptr == ptr && b.width == img.width && b.height == img.height);
+        let hit = cached.bitmap.as_ref().is_some_and(|b| b.image_id == img.id);
         if !hit {
             cached.bitmap = cached
                 .rt
@@ -174,9 +168,7 @@ unsafe fn render(
                 )
                 .ok()
                 .map(|bitmap| CachedBitmap {
-                    data_ptr: ptr,
-                    width: img.width,
-                    height: img.height,
+                    image_id: img.id,
                     bitmap,
                 });
         }

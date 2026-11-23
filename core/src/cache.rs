@@ -383,6 +383,11 @@ impl<V: Clone> FileCache<V> {
         Some(value)
     }
 
+    fn peek(&self, path: &Path) -> Option<V> {
+        let key = FileKey::for_path(path)?;
+        self.lock().map.get(&key).map(|(value, _, _)| value.clone())
+    }
+
     fn contains(&self, path: &Path) -> bool {
         FileKey::for_path(path).is_some_and(|key| self.lock().map.contains_key(&key))
     }
@@ -749,6 +754,10 @@ pub fn get_video_meta(path: &Path) -> Option<Arc<VideoMeta>> {
 
 pub fn is_video_meta_cached(path: &Path) -> bool {
     video_meta_cache().contains(path)
+}
+
+pub(crate) fn cached_video_meta(path: &Path) -> Option<Arc<VideoMeta>> {
+    video_meta_cache().0.peek(path).map(|(meta, _)| meta)
 }
 
 fn audio_meta_cache() -> &'static MetaCache<crate::mf_audio::AudioStreamMeta> {

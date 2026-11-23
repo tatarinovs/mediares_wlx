@@ -136,9 +136,12 @@ pub unsafe extern "system" fn ListGetDetectString(detect_string: *mut c_char, ma
 #[no_mangle]
 pub unsafe extern "system" fn ListSetDefaultParams(dps: *mut ListDefaultParamStruct) {
     guard((), || unsafe {
-        if let Some(dps) = dps.as_ref() {
-            if let Some(ini) = pstr_to_path(dps.default_ini_name.as_ptr()) {
-                config::set_tc_ini_path(&ini);
+        if !dps.is_null() && (*dps.cast::<i32>()) >= size_of::<ListDefaultParamStruct>() as i32 {
+            let dps = &*dps;
+            if dps.default_ini_name.contains(&0) {
+                if let Some(ini) = pstr_to_path(dps.default_ini_name.as_ptr()) {
+                    config::set_tc_ini_path(&ini);
+                }
             }
         }
     })

@@ -288,8 +288,8 @@ impl Drop for ScanReservation {
 trait SampleAnalysis {
     const STORES_MONO: bool = true;
     type Output;
-    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self;
-    fn samples(&mut self, samples: &[f32], channels: usize);
+    fn start(rate: u32, channels: usize) -> Self;
+    fn samples(&mut self, samples: &[f32], channels: usize) -> Result<(), AudioError>;
     fn result(self, duration: f64) -> Self::Output;
 }
 
@@ -297,8 +297,10 @@ impl SampleAnalysis for () {
     const STORES_MONO: bool = false;
     type Output = AudioDuration;
 
-    fn start(_: u32, _: usize, _: Option<f64>) -> Self {}
-    fn samples(&mut self, _: &[f32], _: usize) {}
+    fn start(_: u32, _: usize) -> Self {}
+    fn samples(&mut self, _: &[f32], _: usize) -> Result<(), AudioError> {
+        Ok(())
+    }
     fn result(self, duration: f64) -> Self::Output {
         AudioDuration(duration.round() as u32)
     }
@@ -307,16 +309,14 @@ impl SampleAnalysis for () {
 impl SampleAnalysis for (BandAnalyzer, PcmHash) {
     type Output = AudioAnalysis;
 
-    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self {
-        (
-            BandAnalyzer::with_duration(rate, duration_sec),
-            PcmHash::new(rate, channels),
-        )
+    fn start(rate: u32, channels: usize) -> Self {
+        (BandAnalyzer::new(rate), PcmHash::new(rate, channels))
     }
 
-    fn samples(&mut self, samples: &[f32], channels: usize) {
-        self.0.push_samples(samples, channels);
+    fn samples(&mut self, samples: &[f32], channels: usize) -> Result<(), AudioError> {
+        self.0.push_samples(samples, channels)?;
         self.1.update(samples);
+        Ok(())
     }
 
     fn result(self, duration: f64) -> Self::Output {
@@ -339,16 +339,14 @@ struct FastSequential(BandAnalyzer, PcmHash);
 impl SampleAnalysis for FastSequential {
     type Output = AudioFastFingerprint;
 
-    fn start(rate: u32, channels: usize, duration_sec: Option<f64>) -> Self {
-        Self(
-            BandAnalyzer::with_duration(rate, duration_sec),
-            PcmHash::new(rate, channels),
-        )
+    fn start(rate: u32, channels: usize) -> Self {
+        Self(BandAnalyzer::new(rate), PcmHash::new(rate, channels))
     }
 
-    fn samples(&mut self, samples: &[f32], channels: usize) {
-        self.0.push_samples(samples, channels);
+    fn samples(&mut self, samples: &[f32], channels: usize) -> Result<(), AudioError> {
+        self.0.push_samples(samples, channels)?;
         self.1.update(samples);
+        Ok(())
     }
 
     fn result(self, duration: f64) -> Self::Output {
@@ -470,7 +468,7 @@ fn analyze_source_with<A: SampleAnalysis, P: Profiler>(
     let _reservation = A::STORES_MONO
         .then(|| ScanReservation::acquire(expected, cancelled))
         .transpose()?;
-    let mut analysis = A::start(rate, channels, expected);
+    let mut analysis = A::start(rate, channels);
     let mut frames_total: u64 = 0;
     let mut chunks = 0u32;
 
@@ -490,7 +488,7 @@ fn analyze_source_with<A: SampleAnalysis, P: Profiler>(
             return Err(AudioError::Cancelled);
         }
         let m_math = prof.mark();
-        analysis.samples(samples, channels);
+        analysis.samples(samples, channels)?;
         prof.record_math(m_math);
         frames_total += (samples.len() / channels) as u64;
     }
@@ -552,7 +550,7 @@ fn read_window(
             None => chunk_frames,
         };
         if take_frames > 0 {
-            analyzer.push_samples(&samples[..take_frames as usize * channels], channels);
+            analyzer.push_samples(&samples[..take_frames as usize * channels], channels)?;
             frames_read += take_frames;
         }
         if target_frames.is_some_and(|t| frames_read >= t) || frames_read >= max_frames {
@@ -576,7 +574,7 @@ fn analyze_source_seek(
     }
 
     let head_target = (EDGE_PROBE_SEC * rate as f64).ceil() as u64;
-    let mut head = BandAnalyzer::with_duration(rate, Some(EDGE_PROBE_SEC));
+    let mut head = BandAnalyzer::new(rate);
     let (head_frames, head_start) = read_window(
         source,
         Some(head_target),
@@ -598,7 +596,7 @@ fn analyze_source_seek(
         return Ok(SeekProbe::FallbackSequential);
     };
     let max_tail_frames = ((EDGE_PROBE_SEC + 30.0) * rate as f64).ceil() as u64;
-    let mut tail = BandAnalyzer::with_duration(rate, Some(EDGE_PROBE_SEC + 2.0));
+    let mut tail = BandAnalyzer::new(rate);
     let (tail_frames, tail_start) = read_window(
         source,
         None,
@@ -652,7 +650,7 @@ fn analyze_source_seek(
         let Some(seek_sec) = source.seek(win_start) else {
             return Ok(SeekProbe::FallbackSequential);
         };
-        let mut analyzer = BandAnalyzer::with_duration(rate, Some(win_sec));
+        let mut analyzer = BandAnalyzer::new(rate);
         let (got_frames, _) = read_window(
             source,
             Some(win_target_frames),
@@ -809,9 +807,9 @@ fn spectral_tables() -> &'static SpectralTables {
 struct BandAnalyzer {
     rate: u32,
     /// Box-filter decimation state.
-    phase: u32,
+    phase: u64,
     sum: f32,
-    count: u32,
+    count: u64,
     mono: Vec<f32>,
     hop_sq: Vec<f32>,
     cur_hop_sq: f32,
@@ -819,33 +817,37 @@ struct BandAnalyzer {
 }
 
 impl BandAnalyzer {
-    #[cfg(test)]
     fn new(rate: u32) -> Self {
-        Self::with_duration(rate, None)
-    }
-
-    fn with_duration(rate: u32, duration_sec: Option<f64>) -> Self {
-        let samples = duration_sec
-            .filter(|d| d.is_finite() && *d > 0.0)
-            .map_or(0, |d| (d.min(7200.0) * ANALYSIS_RATE as f64) as usize);
         Self {
             rate,
             phase: 0,
             sum: 0.0,
             count: 0,
-            mono: Vec::with_capacity(samples),
-            hop_sq: Vec::with_capacity(if samples > 0 { samples / HOP + 1 } else { 0 }),
+            mono: Vec::new(),
+            hop_sq: Vec::new(),
             cur_hop_sq: 0.0,
             cur_hop_len: 0,
         }
     }
 
-    fn push_samples(&mut self, samples: &[f32], channels: usize) {
+    fn push_samples(&mut self, samples: &[f32], channels: usize) -> Result<(), AudioError> {
+        const MONO_LIMIT: usize = 7200 * ANALYSIS_RATE as usize;
+        let frames = (samples.len() / channels) as u64;
+        let added = self
+            .phase
+            .saturating_add(frames.saturating_mul(u64::from(ANALYSIS_RATE)))
+            / u64::from(self.rate);
+        let needed = (self.mono.len() as u64).saturating_add(added);
+        if needed > MONO_LIMIT as u64 {
+            return Err(AudioError::Invalid);
+        }
+        reserve_samples(&mut self.mono, needed as usize, MONO_LIMIT)?;
+        reserve_samples(&mut self.hop_sq, needed as usize / HOP, MONO_LIMIT / HOP)?;
         if self.rate == ANALYSIS_RATE * 4 && (channels == 1 || channels == 2) {
             let mut rest = samples;
             while !rest.is_empty() && (self.phase != 0 || self.count != 0) {
                 if rest.len() < channels {
-                    return;
+                    return Ok(());
                 }
                 let (frame, tail) = rest.split_at(channels);
                 let x = if channels == 2 {
@@ -875,7 +877,7 @@ impl BandAnalyzer {
                     self.push(x);
                 }
             }
-            return;
+            return Ok(());
         }
         match channels {
             1 => {
@@ -895,6 +897,7 @@ impl BandAnalyzer {
                 }
             }
         }
+        Ok(())
     }
 
     /// One mono sample at the source rate.
@@ -902,13 +905,14 @@ impl BandAnalyzer {
     fn push(&mut self, x: f32) {
         self.sum += x;
         self.count += 1;
-        self.phase += ANALYSIS_RATE;
+        self.phase += u64::from(ANALYSIS_RATE);
+        let rate = u64::from(self.rate);
         // One averaged sample per analysis period (repeated when upsampling).
-        if self.phase >= self.rate {
+        if self.phase >= rate {
             let v = self.sum / self.count as f32;
             (self.sum, self.count) = (0.0, 0);
-            while self.phase >= self.rate {
-                self.phase -= self.rate;
+            while self.phase >= rate {
+                self.phase -= rate;
                 self.push_resampled(v);
             }
         }
@@ -916,6 +920,7 @@ impl BandAnalyzer {
 
     #[inline]
     fn push_resampled(&mut self, v: f32) {
+        let v = if v.is_finite() { v } else { 0.0 };
         self.mono.push(v);
         self.cur_hop_sq += v * v;
         self.cur_hop_len += 1;
@@ -925,6 +930,16 @@ impl BandAnalyzer {
             self.cur_hop_len = 0;
         }
     }
+}
+
+fn reserve_samples(samples: &mut Vec<f32>, needed: usize, limit: usize) -> Result<(), AudioError> {
+    if needed > samples.capacity() {
+        let capacity = needed.max(samples.capacity().saturating_mul(2)).min(limit);
+        samples
+            .try_reserve_exact(capacity - samples.len())
+            .map_err(|_| AudioError::Invalid)?;
+    }
+    Ok(())
 }
 
 fn analyze_frame_bands(
@@ -1345,7 +1360,7 @@ mod tests {
     #[test]
     fn low_rate_constant_stays_constant() {
         let mut analyzer = BandAnalyzer::new(8000);
-        analyzer.push_samples(&[1.0; 8000], 1);
+        analyzer.push_samples(&[1.0; 8000], 1).unwrap();
         assert_eq!(analyzer.mono, vec![1.0; 11025]);
     }
 

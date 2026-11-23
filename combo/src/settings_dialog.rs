@@ -170,9 +170,9 @@ const PRESET_COLORS: [u32; 6] = [
 struct Context {
     /// The settings as the dialog opened, to save only what changed.
     initial: ViewerConfig,
-    config: ViewerConfig,
-    color: u32,
-    background: u32,
+    config: std::cell::RefCell<ViewerConfig>,
+    color: std::cell::Cell<u32>,
+    background: std::cell::Cell<u32>,
     loupe_scales: Vec<f32>,
     font_sizes: Vec<i32>,
     slideshow_seconds: Vec<u32>,
@@ -182,11 +182,11 @@ struct Context {
     grid_rows: Vec<u32>,
     font_families: Vec<String>,
     /// Fills both previews: the background swatch and the OSD "Aa" (shown on that background).
-    background_brush: Brush,
+    background_brush: std::cell::RefCell<Brush>,
     /// Read from `wincmd.ini` on every opening: TC or the user may have changed the plugin list.
-    registration: Option<Registration>,
+    registration: std::cell::RefCell<Option<Registration>>,
     pages: Pages,
-    result: Option<ViewerConfig>,
+    result: std::cell::RefCell<Option<ViewerConfig>>,
 }
 
 /// Shows the dialog; returns the new (already saved) configuration if the user pressed OK.
@@ -201,9 +201,9 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
 
     let ctx = Box::into_raw(Box::new(Context {
         initial: current.clone(),
-        config: current.clone(),
-        color: current.osd_font_color,
-        background: current.photo_background,
+        config: std::cell::RefCell::new(current.clone()),
+        color: std::cell::Cell::new(current.osd_font_color),
+        background: std::cell::Cell::new(current.photo_background),
         loupe_scales: with_current(LOUPE_SCALES, current.loupe_scale, |a, b| {
             (a - b).abs() < 0.05
         }),
@@ -218,16 +218,15 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
         grid_columns: with_current(GRID_SIZES, current.contact_sheet_columns, |a, b| a == b),
         grid_rows: with_current(GRID_SIZES, current.contact_sheet_rows, |a, b| a == b),
         font_families: with_current_str(FONT_FAMILIES, &current.osd_font_name),
-        background_brush: gdi::solid_brush(current.photo_background),
-        registration: Registration::find(),
+        background_brush: std::cell::RefCell::new(gdi::solid_brush(current.photo_background)),
+        registration: std::cell::RefCell::new(Registration::find()),
         pages: Pages::default(),
-        result: None,
+        result: std::cell::RefCell::default(),
     }));
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
-
     let font = dialog::font(dlg, "Segoe UI", -12);
     let (ok, pages) = build_controls(dlg, &*ctx, font.0);
     (*ctx).pages = pages;
+    SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
     show_page(
         dlg,
         &*ctx,
@@ -236,7 +235,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
     dialog::run_modal(dlg, ok);
 
     // run_modal returns only after the window is destroyed, so nothing references `ctx` anymore.
-    Box::from_raw(ctx).result
+    Box::from_raw(ctx).result.into_inner()
 }
 
 /// Standard options plus the configured value if it isn't one of them (e.g. edited in the INI).
@@ -383,25 +382,31 @@ unsafe fn turn_page(dlg: HWND, ctx: &Context, back: bool) {
 }
 
 /// Opens the template editor; the result is kept in `ctx` and saved with OK.
-unsafe fn edit_osd_template(dlg: HWND, ctx: &mut Context, video: bool) {
-    let cfg = &mut ctx.config;
+unsafe fn edit_osd_template(dlg: HWND, ctx: &Context, video: bool) {
+    let cfg = ctx.config.borrow();
     let (title, template, default, fields) = if video {
         (
             tr("Video OSD"),
-            &mut cfg.video_osd,
+            cfg.video_osd.clone(),
             osd_template::DEFAULT_VIDEO,
             osd_template::VIDEO_FIELDS,
         )
     } else {
         (
             tr("Photo OSD"),
-            &mut cfg.photo_osd,
+            cfg.photo_osd.clone(),
             osd_template::DEFAULT_PHOTO,
             osd_template::PHOTO_FIELDS,
         )
     };
-    if let Some(edited) = osd_template_dialog::show(dlg, title, template, default, fields) {
-        *template = edited;
+    drop(cfg);
+    if let Some(edited) = osd_template_dialog::show(dlg, title, &template, default, fields) {
+        let mut cfg = ctx.config.borrow_mut();
+        if video {
+            cfg.video_osd = edited;
+        } else {
+            cfg.photo_osd = edited;
+        }
     }
 }
 
@@ -410,15 +415,20 @@ fn registered_label() -> &'static str {
 }
 
 /// Adds this DLL to `[ContentPlugins]` right away (independent of OK / Cancel), then greys the button.
-unsafe fn register_wdx(dlg: HWND, ctx: &mut Context) {
-    let Some(registration) = ctx.registration.as_mut() else {
+unsafe fn register_wdx(dlg: HWND, ctx: &Context) {
+    let result = ctx
+        .registration
+        .borrow_mut()
+        .as_mut()
+        .map(Registration::register);
+    let Some(result) = result else {
         show_error(
             dlg,
             tr("wincmd.ini not found. Add the plugin manually: Configuration → Options → Plugins → Content plugins → Add, select mediares.wlx64."),
         );
         return;
     };
-    if let Err(message) = registration.register() {
+    if let Err(message) = result {
         show_error(dlg, &message);
         return;
     }
@@ -456,9 +466,9 @@ unsafe fn selected<T: Clone>(dlg: HWND, pages: &Pages, id: i32, options: &[T]) -
         .and_then(|i| options.get(i).cloned())
 }
 
-unsafe fn accept(dlg: HWND, ctx: &mut Context) {
+unsafe fn accept(dlg: HWND, ctx: &Context) {
     let pages = &ctx.pages;
-    let cfg = &mut ctx.config;
+    let mut cfg = ctx.config.borrow().clone();
     cfg.language = selected(dlg, pages, IDC_LANGUAGE, &LangSetting::all()).unwrap_or(cfg.language);
     cfg.start_fullscreen = is_checked(dlg, pages, IDC_START_FULLSCREEN);
     cfg.auto_rotate_exif = is_checked(dlg, pages, IDC_AUTO_ROTATE_EXIF);
@@ -467,7 +477,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
         selected(dlg, pages, IDC_LOUPE_SCALE, &ctx.loupe_scales).unwrap_or(cfg.loupe_scale);
     cfg.osd_font_size =
         selected(dlg, pages, IDC_FONT_SIZE, &ctx.font_sizes).unwrap_or(cfg.osd_font_size);
-    cfg.osd_font_color = ctx.color;
+    cfg.osd_font_color = ctx.color.get();
     cfg.queue.auto_advance = is_checked(dlg, pages, IDC_AUTO_ADVANCE);
     cfg.queue.repeat = selected(dlg, pages, IDC_REPEAT, &Repeat::ALL).unwrap_or(cfg.queue.repeat);
     cfg.queue.shuffle = is_checked(dlg, pages, IDC_SHUFFLE);
@@ -476,7 +486,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
     cfg.overlay_autohide = is_checked(dlg, pages, IDC_OVERLAY_AUTOHIDE);
     cfg.slideshow_seconds = selected(dlg, pages, IDC_SLIDESHOW, &ctx.slideshow_seconds)
         .unwrap_or(cfg.slideshow_seconds);
-    cfg.photo_background = ctx.background;
+    cfg.photo_background = ctx.background.get();
     cfg.no_upscale = is_checked(dlg, pages, IDC_NO_UPSCALE);
     cfg.smooth_zoom = is_checked(dlg, pages, IDC_SMOOTH_ZOOM);
     cfg.keep_zoom = is_checked(dlg, pages, IDC_KEEP_ZOOM);
@@ -511,7 +521,7 @@ unsafe fn accept(dlg: HWND, ctx: &mut Context) {
             ),
         );
     }
-    ctx.result = Some(cfg.clone());
+    ctx.result.replace(Some(cfg));
 }
 
 /// The system color picker starting at `initial`; `None` if cancelled.
@@ -589,17 +599,17 @@ unsafe fn browse_program(dlg: HWND, pages: &Pages, edit_id: i32) {
     }
 }
 
-unsafe fn choose_color(dlg: HWND, ctx: &mut Context) {
-    if let Some(color) = pick_color(dlg, ctx.color) {
-        ctx.color = color;
+unsafe fn choose_color(dlg: HWND, ctx: &Context) {
+    if let Some(color) = pick_color(dlg, ctx.color.get()) {
+        ctx.color.set(color);
         repaint_previews(dlg, &ctx.pages);
     }
 }
 
-unsafe fn choose_background(dlg: HWND, ctx: &mut Context) {
-    if let Some(color) = pick_color(dlg, ctx.background) {
-        ctx.background = color;
-        ctx.background_brush = gdi::solid_brush(color);
+unsafe fn choose_background(dlg: HWND, ctx: &Context) {
+    if let Some(color) = pick_color(dlg, ctx.background.get()) {
+        ctx.background.set(color);
+        ctx.background_brush.replace(gdi::solid_brush(color));
         repaint_previews(dlg, &ctx.pages);
     }
 }
@@ -611,7 +621,7 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
-        let ctx = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Context).as_mut();
+        let ctx = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Context).as_ref();
         let Some(ctx) = ctx else {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
@@ -625,11 +635,11 @@ unsafe extern "system" fn wnd_proc(
             {
                 let hdc = HDC(wparam.0 as *mut _);
                 SetBkMode(hdc, OPAQUE);
-                SetBkColor(hdc, COLORREF(ctx.background));
-                SetTextColor(hdc, COLORREF(ctx.color));
-                LRESULT(ctx.background_brush.0 .0 as isize)
+                SetBkColor(hdc, COLORREF(ctx.background.get()));
+                SetTextColor(hdc, COLORREF(ctx.color.get()));
+                LRESULT(ctx.background_brush.borrow().0 .0 as isize)
             }
-            WM_NOTIFY => {
+            WM_NOTIFY if lparam.0 != 0 => {
                 let header = &*(lparam.0 as *const NMHDR);
                 if header.idFrom == IDC_TABS as usize && header.code == TCN_SELCHANGE {
                     let index = SendMessageW(header.hwndFrom, TCM_GETCURSEL, None, None).0;

@@ -47,7 +47,12 @@ impl Selector {
             + self.tag.is_some() as u32
     }
 
-    fn matches(&self, tag: &str, classes: &[&str], id: Option<&str>) -> bool {
+    fn matches(
+        &self,
+        tag: &str,
+        classes: &std::collections::HashSet<&str>,
+        id: Option<&str>,
+    ) -> bool {
         self.tag.as_deref().is_none_or(|t| t == tag)
             && self.class.as_deref().is_none_or(|c| classes.contains(&c))
             && self.id.as_deref().is_none_or(|i| id == Some(i))
@@ -67,10 +72,11 @@ fn strip_comments(css: &str) -> String {
     out
 }
 
-fn parse_rules(css: &str) -> Vec<Rule> {
+fn parse_rules(css: &str, max_selectors: usize) -> Option<Vec<Rule>> {
     let css = strip_comments(css);
     let mut rules = Vec::new();
     let mut rest = css.as_str();
+    let mut remaining = max_selectors;
     while let Some(open) = rest.find('{') {
         let head = rest[..open].trim();
         let body_start = open + 1;
@@ -96,6 +102,7 @@ fn parse_rules(css: &str) -> Vec<Rule> {
             .find('}')
             .map_or(rest.len(), |i| body_start + i);
         let declarations = rest[body_start..close].trim().replace('"', "'");
+        remaining = remaining.checked_sub(head.split(',').count())?;
         let selectors: Option<Vec<Selector>> = head.split(',').map(Selector::parse).collect();
         if let Some(selectors) = selectors.filter(|_| !declarations.is_empty()) {
             rules.push(Rule {
@@ -105,7 +112,7 @@ fn parse_rules(css: &str) -> Vec<Rule> {
         }
         rest = &rest[(close + 1).min(rest.len())..];
     }
-    rules
+    Some(rules)
 }
 
 /// An attribute of a start tag: its name, its value and where the whole `name="value"` is.
@@ -161,7 +168,7 @@ fn attributes(tag: &str) -> Vec<Attr<'_>> {
 }
 
 /// The text of every `<style>` element (CDATA markers removed).
-fn style_sheets(xml: &str) -> String {
+fn style_sheets(xml: &str, limit: usize) -> Option<String> {
     let mut css = String::new();
     let mut rest = xml;
     while let Some(start) = rest.find("<style") {
@@ -173,25 +180,42 @@ fn style_sheets(xml: &str) -> String {
             break;
         };
         let text = &rest[body..body + len];
+        if css.len() + text.len() + 1 > limit {
+            return None;
+        }
         css.push_str(&text.replace("<![CDATA[", "").replace("]]>", ""));
         css.push('\n');
         rest = &rest[body + len..];
     }
-    css
+    Some(css)
 }
 
 /// `xml` with the `<style>` rules copied into `style` attributes; `None` when there is nothing to
 /// do (no sheet, not UTF-8).
 pub fn inline(xml: &[u8]) -> Option<Vec<u8>> {
     let xml = std::str::from_utf8(xml).ok()?;
-    let rules = parse_rules(&style_sheets(xml));
+    const MAX_CSS_BYTES: usize = 1024 * 1024;
+    let rules = parse_rules(&style_sheets(xml, MAX_CSS_BYTES)?, 4096)?;
     if rules.is_empty() {
         return None;
     }
-    let mut out = String::with_capacity(xml.len() + xml.len() / 4);
+    let limit = 64 * 1024 * 1024;
+    let mut out = String::new();
+    let mut budget = 64 * 1024 * 1024usize;
+    let match_cost: usize = rules
+        .iter()
+        .flat_map(|rule| &rule.selectors)
+        .map(|selector| {
+            16 + [&selector.tag, &selector.class, &selector.id]
+                .into_iter()
+                .flatten()
+                .map(String::len)
+                .sum::<usize>()
+        })
+        .sum();
     let mut i = 0;
     while let Some(lt) = xml[i..].find('<').map(|p| i + p) {
-        out.push_str(&xml[i..lt]);
+        append(&mut out, &xml[i..lt], limit)?;
         let rest = &xml[lt..];
         // Comments, CDATA, declarations, processing instructions and end tags are copied as is.
         let skip_to = if rest.starts_with("<!--") {
@@ -204,19 +228,34 @@ pub fn inline(xml: &[u8]) -> Option<Vec<u8>> {
             None
         };
         if let Some(len) = skip_to {
-            out.push_str(&rest[..len]);
+            append(&mut out, &rest[..len], limit)?;
             i = lt + len;
             continue;
         }
         let Some(end) = tag_end(rest) else {
-            out.push_str(rest);
+            append(&mut out, rest, limit)?;
             return Some(out.into_bytes());
         };
-        out.push_str(&styled_tag(&rest[1..end], &rules));
+        budget = budget.checked_sub(match_cost)?;
+        let tag = styled_tag(&rest[1..end], &rules, limit - out.len())?;
+        append(&mut out, &tag, limit)?;
         i = lt + end;
     }
-    out.push_str(&xml[i..]);
+    append(&mut out, &xml[i..], limit)?;
     Some(out.into_bytes())
+}
+
+fn append(out: &mut String, text: &str, limit: usize) -> Option<()> {
+    if text.len() > limit - out.len() {
+        return None;
+    }
+    let needed = out.len() + text.len();
+    if needed > out.capacity() {
+        let capacity = needed.max(out.capacity().saturating_mul(2)).min(limit);
+        out.try_reserve_exact(capacity - out.len()).ok()?;
+    }
+    out.push_str(text);
+    Some(())
 }
 
 /// Index of the `>` closing the start tag at the beginning of `s` (quotes respected).
@@ -235,7 +274,10 @@ fn tag_end(s: &str) -> Option<usize> {
 
 /// `<` + the tag text with a `style` attribute holding the matching declarations (the element's
 /// own `style` last, so it keeps precedence).
-fn styled_tag(tag: &str, rules: &[Rule]) -> String {
+fn styled_tag(tag: &str, rules: &[Rule], remaining: usize) -> Option<String> {
+    if tag.len() >= remaining {
+        return None;
+    }
     let name_len = tag
         .find(|c: char| c.is_whitespace() || c == '/')
         .unwrap_or(tag.len());
@@ -243,8 +285,9 @@ fn styled_tag(tag: &str, rules: &[Rule]) -> String {
     let local_name = name.rsplit(':').next().unwrap_or(name);
     let attrs = attributes(tag);
     let find = |n: &str| attrs.iter().find(|a| a.name == n);
-    let classes: Vec<&str> =
-        find("class").map_or(Vec::new(), |a| a.value.split_whitespace().collect());
+    let classes = find("class")
+        .map(|a| a.value.split_whitespace().collect())
+        .unwrap_or_default();
     let id = find("id").map(|a| a.value);
 
     let mut matched: Vec<(u32, usize, &str)> = Vec::new();
@@ -260,7 +303,7 @@ fn styled_tag(tag: &str, rules: &[Rule]) -> String {
         }
     }
     if matched.is_empty() {
-        return format!("<{tag}");
+        return Some(format!("<{tag}"));
     }
     matched.sort();
     let mut style: Vec<&str> = matched.iter().map(|m| m.2.trim_end_matches(';')).collect();
@@ -269,8 +312,12 @@ fn styled_tag(tag: &str, rules: &[Rule]) -> String {
         style.push(own.value);
     }
     // Written in double quotes: a value that was in single ones may hold them (font names).
+    let bytes = style.iter().map(|value| value.len() + 1).sum::<usize>();
+    if tag.len() - own.map_or(0, |attr| attr.span.len()) + bytes + 11 > remaining {
+        return None;
+    }
     let style = style.join(";").replace('"', "'");
-    match own {
+    Some(match own {
         Some(own) => format!(
             "<{}style=\"{}\"{}",
             &tag[..own.span.start],
@@ -278,7 +325,7 @@ fn styled_tag(tag: &str, rules: &[Rule]) -> String {
             &tag[own.span.end..]
         ),
         None => format!("<{name} style=\"{style}\"{}", &tag[name_len..]),
-    }
+    })
 }
 
 #[cfg(test)]

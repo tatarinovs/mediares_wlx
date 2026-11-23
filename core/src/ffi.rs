@@ -129,15 +129,17 @@ pub unsafe fn write_wide(dest: *mut u16, max_bytes: usize, text: &str) -> bool {
     }
     let mut units = text.encode_utf16();
     let mut i = 0;
+    let mut last = 0;
     for ch in units.by_ref().take(max_chars - 1) {
-        *dest.add(i) = ch;
+        dest.add(i).write_unaligned(ch);
+        last = ch;
         i += 1;
     }
-    // Cut short right after the first half of a surrogate pair: drop that half too.
-    if i > 0 && (0xD800..0xDC00).contains(&*dest.add(i - 1)) && units.next().is_some() {
+    // Drop a high surrogate if the rest of its pair did not fit.
+    if (0xD800..0xDC00).contains(&last) {
         i -= 1;
     }
-    *dest.add(i) = 0;
+    dest.add(i).write_unaligned(0);
     true
 }
 

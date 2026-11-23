@@ -126,6 +126,15 @@ pub struct OpenOptions {
     pub seek_preview: bool,
 }
 
+impl Drop for MediaView {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.viewer), STATUS_TIMER_ID);
+            let _ = KillTimer(Some(self.viewer), LOUPE_TIMER_ID);
+        }
+    }
+}
+
 impl MediaView {
     /// Opens `path` (`kind` must be playable), reusing `previous` when it shows the same kind of
     /// content. `None` if the file can't be played.
@@ -201,6 +210,13 @@ impl MediaView {
         };
         view.layout();
         Some(view)
+    }
+
+    pub unsafe fn restart_timer(&self) {
+        match &self.content {
+            Content::Audio(view) => view.restart_timer(),
+            Content::Video(view) => view.restart_timer(),
+        }
     }
 
     pub fn transport(&self) -> &dyn Transport {
@@ -804,7 +820,8 @@ impl MediaView {
     fn keep_in_loop(&self) {
         if let (Some(a), Some(b)) = self.ab_loop {
             let t = self.transport();
-            if t.position() >= b && t.is_playing() {
+            let seeking = matches!(&self.content, Content::Video(view) if view.is_seeking());
+            if !seeking && t.position() >= b && t.is_playing() {
                 t.seek(a, false);
             }
         }

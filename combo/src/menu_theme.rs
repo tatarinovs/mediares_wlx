@@ -75,6 +75,10 @@ impl Style {
     }
 }
 
+thread_local! {
+    static ACTIVE_STYLE: std::cell::Cell<*const Style> = const { std::cell::Cell::new(std::ptr::null()) };
+}
+
 /// Popup menu destroyed on drop. Command ids must be nonzero: id 0 marks a separator.
 pub struct ThemedMenu(Box<Style>);
 
@@ -134,6 +138,13 @@ impl ThemedMenu {
 
     /// Shows the menu (modal); returns the chosen id, 0 if none.
     pub unsafe fn track(&self, owner: HWND, x: i32, y: i32, flags: TRACK_POPUP_MENU_FLAGS) -> u32 {
+        struct Restore(*const Style);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                ACTIVE_STYLE.set(self.0);
+            }
+        }
+        let _restore = Restore(ACTIVE_STYLE.replace(&*self.0));
         TrackPopupMenu(self.0.menu, flags, x, y, Some(0), owner, None).0 as u32
     }
 }
@@ -148,11 +159,14 @@ impl Drop for ThemedMenu {
 
 /// `WM_MEASUREITEM` handler; false if the message isn't about a [`ThemedMenu`] item.
 pub unsafe fn measure_item(lparam: LPARAM) -> bool {
-    let mis = &mut *(lparam.0 as *mut MEASUREITEMSTRUCT);
-    if mis.CtlType != ODT_MENU || mis.itemData == 0 {
+    let Some(mis) = (lparam.0 as *mut MEASUREITEMSTRUCT).as_mut() else {
+        return false;
+    };
+    let ptr = ACTIVE_STYLE.get();
+    if mis.CtlType != ODT_MENU || ptr.is_null() || mis.itemData != ptr as usize {
         return false;
     }
-    let style = &*(mis.itemData as *const Style);
+    let style = &*ptr;
     if mis.itemID == 0 {
         mis.itemHeight = style.px(7.0) as u32;
         return true;
@@ -181,11 +195,14 @@ pub unsafe fn measure_item(lparam: LPARAM) -> bool {
 
 /// `WM_DRAWITEM` handler; false if the message isn't about a [`ThemedMenu`] item.
 pub unsafe fn draw_item(lparam: LPARAM) -> bool {
-    let dis = &*(lparam.0 as *const DRAWITEMSTRUCT);
-    if dis.CtlType != ODT_MENU || dis.itemData == 0 {
+    let Some(dis) = (lparam.0 as *const DRAWITEMSTRUCT).as_ref() else {
+        return false;
+    };
+    let ptr = ACTIVE_STYLE.get();
+    if dis.CtlType != ODT_MENU || ptr.is_null() || dis.itemData != ptr as usize {
         return false;
     }
-    let style = &*(dis.itemData as *const Style);
+    let style = &*ptr;
     let (p, dc, rc) = (style.palette, dis.hDC, dis.rcItem);
     gdi::fill(dc, rc, p.background);
 

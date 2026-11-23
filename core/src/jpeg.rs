@@ -70,12 +70,27 @@ pub fn read_frame_header(r: &mut (impl BufRead + Seek)) -> Option<FrameHeader> {
 /// Walks marker segments instead of searching for the first `FF D9`, so EXIF thumbnails
 /// nested inside APP1 do not terminate the stream early.
 pub fn stream_len(data: &[u8]) -> Option<usize> {
+    let mut budget = usize::MAX;
+    stream_len_with_budget(data, &mut budget)
+}
+
+fn stream_len_with_budget(data: &[u8], budget: &mut usize) -> Option<usize> {
     if !data.starts_with(&[0xFF, 0xD8]) {
         return None;
     }
-    let mut i = 2;
+    let mut i = 2usize;
     loop {
-        let (marker, next) = read_marker(data, i)?;
+        let end = data.len().min(i.saturating_add(*budget));
+        let marker = read_marker(&data[..end], i);
+        let Some((marker, next)) = marker else {
+            // Charge a truncated run of marker fill bytes as well.
+            *budget -= data[i..end]
+                .iter()
+                .take_while(|&&byte| byte == 0xFF)
+                .count();
+            return None;
+        };
+        *budget -= next - i;
         i = next;
         match marker {
             0xD9 => return Some(i),
@@ -84,7 +99,14 @@ pub fn stream_len(data: &[u8]) -> Option<usize> {
                 i = skip_segment(data, i)?;
                 // Entropy-coded data: FF 00 is stuffing, FF D0..D7 are restart markers.
                 loop {
-                    i += memchr::memchr(0xFF, data.get(i..)?)?;
+                    let end = data.len().min(i.saturating_add(*budget));
+                    let scanned = data.get(i..end)?;
+                    let Some(marker) = memchr::memchr(0xFF, scanned) else {
+                        *budget -= scanned.len();
+                        return None;
+                    };
+                    *budget -= marker + 1;
+                    i += marker;
                     match *data.get(i + 1)? {
                         0x00 | 0xD0..=0xD7 => i += 2,
                         0xFF => i += 1,
@@ -122,9 +144,14 @@ pub fn is_decodable(data: &[u8]) -> bool {
 pub fn find_largest(data: &[u8], min_len: usize) -> Option<&[u8]> {
     let mut best: Option<&[u8]> = None;
     let mut pos = 0;
-    while let Some(found) = memchr::memmem::find(&data[pos..], &[0xFF, 0xD8, 0xFF]) {
+    // A failed candidate can overlap later ones. Bound the total work spent parsing them.
+    let mut budget = data.len().saturating_mul(4);
+    while budget != 0 {
+        let Some(found) = memchr::memmem::find(&data[pos..], &[0xFF, 0xD8, 0xFF]) else {
+            break;
+        };
         let start = pos + found;
-        match stream_len(&data[start..]) {
+        match stream_len_with_budget(&data[start..], &mut budget) {
             Some(len) => {
                 let jpeg = &data[start..start + len];
                 if len >= min_len && best.is_none_or(|b| len > b.len()) && is_decodable(jpeg) {

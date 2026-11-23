@@ -103,7 +103,10 @@ fn make(
     if info.columns == 0 || info.rows == 0 {
         return None;
     }
-    let count = info.columns * info.rows;
+    let count = info.columns.checked_mul(info.rows)?;
+    if count > 100 {
+        return None;
+    }
     let times: Vec<f64> = (0..count)
         .map(|i| info.duration * (f64::from(i) + 0.5) / f64::from(count))
         .collect();
@@ -163,6 +166,9 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
     let cell = (CELL_WIDTH as i32, (CELL_WIDTH * fh / fw.max(1)) as i32);
     let width = 2 * MARGIN + columns * cell.0 + (columns - 1) * GAP;
     let height = HEADER + MARGIN + rows * cell.1 + (rows - 1) * GAP;
+    if !mediares_core::image_decode::valid_dimensions(width as u32, height as u32) {
+        return None;
+    }
 
     let dc = CreateCompatibleDC(None);
     if dc.is_invalid() {
@@ -174,6 +180,11 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
         let _ = DeleteDC(dc);
         return None;
     };
+    if bits.is_null() {
+        let _ = DeleteObject(bitmap.into());
+        let _ = DeleteDC(dc);
+        return None;
+    }
     let old = SelectObject(dc, bitmap.into());
     gdi::fill(dc, gdi::rect(width, height), BACKGROUND);
 
@@ -233,16 +244,24 @@ unsafe fn compose(video: &Path, info: &SheetInfo, frames: &[Option<Shot>]) -> Op
     }
 
     let len = width as usize * height as usize * 4;
-    let mut pixels = std::slice::from_raw_parts(bits as *const u8, len).to_vec();
+    let mut pixels = Vec::new();
+    if windows::Win32::Graphics::Gdi::GdiFlush().as_bool() && pixels.try_reserve_exact(len).is_ok()
+    {
+        pixels.extend_from_slice(std::slice::from_raw_parts(bits.cast::<u8>(), len));
+    }
+    SelectObject(dc, old);
+    let _ = DeleteObject(bitmap.into());
+    let _ = DeleteDC(dc);
+    if pixels.is_empty() {
+        return None;
+    }
     pixels
         .as_chunks_mut::<4>()
         .0
         .iter_mut()
         .for_each(|px| px[3] = 255);
-    SelectObject(dc, old);
-    let _ = DeleteObject(bitmap.into());
-    let _ = DeleteDC(dc);
     Some(DecodedImage {
+        id: DecodedImage::next_id(),
         width: width as u32,
         height: height as u32,
         full: (width as u32, height as u32),

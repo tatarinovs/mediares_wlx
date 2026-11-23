@@ -60,7 +60,7 @@ impl AudioDecoder {
         let decoder = symphonia::default::get_codecs()
             .make_audio_decoder(params, &AudioDecoderOptions::default())
             .ok()?;
-        let sample_rate = params.sample_rate?;
+        let sample_rate = params.sample_rate.filter(|&rate| rate != 0)?;
         let channels = params
             .channels
             .as_ref()
@@ -364,17 +364,17 @@ impl Read for Spliced {
 impl Seek for Spliced {
     fn seek(&mut self, to: SeekFrom) -> io::Result<u64> {
         let target = match to {
-            SeekFrom::Start(p) => p as i64,
-            SeekFrom::Current(d) => self.pos as i64 + d,
-            SeekFrom::End(d) => self.len as i64 + d,
+            SeekFrom::Start(p) => Some(p),
+            SeekFrom::Current(d) => self.pos.checked_add_signed(d),
+            SeekFrom::End(d) => self.len.checked_add_signed(d),
         };
-        if target < 0 {
+        let Some(target) = target else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "seek before start",
+                "seek outside the representable range",
             ));
-        }
-        self.pos = (target as u64).min(self.len);
+        };
+        self.pos = target.min(self.len);
         Ok(self.pos)
     }
 }

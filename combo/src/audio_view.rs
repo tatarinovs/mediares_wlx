@@ -182,6 +182,15 @@ impl AudioView {
         Some(view)
     }
 
+    pub unsafe fn restart_timer(&self) {
+        SetTimer(
+            Some(self.viewer),
+            PROGRESS_TIMER_ID,
+            PROGRESS_INTERVAL_MS,
+            None,
+        );
+    }
+
     /// Switches to another file, reusing the output device when possible.
     pub unsafe fn open(&mut self, path: &Path, replay_gain: bool) -> bool {
         self.replay_gain = replay_gain;

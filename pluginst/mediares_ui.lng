@@ -31,6 +31,7 @@ Could not make the contact sheet=Не удалось сделать раскад
 No EXIF metadata found, or the format is not supported.=EXIF метаданные не найдены или формат не поддерживается.
 File path=Путь к файлу
 EXIF metadata=EXIF метаданные
+Reading EXIF metadata...=Чтение метаданных EXIF…
 Close=Закрыть
 Make=Производитель
 Camera model=Модель камеры

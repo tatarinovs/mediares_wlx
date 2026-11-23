@@ -228,10 +228,12 @@ impl AudioPlayer {
             track.state.stopped.store(true, Ordering::Relaxed);
             return false;
         }
-        if let Some((_, old)) = self.pending.take() {
-            old.state.stopped.store(true, Ordering::Relaxed);
+        let mut slot = self.next_slot.lock().unwrap_or_else(|e| e.into_inner());
+        if self.pending.is_some() && slot.is_none() {
+            return false; // The output already took the successor.
         }
-        *self.next_slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(NextTrack {
+        self.pending = None;
+        *slot = Some(NextTrack {
             state: track.state.clone(),
             chunks,
         });
@@ -433,13 +435,17 @@ struct Stream {
 impl Stream {
     unsafe fn open(channels: u16, rate: u32) -> windows::core::Result<Self> {
         let client: IAudioClient = default_device()?.Activate(CLSCTX_ALL, None)?;
-        let block_align = channels * 4;
+        let invalid = || windows::core::Error::from(windows::Win32::Foundation::E_INVALIDARG);
+        let block_align = channels.checked_mul(4).ok_or_else(invalid)?;
+        let bytes_per_sec = rate
+            .checked_mul(u32::from(block_align))
+            .ok_or_else(invalid)?;
         let format = WAVEFORMATEXTENSIBLE {
             Format: WAVEFORMATEX {
                 wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
                 nChannels: channels,
                 nSamplesPerSec: rate,
-                nAvgBytesPerSec: rate * block_align as u32,
+                nAvgBytesPerSec: bytes_per_sec,
                 nBlockAlign: block_align,
                 wBitsPerSample: 32,
                 cbSize: (size_of::<WAVEFORMATEXTENSIBLE>() - size_of::<WAVEFORMATEX>()) as u16,
@@ -463,10 +469,12 @@ impl Stream {
             format_ptr,
             None,
         )?;
+        let render = client.GetService()?;
+        let buffer_frames = client.GetBufferSize()?;
         let event = CreateEventW(None, false, false, None)?;
         let stream = Self {
-            render: client.GetService()?,
-            buffer_frames: client.GetBufferSize()?,
+            render,
+            buffer_frames,
             client,
             event,
             channels: channels as usize,

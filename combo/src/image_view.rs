@@ -850,6 +850,7 @@ mod tests {
     #[test]
     fn frame_loupe_keeps_the_pressed_point() {
         let frame = || DecodedImage {
+            id: DecodedImage::next_id(),
             width: 2000,
             height: 1000,
             full: (2000, 1000),
@@ -909,6 +910,7 @@ mod tests {
             CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, SelectObject,
         };
         let img = DecodedImage {
+            id: DecodedImage::next_id(),
             width: 4,
             height: 4,
             full: (4, 4),

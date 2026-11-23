@@ -5,16 +5,19 @@
 
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
-use windows::Win32::Graphics::Gdi::{COLOR_BTNFACE, HBRUSH, HFONT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, COLOR_BTNFACE, HBRUSH, HFONT, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB,
+    EnableWindow, GetFocus, GetKeyState, SetFocus, VK_CONTROL, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DestroyWindow, DispatchMessageW, GetAncestor, GetDlgItem, GetMessageW,
-    GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsDialogMessageW, IsWindow,
-    PostQuitMessage, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage, CS_HREDRAW,
-    CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_KEYDOWN, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP,
+    GetWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IsChild, IsDialogMessageW,
+    IsWindow, PostQuitMessage, SendMessageW, SetForegroundWindow, ShowWindow, TranslateMessage,
+    CS_HREDRAW, CS_VREDRAW, GA_ROOT, GW_OWNER, HMENU, MSG, SW_SHOW, WINDOW_EX_STYLE, WINDOW_STYLE,
+    WM_APP, WM_KEYDOWN, WM_SETFONT, WNDPROC, WS_CAPTION, WS_CHILD, WS_EX_DLGMODALFRAME, WS_POPUP,
     WS_SYSMENU, WS_VISIBLE,
 };
 
@@ -80,13 +83,27 @@ pub unsafe fn create_frame(
     } else {
         (200, 200)
     };
+    let monitor = MonitorFromWindow(owner, MONITOR_DEFAULTTONEAREST);
+    let mut info = MONITORINFO {
+        cbSize: size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    let (x, y) = if GetMonitorInfoW(monitor, &mut info).as_bool() {
+        let work = info.rcWork;
+        (
+            x.clamp(work.left, (work.right - width).max(work.left)),
+            y.clamp(work.top, (work.bottom - height).max(work.top)),
+        )
+    } else {
+        (x, y)
+    };
     CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         class,
         &HSTRING::from(title),
         WS_POPUP | WS_CAPTION | WS_SYSMENU,
-        x.max(0),
-        y.max(0),
+        x,
+        y,
         width,
         height,
         Some(owner),
@@ -156,6 +173,11 @@ pub unsafe fn control_px(
 
 /// Shows `dlg` modally: disables its owner and pumps messages until the dialog is destroyed.
 pub unsafe fn run_modal(dlg: HWND, focus: HWND) {
+    run_modal_with(dlg, focus, |_| false);
+}
+
+pub unsafe fn run_modal_with(dlg: HWND, focus: HWND, mut handle: impl FnMut(&MSG) -> bool) {
+    let previous_focus = GetFocus();
     let owner = GetWindow(dlg, GW_OWNER).unwrap_or_default();
     if !owner.is_invalid() {
         let _ = EnableWindow(owner, false);
@@ -173,6 +195,9 @@ pub unsafe fn run_modal(dlg: HWND, focus: HWND) {
             }
             -1 => break,
             _ => {}
+        }
+        if handle(&msg) {
+            continue;
         }
         // IsDialogMessage would take Ctrl+Tab for plain Tab.
         if msg.message == WM_KEYDOWN
@@ -196,6 +221,9 @@ pub unsafe fn run_modal(dlg: HWND, focus: HWND) {
     if IsWindow(Some(owner)).as_bool() {
         let _ = EnableWindow(owner, true);
         let _ = SetForegroundWindow(owner);
+        if previous_focus == owner || IsChild(owner, previous_focus).as_bool() {
+            let _ = SetFocus(Some(previous_focus));
+        }
     }
 }
 

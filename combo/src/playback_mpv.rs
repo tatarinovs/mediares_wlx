@@ -169,7 +169,10 @@ unsafe fn load_api() -> Option<Api> {
     })?;
     macro_rules! entry {
         ($name:literal) => {{
-            let f = GetProcAddress(module, s!($name))?;
+            let Some(f) = GetProcAddress(module, s!($name)) else {
+                let _ = windows::Win32::Foundation::FreeLibrary(module);
+                return None;
+            };
             // Every field is a function pointer, the size of `f`.
             std::mem::transmute_copy(&f)
         }};
@@ -882,7 +885,11 @@ impl MpvPlayer {
                 size
             }
         };
-        let face_len = lf.lfFaceName.iter().position(|&c| c == 0).unwrap_or(0);
+        let face_len = lf
+            .lfFaceName
+            .iter()
+            .position(|&c| c == 0)
+            .unwrap_or(lf.lfFaceName.len());
         let face = String::from_utf16_lossy(&lf.lfFaceName[..face_len]);
         let bold = (lf.lfWeight >= FW_BOLD.0 as i32) as u8;
         let mut escaped = String::with_capacity(osd.text.len());
@@ -1068,25 +1075,32 @@ unsafe fn read_screenshot(node: &Node) -> Option<(u32, u32, Vec<u8>)> {
     if node.format != FORMAT_NODE_MAP {
         return None;
     }
-    let list = &*node.u.list;
+    let list = node.u.list.as_ref()?;
+    if list.num <= 0 || list.keys.is_null() || list.values.is_null() {
+        return None;
+    }
     let (mut w, mut h, mut stride, mut data, mut format) = (0i64, 0i64, 0i64, None, None);
     for i in 0..list.num.max(0) as usize {
-        let key = CStr::from_ptr(*list.keys.add(i)).to_bytes();
+        let key = *list.keys.add(i);
+        if key.is_null() {
+            return None;
+        }
+        let key = CStr::from_ptr(key).to_bytes();
         let value = &*list.values.add(i);
         match (key, value.format) {
             (b"w", FORMAT_INT64) => w = value.u.int64,
             (b"h", FORMAT_INT64) => h = value.u.int64,
             (b"stride", FORMAT_INT64) => stride = value.u.int64,
-            (b"format", FORMAT_STRING) => {
-                format = Some(CStr::from_ptr(value.u.string).to_bytes().to_vec())
+            (b"format", FORMAT_STRING) if !value.u.string.is_null() => {
+                format = Some(CStr::from_ptr(value.u.string).to_bytes())
             }
-            (b"data", FORMAT_BYTE_ARRAY) => data = Some(&*value.u.ba),
+            (b"data", FORMAT_BYTE_ARRAY) => data = value.u.ba.as_ref(),
             _ => {}
         }
     }
     // "bgr0" / "bgra": already the BGRA byte order.
     let format = format?;
-    if w <= 0 || h <= 0 || stride < w * 4 || !(format == b"bgr0" || format == b"bgra") {
+    if !(format == b"bgr0" || format == b"bgra") {
         return None;
     }
     let data = data?;
@@ -1094,12 +1108,19 @@ unsafe fn read_screenshot(node: &Node) -> Option<(u32, u32, Vec<u8>)> {
     if !mediares_core::image_decode::valid_dimensions(width, height) {
         return None;
     }
-    let (w, h, stride) = (w as usize, h as usize, stride as usize);
-    if data.size < stride * (h - 1) + w * 4 {
+    let (w, h, stride) = (
+        width as usize,
+        height as usize,
+        usize::try_from(stride).ok()?,
+    );
+    let row = w.checked_mul(4)?;
+    let needed = stride.checked_mul(h - 1)?.checked_add(row)?;
+    if stride < row || data.data.is_null() || data.size < needed || needed > isize::MAX as usize {
         return None;
     }
-    let bytes = std::slice::from_raw_parts(data.data as *const u8, data.size);
-    let mut pixels = Vec::with_capacity(w * h * 4);
+    let bytes = std::slice::from_raw_parts(data.data as *const u8, needed);
+    let mut pixels = Vec::new();
+    pixels.try_reserve_exact(row.checked_mul(h)?).ok()?;
     for y in 0..h {
         pixels.extend_from_slice(&bytes[y * stride..y * stride + w * 4]);
     }
@@ -1136,7 +1157,7 @@ fn event_loop(api: &'static Api, handle: Handle, shared: &Shared) {
                 shared.stepping.store(false, Ordering::SeqCst);
                 post(MF_MEDIA_ENGINE_EVENT_SEEKED);
             }
-            EVENT_END_FILE => {
+            EVENT_END_FILE if !event.data.is_null() => {
                 let end = unsafe { &*(event.data as *const EventEndFile) };
                 if end.reason == END_FILE_ERROR {
                     // Everything mpv can't open reads as "format or codec not supported"; other
@@ -1160,9 +1181,12 @@ fn event_loop(api: &'static Api, handle: Handle, shared: &Shared) {
                 2 => post(MF_MEDIA_ENGINE_EVENT_PAUSE),
                 3 => post(MF_MEDIA_ENGINE_EVENT_DURATIONCHANGE),
                 4 | 5 => post(MF_MEDIA_ENGINE_EVENT_VOLUMECHANGE),
-                6 => {
+                6 if !event.data.is_null() => {
                     let p = unsafe { &*(event.data as *const EventProperty) };
-                    if p.format == FORMAT_FLAG && unsafe { *(p.data as *const c_int) } != 0 {
+                    if p.format == FORMAT_FLAG
+                        && !p.data.is_null()
+                        && unsafe { *(p.data as *const c_int) } != 0
+                    {
                         post(MF_MEDIA_ENGINE_EVENT_ENDED);
                     }
                 }

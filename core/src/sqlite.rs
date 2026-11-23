@@ -28,7 +28,7 @@ const SQLITE_OPEN_CREATE: c_int = 0x0000_0004;
 const SQLITE_OPEN_FULLMUTEX: c_int = 0x0001_0000;
 
 type Destructor = isize;
-const SQLITE_STATIC: Destructor = 0;
+const SQLITE_TRANSIENT: Destructor = -1;
 
 #[repr(C)]
 struct sqlite3 {
@@ -242,6 +242,9 @@ impl Connection {
                 std::ptr::null_mut(),
             )
         })?;
+        if stmt.is_null() {
+            return Err(Error::InvalidQuery);
+        }
         Ok(Statement {
             conn: Arc::clone(&self.inner),
             stmt,
@@ -468,7 +471,7 @@ fn non_null_bytes(bytes: &[u8]) -> Result<(*const c_void, c_int)> {
 impl ToSql for [u8] {
     fn bind_to(&self, stmt: &Statement, idx: c_int) -> Result<()> {
         let (ptr, len) = non_null_bytes(self)?;
-        check(unsafe { (stmt.conn.api.bind_blob)(stmt.stmt, idx, ptr, len, SQLITE_STATIC) })
+        check(unsafe { (stmt.conn.api.bind_blob)(stmt.stmt, idx, ptr, len, SQLITE_TRANSIENT) })
     }
 }
 
@@ -481,7 +484,9 @@ impl ToSql for Vec<u8> {
 impl ToSql for str {
     fn bind_to(&self, stmt: &Statement, idx: c_int) -> Result<()> {
         let (ptr, len) = non_null_bytes(self.as_bytes())?;
-        check(unsafe { (stmt.conn.api.bind_text)(stmt.stmt, idx, ptr.cast(), len, SQLITE_STATIC) })
+        check(unsafe {
+            (stmt.conn.api.bind_text)(stmt.stmt, idx, ptr.cast(), len, SQLITE_TRANSIENT)
+        })
     }
 }
 
@@ -570,11 +575,11 @@ impl FromSql for String {
         if unsafe { (row.api.column_type)(row.stmt, col) } != SQLITE_TEXT {
             return Err(Error::TypeMismatch);
         }
+        let ptr = unsafe { (row.api.column_blob)(row.stmt, col) }.cast::<u8>();
         let len = unsafe { (row.api.column_bytes)(row.stmt, col) };
         if len <= 0 {
             return Ok(String::new());
         }
-        let ptr = unsafe { (row.api.column_blob)(row.stmt, col) }.cast::<u8>();
         if ptr.is_null() {
             return Err(Error::TypeMismatch);
         }

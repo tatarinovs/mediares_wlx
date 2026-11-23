@@ -316,7 +316,7 @@ impl Section {
 
     /// The first value of `key` (any case), without the quotes that enclose it as a whole.
     fn get(&self, key: &str) -> Option<&str> {
-        let value = &self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(key))?.1;
+        let value = self.raw(key)?;
         let quoted = value.len() >= 2
             && (value.starts_with('"') && value.ends_with('"')
                 || value.starts_with('\'') && value.ends_with('\''));
@@ -325,6 +325,23 @@ impl Section {
         } else {
             value
         })
+    }
+
+    fn raw(&self, key: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.as_str())
+    }
+
+    fn editor(&self, key: &str) -> String {
+        let value = self.raw(key).unwrap_or_default();
+        // Keep arguments quoted. Single quotes were also accepted as outer INI delimiters.
+        value
+            .strip_prefix('\'')
+            .and_then(|value| value.strip_suffix('\''))
+            .unwrap_or(value)
+            .to_string()
     }
 
     /// As `GetPrivateProfileStringW`: `default` when the key is missing.
@@ -432,9 +449,9 @@ impl ViewerConfig {
                 as u32,
             seek_preview: int("SeekPreview", d.seek_preview as i32) != 0,
             wheel_zoom: int("WheelZoom", d.wheel_zoom as i32) != 0,
-            photo_editor: string("PhotoEditor", "").trim().to_string(),
-            video_editor: string("VideoEditor", "").trim().to_string(),
-            audio_editor: string("AudioEditor", "").trim().to_string(),
+            photo_editor: section.editor("PhotoEditor"),
+            video_editor: section.editor("VideoEditor"),
+            audio_editor: section.editor("AudioEditor"),
             photo_osd: template(string("PhotoOSDTemplate", ""), osd_template::DEFAULT_PHOTO),
             video_osd: template(string("VideoOSDTemplate", ""), osd_template::DEFAULT_VIDEO),
         }
@@ -700,5 +717,29 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), before);
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editor_arguments_keep_their_quotes_after_saving() {
+        let path =
+            std::env::temp_dir().join(format!("mediares_command_{}.ini", std::process::id()));
+        let original = ViewerConfig::default();
+        let editor = r#""C:\Program Files\App\app.exe" -n "%1""#;
+        let updated = ViewerConfig {
+            photo_editor: editor.into(),
+            ..original.clone()
+        };
+        assert!(updated.save_to(&original, &path));
+        let section = Section::read(&HSTRING::from(path.as_os_str()));
+        let _ = std::fs::remove_file(path);
+        assert_eq!(section.editor("PhotoEditor"), editor);
+        assert_eq!(
+            Section::parse(r"PhotoEditor='C:\Program Files\App\app.exe'").editor("PhotoEditor"),
+            r"C:\Program Files\App\app.exe"
+        );
+        assert_eq!(
+            crate::file_actions::split_command(editor, |_| false),
+            (r"C:\Program Files\App\app.exe", r#"-n "%1""#)
+        );
     }
 }

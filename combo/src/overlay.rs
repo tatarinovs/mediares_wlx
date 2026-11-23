@@ -238,8 +238,10 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
             radius,
             radius,
         );
-        // The window owns the region from here on.
-        SetWindowRgn(hwnd, Some(region), false);
+        // Windows takes ownership only when the assignment succeeds.
+        if !region.is_invalid() && SetWindowRgn(hwnd, Some(region), false) == 0 {
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(region.into());
+        }
     }
     Some(Panel {
         hwnd,

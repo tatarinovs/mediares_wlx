@@ -105,7 +105,7 @@ fn find_thumbnail_resource(res: &[u8]) -> Option<&[u8]> {
                 return Some(jfif);
             }
         }
-        idx = start + ((size + 1) & !1);
+        idx = end.checked_add(size & 1)?;
     }
     None
 }
@@ -268,8 +268,10 @@ fn decode_psd_composite(path: &Path) -> Option<DynamicImage> {
             let mut unpacked = Vec::with_capacity(row_bytes);
             for (c, lens) in line_lens.chunks_exact(h).enumerate() {
                 let Some(plane) = planes.get_mut(c) else {
-                    let skip: usize = lens.iter().sum();
-                    reader.seek(SeekFrom::Current(skip as i64)).ok()?;
+                    let skip: u64 = lens.iter().map(|&len| len as u64).sum();
+                    reader
+                        .seek(SeekFrom::Current(i64::try_from(skip).ok()?))
+                        .ok()?;
                     continue;
                 };
                 for &len in lens {

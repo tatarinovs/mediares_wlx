@@ -33,6 +33,7 @@ pub const WM_IMAGE_READY: u32 = WM_APP + 0x12;
 pub const BACKGROUND: u32 = 0x0018_1818;
 
 pub struct DecodedImage {
+    pub id: u64,
     pub width: u32,
     pub height: u32,
     /// Size of the whole picture this one shows: larger than `width` x `height` when it was
@@ -69,6 +70,11 @@ impl DecodeOptions {
 }
 
 impl DecodedImage {
+    pub fn next_id() -> u64 {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        NEXT_ID.fetch_add(1, Ordering::Relaxed)
+    }
+
     /// Whether this is the whole picture rather than a copy fitted to the screen.
     pub fn is_whole(&self) -> bool {
         self.full == (self.width, self.height)
@@ -308,6 +314,9 @@ impl Ticket {
             if let Some(result) = self.result() {
                 return result;
             }
+            if !q.in_flight.iter().any(|job| Arc::ptr_eq(job, &self.job)) {
+                return None;
+            }
             q = pool.finished.wait(q).unwrap_or_else(|e| e.into_inner());
         }
     }
@@ -541,6 +550,7 @@ pub(crate) fn decode(
         cancelled,
     )?;
     Some(DecodedImage {
+        id: DecodedImage::next_id(),
         exif,
         full,
         pages: page_count(path, kind),
@@ -603,6 +613,7 @@ pub fn to_bgra(img: DynamicImage, background: u32, is_preview: bool) -> DecodedI
         }
     }
     DecodedImage {
+        id: DecodedImage::next_id(),
         width,
         height,
         full: (width, height),
@@ -647,6 +658,7 @@ pub fn rotated(img: &DecodedImage, clockwise: bool) -> DecodedImage {
         }
     }
     DecodedImage {
+        id: DecodedImage::next_id(),
         width: img.height,
         height: img.width,
         full: (img.full.1, img.full.0),
@@ -674,6 +686,7 @@ fn rotated_bytes(img: &DecodedImage, clockwise: bool) -> DecodedImage {
         }
     }
     DecodedImage {
+        id: DecodedImage::next_id(),
         width: img.height,
         height: img.width,
         full: (img.full.1, img.full.0),
@@ -731,6 +744,7 @@ mod tests {
     fn rotates_by_quarter_turns() {
         // 2x1: red, green  ->  clockwise 1x2: red above green; counter-clockwise: green above red.
         let img = DecodedImage {
+            id: DecodedImage::next_id(),
             width: 2,
             height: 1,
             full: (2, 1),
@@ -748,6 +762,7 @@ mod tests {
         );
         // 2x2 turned four times is the original.
         let square = DecodedImage {
+            id: DecodedImage::next_id(),
             width: 2,
             height: 2,
             full: (2, 2),
@@ -764,6 +779,7 @@ mod tests {
     fn cache_evicts_least_recently_used_by_bytes() {
         let big = |n: usize| {
             Arc::new(DecodedImage {
+                id: DecodedImage::next_id(),
                 width: 1,
                 height: 1,
                 full: (1, 1),
@@ -842,6 +858,7 @@ mod tests {
             },
         };
         let img = Arc::new(DecodedImage {
+            id: DecodedImage::next_id(),
             width: 1,
             height: 1,
             full: (1, 1),

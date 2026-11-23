@@ -168,7 +168,7 @@ fn next_random() -> u64 {
 /// Reads an M3U / M3U8 playlist without probing every entry: relative paths resolved against
 /// the playlist's folder, `file:///` URLs included. `#` lines (EXTINF etc.) and other URLs are
 /// skipped.
-pub fn read_m3u(path: &Path) -> Vec<PathBuf> {
+fn read_m3u(path: &Path) -> Vec<PathBuf> {
     use std::io::Read;
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
     let mut bytes = Vec::new();
@@ -180,6 +180,50 @@ pub fn read_m3u(path: &Path) -> Vec<PathBuf> {
     }
     let base = path.parent().unwrap_or(Path::new(""));
     parse_m3u(&bytes, base)
+}
+
+/// Entries that the viewer can open automatically. A playlist may refer to files on
+/// its own network share, but it cannot cause a connection to a different one.
+pub fn media_entries(path: &Path) -> Vec<PathBuf> {
+    use std::collections::HashMap;
+    use std::path::{Component, Prefix};
+    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
+    use windows::Win32::System::WindowsProgramming::{
+        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE,
+    };
+
+    fn prefix(path: &Path) -> Option<Prefix<'_>> {
+        match path.components().next()? {
+            Component::Prefix(prefix) => Some(prefix.kind()),
+            _ => None,
+        }
+    }
+    let mut local_drives = HashMap::new();
+    let playlist_prefix = prefix(path);
+    read_m3u(path)
+        .into_iter()
+        .filter(|entry| {
+            let kind = probe_file(entry);
+            entry.is_absolute() && (kind.is_image_kind() || kind.is_playable())
+        })
+        .filter(|entry| match prefix(entry) {
+            Some(Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) => {
+                if matches!(playlist_prefix, Some(Prefix::Disk(d) | Prefix::VerbatimDisk(d)) if d == drive) {
+                    return true;
+                }
+                *local_drives.entry(drive).or_insert_with(|| {
+                    let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
+                    let kind = unsafe { GetDriveTypeW(windows::core::PCWSTR(root.as_ptr())) };
+                    matches!(kind, DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK)
+                })
+            }
+            Some(Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share)) => {
+                matches!(playlist_prefix, Some(Prefix::UNC(base_server, base_share) | Prefix::VerbatimUNC(base_server, base_share))
+                    if crate::state::same_name(server, base_server) && crate::state::same_name(share, base_share))
+            }
+            _ => false,
+        })
+        .collect()
 }
 
 fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
@@ -211,7 +255,7 @@ fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
                 return None;
             }
             let entry = Path::new(&line);
-            Some(if entry.is_absolute() || entry.has_root() {
+            Some(if entry.is_absolute() {
                 entry.to_path_buf()
             } else {
                 base.join(entry)
@@ -311,6 +355,23 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(on_end(&list, 0, &o), EndAction::Play(1));
+    }
+
+    #[test]
+    fn local_playlist_filters_external_network_entries() {
+        let path =
+            std::env::temp_dir().join(format!("mediares_playlist_{}.m3u", std::process::id()));
+        std::fs::write(
+            &path,
+            r#"local.wav
+\\external.invalid\share\track.wav
+file://external.invalid/share/other.wav
+"#,
+        )
+        .unwrap();
+        let entries = media_entries(&path);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(entries, [path.with_file_name("local.wav")]);
     }
 
     #[test]

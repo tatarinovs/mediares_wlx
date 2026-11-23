@@ -553,11 +553,16 @@ impl KeyFrameDecoder {
         let buffer = sample.GetBufferByIndex(0).ok()?;
         let (width, height) = self.size;
         let rows = self.frame.1 as usize;
+        if !crate::image_decode::valid_dimensions(width, height) || rows < height as usize {
+            return None;
+        }
         let convert = |data: &[u8], pitch: usize| {
-            let chroma = pitch * rows;
-            (pitch >= width as usize
-                && data.len() >= chroma + pitch * (height as usize).div_ceil(2))
-            .then(|| nv12_to_bgra(data, pitch, chroma, width, height))
+            let chroma = pitch.checked_mul(rows)?;
+            let end = chroma.checked_add(pitch.checked_mul((height as usize).div_ceil(2))?)?;
+            if pitch < (width as usize).div_ceil(2) * 2 || data.len() < end {
+                return None;
+            }
+            nv12_to_bgra(data, pitch, chroma, width, height)
         };
         // The 2D lock that also tells the buffer's length: every row read is checked against it.
         if let Ok(buffer2d) = buffer.cast::<IMF2DBuffer2>() {
@@ -576,7 +581,7 @@ impl KeyFrameDecoder {
                 let picture = (pitch > 0 && !start.is_null() && scan0 >= start)
                     .then(|| {
                         let data = std::slice::from_raw_parts(start, len as usize);
-                        let top = data.get(scan0.offset_from(start) as usize..)?;
+                        let top = data.get((scan0 as usize).checked_sub(start as usize)?..)?;
                         convert(top, pitch as usize)
                     })
                     .flatten();
@@ -638,6 +643,10 @@ unsafe fn memory_buffer(bytes: &[u8]) -> Option<IMFMediaBuffer> {
     let buffer = MFCreateMemoryBuffer(u32::try_from(bytes.len()).ok()?).ok()?;
     let mut ptr = std::ptr::null_mut();
     buffer.Lock(&mut ptr, None, None).ok()?;
+    if ptr.is_null() {
+        let _ = buffer.Unlock();
+        return None;
+    }
     std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
     let _ = buffer.Unlock();
     buffer.SetCurrentLength(bytes.len() as u32).ok()?;
@@ -646,7 +655,13 @@ unsafe fn memory_buffer(bytes: &[u8]) -> Option<IMFMediaBuffer> {
 
 /// Video range NV12 (`chroma`: offset of the interleaved UV plane) to BGRA: BT.709 for HD,
 /// BT.601 below.
-fn nv12_to_bgra(data: &[u8], pitch: usize, chroma: usize, width: u32, height: u32) -> KeyPicture {
+fn nv12_to_bgra(
+    data: &[u8],
+    pitch: usize,
+    chroma: usize,
+    width: u32,
+    height: u32,
+) -> Option<KeyPicture> {
     let (w, h) = (width as usize, height as usize);
     // R = Y + rv·V, G = Y - gu·U - gv·V, B = Y + bu·U, in 8.8 fixed point.
     let (rv, gu, gv, bu) = if h >= 720 {
@@ -654,7 +669,7 @@ fn nv12_to_bgra(data: &[u8], pitch: usize, chroma: usize, width: u32, height: u3
     } else {
         (409, 100, 208, 516)
     };
-    let mut bgra = vec![0u8; w * h * 4];
+    let mut bgra = crate::image_decode::zeroed_bytes(w * h * 4)?;
     for (y, out) in bgra.chunks_exact_mut(w * 4).enumerate() {
         let luma = &data[y * pitch..y * pitch + w];
         let uv_row = chroma + y / 2 * pitch;
@@ -669,12 +684,12 @@ fn nv12_to_bgra(data: &[u8], pitch: usize, chroma: usize, width: u32, height: u3
             px[3] = 255;
         }
     }
-    KeyPicture {
+    Some(KeyPicture {
         width,
         height,
         bgra,
         shown: (width, height),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -705,7 +720,7 @@ mod tests {
     fn nv12_levels() {
         // 2x2 luma 16 / 126 / 235 / 235, one neutral chroma pair.
         let data = [16, 126, 235, 235, 128, 128];
-        let picture = nv12_to_bgra(&data, 2, 4, 2, 2);
+        let picture = nv12_to_bgra(&data, 2, 4, 2, 2).unwrap();
         let px = |i: usize| &picture.bgra[i * 4..i * 4 + 3];
         assert_eq!(px(0), [0, 0, 0]);
         assert!(
