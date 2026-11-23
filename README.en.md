@@ -200,7 +200,7 @@ Total Commander compares values exactly, so some modified copies may not be foun
 
 ## Settings
 
-Press **S** in the viewer or choose **“Settings...”** from the context menu. Options include language, background, zoom, slideshow, fullscreen, playback, external editors and on-screen information (OSD).
+Press **S** in the viewer or choose **“Settings...”** from the context menu. Options include language, separating browsing by media type (photo, video, audio), background, zoom, slideshow, fullscreen, playback, external editors and on-screen information (OSD).
 
 The interface is available in Russian and English; additional translations can be added through `mediares_ui.lng`.
 

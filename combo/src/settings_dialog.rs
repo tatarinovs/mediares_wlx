@@ -89,6 +89,7 @@ const IDC_SEEK_PREVIEW: i32 = 139;
 const IDC_RESUME_THRESHOLD: i32 = 141;
 const IDC_CONTACT_COLUMNS: i32 = 142;
 const IDC_CONTACT_ROWS: i32 = 143;
+const IDC_SEPARATE_MEDIA_TYPES: i32 = 144;
 
 const PAGE_COUNT: usize = 4;
 const PAGE_TITLES: [&str; PAGE_COUNT] =
@@ -197,7 +198,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
     };
     let _ = InitCommonControlsEx(&controls);
     dialog::register_class(CLASS_NAME, Some(wnd_proc));
-    let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 502, 470)?;
+    let dlg = dialog::create_frame(owner, CLASS_NAME, tr("Mediares Settings"), 502, 498)?;
 
     let ctx = Box::into_raw(Box::new(Context {
         initial: current.clone(),
@@ -470,6 +471,7 @@ unsafe fn accept(dlg: HWND, ctx: &Context) {
     let pages = &ctx.pages;
     let mut cfg = ctx.config.borrow().clone();
     cfg.language = selected(dlg, pages, IDC_LANGUAGE, &LangSetting::all()).unwrap_or(cfg.language);
+    cfg.separate_media_types = is_checked(dlg, pages, IDC_SEPARATE_MEDIA_TYPES);
     cfg.start_fullscreen = is_checked(dlg, pages, IDC_START_FULLSCREEN);
     cfg.auto_rotate_exif = is_checked(dlg, pages, IDC_AUTO_ROTATE_EXIF);
     cfg.osd = selected(dlg, pages, IDC_SHOW_OSD, &OsdMode::ALL).unwrap_or(cfg.osd);

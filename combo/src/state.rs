@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mediares_core::image_decode::{header_looks_decodable, may_have_pages};
-use mediares_core::probe::{probe_file, MediaType};
+use mediares_core::probe::{probe_file, MediaGroup, MediaType};
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, WPARAM};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
@@ -225,6 +225,7 @@ impl ViewerState {
                 self.dir_files = entries;
                 self.playlist = Some(playlist_file.source().to_path_buf());
                 self.scan = None;
+                self.compare = None;
                 return self.show_page_prepared(Some(prepared));
             }
         }
@@ -253,7 +254,14 @@ impl ViewerState {
             })
         });
         (self.dir_files, self.current_idx) = (files, idx);
-        let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
+        let can_skip = playlist::step(
+            &self.dir_files,
+            self.current_idx,
+            true,
+            true,
+            self.active_group(),
+        )
+        .is_some();
         if let Some(media) = self.media.as_mut() {
             media.set_skip(can_skip);
         }
@@ -357,10 +365,27 @@ impl ViewerState {
         }
     }
 
+    /// Active media-type filter for navigation, playlist advancing, prefetching and list position.
+    pub(crate) fn active_group(&self) -> Option<MediaGroup> {
+        if self.compare.is_some() {
+            return Some(MediaGroup::Photo);
+        }
+        if self.config.separate_media_types {
+            return probe_file(&self.file_path).group();
+        }
+        None
+    }
+
+    /// Current `(index, count)` shown in the title and OSD, respecting [`Self::active_group`].
+    pub fn list_position(&self) -> Option<(usize, usize)> {
+        list_position_in(&self.dir_files, self.current_idx, self.active_group())
+    }
+
     /// Starts comparing other photos with the one on screen (its whole picture decoded now if it
     /// is not there yet: zooming in on the reference needs it), or stops comparing.
     pub fn toggle_compare(&mut self) -> bool {
         if self.compare.take().is_some() {
+            image_cache::prefetch(self.prefetch_candidates());
             return true;
         }
         let Some(image) = self.image.clone() else {
@@ -372,6 +397,7 @@ impl ViewerState {
             image,
             whole,
         });
+        image_cache::prefetch(self.prefetch_candidates());
         true
     }
 
@@ -429,10 +455,13 @@ impl ViewerState {
 
     /// Slideshow step: the next photo in the list (wrapping). False if there is no other photo.
     pub fn next_photo(&mut self) -> bool {
-        let n = self.dir_files.len();
-        let next = (1..n)
-            .map(|k| (self.current_idx + k) % n)
-            .find(|&i| probe_file(&self.dir_files[i].target).is_image_kind());
+        let next = navigable_from(
+            &self.dir_files,
+            self.current_idx,
+            true,
+            Some(MediaGroup::Photo),
+        )
+        .next();
         match next {
             Some(idx) => {
                 self.forward = true;
@@ -445,7 +474,7 @@ impl ViewerState {
     /// The bar's previous / next track and media keys: the adjacent audio/video file.
     pub fn skip_track(&mut self, forward: bool) -> bool {
         let start = self.current_idx;
-        let total = self.dir_files.len();
+        let group = self.active_group();
         if forward && self.config.queue.shuffle {
             return self.show_first(playlist::candidates(
                 &self.dir_files,
@@ -453,15 +482,11 @@ impl ViewerState {
                 true,
                 true,
                 true,
+                group,
             ));
         }
-        for offset in 1..total {
-            let idx = if forward {
-                (start + offset) % total
-            } else {
-                (start + total - offset) % total
-            };
-            if probe_file(&self.dir_files[idx].target).is_playable() && self.go_to(idx) {
+        for idx in playlist::candidates(&self.dir_files, start, forward, true, false, group) {
+            if self.go_to(idx) {
                 return true;
             }
         }
@@ -481,15 +506,18 @@ impl ViewerState {
 
     /// Near the end of an audio file: has the one the queue plays next decoded ahead.
     pub fn preload_next(&mut self) {
-        let EndAction::Play(idx) =
-            playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue)
-        else {
+        let EndAction::Play(idx) = playlist::on_end(
+            &self.dir_files,
+            self.current_idx,
+            &self.config.queue,
+            self.active_group(),
+        ) else {
             return;
         };
-        let path = self.dir_files[idx].target.clone();
-        if probe_file(&path) != MediaType::Audio {
+        if self.dir_files[idx].kind != MediaType::Audio {
             return;
         }
+        let path = self.dir_files[idx].target.clone();
         if self.media.as_mut().is_some_and(|m| m.preload(&path)) {
             self.preloaded = Some(idx);
         }
@@ -501,7 +529,8 @@ impl ViewerState {
         if let Some(idx) = self.preloaded.take() {
             return self.go_to(idx);
         }
-        match playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue) {
+        let group = self.active_group();
+        match playlist::on_end(&self.dir_files, self.current_idx, &self.config.queue, group) {
             EndAction::Replay => {
                 if let Some(media) = &self.media {
                     media.replay();
@@ -520,6 +549,7 @@ impl ViewerState {
                     true,
                     wrap || self.config.queue.shuffle,
                     self.config.queue.shuffle,
+                    group,
                 );
                 // "Repeat list" still loops the current track when all other files fail.
                 candidates.retain(|&idx| idx != first);
@@ -535,27 +565,19 @@ impl ViewerState {
 
     /// Moves to the next/previous file in the directory (wrapping around).
     pub fn navigate(&mut self, forward: bool) -> bool {
-        let total = self.dir_files.len();
-        if total <= 1 {
-            return false;
-        }
+        let group = self.active_group();
         if self.playlist.is_some() {
+            let candidates: Vec<_> =
+                navigable_from(&self.dir_files, self.current_idx, forward, group).collect();
+            if candidates.is_empty() {
+                return false;
+            }
             self.forward = forward;
-            let candidates = (1..total)
-                .map(|k| {
-                    if forward {
-                        (self.current_idx + k) % total
-                    } else {
-                        (self.current_idx + total - k) % total
-                    }
-                })
-                .collect();
             return self.show_first(candidates);
         }
-        let idx = if forward {
-            (self.current_idx + 1) % total
-        } else {
-            (self.current_idx + total - 1) % total
+        let Some(idx) = navigable_from(&self.dir_files, self.current_idx, forward, group).next()
+        else {
+            return false;
         };
         self.forward = forward;
         self.go_to(idx);
@@ -610,6 +632,7 @@ impl ViewerState {
 
     pub fn apply_config(&mut self, config: ViewerConfig) {
         let old = self.decode_options();
+        let separate_changed = config.separate_media_types != self.config.separate_media_types;
         if config.skip_raw_twins != self.config.skip_raw_twins && self.playlist.is_none() {
             self.scan = self
                 .dir_files
@@ -617,7 +640,7 @@ impl ViewerState {
                 .map(|e| DirScan::start(e.source(), config.skip_raw_twins, self.hwnd));
         }
         self.set_queue(config.queue);
-        if config.replay_gain != self.config.replay_gain {
+        if config.replay_gain != self.config.replay_gain || separate_changed {
             self.cancel_preload();
         }
         i18n::set(config.language.resolve());
@@ -627,8 +650,23 @@ impl ViewerState {
         if let Some(media) = self.media.as_mut() {
             media.apply_options(&options);
         }
+        if separate_changed {
+            let can_skip = playlist::step(
+                &self.dir_files,
+                self.current_idx,
+                true,
+                true,
+                self.active_group(),
+            )
+            .is_some();
+            if let Some(media) = self.media.as_mut() {
+                media.set_skip(can_skip);
+            }
+        }
         if old != self.decode_options() && self.shows_photo() {
             self.load_media();
+        } else if separate_changed && self.shows_photo() {
+            image_cache::prefetch(self.prefetch_candidates());
         }
     }
 
@@ -678,6 +716,7 @@ impl ViewerState {
     /// place (or the new last one). False if nothing is left; a next file that can't be shown
     /// still keeps the viewer open, so the user can move on from it.
     pub fn remove_deleted(&mut self, path: &Path) -> bool {
+        let group = self.active_group();
         if self.playlist.as_deref().is_some_and(|p| same_path(p, path)) {
             self.dir_files.clear();
         }
@@ -695,12 +734,12 @@ impl ViewerState {
         self.whole = None;
         self.whole_upright = None;
         self.previous = None;
-        if self.dir_files.is_empty() {
+        let Some(idx) = index_after_delete(&self.dir_files, next, group) else {
             self.pending = None;
             self.media = None;
             return false;
-        }
-        self.go_to(next.min(self.dir_files.len() - 1));
+        };
+        self.go_to(idx);
         true
     }
 
@@ -727,6 +766,7 @@ impl ViewerState {
         self.whole_pending = None;
         self.load_failed = false;
         if kind.is_playable() {
+            self.compare = None;
             self.previous = None;
             // The player is reused when going from one file of the same kind to the next.
             let options = self.open_options();
@@ -739,7 +779,14 @@ impl ViewerState {
                     MediaView::open(self.hwnd, self.media.take(), &self.file_path, kind, options)
                 }
             };
-            let can_skip = playlist::step(&self.dir_files, self.current_idx, true, true).is_some();
+            let can_skip = playlist::step(
+                &self.dir_files,
+                self.current_idx,
+                true,
+                true,
+                self.active_group(),
+            )
+            .is_some();
             match self.media.as_mut() {
                 Some(media) => media.set_skip(can_skip),
                 // Said in the window: moved onto from another file, the viewer stays open.
@@ -791,29 +838,106 @@ impl ViewerState {
             .map(|page| (self.file_path.clone(), DecodeOptions { page, ..options }))
             .into_iter()
             .collect();
-        let total = self.dir_files.len();
-        if total <= 1 {
-            return pictures;
-        }
-        let at =
-            |step: isize| (self.current_idx as isize + step).rem_euclid(total as isize) as usize;
-        let dir = if self.forward { 1 } else { -1 };
-        let mut indices = Vec::new();
-        for i in [at(dir), at(-dir), at(2 * dir)] {
-            if i != self.current_idx && !indices.contains(&i) {
-                indices.push(i);
-            }
-        }
+        let indices = neighbor_indices(
+            &self.dir_files,
+            self.current_idx,
+            self.forward,
+            self.active_group(),
+        );
         let first_page = DecodeOptions { page: 0, ..options };
         pictures.extend(
             indices
                 .into_iter()
-                .map(|i| self.dir_files[i].target.clone())
-                .filter(|p| probe_file(p).is_image_kind())
-                .map(|p| (p, first_page)),
+                .filter(|&i| self.dir_files[i].kind.is_image_kind())
+                .map(|i| (self.dir_files[i].target.clone(), first_page)),
         );
         pictures
     }
+}
+
+fn navigable_from(
+    files: &[MediaEntry],
+    current: usize,
+    forward: bool,
+    group: Option<MediaGroup>,
+) -> impl Iterator<Item = usize> + '_ {
+    let total = files.len();
+    (1..total)
+        .map(move |k| {
+            if forward {
+                (current + k) % total
+            } else {
+                (current + total - k) % total
+            }
+        })
+        .filter(move |&i| group.is_none_or(|g| files[i].group() == Some(g)))
+}
+
+fn neighbor_indices(
+    files: &[MediaEntry],
+    current: usize,
+    forward: bool,
+    group: Option<MediaGroup>,
+) -> Vec<usize> {
+    let mut ahead = navigable_from(files, current, forward, group);
+    let mut behind = navigable_from(files, current, !forward, group);
+    let mut indices = Vec::with_capacity(3);
+    for idx in [ahead.next(), behind.next(), ahead.next()]
+        .into_iter()
+        .flatten()
+    {
+        if idx != current && !indices.contains(&idx) {
+            indices.push(idx);
+        }
+    }
+    indices
+}
+
+fn list_position_in(
+    files: &[MediaEntry],
+    current: usize,
+    group: Option<MediaGroup>,
+) -> Option<(usize, usize)> {
+    if files.is_empty() {
+        return None;
+    }
+    let Some(group) = group else {
+        return Some((current, files.len()));
+    };
+    let mut pos = None;
+    let mut count = 0;
+    for (i, entry) in files.iter().enumerate() {
+        if entry.group() == Some(group) {
+            if i == current {
+                pos = Some(count);
+            }
+            count += 1;
+        }
+    }
+    Some((pos?, count))
+}
+
+fn index_after_delete(
+    files: &[MediaEntry],
+    next: usize,
+    group: Option<MediaGroup>,
+) -> Option<usize> {
+    if files.is_empty() {
+        return None;
+    }
+    let Some(group) = group else {
+        return Some(next.min(files.len() - 1));
+    };
+    let next = next.min(files.len());
+    files[next..]
+        .iter()
+        .position(|e| e.group() == Some(group))
+        .map(|offset| next + offset)
+        .or_else(|| {
+            files[..next]
+                .iter()
+                .rposition(|e| e.group() == Some(group))
+        })
 }
 
 /// A photo kept on the left for comparison, as it was shown (turned) when picked.
@@ -980,7 +1104,7 @@ fn scan_directory_media(
                 .is_ok_and(|t| t.is_file() || t.is_symlink() && e.path().is_file())
         })
         .filter_map(|e| MediaEntry::resolve(e.path()))
-        .filter(|e| is_viewable(probe_file(&e.target)))
+        .filter(|e| is_viewable(e.kind))
         .collect();
     if cancelled() {
         return Vec::new();
@@ -1093,6 +1217,81 @@ mod tests {
         assert_eq!(
             names,
             ["a.png", "img1.jpg", "IMG2.jpg", "img02.jpg", "img10.jpg"]
+        );
+    }
+
+    #[test]
+    fn navigable_and_neighbors_respect_active_group() {
+        let entries: Vec<MediaEntry> = [
+            "p1.jpg", "v1.mp4", "a1.mp3", "p2.cr2", "v2.mkv", "p3.png", "a2.flac",
+        ]
+        .iter()
+        .filter_map(|p| MediaEntry::resolve(PathBuf::from(p)))
+        .collect();
+
+        assert_eq!(
+            navigable_from(&entries, 0, true, Some(MediaGroup::Photo)).collect::<Vec<_>>(),
+            [3, 5]
+        );
+        assert_eq!(
+            navigable_from(&entries, 0, false, Some(MediaGroup::Photo)).collect::<Vec<_>>(),
+            [5, 3]
+        );
+        assert_eq!(
+            navigable_from(&entries, 1, true, Some(MediaGroup::Video)).collect::<Vec<_>>(),
+            [4]
+        );
+        assert_eq!(
+            navigable_from(&entries, 2, true, Some(MediaGroup::Audio)).collect::<Vec<_>>(),
+            [6]
+        );
+        assert_eq!(
+            navigable_from(&entries, 0, true, None).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6]
+        );
+
+        assert_eq!(
+            neighbor_indices(&entries, 0, true, Some(MediaGroup::Photo)),
+            [3, 5]
+        );
+        assert_eq!(
+            neighbor_indices(&entries, 0, true, None),
+            [1, 6, 2]
+        );
+    }
+
+    #[test]
+    fn list_position_and_delete_follow_active_group() {
+        let entries: Vec<MediaEntry> = ["p1.jpg", "v1.mp4", "a1.mp3", "p2.png"]
+            .iter()
+            .filter_map(|p| MediaEntry::resolve(PathBuf::from(p)))
+            .collect();
+
+        assert_eq!(list_position_in(&entries, 3, None), Some((3, 4)));
+        assert_eq!(
+            list_position_in(&entries, 3, Some(MediaGroup::Photo)),
+            Some((1, 2))
+        );
+        assert_eq!(
+            list_position_in(&entries, 1, Some(MediaGroup::Video)),
+            Some((0, 1))
+        );
+
+        assert_eq!(
+            index_after_delete(&entries, 1, Some(MediaGroup::Photo)),
+            Some(3)
+        );
+        assert_eq!(
+            index_after_delete(&entries, 4, Some(MediaGroup::Photo)),
+            Some(3)
+        );
+        let no_more_videos: Vec<MediaEntry> = ["p1.jpg", "a1.mp3"]
+            .iter()
+            .filter_map(|p| MediaEntry::resolve(PathBuf::from(p)))
+            .collect();
+        assert_eq!(
+            index_after_delete(&no_more_videos, 1, Some(MediaGroup::Video)),
+            None
         );
     }
 }

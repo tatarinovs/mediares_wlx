@@ -230,6 +230,7 @@ unsafe fn update_title(state: &ViewerState) {
 
 /// Video OSD per the config's template.
 unsafe fn sync_video_osd(state: &mut ViewerState) {
+    let position = state.list_position();
     let Some(video) = state.media.as_mut().and_then(|m| m.video_mut()) else {
         return;
     };
@@ -250,8 +251,6 @@ unsafe fn sync_video_osd(state: &mut ViewerState) {
         return;
     }
     let template = config.video_osd.clone();
-    let position =
-        (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
     let (width, height, fps) = (video.info.width, video.info.height, video.info.frame_rate);
     let tags = osd_template::uses_any(&template, osd_template::VIDEO_TAG_KEYS)
         .then(|| video.tags())
@@ -302,18 +301,20 @@ unsafe fn caption(state: &ViewerState) -> String {
         }
         title += &format!(" - [{}]", media.title_info());
     }
-    if state.has_content() && !state.dir_files.is_empty() {
-        let list = state
-            .playlist
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| format!(" · {}", n.to_string_lossy()));
-        title += &format!(
-            " [{}/{}{}]",
-            state.current_idx + 1,
-            state.dir_files.len(),
-            list.unwrap_or_default()
-        );
+    if state.has_content() {
+        if let Some((idx, total)) = state.list_position() {
+            let list = state
+                .playlist
+                .as_ref()
+                .and_then(|p| p.file_name())
+                .map(|n| format!(" · {}", n.to_string_lossy()));
+            title += &format!(
+                " [{}/{}{}]",
+                idx + 1,
+                total,
+                list.unwrap_or_default()
+            );
+        }
     }
     if state.slideshow {
         title += tr(" [slideshow]");

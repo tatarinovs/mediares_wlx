@@ -3,6 +3,7 @@ use std::os::windows::ffi::OsStringExt;
 use std::path::{Path, PathBuf};
 
 use mediares_core::mf_init::ComScope;
+use mediares_core::probe::{probe_file, MediaGroup, MediaType};
 use windows::core::{Interface, HSTRING};
 use windows::Win32::System::Com::{
     CoCreateInstance, IPersistFile, CLSCTX_INPROC_SERVER, STGM_READ,
@@ -13,6 +14,7 @@ use windows::Win32::UI::Shell::{IShellLinkW, ShellLink};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MediaEntry {
     pub target: PathBuf,
+    pub kind: MediaType,
     shortcut: Option<PathBuf>,
 }
 
@@ -26,6 +28,10 @@ impl MediaEntry {
         self.shortcut.as_deref().unwrap_or(&self.target)
     }
 
+    pub fn group(&self) -> Option<MediaGroup> {
+        self.kind.group()
+    }
+
     pub fn resolve(path: PathBuf) -> Option<Self> {
         Self::resolve_allowed(path, |_| true)
     }
@@ -35,15 +41,21 @@ impl MediaEntry {
             return None;
         }
         if !is_shortcut(&path) {
+            let kind = probe_file(&path);
             return Some(Self {
                 target: path,
+                kind,
                 shortcut: None,
             });
         }
         let target = read_link(&path)?;
-        (allowed(&target) && target.is_file()).then_some(Self {
-            target,
-            shortcut: Some(path),
+        (allowed(&target) && target.is_file()).then(|| {
+            let kind = probe_file(&target);
+            Self {
+                target,
+                kind,
+                shortcut: Some(path),
+            }
         })
     }
 }

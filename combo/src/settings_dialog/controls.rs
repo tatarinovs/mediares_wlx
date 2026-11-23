@@ -17,7 +17,7 @@ pub(super) unsafe fn build_controls(
         w!("SysTabControl32"),
         "",
         tab | WS_CLIPSIBLINGS.0,
-        (10, 10, 466, 372),
+        (10, 10, 466, 400),
         IDC_TABS as usize,
         font,
     );
@@ -534,7 +534,18 @@ pub(super) unsafe fn build_controls(
         244,
     );
 
-    let editors = below(interface, 1);
+    let navigation = below(interface, 1);
+    group(tr("Navigation"), navigation, 1);
+    checkbox(
+        GROUPED,
+        row(navigation, 0),
+        GROUPED_W,
+        tr("Browse only files of the same type (photo, video, audio)"),
+        IDC_SEPARATE_MEDIA_TYPES,
+        cfg.separate_media_types,
+    );
+
+    let editors = below(navigation, 1);
     group(tr("External editors (\"Open in editor\")"), editors, 3);
     program_row(
         row(editors, 0),
@@ -586,14 +597,14 @@ pub(super) unsafe fn build_controls(
         w!("BUTTON"),
         tr("OK"),
         tab | BS_DEFPUSHBUTTON as u32,
-        (276, 392, 95, 28),
+        (276, 420, 95, 28),
         IDOK.0,
     );
     control(
         w!("BUTTON"),
         tr("Cancel"),
         tab | BS_PUSHBUTTON as u32,
-        (381, 392, 95, 28),
+        (381, 420, 95, 28),
         IDCANCEL.0,
     );
 

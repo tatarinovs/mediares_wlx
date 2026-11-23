@@ -411,6 +411,7 @@ the right-click menu. You can set:
   * the language (English, Russian or one added in mediares_ui.lng,
     see below): until you choose one, Total Commander's language is
     used, or English if there is no translation for it;
+  * separating browsing by media type (photos, videos, or audio only);
   * starting in full screen;
   * auto-rotating photos by the camera data;
   * the loupe zoom, the background color around photos;

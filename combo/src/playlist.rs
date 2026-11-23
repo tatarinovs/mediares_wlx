@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use mediares_core::ffi::ansi_to_os_string;
-use mediares_core::probe::probe_file;
+use mediares_core::probe::MediaGroup;
 
 use crate::i18n::tr;
 use crate::shortcut::MediaEntry;
@@ -70,14 +70,20 @@ pub enum EndAction {
     Stop,
 }
 
-fn is_playable(entry: &MediaEntry) -> bool {
-    probe_file(&entry.target).is_playable()
+fn is_playable_in(entry: &MediaEntry, group: Option<MediaGroup>) -> bool {
+    entry.kind.is_playable() && group.is_none_or(|g| entry.group() == Some(g))
 }
 
 /// Nearest playable file after (`forward`) or before `current`, wrapping around if `wrap`.
-/// Photos in between are skipped.
-pub fn step(files: &[MediaEntry], current: usize, forward: bool, wrap: bool) -> Option<usize> {
-    following(files, current, forward, wrap).next()
+/// Photos in between are skipped; when `group` is `Some`, only that group is considered.
+pub fn step(
+    files: &[MediaEntry],
+    current: usize,
+    forward: bool,
+    wrap: bool,
+    group: Option<MediaGroup>,
+) -> Option<usize> {
+    following(files, current, forward, wrap, group).next()
 }
 
 fn following(
@@ -85,6 +91,7 @@ fn following(
     current: usize,
     forward: bool,
     wrap: bool,
+    group: Option<MediaGroup>,
 ) -> impl Iterator<Item = usize> + '_ {
     let n = files.len() as isize;
     let dir = if forward { 1 } else { -1 };
@@ -97,7 +104,7 @@ fn following(
                 None
             }
         })
-        .filter(move |&i| is_playable(&files[i]))
+        .filter(move |&i| is_playable_in(&files[i], group))
 }
 
 /// Try each successor at most once; opening, rather than a directory probe, decides availability.
@@ -107,8 +114,9 @@ pub fn candidates(
     forward: bool,
     wrap: bool,
     shuffle: bool,
+    group: Option<MediaGroup>,
 ) -> Vec<usize> {
-    let mut indices: Vec<_> = following(files, current, forward, wrap).collect();
+    let mut indices: Vec<_> = following(files, current, forward, wrap, group).collect();
     if shuffle {
         for i in (1..indices.len()).rev() {
             indices.swap(i, next_random() as usize % (i + 1));
@@ -118,14 +126,19 @@ pub fn candidates(
 }
 
 /// A random playable file other than `current`.
-pub fn random(files: &[MediaEntry], current: usize) -> Option<usize> {
+pub fn random(files: &[MediaEntry], current: usize, group: Option<MediaGroup>) -> Option<usize> {
     let candidates: Vec<usize> = (0..files.len())
-        .filter(|&i| i != current && is_playable(&files[i]))
+        .filter(|&i| i != current && is_playable_in(&files[i], group))
         .collect();
     (!candidates.is_empty()).then(|| candidates[next_random() as usize % candidates.len()])
 }
 
-pub fn on_end(files: &[MediaEntry], current: usize, options: &QueueOptions) -> EndAction {
+pub fn on_end(
+    files: &[MediaEntry],
+    current: usize,
+    options: &QueueOptions,
+    group: Option<MediaGroup>,
+) -> EndAction {
     if options.repeat == Repeat::One {
         return EndAction::Replay;
     }
@@ -133,15 +146,15 @@ pub fn on_end(files: &[MediaEntry], current: usize, options: &QueueOptions) -> E
         return EndAction::Stop;
     }
     let next = if options.shuffle {
-        random(files, current)
+        random(files, current, group)
     } else {
-        step(files, current, true, options.repeat == Repeat::All)
+        step(files, current, true, options.repeat == Repeat::All, group)
     };
     match next {
         Some(i) => EndAction::Play(i),
         // A single file with "repeat list" loops it.
         None if options.repeat == Repeat::All
-            && files.get(current).is_some_and(|f| is_playable(f)) =>
+            && files.get(current).is_some_and(|f| is_playable_in(f, group)) =>
         {
             EndAction::Replay
         }
@@ -228,10 +241,7 @@ pub fn media_entries(path: &Path) -> Vec<MediaEntry> {
     read_m3u(path)
         .into_iter()
         .filter_map(|p| MediaEntry::resolve_allowed(p, &mut allowed))
-        .filter(|entry| {
-            let kind = probe_file(&entry.target);
-            kind.is_image_kind() || kind.is_playable()
-        })
+        .filter(|entry| entry.kind.is_image_kind() || entry.kind.is_playable())
         .collect()
 }
 
@@ -327,21 +337,21 @@ mod tests {
     #[test]
     fn step_skips_photos_and_respects_wrap() {
         let list = files(&["a.mp3", "b.jpg", "c.mp4", "d.png"]);
-        assert_eq!(step(&list, 0, true, false), Some(2));
-        assert_eq!(step(&list, 2, true, false), None);
-        assert_eq!(step(&list, 2, true, true), Some(0));
-        assert_eq!(step(&list, 2, false, false), Some(0));
-        assert_eq!(step(&list, 0, false, false), None);
-        assert_eq!(step(&list, 0, false, true), Some(2));
+        assert_eq!(step(&list, 0, true, false, None), Some(2));
+        assert_eq!(step(&list, 2, true, false, None), None);
+        assert_eq!(step(&list, 2, true, true, None), Some(0));
+        assert_eq!(step(&list, 2, false, false, None), Some(0));
+        assert_eq!(step(&list, 0, false, false, None), None);
+        assert_eq!(step(&list, 0, false, true, None), Some(2));
     }
 
     #[test]
     fn retry_candidates_preserve_direction_and_never_repeat_even_when_shuffled() {
         let list = files(&["a.mp3", "photo.jpg", "missing.wav", "b.mp3"]);
-        assert_eq!(candidates(&list, 0, true, false, false), [2, 3]);
-        assert_eq!(candidates(&list, 0, false, true, false), [3, 2]);
-        assert!(candidates(&list, 3, true, false, false).is_empty());
-        let mut shuffled = candidates(&list, 0, true, true, true);
+        assert_eq!(candidates(&list, 0, true, false, false, None), [2, 3]);
+        assert_eq!(candidates(&list, 0, false, true, false, None), [3, 2]);
+        assert!(candidates(&list, 3, true, false, false, None).is_empty());
+        let mut shuffled = candidates(&list, 0, true, true, true, None);
         shuffled.sort_unstable();
         assert_eq!(shuffled, [2, 3]);
     }
@@ -350,23 +360,57 @@ mod tests {
     fn end_of_track_actions() {
         let list = files(&["a.mp3", "b.flac"]);
         let mut o = QueueOptions::default();
-        assert_eq!(on_end(&list, 0, &o), EndAction::Play(1));
-        assert_eq!(on_end(&list, 1, &o), EndAction::Stop);
+        assert_eq!(on_end(&list, 0, &o, None), EndAction::Play(1));
+        assert_eq!(on_end(&list, 1, &o, None), EndAction::Stop);
         o.repeat = Repeat::All;
-        assert_eq!(on_end(&list, 1, &o), EndAction::Play(0));
-        assert_eq!(on_end(&files(&["only.mp3"]), 0, &o), EndAction::Replay);
+        assert_eq!(on_end(&list, 1, &o, None), EndAction::Play(0));
+        assert_eq!(on_end(&files(&["only.mp3"]), 0, &o, None), EndAction::Replay);
         o.repeat = Repeat::One;
-        assert_eq!(on_end(&list, 0, &o), EndAction::Replay);
+        assert_eq!(on_end(&list, 0, &o, None), EndAction::Replay);
         o = QueueOptions {
             auto_advance: false,
             ..Default::default()
         };
-        assert_eq!(on_end(&list, 0, &o), EndAction::Stop);
+        assert_eq!(on_end(&list, 0, &o, None), EndAction::Stop);
         o = QueueOptions {
             shuffle: true,
             ..Default::default()
         };
-        assert_eq!(on_end(&list, 0, &o), EndAction::Play(1));
+        assert_eq!(on_end(&list, 0, &o, None), EndAction::Play(1));
+    }
+
+    #[test]
+    fn group_filtering_separates_audio_and_video() {
+        let list = files(&["a.mp3", "b.jpg", "c.mp4", "d.flac", "e.mkv"]);
+        assert_eq!(
+            step(&list, 0, true, false, Some(MediaGroup::Audio)),
+            Some(3)
+        );
+        assert_eq!(
+            candidates(&list, 0, true, false, false, Some(MediaGroup::Audio)),
+            [3]
+        );
+        assert_eq!(
+            candidates(&list, 2, true, true, false, Some(MediaGroup::Video)),
+            [4]
+        );
+        assert_eq!(random(&list, 0, Some(MediaGroup::Audio)), Some(3));
+        assert_eq!(random(&list, 2, Some(MediaGroup::Video)), Some(4));
+
+        let single_audio = files(&["only.mp3", "clip.mp4"]);
+        let mut o = QueueOptions {
+            repeat: Repeat::All,
+            ..Default::default()
+        };
+        assert_eq!(
+            on_end(&single_audio, 0, &o, Some(MediaGroup::Audio)),
+            EndAction::Replay
+        );
+        o.repeat = Repeat::Off;
+        assert_eq!(
+            on_end(&single_audio, 0, &o, Some(MediaGroup::Audio)),
+            EndAction::Stop
+        );
     }
 
     #[test]

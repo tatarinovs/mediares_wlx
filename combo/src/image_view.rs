@@ -709,8 +709,7 @@ pub fn format_thousands(n: u64) -> String {
 }
 
 fn osd_text(state: &ViewerState, zoom: Option<i32>) -> String {
-    let position =
-        (!state.dir_files.is_empty()).then_some((state.current_idx, state.dir_files.len()));
+    let position = state.list_position();
     let file =
         |key: &str| osd_template::file_field(&state.file_path, state.file_size, position, key);
     let Some(img) = &state.image else {

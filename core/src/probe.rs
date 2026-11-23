@@ -15,6 +15,13 @@ pub enum MediaType {
     Unsupported,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaGroup {
+    Photo,
+    Video,
+    Audio,
+}
+
 /// Decoded by the `image` crate.
 const STANDARD_IMAGE_EXTS: &[&str] = &[
     "jpg", "jpeg", "jpe", "thm", "png", "gif", "webp", "bmp", "ico", "tga", "hdr",
@@ -145,6 +152,17 @@ impl MediaType {
     pub fn is_playable(self) -> bool {
         matches!(self, MediaType::Audio | MediaType::Video)
     }
+
+    pub fn group(self) -> Option<MediaGroup> {
+        match self {
+            MediaType::StandardImage | MediaType::RawImage | MediaType::PsdImage => {
+                Some(MediaGroup::Photo)
+            }
+            MediaType::Video => Some(MediaGroup::Video),
+            MediaType::Audio => Some(MediaGroup::Audio),
+            MediaType::Playlist | MediaType::Unsupported => None,
+        }
+    }
 }
 
 pub fn probe_file(path: &Path) -> MediaType {
@@ -196,5 +214,16 @@ mod tests {
         for ext in RAW_EXTS.iter().chain(PSD_EXTS) {
             assert!(s.contains(&format!("EXT=\"{}\"", ext.to_ascii_uppercase())));
         }
+    }
+
+    #[test]
+    fn media_type_group_maps_all_variants() {
+        assert_eq!(MediaType::StandardImage.group(), Some(MediaGroup::Photo));
+        assert_eq!(MediaType::RawImage.group(), Some(MediaGroup::Photo));
+        assert_eq!(MediaType::PsdImage.group(), Some(MediaGroup::Photo));
+        assert_eq!(MediaType::Video.group(), Some(MediaGroup::Video));
+        assert_eq!(MediaType::Audio.group(), Some(MediaGroup::Audio));
+        assert_eq!(MediaType::Playlist.group(), None);
+        assert_eq!(MediaType::Unsupported.group(), None);
     }
 }

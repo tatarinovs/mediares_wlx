@@ -198,6 +198,8 @@ pub struct ViewerConfig {
     pub keep_zoom: bool,
     /// Navigation passes over RAW files whose JPEG (or HEIC) of the same name is in the folder.
     pub skip_raw_twins: bool,
+    /// Browsing and playback stay within the current media type (photos, videos, or audio).
+    pub separate_media_types: bool,
     /// Ask before Del moves the file to the Recycle Bin.
     pub confirm_delete: bool,
     /// Long videos continue where they were left.
@@ -247,6 +249,7 @@ impl Default for ViewerConfig {
             smooth_zoom: true,
             keep_zoom: false,
             skip_raw_twins: false,
+            separate_media_types: false,
             confirm_delete: true,
             resume_video: true,
             replay_gain: false,
@@ -432,6 +435,7 @@ impl ViewerConfig {
             smooth_zoom: int("SmoothZoom", d.smooth_zoom as i32) != 0,
             keep_zoom: int("KeepZoom", d.keep_zoom as i32) != 0,
             skip_raw_twins: int("SkipRawTwins", d.skip_raw_twins as i32) != 0,
+            separate_media_types: int("SeparateMediaTypes", d.separate_media_types as i32) != 0,
             confirm_delete: int("ConfirmDelete", d.confirm_delete as i32) != 0,
             resume_video: int("ResumeVideo", d.resume_video as i32) != 0,
             replay_gain: int("ReplayGain", d.replay_gain as i32) != 0,
@@ -458,7 +462,7 @@ impl ViewerConfig {
     }
 
     /// The settings as INI key / value pairs.
-    fn entries(&self) -> [(PCWSTR, String); 35] {
+    fn entries(&self) -> [(PCWSTR, String); 36] {
         let flag = |b: bool| if b { "1" } else { "0" }.to_string();
         [
             (w!("Language"), self.language.to_ini().to_string()),
@@ -481,6 +485,7 @@ impl ViewerConfig {
             (w!("SmoothZoom"), flag(self.smooth_zoom)),
             (w!("KeepZoom"), flag(self.keep_zoom)),
             (w!("SkipRawTwins"), flag(self.skip_raw_twins)),
+            (w!("SeparateMediaTypes"), flag(self.separate_media_types)),
             (w!("ConfirmDelete"), flag(self.confirm_delete)),
             (w!("ResumeVideo"), flag(self.resume_video)),
             (w!("ReplayGain"), flag(self.replay_gain)),
@@ -741,5 +746,34 @@ mod tests {
             crate::file_actions::split_command(editor, |_| false),
             (r"C:\Program Files\App\app.exe", r#"-n "%1""#)
         );
+    }
+
+    #[test]
+    fn separate_media_types_defaults_false_and_round_trips() {
+        let default = ViewerConfig::default();
+        assert!(!default.separate_media_types);
+
+        let path = std::env::temp_dir().join(format!(
+            "mediares_separate_media_{}.ini",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+
+        let updated = ViewerConfig {
+            separate_media_types: true,
+            ..default.clone()
+        };
+        assert!(updated.save_to(&default, &path));
+        let section = Section::read(&HSTRING::from(path.as_os_str()));
+        assert_eq!(section.int("SeparateMediaTypes", 0), 1);
+
+        let reverted = ViewerConfig {
+            separate_media_types: false,
+            ..updated.clone()
+        };
+        assert!(reverted.save_to(&updated, &path));
+        let section = Section::read(&HSTRING::from(path.as_os_str()));
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(section.int("SeparateMediaTypes", -1), 0);
     }
 }
