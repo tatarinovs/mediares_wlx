@@ -308,12 +308,7 @@ unsafe fn caption(state: &ViewerState) -> String {
                 .as_ref()
                 .and_then(|p| p.file_name())
                 .map(|n| format!(" · {}", n.to_string_lossy()));
-            title += &format!(
-                " [{}/{}{}]",
-                idx + 1,
-                total,
-                list.unwrap_or_default()
-            );
+            title += &format!(" [{}/{}{}]", idx + 1, total, list.unwrap_or_default());
         }
     }
     if state.slideshow {

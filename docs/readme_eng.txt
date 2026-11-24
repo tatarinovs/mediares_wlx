@@ -115,6 +115,14 @@ skipped (a setting), so each shot comes up once.
 Open in editor (F4) uses the program Windows has for editing this file
 type. You can choose your own program in the settings.
 
+Windows shortcuts (.lnk): press F3 or Ctrl+Q on a shortcut to view
+its target media file. Files and shortcuts are browsed in filename
+order in the shortcut's folder (shortcuts to external network shares
+are skipped during folder scan). M3U and M3U8 playlists can also
+contain shortcuts. Thumbnails come from the target. Del moves the
+shortcut to the Recycle Bin, while saving a rotation updates the
+original file.
+
 
 Temporary PNGs in %TEMP%\Mediares are cleaned up on viewer startup
 or another copy, once at least 24 hours old. The current file

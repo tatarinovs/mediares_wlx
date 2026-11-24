@@ -184,18 +184,6 @@ impl Store {
             SCHEMA_VERSION => {}
             _ => return Err(Error::InvalidQuery),
         }
-        let read_stmt = db.prepare(
-            "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
-                    fingerprint, pcm_hash, sharpness, payload FROM entries
-             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
-               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
-        )?;
-        let insert_stmt = db.prepare(
-            "INSERT OR REPLACE INTO entries
-             (path, slot, size, modified, version, kind, width, height, duration,
-              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
-        )?;
         // Bound the main database and SQLite's RAM. WAL is checkpointed every ~1 MiB and
         // truncated after checkpoints; only short transactions are used by this plugin.
         let page_size = db.pragma_query_i64("page_size")?;
@@ -213,6 +201,18 @@ impl Store {
              PRAGMA mmap_size=0;
              PRAGMA wal_autocheckpoint=2048;
              PRAGMA journal_size_limit=8388608;",
+        )?;
+        let read_stmt = db.prepare(
+            "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
+                    fingerprint, pcm_hash, sharpness, payload FROM entries
+             WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
+        )?;
+        let insert_stmt = db.prepare(
+            "INSERT OR REPLACE INTO entries
+             (path, slot, size, modified, version, kind, width, height, duration,
+              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         )?;
         // First maintenance is due, but opening for a quick read must not scan the database.
         Ok(Self {
@@ -564,12 +564,15 @@ impl DiskValue for u32 {
     const VERSION: i32 = 1;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<i32>(COL_KIND)? != Self::SLOT {
+            return Err(Error::TypeMismatch);
+        }
         r.get(COL_SHARPNESS)
     }
 
     fn columns(&self) -> Option<Columns<'_>> {
         Some(Columns {
-            kind: 4,
+            kind: Self::SLOT,
             sharpness: Some(*self),
             ..Columns::default()
         })
@@ -590,6 +593,9 @@ macro_rules! metadata {
             const VERSION: i32 = $version;
 
             fn from_row(row: &Row<'_>) -> Result<Self> {
+                if row.get::<i32>(COL_KIND)? != Self::SLOT {
+                    return Err(Error::TypeMismatch);
+                }
                 let payload: String = row.get(COL_PAYLOAD)?;
                 <$ty as JsonCodec>::from_json(&payload).ok_or(Error::InvalidQuery)
             }
@@ -597,7 +603,7 @@ macro_rules! metadata {
             fn columns(&self) -> Option<Columns<'_>> {
                 let payload = <$ty as JsonCodec>::to_json(self)?;
                 (payload.len() <= MAX_PAYLOAD).then_some(Columns {
-                    kind: 5,
+                    kind: Self::SLOT,
                     payload: Some(payload),
                     ..Columns::default()
                 })

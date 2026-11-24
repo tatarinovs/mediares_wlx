@@ -199,45 +199,7 @@ fn read_m3u(path: &Path) -> Vec<PathBuf> {
 /// Entries that the viewer can open automatically. A playlist may refer to files on
 /// its own network share, but it cannot cause a connection to a different one.
 pub fn media_entries(path: &Path) -> Vec<MediaEntry> {
-    use std::collections::HashMap;
-    use std::path::{Component, Prefix};
-    use windows::Win32::Storage::FileSystem::GetDriveTypeW;
-    use windows::Win32::System::WindowsProgramming::{
-        DRIVE_CDROM, DRIVE_FIXED, DRIVE_RAMDISK, DRIVE_REMOVABLE,
-    };
-
-    fn prefix(path: &Path) -> Option<Prefix<'_>> {
-        match path.components().next()? {
-            Component::Prefix(prefix) => Some(prefix.kind()),
-            _ => None,
-        }
-    }
-    let mut local_drives = HashMap::new();
-    let playlist_prefix = prefix(path);
-    let mut allowed = |entry: &Path| {
-        entry.is_absolute()
-            && match prefix(entry) {
-                Some(Prefix::Disk(drive) | Prefix::VerbatimDisk(drive)) => {
-                    if matches!(playlist_prefix, Some(Prefix::Disk(d) | Prefix::VerbatimDisk(d)) if d == drive)
-                    {
-                        return true;
-                    }
-                    *local_drives.entry(drive).or_insert_with(|| {
-                        let root = [u16::from(drive), b':' as u16, b'\\' as u16, 0];
-                        let kind = unsafe { GetDriveTypeW(windows::core::PCWSTR(root.as_ptr())) };
-                        matches!(
-                            kind,
-                            DRIVE_FIXED | DRIVE_REMOVABLE | DRIVE_CDROM | DRIVE_RAMDISK
-                        )
-                    })
-                }
-                Some(Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share)) => {
-                    matches!(playlist_prefix, Some(Prefix::UNC(base_server, base_share) | Prefix::VerbatimUNC(base_server, base_share))
-                    if crate::state::same_name(server, base_server) && crate::state::same_name(share, base_share))
-                }
-                _ => false,
-            }
-    };
+    let mut allowed = crate::shortcut::same_origin_filter(path);
     read_m3u(path)
         .into_iter()
         .filter_map(|p| MediaEntry::resolve_allowed(p, &mut allowed))
@@ -364,7 +326,10 @@ mod tests {
         assert_eq!(on_end(&list, 1, &o, None), EndAction::Stop);
         o.repeat = Repeat::All;
         assert_eq!(on_end(&list, 1, &o, None), EndAction::Play(0));
-        assert_eq!(on_end(&files(&["only.mp3"]), 0, &o, None), EndAction::Replay);
+        assert_eq!(
+            on_end(&files(&["only.mp3"]), 0, &o, None),
+            EndAction::Replay
+        );
         o.repeat = Repeat::One;
         assert_eq!(on_end(&list, 0, &o, None), EndAction::Replay);
         o = QueueOptions {

@@ -315,7 +315,7 @@ impl Transaction<'_> {
         self.conn.execute(sql, params)
     }
 
-    pub(crate) fn query_row<T>(
+    pub fn query_row<T>(
         &self,
         sql: &str,
         params: &[&dyn ToSql],

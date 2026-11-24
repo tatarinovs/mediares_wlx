@@ -933,11 +933,7 @@ fn index_after_delete(
         .iter()
         .position(|e| e.group() == Some(group))
         .map(|offset| next + offset)
-        .or_else(|| {
-            files[..next]
-                .iter()
-                .rposition(|e| e.group() == Some(group))
-        })
+        .or_else(|| files[..next].iter().rposition(|e| e.group() == Some(group)))
 }
 
 /// A photo kept on the left for comparison, as it was shown (turned) when picked.
@@ -1096,6 +1092,7 @@ fn scan_directory_media(
         return Vec::new();
     };
 
+    let mut allowed = crate::shortcut::same_origin_filter(current_file);
     let mut files: Vec<MediaEntry> = entries
         .take_while(|_| !cancelled())
         .flatten()
@@ -1103,7 +1100,7 @@ fn scan_directory_media(
             e.file_type()
                 .is_ok_and(|t| t.is_file() || t.is_symlink() && e.path().is_file())
         })
-        .filter_map(|e| MediaEntry::resolve(e.path()))
+        .filter_map(|e| MediaEntry::resolve_allowed(e.path(), &mut allowed))
         .filter(|e| is_viewable(e.kind))
         .collect();
     if cancelled() {
@@ -1254,10 +1251,7 @@ mod tests {
             neighbor_indices(&entries, 0, true, Some(MediaGroup::Photo)),
             [3, 5]
         );
-        assert_eq!(
-            neighbor_indices(&entries, 0, true, None),
-            [1, 6, 2]
-        );
+        assert_eq!(neighbor_indices(&entries, 0, true, None), [1, 6, 2]);
     }
 
     #[test]

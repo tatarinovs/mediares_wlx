@@ -5,25 +5,53 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use mediares_core::sqlite::{Connection, Result};
+use mediares_core::sqlite::{Connection, Error, Result};
 
 use crate::config;
 
 const FILE_NAME: &str = "mediares.sqlite3";
+const SCHEMA_VERSION: i64 = 1;
 const MAX_ENTRIES: usize = 200;
 pub const DEFAULT_MIN_DURATION_SEC: f64 = 300.0;
 const EDGE_SEC: f64 = 30.0;
 
 fn open(path: &Path) -> Result<Connection> {
-    let db = Connection::open(path)?;
+    let mut db = Connection::open(path)?;
     db.busy_timeout(Duration::from_millis(50))?;
-    db.execute_batch(
-        "CREATE TABLE IF NOT EXISTS resume (
+    match db.pragma_query_i64("user_version")? {
+        SCHEMA_VERSION => Ok(db),
+        0 => {
+            create_schema(&mut db)?;
+            Ok(db)
+        }
+        _ => Err(Error::InvalidQuery),
+    }
+}
+
+fn create_schema(db: &mut Connection) -> Result<()> {
+    let tx = db.transaction_immediate()?;
+    match tx.query_row("PRAGMA user_version", &[], |r| r.get(0))? {
+        SCHEMA_VERSION => return tx.commit(),
+        0 => {}
+        _ => return Err(Error::InvalidQuery),
+    }
+    let has_objects: i64 = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name NOT GLOB 'sqlite_*')",
+        &[],
+        |r| r.get(0),
+    )?;
+    if has_objects != 0 {
+        return Err(Error::InvalidQuery);
+    }
+    tx.execute(
+        "CREATE TABLE resume (
             path BLOB PRIMARY KEY NOT NULL,
             position REAL NOT NULL CHECK(position >= 0)
-         );",
+         )",
+        &[],
     )?;
-    Ok(db)
+    tx.execute(&format!("PRAGMA user_version={SCHEMA_VERSION}"), &[])?;
+    tx.commit()
 }
 
 /// Normalize separators and case as for viewer navigation. Keep Windows UTF-16 losslessly
@@ -41,7 +69,11 @@ fn key(video: &Path) -> Vec<u8> {
 }
 
 pub fn load(video: &Path) -> Option<f64> {
-    let db = open(&config::local_path(FILE_NAME)).ok()?;
+    let path = config::local_path(FILE_NAME);
+    if !path.exists() {
+        return None;
+    }
+    let db = open(&path).ok()?;
     load_from(&db, video).ok().flatten()
 }
 
@@ -126,8 +158,35 @@ mod tests {
         }
         {
             let db = open(&file).unwrap();
+            assert_eq!(db.pragma_query_i64("user_version").unwrap(), SCHEMA_VERSION);
             assert_eq!(load_from(&db, video).unwrap(), Some(75.0));
         }
         std::fs::remove_file(file).unwrap();
+    }
+
+    #[test]
+    fn schema_sets_user_version_and_rejects_foreign_or_future_databases() {
+        let dir =
+            std::env::temp_dir().join(format!("mediares-resume-schema-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let foreign = dir.join("foreign.sqlite3");
+        {
+            let db = Connection::open(&foreign).unwrap();
+            db.execute("CREATE TABLE other (id INTEGER PRIMARY KEY)", &[])
+                .unwrap();
+            assert!(open(&foreign).is_err());
+            assert_eq!(db.pragma_query_i64("user_version").unwrap(), 0);
+        }
+
+        let future = dir.join("future.sqlite3");
+        {
+            let db = Connection::open(&future).unwrap();
+            db.pragma_update_i64("user_version", 2).unwrap();
+            assert!(open(&future).is_err());
+            assert_eq!(db.pragma_query_i64("user_version").unwrap(), 2);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
