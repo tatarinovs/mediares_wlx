@@ -3,7 +3,9 @@
 [Русский](README.md) | **English**
 
 [![Platform](https://img.shields.io/badge/Platform-Windows%20x64-0078D6?logo=windows&logoColor=white)](https://www.microsoft.com/windows)
+[![Total Commander](https://img.shields.io/badge/Total%20Commander-WLX%20%2B%20WDX-1f6feb)](https://www.ghisler.com/)
 [![Release](https://img.shields.io/github/v/release/tatarinovs/mediares_wlx)](https://github.com/tatarinovs/mediares_wlx/releases/latest)
+[![Rust](https://img.shields.io/badge/Rust-stable-DE6E39?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 Mediares opens photos, video and audio with **F3**, displays metadata in Total Commander columns and helps find duplicates.
@@ -46,11 +48,11 @@ You can also register them manually: **Configuration → Options → Plugins →
 
 ## Viewer
 
-Press F3 or Ctrl+Q on a Windows shortcut (`.lnk`) to view its target media file. Browse files and shortcuts in filename order in the shortcut's folder. M3U and M3U8 playlists can also contain shortcuts. Thumbnails also come from the target. Del moves the shortcut to the Recycle Bin. Saving a rotation updates the original file.
-
-Temporary PNGs of copied frames and cover art in `%TEMP%\Mediares` are cleaned up on viewer startup or another copy, once at least 24 hours old. The current file clipboard and files opened by other applications are kept.
+The viewer (**F3** / **Ctrl+Q**) also provides thumbnails for Total Commander (photos, video frames or audio cover art) and supports Windows shortcuts (`.lnk`).
 
 ### Photos
+
+![Photo view](docs/screenshots/photo.png)
 
 Supports JPEG, PNG, GIF, WebP, BMP, ICO, TGA, HDR, TIFF, JPEG XR, DDS, PSD/PSB and RAW from popular cameras. RAW files use their embedded JPEG preview; PSD/PSB files use the saved composite image. All pages of multipage TIFF files are available.
 
@@ -65,11 +67,17 @@ Features:
 - Lossless JPEG rotation and metadata removal.
 - Skip RAW files when a matching JPEG exists.
 
+![Print preview](docs/screenshots/print.png)
+
 ### Video and audio
+
+![Video playback](docs/screenshots/video.png)
 
 **Video:** MP4, MKV, AVI, MOV, WMV, WebM, M4V, 3GP, FLV, TS, MTS, MPEG, VOB and other formats when codecs are available.
 
 **Audio:** MP3, MP2, FLAC, WAV, OGG, M4A/M4B, AAC, AIFF, CAF, MKA, WMA, Opus and AC3. Displays tags, cover art and lyrics when present in the file.
+
+![Audio playback](docs/screenshots/audio.png)
 
 Features:
 
@@ -80,7 +88,9 @@ Features:
 - Resume video from the last position.
 - Gapless audio between compatible tracks and ReplayGain volume adjustment.
 
-The viewer also provides thumbnails for Total Commander: photos, video frames or audio cover art.
+### Windows shortcuts (.lnk)
+
+Pressing **F3** or **Ctrl+Q** on a Windows shortcut plays or displays its target media file. Files and shortcuts are browsed in filename order within the shortcut's folder; shortcuts are also supported in M3U/M3U8 playlists. Thumbnails come from the target file, saved rotations update the original file, and **Del** moves the shortcut itself to the Recycle Bin.
 
 ### Additional codecs: libmpv
 
@@ -149,13 +159,13 @@ Both versions provide fields in the **`mediares`** group for columns, tooltips, 
 | Video | Duration, dimensions, frame rate, codecs, bitrate, HDR, rotation, audio track and tags |
 | Audio | Artist, title, album, year, genre, track number, duration, codec and audio properties |
 
-For the full field list, see the [user guide](docs/readme_eng.txt).
+Video dimensions and duration are read from metadata without decoding frames. Use `Audio_Length` for a normal audio duration column (`Audio_Duration_Sec` measures the decoded stream). For the full field list, see the [user guide](docs/readme_eng.txt).
 
 ### Ready-made column sets
 
-Below are three sets for **Show → Custom columns mode → Configure custom columns → New**. Use `Headers` (column headings) and `Contents` (field expressions) when editing a set, or add the lines directly to `wincmd.ini`
-(in sections such as `[Columns0]`, `[Columns1]`, with `Headers0`/`Contents0`, etc.; adjust the numbers to match your sets).
-`mediares` is the plugin's registered name in Total Commander (by default, its filename). If you chose another name during installation, replace the prefix. `tc.size` is a built-in Total Commander field.
+Three sets for **Show → Custom columns mode → Configure custom columns → New**. Paste the lines into `Headers` and `Contents` in the set editor, or add them directly to `wincmd.ini` (in sections such as `[Columns0]`, `[Columns1]`, with `Headers0`/`Contents0`, etc.; adjust the numbers to match your sets).
+
+`mediares` is the plugin's registered name in Total Commander (by default, its filename); if you chose another name during installation, replace the prefix. `tc.size` is a built-in Total Commander field.
 
 **Photos** (EXIF):
 
@@ -194,7 +204,11 @@ In Total Commander's duplicate search, choose comparison by plugin fields and se
 | `Audio_PCM_Hash` | Identical decoded audio, such as WAV and FLAC |
 | `Audio_Artist_Title` | Match artist and title tags |
 
-Total Commander compares values exactly, so some modified copies may not be found. Photo rotation, cropping, video edits or different audio mastering can change the result. `Audio_Fingerprint` and `Audio_PCM_Hash` read the entire file in one pass; `Audio_Fast_Fingerprint` skips the bulk of tracks longer than 75 s and decodes only short slices. Audio hashes and fingerprints are withheld on a decoding error or detected truncation. `Audio_Duration_Sec` measures the decoded stream; use `Audio_Length` for a normal duration column. Video dimensions and duration come from metadata without analyzing frames.
+Behavior notes:
+
+- Total Commander compares values exactly, so photo rotation, cropping, video edits or different audio mastering can change the result and leave some modified copies unmatched.
+- `Audio_Fingerprint` and `Audio_PCM_Hash` read the entire file in one pass; `Audio_Fast_Fingerprint` skips the bulk of tracks longer than 75 s and decodes only short slices.
+- Audio hashes and fingerprints are withheld on a decoding error or detected truncation.
 
 **Check matches before deleting files.**
 
@@ -202,36 +216,48 @@ Total Commander compares values exactly, so some modified copies may not be foun
 
 Press **S** in the viewer or choose **“Settings...”** from the context menu. Options include language, separating browsing by media type (photo, video, audio), background, zoom, slideshow, fullscreen, playback, external editors and on-screen information (OSD).
 
+| Photos | Video and audio |
+|:---:|:---:|
+| ![Settings — Photos](docs/screenshots/opt1.png) | ![Settings — Video and audio](docs/screenshots/opt2.png) |
+| **Display** | **General** |
+| ![Settings — Display](docs/screenshots/opt3.png) | ![Settings — General](docs/screenshots/opt4.png) |
+
 The interface is available in Russian and English; additional translations can be added through `mediares_ui.lng`.
 
-For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used. Video resume positions are stored in `%LOCALAPPDATA%\mediares\mediares.sqlite3` (up to 200 videos), separately from the local cache.
+For a portable installation, place `mediares.ini` next to the plugin. Otherwise, Total Commander's plugin settings folder is used.
 
-Hashes, fingerprints, sharpness and metadata (EXIF, tags, stream properties, dimensions and pixel format) survive restarts in `%LOCALAPPDATA%\mediares\content-cache.sqlite3`. Results are reread when the file size, modification time or algorithm version changes. The main database is limited to 256 MiB. Background maintenance removes the oldest records to keep the count around 500,000. To clear it, close all TC instances and delete the cache database. There is no need to disable caching during normal use; for diagnostics, set the `MEDIARES_CONTENT_CACHE=off` environment variable before starting TC. An absolute database path on a local drive can be used instead of `off`.
+### Data storage and cache
 
-Hash, fingerprint and sharpness requests in columns or duplicate search also prepare the requested family for nearby files in the same folder. Metadata and duration are read and cached only when TC requests them, without prefetching neighboring files. Prefetch starts with up to four tasks within the available pool and adjusts concurrency based on analysis throughput and TC request latency. Measurements carry over between folders on the same drive when the analysis type and file extension match. The shared ceiling is the available logical CPU count minus one, capped at 16; photos, video and audio have no separate limits. Short scans may not provide enough samples to tune. Read-ahead is limited to 32 directory entries per family and replenished by further TC requests; subfolders are not traversed. If needed, set the worker count manually in `mediares.ini`:
+- **Video resume positions:** stored in `%LOCALAPPDATA%\mediares\mediares.sqlite3` (up to 200 recent videos), separately from the clearable metadata cache.
+- **Metadata and hash cache:** EXIF, tags, stream properties, dimensions, sharpness, hashes and fingerprints are cached in `%LOCALAPPDATA%\mediares\content-cache.sqlite3` (capped at 256 MiB / ~500,000 records, with background eviction of oldest entries). Values are reread when file size, modification time or algorithm version changes.
+- **Cache management:** to clear it, close all TC instances and delete `content-cache.sqlite3`. For diagnostics, set `MEDIARES_CONTENT_CACHE=off` before starting TC (or specify an absolute path on a local drive).
+- **Temporary files:** PNGs of copied frames and cover art in `%TEMP%\Mediares` are cleaned up on viewer startup or another copy once at least 24 hours old; the current clipboard image and files open in other apps are kept.
+
+### Background prefetch (WDX)
+
+- Hash, fingerprint and sharpness requests automatically prefetch neighboring files with the same extension in the current folder (subfolders are not traversed; metadata and duration are not prefetched).
+- `Audio_Fingerprint` and `Audio_PCM_Hash` are computed and cached together in a single decoding pass; `Audio_Fast_Fingerprint` is computed independently. Requesting duration does not start hashing.
+- The worker count is tuned automatically (up to 16, capped by available CPUs). You can override it in `mediares.ini` (`0` disables read-ahead, `1`–`16` sets a fixed worker count; restart TC after editing):
 
 ```ini
 [Settings]
 PrefetchThreads=4
 ```
 
-`0` disables read-ahead; `1`–`16` select the background worker count (also limited by available CPUs). Without the key, the thread count is determined automatically. Restart TC after editing. An existing INI beside the DLL takes priority; otherwise `mediares.ini` in TC's settings directory is used. Saving settings through the GUI preserves this key. `Audio_Fingerprint` and `Audio_PCM_Hash` are computed and cached together in a single decoding pass; `Audio_Fast_Fingerprint` is computed and prefetched independently. Requesting duration does not start hashing.
-
-Read-ahead selects neighbors with the same extension, ignoring case. Different extensions have separate queues. TC does not expose its search mask to the plugin.
-
 ## Building
 
-Checks require Rust and build tools for the selected toolchain. Release script `build_release.bat` uses `stable-x86_64-pc-windows-gnu` (installed through rustup if missing); first add the `bin` directory from w64devkit, containing `dlltool.exe`, to `PATH`.
+Checks and builds require Rust and tools for the selected toolchain. Release script `build_release.bat` uses `stable-x86_64-pc-windows-gnu` (installed via rustup if missing); first add the `bin` directory from w64devkit, containing `dlltool.exe`, to `PATH`.
 
 ```powershell
 cargo test --workspace --locked  # tests for the entire workspace
 .\build_release.bat              # release DLLs and installation archives in dist/
-python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 # SQLite cache (Python 3)
-python scripts/test_prefetch.py --dll dist/mediares_wdx_only.wdx64 # read-ahead, cancellation and unload
-# WLX checks, large database and concurrent processes:
+
+# Internal and integration checks:
+python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64
+python scripts/test_prefetch.py --dll dist/mediares_wdx_only.wdx64
 python scripts/test_content_cache.py --dll dist/mediares_wdx_only.wdx64 --viewer-dll dist/mediares.wlx64 --stress
 cargo build -p mediares_combo --example lister_harness --locked
-python scripts/test_save_as.py  # final filename and overwrite confirmation in the native dialog
+python scripts/test_save_as.py
 ```
 
 ## License
