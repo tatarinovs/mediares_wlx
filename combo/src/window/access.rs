@@ -91,7 +91,7 @@ pub(super) unsafe fn nested(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Opt
         let active = a.get_mut(&(hwnd.0 as isize))?;
         match msg {
             WM_NCDESTROY => {
-                let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut ViewerState;
+                let ptr = crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0) as *mut ViewerState;
                 if !ptr.is_null() {
                     active.retired = Some(ptr);
                 }

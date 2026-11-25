@@ -210,7 +210,11 @@ fn is_ours(value: &str, dll: &Path, lookup: impl Fn(&str) -> Option<String>) -> 
         .file_name()
         .map(|n| n.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    name == own_name || name == "mediares.wdx64"
+    name == own_name
+        || matches!(
+            name,
+            "mediares.wdx64" | "mediares.wdx" | "mediares.wlx64" | "mediares.wlx"
+        )
 }
 
 /// The path as TC itself writes it: relative to `%COMMANDER_PATH%` when inside it (portable installs).
@@ -282,6 +286,12 @@ mod tests {
             dll,
             env
         ));
+        assert!(is_ours(
+            r"C:\TC\Plugins\wdx\mediares\mediares.wdx",
+            dll,
+            env
+        ));
+        assert!(is_ours(r"D:\other\mediares.wlx", dll, env));
         assert!(!is_ours(r"C:\TC\Plugins\wdx\exif\exif.wdx64", dll, env));
     }
 

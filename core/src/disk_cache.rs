@@ -8,12 +8,14 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::cache::{AudioAnalysis, AudioDuration, AudioFastFingerprint, CachedMedia, FileKey};
+use crate::cache::{
+    AudioAnalysis, AudioDuration, AudioFastFingerprint, CachedMedia, FileKey, PartialHash,
+};
 use crate::hashing::ImageAnalysis;
 use crate::sqlite::{Connection, Error, Result, Row, Statement};
 use crate::video_frame::VideoAnalysis;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_PAYLOAD: usize = 1024 * 1024;
 const MAX_BYTES: i64 = 256 * 1024 * 1024;
 const MAX_ENTRIES: i64 = 500_000;
@@ -113,15 +115,25 @@ pub(crate) fn read<T: DiskValue>(key: &FileKey) -> Option<(T, usize)> {
     with_store(|store| store.read_with_weight(&key))
 }
 
-/// Return the RAM weight from the same representation prepared for SQLite.
-pub(crate) fn write<T: DiskValue>(key: &FileKey, value: &T) -> usize {
+pub(crate) fn read_by_content<T: DiskValue>(size: u64, partial_hash: u64) -> Option<(T, usize)> {
+    let size = i64::try_from(size).ok()?;
+    let hash = partial_hash as i64;
+    with_store(|store| store.read_by_content_with_weight(size, hash))
+}
+
+pub(crate) fn write_with_partial_hash<T: DiskValue>(
+    key: &FileKey,
+    value: &T,
+    partial_hash: Option<u64>,
+) -> usize {
     // Unsupported/cancelled analyses must not survive a restart: codecs and permissions change.
     let Some(columns) = value.columns() else {
         return usize::MAX;
     };
     let bytes = columns.memory_bytes();
     if let Some(key) = Key::new(key) {
-        with_store(|store| store.write::<T>(&key, columns, MAINTENANCE_ALLOWED.get()));
+        let ph = partial_hash.map(|h| h as i64);
+        with_store(|store| store.write::<T>(&key, columns, ph, MAINTENANCE_ALLOWED.get()));
     }
     bytes
 }
@@ -165,6 +177,7 @@ impl Key {
 
 struct Store {
     read_stmt: Statement,
+    read_by_content_stmt: Statement,
     insert_stmt: Statement,
     db: Connection,
     writes: u32,
@@ -181,6 +194,7 @@ impl Store {
         let version = db.pragma_query_i64("user_version")?;
         match version {
             0 => Self::create_schema(&mut db)?,
+            1 => Self::migrate_v1_to_v2(&mut db)?,
             SCHEMA_VERSION => {}
             _ => return Err(Error::InvalidQuery),
         }
@@ -208,15 +222,23 @@ impl Store {
              WHERE path=?1 AND slot=?2 AND size=?3 AND modified=?4 AND version=?5
                AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?6)",
         )?;
+        let read_by_content_stmt = db.prepare(
+            "SELECT kind, width, height, duration, hash_a, hash_b, coarse,
+                    fingerprint, pcm_hash, sharpness, payload FROM entries
+             WHERE slot=?1 AND version=?2 AND size=?3 AND partial_hash=?4
+               AND (payload IS NULL OR length(CAST(payload AS BLOB)) <= ?5)
+             ORDER BY rowid DESC LIMIT 1",
+        )?;
         let insert_stmt = db.prepare(
             "INSERT OR REPLACE INTO entries
              (path, slot, size, modified, version, kind, width, height, duration,
-              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              hash_a, hash_b, coarse, fingerprint, pcm_hash, sharpness, payload, partial_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         )?;
         // First maintenance is due, but opening for a quick read must not scan the database.
         Ok(Self {
             read_stmt,
+            read_by_content_stmt,
             insert_stmt,
             db,
             writes: MAINTENANCE_INTERVAL,
@@ -246,8 +268,33 @@ impl Store {
                 kind INTEGER NOT NULL, width INTEGER, height INTEGER, duration INTEGER,
                 hash_a INTEGER, hash_b INTEGER, coarse INTEGER,
                 fingerprint TEXT, pcm_hash TEXT, sharpness INTEGER, payload TEXT,
+                partial_hash INTEGER,
                 PRIMARY KEY(path, slot)
              )",
+            &[],
+        )?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_content
+             ON entries(slot, version, size, partial_hash)
+             WHERE partial_hash IS NOT NULL",
+            &[],
+        )?;
+        tx.execute(&format!("PRAGMA user_version={SCHEMA_VERSION}"), &[])?;
+        tx.commit()
+    }
+
+    fn migrate_v1_to_v2(db: &mut Connection) -> Result<()> {
+        let tx = db.transaction_immediate()?;
+        match tx.query_row("PRAGMA user_version", &[], |r| r.get(0))? {
+            SCHEMA_VERSION => return tx.commit(),
+            1 => {}
+            _ => return Err(Error::InvalidQuery),
+        }
+        tx.execute("ALTER TABLE entries ADD COLUMN partial_hash INTEGER", &[])?;
+        tx.execute(
+            "CREATE INDEX IF NOT EXISTS idx_entries_content
+             ON entries(slot, version, size, partial_hash)
+             WHERE partial_hash IS NOT NULL",
             &[],
         )?;
         tx.execute(&format!("PRAGMA user_version={SCHEMA_VERSION}"), &[])?;
@@ -278,10 +325,32 @@ impl Store {
         )
     }
 
+    fn read_by_content_with_weight<T: DiskValue>(
+        &self,
+        size: i64,
+        partial_hash: i64,
+    ) -> Result<(T, usize)> {
+        self.read_by_content_stmt.query_row(
+            &[
+                &T::SLOT,
+                &T::VERSION,
+                &size,
+                &partial_hash,
+                &(MAX_PAYLOAD as i64),
+            ],
+            |row| {
+                let payload_len = row.column_bytes(COL_PAYLOAD).unwrap_or(0);
+                let value = T::from_row(row)?;
+                Ok((value, Columns::memory_bytes_for_len(payload_len)))
+            },
+        )
+    }
+
     fn write<T: DiskValue>(
         &mut self,
         key: &Key,
         c: Columns<'_>,
+        partial_hash: Option<i64>,
         allow_eviction: bool,
     ) -> Result<()> {
         // Reject unbounded records before eviction (normal analysis strings are tiny).
@@ -292,13 +361,13 @@ impl Store {
         {
             return Err(Error::InvalidQuery);
         }
-        if let Err(error) = self.insert::<T>(key, &c) {
+        if let Err(error) = self.insert::<T>(key, &c, partial_hash) {
             if !allow_eviction || !error.is_full() {
                 return Err(error);
             }
             // Also handles a larger replacement or another process filling our reserved room.
             self.make_room()?;
-            self.insert::<T>(key, &c)?;
+            self.insert::<T>(key, &c, partial_hash)?;
         }
         self.writes = self.writes.saturating_add(1);
         Ok(())
@@ -313,7 +382,12 @@ impl Store {
         Ok(())
     }
 
-    fn insert<T: DiskValue>(&self, key: &Key, c: &Columns<'_>) -> Result<()> {
+    fn insert<T: DiskValue>(
+        &self,
+        key: &Key,
+        c: &Columns<'_>,
+        partial_hash: Option<i64>,
+    ) -> Result<()> {
         let modified: &[u8] = &key.modified;
         self.insert_stmt.execute(&[
             &key.path,
@@ -332,6 +406,7 @@ impl Store {
             &c.pcm_hash,
             &c.sharpness,
             &c.payload,
+            &partial_hash,
         ])?;
         Ok(())
     }
@@ -425,6 +500,7 @@ pub(crate) trait DiskValue: Sized {
     const SLOT: i32;
     // Bump this family's version when its algorithm or payload changes.
     const VERSION: i32;
+    const CONTENT_REUSE: bool = false;
     fn from_row(row: &Row<'_>) -> Result<Self>;
     fn columns(&self) -> Option<Columns<'_>>;
 }
@@ -432,6 +508,7 @@ pub(crate) trait DiskValue: Sized {
 impl DiskValue for CachedMedia {
     const SLOT: i32 = 0;
     const VERSION: i32 = 1;
+    const CONTENT_REUSE: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         Ok(match r.get::<i32>(COL_KIND)? {
@@ -489,6 +566,7 @@ impl DiskValue for CachedMedia {
 impl DiskValue for AudioAnalysis {
     const SLOT: i32 = 10;
     const VERSION: i32 = 1;
+    const CONTENT_REUSE: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -515,6 +593,7 @@ impl DiskValue for AudioAnalysis {
 impl DiskValue for AudioFastFingerprint {
     const SLOT: i32 = 11;
     const VERSION: i32 = 1;
+    const CONTENT_REUSE: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -542,6 +621,7 @@ impl DiskValue for AudioFastFingerprint {
 impl DiskValue for AudioDuration {
     const SLOT: i32 = 12;
     const VERSION: i32 = 1;
+    const CONTENT_REUSE: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -559,9 +639,30 @@ impl DiskValue for AudioDuration {
     }
 }
 
+impl DiskValue for PartialHash {
+    const SLOT: i32 = 13;
+    const VERSION: i32 = 1;
+
+    fn from_row(r: &Row<'_>) -> Result<Self> {
+        if r.get::<i32>(COL_KIND)? != Self::SLOT {
+            return Err(Error::TypeMismatch);
+        }
+        Ok(Self(r.get::<i64>(COL_HASH_A)? as u64))
+    }
+
+    fn columns(&self) -> Option<Columns<'_>> {
+        Some(Columns {
+            kind: Self::SLOT,
+            hash_a: Some(self.0 as i64),
+            ..Columns::default()
+        })
+    }
+}
+
 impl DiskValue for u32 {
     const SLOT: i32 = 1;
     const VERSION: i32 = 1;
+    const CONTENT_REUSE: bool = true;
 
     fn from_row(r: &Row<'_>) -> Result<Self> {
         if r.get::<i32>(COL_KIND)? != Self::SLOT {
@@ -615,12 +716,13 @@ macro_rules! metadata {
 metadata!(crate::exif::ExifInfo, 2, 1);
 #[cfg(feature = "tags")]
 metadata!(crate::audio_tags::AudioTags, 3, 1);
-metadata!(crate::video_frame::VideoMeta, 4, 1);
+metadata!(crate::video_frame::VideoMeta, 4, 2);
 metadata!(crate::mf_audio::AudioStreamMeta, 5, 1);
-metadata!(crate::video_tags::VideoTags, 6, 1);
+metadata!(crate::video_tags::VideoTags, 6, 2);
 metadata!((u32, u32), 7, 1);
 metadata!(crate::image_decode::PixelFormat, 8, 1);
 metadata!(Vec<crate::wic_decode::TiffPage>, 9, 1);
+metadata!(crate::image_meta::ImageExtraMeta, 14, 1);
 
 fn write_json_str(out: &mut String, s: &str) {
     out.push('"');
@@ -1196,6 +1298,9 @@ impl JsonCodec for crate::video_frame::VideoMeta {
         w.u32_opt("audio_sample_rate", self.audio_sample_rate);
         w.u32_opt("rotation", self.rotation);
         w.str_opt("dynamic_range", self.dynamic_range);
+        w.str_opt("container", self.container.as_deref());
+        w.u32_opt("audio_streams", self.audio_streams);
+        w.str_opt("audio_lang", self.audio_lang.as_deref());
         Some(w.finish())
     }
 
@@ -1220,6 +1325,9 @@ impl JsonCodec for crate::video_frame::VideoMeta {
                         None => None,
                     };
                 }
+                "container" => v.container = p.parse_opt(JsonParser::parse_str)?,
+                "audio_streams" => v.audio_streams = p.parse_opt(JsonParser::parse_u32)?,
+                "audio_lang" => v.audio_lang = p.parse_opt(JsonParser::parse_str)?,
                 _ => p.skip_value()?,
             }
             Some(())
@@ -1275,6 +1383,8 @@ impl JsonCodec for crate::video_tags::VideoTags {
         w.str_opt("genre", self.genre.as_deref());
         w.str_opt("comment", self.comment.as_deref());
         w.u64_opt("transfer", self.transfer);
+        w.u32_opt("audio_streams", self.audio_streams);
+        w.str_opt("audio_lang", self.audio_lang.as_deref());
         w.key("chapters");
         w.buf.push('[');
         for (i, (time, name)) in self.chapters.iter().enumerate() {
@@ -1304,6 +1414,8 @@ impl JsonCodec for crate::video_tags::VideoTags {
                 "genre" => v.genre = p.parse_opt(JsonParser::parse_str)?,
                 "comment" => v.comment = p.parse_opt(JsonParser::parse_str)?,
                 "transfer" => v.transfer = p.parse_opt(JsonParser::parse_u64)?,
+                "audio_streams" => v.audio_streams = p.parse_opt(JsonParser::parse_u32)?,
+                "audio_lang" => v.audio_lang = p.parse_opt(JsonParser::parse_str)?,
                 "chapters" => {
                     let mut chapters = Vec::new();
                     p.parse_arr(|p| {
@@ -1380,6 +1492,30 @@ impl JsonCodec for crate::image_decode::PixelFormat {
             channels: ch,
             alpha,
         })
+    }
+}
+
+impl JsonCodec for crate::image_meta::ImageExtraMeta {
+    fn to_json(&self) -> Option<String> {
+        let mut w = ObjWriter::new();
+        w.u32_opt("dpi", self.dpi);
+        w.str_opt("ai_parameters", self.ai_parameters.as_deref());
+        Some(w.finish())
+    }
+
+    fn from_json(s: &str) -> Option<Self> {
+        let mut v = Self::default();
+        let mut p = JsonParser::new(s);
+        p.parse_obj(|k, p| {
+            match k {
+                "dpi" => v.dpi = p.parse_opt(JsonParser::parse_u32)?,
+                "ai_parameters" => v.ai_parameters = p.parse_opt(JsonParser::parse_str)?,
+                _ => p.skip_value()?,
+            }
+            Some(())
+        })?;
+        p.finish()?;
+        Some(v)
     }
 }
 
@@ -1463,7 +1599,7 @@ mod tests {
 
     fn put<T: DiskValue>(store: &mut Store, key: &Key, value: &T) {
         store
-            .write::<T>(key, value.columns().unwrap(), true)
+            .write::<T>(key, value.columns().unwrap(), None, true)
             .unwrap();
     }
 
@@ -1514,6 +1650,9 @@ mod tests {
                 audio_sample_rate: Some(48000),
                 rotation: Some(90),
                 dynamic_range: Some("HDR10"),
+                container: Some("Matroska".into()),
+                audio_streams: Some(2),
+                audio_lang: Some("eng".into()),
             },
         );
         roundtrip(
@@ -1539,6 +1678,8 @@ mod tests {
                 comment: Some("Text\nline".into()),
                 transfer: Some(u64::MAX),
                 chapters: vec![(0.0, "Старт".into()), (60.125, "".into())],
+                audio_streams: Some(2),
+                audio_lang: Some("rus".into()),
             },
         );
         roundtrip(&fixture, &(6000u32, 4000u32));
@@ -1621,7 +1762,7 @@ mod tests {
         // Simulate a second opener that already saw version zero before the first committed.
         let mut other = Connection::open(fixture.path()).unwrap();
         Store::create_schema(&mut other).unwrap();
-        assert_eq!(other.pragma_query_i64("user_version").unwrap(), 1);
+        assert_eq!(other.pragma_query_i64("user_version").unwrap(), SCHEMA_VERSION);
         let reopened = Store::open(&fixture.path()).unwrap();
         assert_eq!(reopened.read::<u32>(&fixture.key()).unwrap(), 42);
     }
@@ -1784,7 +1925,7 @@ mod tests {
         other.execute_batch("BEGIN IMMEDIATE").unwrap();
         let start = Instant::now();
         assert!(store
-            .write::<u32>(&key, 43u32.columns().unwrap(), true)
+            .write::<u32>(&key, 43u32.columns().unwrap(), None, true)
             .is_err());
         assert!(start.elapsed() < Duration::from_millis(500));
         assert_eq!(store.read::<u32>(&key).unwrap(), 42);
@@ -1825,7 +1966,7 @@ mod tests {
         for i in 0u32..150 {
             key.path = i.to_le_bytes().to_vec();
             if store
-                .write::<crate::exif::ExifInfo>(&key, tags.columns().unwrap(), false)
+                .write::<crate::exif::ExifInfo>(&key, tags.columns().unwrap(), None, false)
                 .is_err()
             {
                 failed = true;
@@ -1854,7 +1995,7 @@ mod tests {
         let mut next = fixture.key();
         next.path.push(1);
         store
-            .write::<u32>(&next, 43u32.columns().unwrap(), false)
+            .write::<u32>(&next, 43u32.columns().unwrap(), None, false)
             .unwrap();
         assert_eq!(store.read::<u32>(&next).unwrap(), 43);
         assert_eq!(store.read::<u32>(&key).unwrap(), 42);
@@ -1898,7 +2039,7 @@ mod tests {
         );
         let unknown = fixture.0.join("future.sqlite3");
         let db = Connection::open(&unknown).unwrap();
-        for version in [2, 99] {
+        for version in [SCHEMA_VERSION + 1, 99] {
             db.pragma_update_i64("user_version", version).unwrap();
             assert!(Store::open(&unknown).is_err());
             assert_eq!(db.pragma_query_i64("user_version").unwrap(), version);
@@ -1943,7 +2084,7 @@ mod tests {
             fingerprint: None,
         };
         assert!(store
-            .write::<AudioAnalysis>(&key, value.columns().unwrap(), true)
+            .write::<AudioAnalysis>(&key, value.columns().unwrap(), None, true)
             .is_err());
         assert_eq!(store.read::<u32>(&key).unwrap(), 8999);
     }
@@ -1957,5 +2098,59 @@ mod tests {
         key.modified = Some(UNIX_EPOCH);
         key.path = "relative.jpg".into();
         assert!(Key::new(&key).is_none());
+    }
+
+    #[test]
+    fn v1_database_migrates_to_v2_and_reuses_content_by_partial_hash() {
+        let fixture = Fixture::new();
+        let key1 = fixture.key();
+        let db = Connection::open(&fixture.path()).unwrap();
+        db.execute_batch(
+            "CREATE TABLE entries (
+                path BLOB NOT NULL, slot INTEGER NOT NULL,
+                size INTEGER NOT NULL, modified BLOB NOT NULL, version INTEGER NOT NULL,
+                kind INTEGER NOT NULL, width INTEGER, height INTEGER, duration INTEGER,
+                hash_a INTEGER, hash_b INTEGER, coarse INTEGER,
+                fingerprint TEXT, pcm_hash TEXT, sharpness INTEGER, payload TEXT,
+                PRIMARY KEY(path, slot)
+             );
+             PRAGMA user_version=1;",
+        )
+        .unwrap();
+        let mod_bytes: &[u8] = &key1.modified;
+        db.execute(
+            "INSERT INTO entries (path, slot, size, modified, version, kind, sharpness)
+             VALUES (?1, 1, ?2, ?3, 1, 1, 777)",
+            &[&key1.path, &key1.size, &mod_bytes],
+        )
+        .unwrap();
+        drop(db);
+
+        let mut store = Store::open(&fixture.path()).unwrap();
+        assert_eq!(
+            store.db.pragma_query_i64("user_version").unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(store.read::<u32>(&key1).unwrap(), 777);
+
+        let ph = 0x1234_5678_9ABC_DEF0u64 as i64;
+        let analysis = CachedMedia::Image(Arc::new(ImageAnalysis {
+            width: 800,
+            height: 600,
+            dhash: 0xAAAA,
+            phash: 0xBBBB,
+            coarse_hash: 0xCCCC,
+        }));
+        store
+            .write::<CachedMedia>(&key1, analysis.columns().unwrap(), Some(ph), true)
+            .unwrap();
+
+        let (reused, _) = store
+            .read_by_content_with_weight::<CachedMedia>(key1.size, ph)
+            .unwrap();
+        assert!(matches!(reused, CachedMedia::Image(_)));
+        assert!(store
+            .read_by_content_with_weight::<CachedMedia>(key1.size + 1, ph)
+            .is_err());
     }
 }

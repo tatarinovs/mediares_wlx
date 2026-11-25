@@ -17,8 +17,8 @@ use windows::Win32::Graphics::Gdi::{
     DT_SINGLELINE, DT_VCENTER, HBRUSH, PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetWindowLongPtrW, PostMessageW,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, GWLP_USERDATA, HWND_TOPMOST, MA_NOACTIVATE,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, PostMessageW,
+    SetWindowPos, ShowWindow, GWLP_USERDATA, HWND_TOPMOST, MA_NOACTIVATE,
     SWP_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_APP, WM_ERASEBKGND, WM_MOUSEACTIVATE,
     WM_NCDESTROY, WM_PAINT, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
@@ -108,7 +108,7 @@ impl SeekPreview {
             font: Some(gdi::create_font("Segoe UI", -px(13.0), true)),
             ..Popup::default()
         });
-        SetWindowLongPtrW(popup, GWLP_USERDATA, Box::into_raw(data) as isize);
+        crate::set_window_long_ptr(popup, GWLP_USERDATA, Box::into_raw(data) as isize);
 
         let shared = Arc::new(Shared {
             exchange: Mutex::new(Exchange::default()),
@@ -268,7 +268,7 @@ fn grab_loop(path: &Path, fit: (u32, u32), shared: &Shared, viewer: isize, token
 }
 
 unsafe fn popup_data<'a>(popup: HWND) -> Option<&'a mut Popup> {
-    (GetWindowLongPtrW(popup, GWLP_USERDATA) as *mut Popup).as_mut()
+    (crate::get_window_long_ptr(popup, GWLP_USERDATA) as *mut Popup).as_mut()
 }
 
 unsafe fn register_class() {
@@ -298,7 +298,7 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                let data = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut Popup;
+                let data = crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0) as *mut Popup;
                 if !data.is_null() {
                     drop(Box::from_raw(data));
                 }

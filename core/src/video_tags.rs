@@ -19,6 +19,8 @@ pub struct VideoTags {
     pub transfer: Option<u64>,
     /// Chapters: start in seconds and name (may be empty), in order.
     pub chapters: Vec<(f64, String)>,
+    pub audio_streams: Option<u32>,
+    pub audio_lang: Option<String>,
 }
 
 impl VideoTags {
@@ -156,8 +158,55 @@ fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
     }
     let (_, moov_start, moov_end) = *top.iter().find(|(kind, _, _)| kind == b"moov")?;
     let mut tags = VideoTags::default();
+    let moov_children = mp4_boxes(r, moov_start, moov_end)?;
+    let mut audio_streams = 0u32;
+    let mut audio_lang = None;
+    for (_, trak_start, trak_end) in moov_children
+        .iter()
+        .copied()
+        .filter(|(kind, _, _)| kind == b"trak")
+    {
+        let Some(trak_boxes) = mp4_boxes(r, trak_start, trak_end) else {
+            continue;
+        };
+        let Some((_, mdia_start, mdia_end)) =
+            trak_boxes.into_iter().find(|(kind, _, _)| kind == b"mdia")
+        else {
+            continue;
+        };
+        let Some(mdia_boxes) = mp4_boxes(r, mdia_start, mdia_end) else {
+            continue;
+        };
+        let mut is_audio = false;
+        let mut mdhd_lang = None;
+        for (kind, s, e) in mdia_boxes {
+            if kind == *b"hdlr" && e - s <= 4096 {
+                let mut hdlr = vec![0u8; (e - s) as usize];
+                if r.seek(SeekFrom::Start(s)).is_ok() && r.read_exact(&mut hdlr).is_ok() {
+                    if hdlr.get(8..12) == Some(b"soun") {
+                        is_audio = true;
+                    }
+                }
+            } else if kind == *b"mdhd" && e - s <= 256 {
+                let mut mdhd = vec![0u8; (e - s) as usize];
+                if r.seek(SeekFrom::Start(s)).is_ok() && r.read_exact(&mut mdhd).is_ok() {
+                    mdhd_lang = parse_mp4_mdhd_lang(&mdhd);
+                }
+            }
+        }
+        if is_audio {
+            audio_streams += 1;
+            if audio_lang.is_none() {
+                audio_lang = mdhd_lang;
+            }
+        }
+    }
+    if audio_streams > 0 {
+        tags.audio_streams = Some(audio_streams);
+    }
+    tags.audio_lang = audio_lang;
     // Only the movie's own udta; tracks may have theirs, about the track.
-    for (_, start, end) in mp4_boxes(r, moov_start, moov_end)?
+    for (_, start, end) in moov_children
         .into_iter()
         .filter(|(kind, _, _)| kind == b"udta")
     {
@@ -170,6 +219,24 @@ fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         parse_udta(&udta, &mut tags);
     }
     Some(tags)
+}
+
+fn parse_mp4_mdhd_lang(mdhd: &[u8]) -> Option<String> {
+    let version = *mdhd.first()?;
+    let off = match version {
+        0 => 20,
+        1 => 32,
+        _ => return None,
+    };
+    let packed = u16::from_be_bytes(mdhd.get(off..off + 2)?.try_into().ok()?);
+    let c1 = ((packed >> 10) & 0x1F) as u8;
+    let c2 = ((packed >> 5) & 0x1F) as u8;
+    let c3 = (packed & 0x1F) as u8;
+    if !(1..=26).contains(&c1) || !(1..=26).contains(&c2) || !(1..=26).contains(&c3) {
+        return None;
+    }
+    let s = String::from_utf8(vec![c1 + 0x60, c2 + 0x60, c3 + 0x60]).ok()?;
+    (s != "und").then_some(s)
 }
 
 /// `udta` holds iTunes-style `meta/ilst` items, QuickTime `©xxx` text atoms, or 3GPP `titl`/`auth`...
@@ -305,6 +372,9 @@ const TRACKS: u32 = 0x1654_AE6B;
 const TRACK_ENTRY: u32 = 0xAE;
 const TRACK_TYPE: u32 = 0x83;
 const VIDEO_TRACK: u64 = 1;
+const AUDIO_TRACK: u64 = 2;
+const MKV_LANGUAGE: u32 = 0x22_B59C;
+const MKV_LANGUAGE_IETF: u32 = 0x22_B59D;
 const VIDEO: u32 = 0xE0;
 const COLOUR: u32 = 0x55B0;
 const TRANSFER_CHARACTERISTICS: u32 = 0x55BA;
@@ -469,7 +539,7 @@ fn parse_element(id: u32, data: &[u8], tags: &mut VideoTags) {
     }
 }
 
-/// The transfer characteristics of the first video track.
+/// The transfer characteristics of the first video track, plus audio track count and language.
 fn parse_tracks(data: &[u8], tags: &mut VideoTags) {
     let video = children(data)
         .filter(|(id, _)| *id == TRACK_ENTRY)
@@ -485,6 +555,32 @@ fn parse_tracks(data: &[u8], tags: &mut VideoTags) {
         .flat_map(|(_, colour)| children(colour))
         .find(|(id, _)| *id == TRANSFER_CHARACTERISTICS)
         .map(|(_, v)| uint(v));
+
+    let mut audio_streams = 0u32;
+    let mut audio_lang = None;
+    for (_, entry) in children(data).filter(|(id, _)| *id == TRACK_ENTRY) {
+        if !children(entry).any(|(id, v)| id == TRACK_TYPE && uint(v) == AUDIO_TRACK) {
+            continue;
+        }
+        audio_streams += 1;
+        if audio_lang.is_none() {
+            let lang = children(entry)
+                .find(|(id, _)| *id == MKV_LANGUAGE_IETF)
+                .and_then(|(_, d)| utf8(d))
+                .or_else(|| {
+                    children(entry)
+                        .find(|(id, _)| *id == MKV_LANGUAGE)
+                        .and_then(|(_, d)| utf8(d))
+                });
+            audio_lang = lang.filter(|l| !l.eq_ignore_ascii_case("und"));
+        }
+    }
+    if audio_streams > 0 {
+        tags.audio_streams = Some(audio_streams);
+    }
+    if audio_lang.is_some() {
+        tags.audio_lang = audio_lang;
+    }
 }
 
 /// The chapters of the first edition that isn't hidden (top-level atoms only).
@@ -866,5 +962,66 @@ mod tests {
         );
         assert_eq!(read_matroska(&mut Cursor::new(Vec::new())), None);
         assert_eq!(read_mp4(&mut Cursor::new(b"RIFF....AVI ".to_vec())), None);
+    }
+
+    #[test]
+    fn matroska_and_mp4_audio_streams_and_language() {
+        let mkv = file(&cat(&[
+            el(
+                TRACKS,
+                &cat(&[
+                    el(TRACK_ENTRY, &el(TRACK_TYPE, &[1])),
+                    el(
+                        TRACK_ENTRY,
+                        &cat(&[
+                            el(TRACK_TYPE, &[2]),
+                            el(MKV_LANGUAGE, b"rus"),
+                        ]),
+                    ),
+                    el(
+                        TRACK_ENTRY,
+                        &cat(&[
+                            el(TRACK_TYPE, &[2]),
+                            el(MKV_LANGUAGE, b"eng"),
+                        ]),
+                    ),
+                ]),
+            ),
+            el(CLUSTER, &[0; 8]),
+        ]));
+        let mkv_tags = read_matroska(&mut Cursor::new(mkv)).unwrap();
+        assert_eq!(mkv_tags.audio_streams, Some(2));
+        assert_eq!(mkv_tags.audio_lang.as_deref(), Some("rus"));
+
+        // MP4 with two audio tracks: first "eng" (0x15c7), second "jpn"
+        let audio_trak = |lang_bits: u16| {
+            let mut mdhd = vec![0u8; 24];
+            mdhd[20..22].copy_from_slice(&lang_bits.to_be_bytes());
+            let mut hdlr = vec![0u8; 12];
+            hdlr[8..12].copy_from_slice(b"soun");
+            mp4_box(
+                b"trak",
+                &mp4_box(
+                    b"mdia",
+                    &cat(&[mp4_box(b"mdhd", &mdhd), mp4_box(b"hdlr", &hdlr)]),
+                ),
+            )
+        };
+        let eng_bits: u16 = ((b'e' - 0x60) as u16) << 10
+            | ((b'n' - 0x60) as u16) << 5
+            | ((b'g' - 0x60) as u16);
+        let jpn_bits: u16 = ((b'j' - 0x60) as u16) << 10
+            | ((b'p' - 0x60) as u16) << 5
+            | ((b'n' - 0x60) as u16);
+        let mp4 = cat(&[
+            mp4_box(b"ftyp", b"isom"),
+            mp4_box(
+                b"moov",
+                &cat(&[audio_trak(eng_bits), audio_trak(jpn_bits)]),
+            ),
+        ]);
+        let mp4_tags = read_mp4(&mut Cursor::new(mp4)).unwrap();
+        assert_eq!(mp4_tags.audio_streams, Some(2));
+        assert_eq!(mp4_tags.audio_lang.as_deref(), Some("eng"));
     }
 }

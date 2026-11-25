@@ -231,8 +231,10 @@ Audio_Duration_Sec измеряет декодированный поток; Aud
 размеры и формат пикселей изображений, список страниц TIFF. Данные
 сохраняются по мере обращения; обложки и тексты песен в базу не пишутся.
 Изменение размера, даты файла или версии алгоритма вызывает повторное
-чтение. После переименования файл также читается заново. Изменение
-содержимого с сохранением размера и даты определить нельзя.
+чтение. После переименования или перемещения файла тяжёлые отпечатки
+(хеши изображений, отпечатки видео и аудио, резкость) переиспользуются
+из кэша по размеру и быстрому частичному хешу начала и конца файла.
+Изменение содержимого с сохранением размера и даты определить нельзя.
 
 Кэш включён по умолчанию. Основная база ограничена 256 МиБ. В фоне
 плагин поддерживает около 500 тысяч записей, удаляя самые старые.
@@ -258,8 +260,15 @@ TC; вместо off можно указать абсолютный путь к 
 
 [Settings]
 PrefetchThreads=4
+PrefetchRemote=0
+PrefetchRemovable=1
 
-0 отключает прогрев, 1–16 задают число потоков (с учётом числа CPU).
+0 отключает прогрев, 1–16 задают число потоков (с учётом числа CPU;
+в 32-битной версии — до 4 потоков).
+PrefetchRemote=0 (по умолчанию) отключает фоновый прогрев на сетевых
+дисках и UNC-путях (1 — разрешает, в 1 поток).
+PrefetchRemovable=1 (по умолчанию) разрешает прогрев на съёмных дисках
+в 1 поток (0 — отключает).
 Без ключа число потоков определяется автоматически. После изменения
 перезапустите TC. Используется существующий INI рядом с DLL, иначе —
 mediares.ini в папке настроек TC. Сохранение через GUI сохраняет этот ключ.
@@ -347,6 +356,8 @@ Total Commander умеет искать дубликаты по полю пла�
   Image_dHash, Image_pHash, Image_CoarseHash
   Video_Fingerprint, Video_dHash_Mid
   Audio_Fingerprint, Audio_Fast_Fingerprint, Audio_PCM_Hash, Audio_Artist_Title
+  File_Partial_Hash     Быстрый 64-битный хеш (размер + первые и последние 64 КБ)
+                        для мгновенного поиска точных копий крупных файлов
 
 Общие:
   Media_Type            Тип файла: Image, Video или Audio
@@ -356,11 +367,14 @@ Total Commander умеет искать дубликаты по полю пла�
   Image_Width, Image_Height      Ширина и высота в пикселях
   Image_Megapixels               Число пикселей в миллионах (ширина x высота / 1000000)
   Image_Dimensions               Размер строкой: 6000x4000
-  Image_AspectRatio              Пропорции: 3:2, 16:9, 4:3...
+  Image_AspectRatio              Пропорции (Ratio 3:2, 16:9 | Decimal 1.500)
+  Image_Orientation              Ориентация (Text: Landscape/Portrait/Square | Short: H/V/S | Angle | EXIF)
   Image_Bit_Depth                Бит на канал: 8, 16 у 16-битных PNG/TIFF, 10-12 у HDR HEIC/AVIF
   Image_Has_Alpha                Есть ли канал прозрачности (PNG, WebP, TIFF...)
   Image_Sharpness                Резкость кадра (дисперсия лапласиана): сортировка находит
                                  смазанные и нерезкие снимки одной съёмки (отложенное)
+  Image_DPI                      Разрешение печати, DPI (из EXIF, JFIF или PNG pHYs)
+  Image_AI_Parameters            Параметры генерации AI (PNG tEXt/zTXt/iTXt, JPEG UserComment/COM)
   Photo_Make, Photo_Model        Производитель и модель камеры
   Photo_Lens                     Объектив
   Photo_Date_Taken               Дата и время съёмки
@@ -374,6 +388,7 @@ Total Commander умеет искать дубликаты по полю пла�
   Photo_Software                 Программа, сохранившая файл
   Photo_GPS_Latitude             Широта в градусах
   Photo_GPS_Longitude            Долгота в градусах
+  Photo_GPS                      Координаты строкой (Decimal | DMS | DMM)
   Photo_Has_GPS                  Есть ли координаты
 
 Видео:
@@ -381,14 +396,19 @@ Total Commander умеет искать дубликаты по полю пла�
   Video_Length                   Длительность ч:мм:сс
   Video_Width, Video_Height      Ширина и высота кадра
   Video_Dimensions               Размер строкой: 1920x1080
+  Video_Orientation              Ориентация (Text: Landscape/Portrait/Square | Short: H/V/S | Angle)
   Video_Frame_Rate               Кадров в секунду
   Video_Codec                    Кодек видео: H.264, HEVC, AV1...
+  Video_Container                Контейнер: MP4, Matroska, WebM, AVI, MOV...
   Video_HDR                      Динамический диапазон: HDR10 (PQ), HLG или SDR
   Video_Rotation                 Поворот при показе по часовой стрелке (видео с телефона): 0, 90...
   Video_Bitrate_kbps             Битрейт, кбит/с
   Video_Audio_Codec              Кодек звука: AAC, AC-3...
   Video_Audio_Channels           Число каналов звука
   Video_Audio_Sample_Rate_Hz     Частота звука, Гц
+  Video_Audio_Streams            Количество аудиодорожек
+  Video_Audio_Lang               Язык первой аудиодорожки
+  Video_Summary                  Краткая сводка видео и звука одной строкой
   Video_Title                    Название
   Video_Artist, Video_Director   Автор, режиссёр
   Video_Date, Video_Year         Дата и год
@@ -415,6 +435,7 @@ Total Commander умеет искать дубликаты по полю пла�
   Audio_Sample_Rate_Hz           Частота, Гц
   Audio_Channels                 Число каналов
   Audio_Bit_Depth                Разрядность, бит
+  Audio_Summary                  Краткая сводка аудиопотока одной строкой
 
 Русские названия в тегах, записанные в старой кодировке, показываются
 правильно.

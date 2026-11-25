@@ -63,6 +63,31 @@ pub(crate) fn module() -> HINSTANCE {
     HINSTANCE(MODULE.load(Ordering::Relaxed))
 }
 
+#[inline]
+pub(crate) unsafe fn get_window_long_ptr(
+    hwnd: HWND,
+    index: windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX,
+) -> isize {
+    windows::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(hwnd, index) as isize
+}
+
+#[inline]
+pub(crate) unsafe fn set_window_long_ptr(
+    hwnd: HWND,
+    index: windows::Win32::UI::WindowsAndMessaging::WINDOW_LONG_PTR_INDEX,
+    value: isize,
+) -> isize {
+    #[cfg(target_pointer_width = "32")]
+    {
+        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(hwnd, index, value as i32)
+            as isize
+    }
+    #[cfg(not(target_pointer_width = "32"))]
+    {
+        windows::Win32::UI::WindowsAndMessaging::SetWindowLongPtrW(hwnd, index, value)
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "system" fn DllMain(hinst: HMODULE, reason: u32, _reserved: *mut c_void) -> BOOL {
     if reason == DLL_PROCESS_ATTACH {

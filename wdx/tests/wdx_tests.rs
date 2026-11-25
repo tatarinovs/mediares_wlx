@@ -5,13 +5,22 @@ use std::path::PathBuf;
 
 /// Name and type of the field at `index`; `None` past the end.
 fn field_info(index: i32) -> Option<(String, i32)> {
+    field_info_with_units(index).map(|(name, kind, _)| (name, kind))
+}
+
+fn field_info_with_units(index: i32) -> Option<(String, i32, String)> {
     let mut name = [0 as c_char; 128];
     let mut units = [0 as c_char; 128];
     let kind =
         unsafe { ContentGetSupportedField(index, name.as_mut_ptr(), units.as_mut_ptr(), 128) };
     (kind != FT_NOMOREFIELDS).then(|| {
         let name = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) };
-        (name.to_str().unwrap().to_string(), kind)
+        let units = unsafe { std::ffi::CStr::from_ptr(units.as_ptr()) };
+        (
+            name.to_str().unwrap().to_string(),
+            kind,
+            units.to_str().unwrap().to_string(),
+        )
     })
 }
 
@@ -27,7 +36,7 @@ fn field(name: &str) -> i32 {
 #[test]
 fn test_supported_fields_enumeration() {
     let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
-    assert_eq!(fields.len(), 76);
+    assert_eq!(fields.len(), 87);
     let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     // Hashes for duplicate search come first.
     assert_eq!(
@@ -46,7 +55,7 @@ fn test_supported_fields_enumeration() {
     assert_eq!(names.last(), Some(&"Plugin_Version"));
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 76, "names are unique");
+    assert_eq!(names.len(), 87, "names are unique");
 
     for (name, kind) in [
         ("Image_dHash", FT_STRINGW),
@@ -979,4 +988,113 @@ fn replay_gain_is_a_numeric_tag_and_absent_tags_are_empty() {
     assert_eq!(read(), (FT_NUMERIC_FLOATING, -6.25));
     assert!(!mediares_core::cache::get_cache().is_cached(&path));
     std::fs::remove_file(path).unwrap();
+}
+
+#[test]
+fn test_units_partial_hash_image_extra_and_summaries() {
+    use std::os::windows::ffi::OsStrExt;
+    let dir = std::env::temp_dir().join(format!("mediares-wdx-new-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+
+    let units_of = |name: &str| field_info_with_units(field(name)).unwrap().2;
+    assert_eq!(units_of("Image_AspectRatio"), "Ratio|Decimal");
+    assert_eq!(units_of("Image_Orientation"), "Text|Short|Angle|EXIF");
+    assert_eq!(units_of("Video_Orientation"), "Text|Short|Angle");
+    assert_eq!(units_of("Photo_GPS"), "Decimal|DMS|DMM");
+
+    let read_w = |path: &std::path::Path, name: &str, unit: i32| -> (i32, String, i32) {
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain([0]).collect();
+        let mut buf = [0u16; 256];
+        let code = unsafe {
+            ContentGetValueW(
+                wide.as_ptr(),
+                field(name),
+                unit,
+                buf.as_mut_ptr().cast(),
+                512,
+                0,
+            )
+        };
+        let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+        let text = String::from_utf16_lossy(&buf[..end]);
+        let num = i32::from_le_bytes([
+            (buf[0] & 0xFF) as u8,
+            (buf[0] >> 8) as u8,
+            (buf[1] & 0xFF) as u8,
+            (buf[1] >> 8) as u8,
+        ]);
+        (code, text, num)
+    };
+
+    // Build a 160x90 PNG with pHYs (300 DPI) and tEXt parameters
+    let png_path = dir.join("ai.png");
+    let png_copy = dir.join("ai_copy.png");
+    {
+        let img = mediares_core::image::RgbImage::from_pixel(
+            160,
+            90,
+            mediares_core::image::Rgb([10, 20, 30]),
+        );
+        img.save(&png_path).unwrap();
+        let mut bytes = std::fs::read(&png_path).unwrap();
+        let insert_at = bytes.len() - 12; // before IEND
+        let mut extra = Vec::new();
+        let chunk = |tag: &[u8; 4], body: &[u8]| {
+            let mut c = Vec::new();
+            c.extend_from_slice(&(body.len() as u32).to_be_bytes());
+            c.extend_from_slice(tag);
+            c.extend_from_slice(body);
+            c.extend_from_slice(&[0; 4]);
+            c
+        };
+        let mut phys = Vec::new();
+        phys.extend_from_slice(&11811u32.to_be_bytes());
+        phys.extend_from_slice(&11811u32.to_be_bytes());
+        phys.push(1);
+        extra.extend_from_slice(&chunk(b"pHYs", &phys));
+        extra.extend_from_slice(&chunk(b"tEXt", b"parameters\0best quality, Steps: 25"));
+        bytes.splice(insert_at..insert_at, extra);
+        std::fs::write(&png_path, &bytes).unwrap();
+        std::fs::write(&png_copy, &bytes).unwrap();
+    }
+
+    assert_eq!(
+        read_w(&png_path, "Image_AspectRatio", 0).1,
+        "16:9"
+    );
+    assert_eq!(
+        read_w(&png_path, "Image_AspectRatio", 1).1,
+        "1.778"
+    );
+    assert_eq!(
+        read_w(&png_path, "Image_Orientation", 0).1,
+        "Landscape"
+    );
+    assert_eq!(read_w(&png_path, "Image_Orientation", 1).1, "H");
+    assert_eq!(read_w(&png_path, "Image_Orientation", 2).1, "0");
+    assert_eq!(read_w(&png_path, "Image_Orientation", 3).0, FT_FIELDEMPTY);
+    let (dpi_code, _, dpi_val) = read_w(&png_path, "Image_DPI", 0);
+    assert_eq!((dpi_code, dpi_val), (FT_NUMERIC_32, 300));
+    assert_eq!(
+        read_w(&png_path, "Image_AI_Parameters", 0).1,
+        "best quality, Steps: 25"
+    );
+
+    let (ph_code, ph1, _) = read_w(&png_path, "File_Partial_Hash", 0);
+    let (_, ph2, _) = read_w(&png_copy, "File_Partial_Hash", 0);
+    assert_eq!(ph_code, FT_STRINGW);
+    assert_eq!(ph1.len(), 16);
+    assert_eq!(ph1, ph2);
+
+    // WAV -> Audio_Summary
+    let wav_path = dir.join("tone.wav");
+    write_wav(&wav_path, 44100, 2, 0, 0.5);
+    let (sum_code, sum_text, _) = read_w(&wav_path, "Audio_Summary", 0);
+    assert_eq!(sum_code, FT_STRINGW);
+    assert!(
+        sum_text.contains("PCM") && sum_text.contains("44.1 kHz") && sum_text.contains("1ch"),
+        "unexpected Audio_Summary: {sum_text}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

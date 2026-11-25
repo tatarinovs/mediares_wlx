@@ -1,6 +1,8 @@
 //! Video metadata and keyframe hashing via Windows Media Foundation (IMFSourceReader); also the
 //! playability check for audio that only Media Foundation can decode.
 
+use std::fs::File;
+use std::io::Read;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
@@ -10,14 +12,14 @@ use windows::Win32::Media::MediaFoundation::{
     IMF2DBuffer2, IMFAttributes, IMFMediaBuffer, IMFMediaSource, IMFSample, IMFSourceReader,
     MF2DBuffer_LockFlags_Read, MFCreateAttributes, MFCreateMediaType,
     MFCreateSourceReaderFromMediaSource, MFCreateSourceReaderFromURL, MFCreateSourceResolver,
-    MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32, MF_E_UNSUPPORTED_BYTESTREAM_TYPE,
-    MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND, MF_MT_DEFAULT_STRIDE,
-    MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
-    MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_ROTATION, MF_OBJECT_INVALID, MF_PD_DURATION,
-    MF_RESOLUTION_MEDIASOURCE, MF_RESOLUTION_READ, MF_SOURCE_READERF_ENDOFSTREAM,
-    MF_SOURCE_READER_ALL_STREAMS, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING,
-    MF_SOURCE_READER_FIRST_AUDIO_STREAM, MF_SOURCE_READER_FIRST_VIDEO_STREAM,
-    MF_SOURCE_READER_MEDIASOURCE,
+    MFMediaType_Audio, MFMediaType_Video, MFVideoFormat_NV12, MFVideoFormat_RGB32,
+    MF_E_UNSUPPORTED_BYTESTREAM_TYPE, MF_MT_AUDIO_NUM_CHANNELS, MF_MT_AUDIO_SAMPLES_PER_SECOND,
+    MF_MT_DEFAULT_STRIDE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE, MF_MT_MAJOR_TYPE,
+    MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE, MF_MT_TRANSFER_FUNCTION, MF_MT_VIDEO_ROTATION,
+    MF_OBJECT_INVALID, MF_PD_DURATION, MF_RESOLUTION_MEDIASOURCE, MF_RESOLUTION_READ,
+    MF_SD_LANGUAGE, MF_SOURCE_READERF_ENDOFSTREAM, MF_SOURCE_READER_ALL_STREAMS,
+    MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, MF_SOURCE_READER_FIRST_AUDIO_STREAM,
+    MF_SOURCE_READER_FIRST_VIDEO_STREAM, MF_SOURCE_READER_MEDIASOURCE,
 };
 use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
 use windows::Win32::System::Variant::VT_I8;
@@ -66,6 +68,63 @@ pub struct VideoMeta {
     /// "HDR10" (PQ) or "HLG" for high dynamic range video, "SDR" otherwise; `None` if the stream
     /// doesn't say.
     pub dynamic_range: Option<crate::disk_cache::StaticName>,
+    pub container: Option<String>,
+    pub audio_streams: Option<u32>,
+    pub audio_lang: Option<String>,
+}
+
+/// Detects container format from header magic bytes, falling back to uppercase extension.
+pub fn detect_video_container(path: &Path) -> Option<String> {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_uppercase());
+    let mut buf = [0u8; 200];
+    let n = File::open(path)
+        .and_then(|mut f| f.read(&mut buf))
+        .unwrap_or(0);
+    let head = &buf[..n];
+
+    if head.len() >= 12 && &head[4..8] == b"ftyp" {
+        let brand = &head[8..12];
+        if brand == b"qt  " {
+            return Some("QuickTime".into());
+        } else if brand.starts_with(b"3gp") || brand.starts_with(b"3g2") {
+            return Some("3GP".into());
+        } else if brand == b"M4V " {
+            return Some("M4V".into());
+        }
+        return Some("MP4".into());
+    }
+    if head.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]) {
+        return Some(if ext.as_deref() == Some("WEBM") {
+            "WebM".into()
+        } else {
+            "Matroska".into()
+        });
+    }
+    if head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"AVI " {
+        return Some("AVI".into());
+    }
+    if head.starts_with(&[0x30, 0x26, 0xB2, 0x75]) {
+        return Some(if ext.as_deref() == Some("WMV") {
+            "WMV".into()
+        } else {
+            "ASF".into()
+        });
+    }
+    if head.starts_with(b"FLV") {
+        return Some("FLV".into());
+    }
+    if (head.len() >= 189 && head[0] == 0x47 && head[188] == 0x47)
+        || (head.len() >= 197 && head[4] == 0x47 && head[196] == 0x47)
+    {
+        return Some("MPEG-TS".into());
+    }
+    if head.starts_with(&[0x00, 0x00, 0x01, 0xBA]) {
+        return Some("MPEG-PS".into());
+    }
+    ext
 }
 
 /// The dynamic range named by a stream's transfer function (`MFVideoTransferFunction`).
@@ -202,6 +261,29 @@ pub fn probe_video_source(path: &Path) -> Option<(VideoMeta, bool)> {
         let audio = reader
             .GetNativeMediaType(MF_SOURCE_READER_FIRST_AUDIO_STREAM.0 as u32, 0)
             .ok();
+        let mut audio_streams = 0u32;
+        let mut first_audio_idx = None;
+        for idx in 0u32..64 {
+            let Ok(mt) = reader.GetNativeMediaType(idx, 0) else {
+                break;
+            };
+            if mt.GetGUID(&MF_MT_MAJOR_TYPE).ok() == Some(MFMediaType_Audio) {
+                if first_audio_idx.is_none() {
+                    first_audio_idx = Some(idx);
+                }
+                audio_streams += 1;
+            }
+        }
+        let audio_lang = first_audio_idx.and_then(|idx| {
+            let pv = reader
+                .GetPresentationAttribute(idx, &MF_SD_LANGUAGE)
+                .ok()
+                .map(PropVariant)?;
+            let s = pv.string()?;
+            let trimmed = s.trim();
+            (!trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("und"))
+                .then(|| trimmed.to_string())
+        });
         let positive = |v: windows::core::Result<u32>| v.ok().filter(|&v| v > 0);
         let meta = VideoMeta {
             width: (frame_size >> 32) as u32,
@@ -232,6 +314,9 @@ pub fn probe_video_source(path: &Path) -> Option<(VideoMeta, bool)> {
                 .GetUINT32(&MF_MT_TRANSFER_FUNCTION)
                 .ok()
                 .and_then(dynamic_range_name),
+            container: detect_video_container(path),
+            audio_streams: Some(audio_streams),
+            audio_lang,
         };
         Some((meta, write_sharing))
     }

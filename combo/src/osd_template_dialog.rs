@@ -4,8 +4,8 @@ use windows::core::{w, HSTRING, PCWSTR};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetDlgItem, GetWindowLongPtrW,
-    GetWindowRect, SendDlgItemMessageW, SetDlgItemTextW, SetWindowLongPtrW, TrackPopupMenu,
+    AppendMenuW, CreatePopupMenu, DefWindowProcW, DestroyMenu, GetDlgItem,
+    GetWindowRect, SendDlgItemMessageW, SetDlgItemTextW, TrackPopupMenu,
     BS_DEFPUSHBUTTON, BS_PUSHBUTTON, ES_AUTOVSCROLL, ES_MULTILINE, GWLP_USERDATA, IDCANCEL, IDOK,
     MF_POPUP, MF_STRING, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_TOPALIGN, WM_CLOSE, WM_COMMAND,
     WM_NCDESTROY, WS_BORDER, WS_HSCROLL, WS_TABSTOP, WS_VSCROLL,
@@ -49,7 +49,7 @@ pub unsafe fn show(
         default,
         result: std::cell::RefCell::default(),
     }));
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
+    crate::set_window_long_ptr(dlg, GWLP_USERDATA, ctx as isize);
 
     let font = dialog::font(dlg, "Segoe UI", -12);
     let mono = dialog::font(dlg, "Consolas", -14);
@@ -185,7 +185,7 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
-        let Some(ctx) = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Context).as_ref() else {
+        let Some(ctx) = (crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *const Context).as_ref() else {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
         match msg {
@@ -219,7 +219,7 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

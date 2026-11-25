@@ -10,8 +10,8 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, VK_RETURN};
 use windows::Win32::UI::WindowsAndMessaging::{
-    DefWindowProcW, GetDlgItem, GetWindowLongPtrW, MessageBoxW, PostMessageW, PostThreadMessageW,
-    SetDlgItemTextW, SetWindowLongPtrW, ShowWindow, BS_DEFPUSHBUTTON, DC_HASDEFID, DM_GETDEFID,
+    DefWindowProcW, GetDlgItem, MessageBoxW, PostMessageW, PostThreadMessageW,
+    SetDlgItemTextW, ShowWindow, BS_DEFPUSHBUTTON, DC_HASDEFID, DM_GETDEFID,
     ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY, GWLP_USERDATA, IDCANCEL, IDOK, IDYES, MB_DEFBUTTON2,
     MB_ICONWARNING, MB_YESNO, SW_HIDE, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WS_BORDER, WS_TABSTOP,
     WS_VSCROLL,
@@ -151,7 +151,7 @@ unsafe fn show_with_reader(
         place: std::cell::Cell::new(None),
         cleared: std::cell::Cell::new(false),
     }));
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, data as isize);
+    crate::set_window_long_ptr(dlg, GWLP_USERDATA, data as isize);
 
     dialog::run_modal_with(dlg, close, |msg| {
         // The multiline EDIT claims Enter even when its contents are read-only.
@@ -350,14 +350,14 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_EXIF_READY => {
-                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Data;
+                let data = crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *const Data;
                 if let Some(data) = data.as_ref().filter(|data| data.token == wparam.0) {
                     show_metadata(hwnd, data);
                 }
                 LRESULT(0)
             }
             WM_COMMAND if id == IDC_OPEN_MAP || id == IDC_CLEAR => {
-                let data = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut Data;
+                let data = crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *mut Data;
                 if let Some(data) = data.as_ref() {
                     if id == IDC_CLEAR {
                         clear(hwnd, data);
@@ -368,7 +368,7 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             windows::Win32::UI::WindowsAndMessaging::WM_NCDESTROY => {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0);
                 // A sent message can destroy the window while GetMessageW waits for a post.
                 let _ = PostThreadMessageW(
                     GetCurrentThreadId(),

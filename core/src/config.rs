@@ -59,6 +59,9 @@ pub fn ini_path() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("mediares.ini"))
 }
 
+#[cfg(target_pointer_width = "32")]
+const MAX_PREFETCH_THREADS: usize = 4;
+#[cfg(not(target_pointer_width = "32"))]
 const MAX_PREFETCH_THREADS: usize = 16;
 
 pub(crate) fn default_prefetch_threads() -> usize {
@@ -72,6 +75,32 @@ pub(crate) fn prefetch_threads() -> usize {
 
 pub(crate) fn fixed_prefetch_threads() -> Option<usize> {
     read_prefetch_override(&ini_path())
+}
+
+pub(crate) fn prefetch_remote() -> bool {
+    read_bool_setting(&ini_path(), w!("PrefetchRemote"), false)
+}
+
+pub(crate) fn prefetch_removable() -> bool {
+    read_bool_setting(&ini_path(), w!("PrefetchRemovable"), true)
+}
+
+fn read_bool_setting(path: &Path, key: PCWSTR, default: bool) -> bool {
+    let mut buf = [0u16; 16];
+    let len = unsafe {
+        GetPrivateProfileStringW(
+            w!("Settings"),
+            key,
+            w!(""),
+            Some(&mut buf),
+            &HSTRING::from(path.as_os_str()),
+        )
+    };
+    match String::from_utf16_lossy(&buf[..len as usize]).trim() {
+        "1" => true,
+        "0" => false,
+        _ => default,
+    }
 }
 
 #[cfg(test)]
@@ -110,7 +139,7 @@ mod tests {
         for (i, (value, expected)) in [
             ("", default),
             ("PrefetchThreads=0", 0),
-            ("PrefetchThreads=7", 7),
+            ("PrefetchThreads=7", 7.min(MAX_PREFETCH_THREADS)),
             ("PrefetchThreads=99", MAX_PREFETCH_THREADS),
             ("PrefetchThreads=-1", default),
             ("PrefetchThreads=bad", default),
@@ -121,6 +150,36 @@ mod tests {
             let path = dir.join(format!("{i}.ini"));
             std::fs::write(&path, format!("[Settings]\r\n{value}\r\n")).unwrap();
             assert_eq!(read_prefetch_threads(&path), expected, "{value}");
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prefetch_drive_flags_default_and_parse_zero_one() {
+        let dir =
+            std::env::temp_dir().join(format!("mediares_prefetch_flags_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for (i, (body, exp_remote, exp_removable)) in [
+            ("", false, true),
+            ("PrefetchRemote=1\r\nPrefetchRemovable=0", true, false),
+            ("PrefetchRemote=0\r\nPrefetchRemovable=1", false, true),
+            ("PrefetchRemote=yes\r\nPrefetchRemovable=bad", false, true),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = dir.join(format!("{i}.ini"));
+            std::fs::write(&path, format!("[Settings]\r\n{body}\r\n")).unwrap();
+            assert_eq!(
+                read_bool_setting(&path, w!("PrefetchRemote"), false),
+                exp_remote,
+                "{body}"
+            );
+            assert_eq!(
+                read_bool_setting(&path, w!("PrefetchRemovable"), true),
+                exp_removable,
+                "{body}"
+            );
         }
         std::fs::remove_dir_all(dir).unwrap();
     }

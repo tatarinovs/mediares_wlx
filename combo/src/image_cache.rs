@@ -23,6 +23,9 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{PostMessageW, WM_APP};
 
 /// Upper bound for decoded pixels kept in memory (the image on screen is always kept).
+#[cfg(target_pointer_width = "32")]
+const CACHE_BUDGET_BYTES: usize = 128 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "32"))]
 const CACHE_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 const MAX_WORKERS: usize = 3;
 

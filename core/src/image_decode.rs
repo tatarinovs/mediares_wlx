@@ -16,6 +16,9 @@ use crate::probe::MediaType;
 /// Largest decoded image we accept (pixels). Bounds memory inside the host process.
 pub const MAX_PIXELS: u64 = 64_000_000;
 pub const MAX_DIMENSION: u32 = 16_384;
+#[cfg(target_pointer_width = "32")]
+const MAX_DECODER_ALLOC: u64 = 256 * 1024 * 1024;
+#[cfg(not(target_pointer_width = "32"))]
 const MAX_DECODER_ALLOC: u64 = 512 * 1024 * 1024;
 /// Encoded previews are bounded independently from their decoded dimensions.
 pub const MAX_ENCODED_BYTES: usize = 256 * 1024 * 1024;

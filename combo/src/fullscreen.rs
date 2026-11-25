@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::SetFocus;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, GetClientRect, GetWindowLongPtrW, SetForegroundWindow, SetParent,
-    SetWindowLongPtrW, SetWindowPos, GA_ROOT, GWLP_HWNDPARENT, GWL_STYLE, HWND_TOP,
+    GetAncestor, GetClientRect, SetForegroundWindow, SetParent,
+    SetWindowPos, GA_ROOT, GWLP_HWNDPARENT, GWL_STYLE, HWND_TOP,
     SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, WINDOWPOS, WS_CHILD,
     WS_POPUP,
 };
@@ -56,7 +56,7 @@ unsafe fn enter(state: &mut ViewerState) {
     let _ = SetParent(hwnd, None);
     set_style(hwnd, WS_POPUP.0, WS_CHILD.0);
     // Owned by the Lister: no taskbar button, closes with it, stays above it.
-    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, state.lister.0 as isize);
+    crate::set_window_long_ptr(hwnd, GWLP_HWNDPARENT, state.lister.0 as isize);
     let _ = SetWindowPos(
         hwnd,
         Some(HWND_TOP),
@@ -107,7 +107,7 @@ unsafe fn exit(state: &mut ViewerState) {
     // Unpin first so the moves below are not overridden.
     state.fullscreen = None;
     crate::window::pin_fullscreen(hwnd, None);
-    SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, 0);
+    crate::set_window_long_ptr(hwnd, GWLP_HWNDPARENT, 0);
     // Switch WS_POPUP -> WS_CHILD before re-parenting.
     set_style(hwnd, WS_CHILD.0, WS_POPUP.0);
     let _ = SetParent(hwnd, Some(state.lister));
@@ -161,6 +161,6 @@ pub(crate) fn pin_bounds(bounds: Option<RECT>, pos: &mut WINDOWPOS) {
 }
 
 unsafe fn set_style(hwnd: HWND, add: u32, remove: u32) {
-    let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
-    SetWindowLongPtrW(hwnd, GWL_STYLE, ((style & !remove) | add) as isize);
+    let style = crate::get_window_long_ptr(hwnd, GWL_STYLE) as u32;
+    crate::set_window_long_ptr(hwnd, GWL_STYLE, ((style & !remove) | add) as isize);
 }

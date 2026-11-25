@@ -29,9 +29,12 @@ pub fn reset_stop_flag() {
 pub(crate) enum Source {
     Constant,
     Probe,
+    PartialHash,
     Tags,
     Exif,
     ImageSize,
+    ImageOrientation,
+    ImageExtra,
     PixelFormat,
     Sharpness,
     VideoMeta,
@@ -64,12 +67,12 @@ impl Scope {
     }
 }
 
-// Name, ABI type, data source and applicable media kinds have one definition.
+// Name, ABI type, units, data source and applicable media kinds have one definition.
 macro_rules! fields {
-    ($( $field:ident, $name:literal, $kind:ident, $source:ident, $scope:ident; )*) => {
+    ($( $field:ident, $name:literal, $kind:ident, $units:literal, $source:ident, $scope:ident; )*) => {
         #[derive(Clone, Copy, PartialEq, Eq)]
         pub(crate) enum Field { $($field,)* }
-        const FIELDS: &[(Field, &str, c_int)] = &[$((Field::$field, $name, $kind),)*];
+        const FIELDS: &[(Field, &str, c_int, &str)] = &[$((Field::$field, $name, $kind, $units),)*];
         impl Field {
             pub(crate) fn source(self) -> Source { match self { $(Self::$field => Source::$source,)* } }
             pub(crate) fn applies_to(self, kind: MediaType) -> bool { match self { $(Self::$field => Scope::$scope.accepts(kind),)* } }
@@ -78,85 +81,96 @@ macro_rules! fields {
 }
 
 fields! {
-    ImageDHash, "Image_dHash", FT_STRINGW, Analysis, Image;
-    ImagePHash, "Image_pHash", FT_STRINGW, Analysis, Image;
-    ImageCoarseHash, "Image_CoarseHash", FT_STRINGW, Analysis, Image;
-    VideoFingerprint, "Video_Fingerprint", FT_STRINGW, Analysis, Video;
-    VideoDHashMid, "Video_dHash_Mid", FT_STRINGW, Analysis, Video;
-    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, AudioAnalysis, Audio;
-    AudioFastFingerprint, "Audio_Fast_Fingerprint", FT_STRINGW, AudioFastFingerprint, Audio;
-    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, AudioAnalysis, Audio;
-    MediaTypeName, "Media_Type", FT_STRINGW, Probe, Media;
-    ImageWidth, "Image_Width", FT_NUMERIC_32, ImageSize, Image;
-    ImageHeight, "Image_Height", FT_NUMERIC_32, ImageSize, Image;
-    ImageMegapixels, "Image_Megapixels", FT_NUMERIC_FLOATING, ImageSize, Image;
-    ImageDimensions, "Image_Dimensions", FT_STRINGW, ImageSize, Image;
-    ImageAspectRatio, "Image_AspectRatio", FT_STRINGW, ImageSize, Image;
-    ImageBitDepth, "Image_Bit_Depth", FT_NUMERIC_32, PixelFormat, StandardImage;
-    ImageHasAlpha, "Image_Has_Alpha", FT_BOOLEAN, PixelFormat, StandardImage;
-    ImageSharpness, "Image_Sharpness", FT_NUMERIC_32, Sharpness, Image;
-    PhotoMake, "Photo_Make", FT_STRINGW, Exif, Image;
-    PhotoModel, "Photo_Model", FT_STRINGW, Exif, Image;
-    PhotoLens, "Photo_Lens", FT_STRINGW, Exif, Image;
-    PhotoDateTaken, "Photo_Date_Taken", FT_DATETIME, Exif, Image;
-    PhotoExposure, "Photo_Exposure", FT_STRINGW, Exif, Image;
-    PhotoFNumber, "Photo_FNumber", FT_NUMERIC_FLOATING, Exif, Image;
-    PhotoIso, "Photo_ISO", FT_NUMERIC_32, Exif, Image;
-    PhotoFocalLength, "Photo_Focal_Length_mm", FT_NUMERIC_FLOATING, Exif, Image;
-    PhotoFocalLength35, "Photo_Focal_Length_35mm", FT_NUMERIC_32, Exif, Image;
-    PhotoFlash, "Photo_Flash", FT_BOOLEAN, Exif, Image;
-    PhotoOrientation, "Photo_Orientation", FT_NUMERIC_32, Exif, Image;
-    PhotoSoftware, "Photo_Software", FT_STRINGW, Exif, Image;
-    PhotoGpsLatitude, "Photo_GPS_Latitude", FT_NUMERIC_FLOATING, Exif, Image;
-    PhotoGpsLongitude, "Photo_GPS_Longitude", FT_NUMERIC_FLOATING, Exif, Image;
-    PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN, Exif, Image;
-    VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32, VideoMeta, Video;
-    VideoLength, "Video_Length", FT_TIME, VideoMeta, Video;
-    VideoWidth, "Video_Width", FT_NUMERIC_32, VideoMeta, Video;
-    VideoHeight, "Video_Height", FT_NUMERIC_32, VideoMeta, Video;
-    VideoDimensions, "Video_Dimensions", FT_STRINGW, VideoMeta, Video;
-    VideoFrameRate, "Video_Frame_Rate", FT_NUMERIC_FLOATING, VideoMeta, Video;
-    VideoCodec, "Video_Codec", FT_STRINGW, VideoMeta, Video;
-    VideoDynamicRange, "Video_HDR", FT_STRINGW, VideoMeta, Video;
-    VideoRotation, "Video_Rotation", FT_NUMERIC_32, VideoMeta, Video;
-    VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32, VideoMeta, Video;
-    VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW, VideoMeta, Video;
-    VideoAudioChannels, "Video_Audio_Channels", FT_NUMERIC_32, VideoMeta, Video;
-    VideoAudioSampleRate, "Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32, VideoMeta, Video;
-    VideoTitle, "Video_Title", FT_STRINGW, VideoTags, Video;
-    VideoArtist, "Video_Artist", FT_STRINGW, VideoTags, Video;
-    VideoDirector, "Video_Director", FT_STRINGW, VideoTags, Video;
-    VideoDate, "Video_Date", FT_STRINGW, VideoTags, Video;
-    VideoYear, "Video_Year", FT_NUMERIC_32, VideoTags, Video;
-    VideoGenre, "Video_Genre", FT_STRINGW, VideoTags, Video;
-    VideoComment, "Video_Comment", FT_STRINGW, VideoTags, Video;
-    AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32, AudioDuration, Audio;
-    AudioLength, "Audio_Length", FT_TIME, Tags, Audio;
-    AudioArtistTitle, "Audio_Artist_Title", FT_STRINGW, Tags, Audio;
-    AudioArtist, "Audio_Artist", FT_STRINGW, Tags, Audio;
-    AudioTitle, "Audio_Title", FT_STRINGW, Tags, Audio;
-    AudioAlbum, "Audio_Album", FT_STRINGW, Tags, Audio;
-    AudioAlbumArtist, "Audio_Album_Artist", FT_STRINGW, Tags, Audio;
-    AudioComposer, "Audio_Composer", FT_STRINGW, Tags, Audio;
-    AudioGenre, "Audio_Genre", FT_STRINGW, Tags, Audio;
-    AudioYear, "Audio_Year", FT_NUMERIC_32, Tags, Audio;
-    AudioTrack, "Audio_Track", FT_NUMERIC_32, Tags, Audio;
-    AudioTrackTotal, "Audio_Track_Total", FT_NUMERIC_32, Tags, Audio;
-    AudioDisc, "Audio_Disc", FT_NUMERIC_32, Tags, Audio;
-    AudioDiscTotal, "Audio_Disc_Total", FT_NUMERIC_32, Tags, Audio;
-    AudioComment, "Audio_Comment", FT_STRINGW, Tags, Audio;
-    AudioHasCover, "Audio_Has_Cover", FT_BOOLEAN, Tags, Audio;
-    AudioCodec, "Audio_Codec", FT_STRINGW, Tags, Audio;
-    AudioLossless, "Audio_Lossless", FT_BOOLEAN, Tags, Audio;
-    AudioReplayGain, "Audio_ReplayGain_dB", FT_NUMERIC_FLOATING, Tags, Audio;
-    AudioBitrate, "Audio_Bitrate_kbps", FT_NUMERIC_32, Tags, Audio;
-    AudioSampleRate, "Audio_Sample_Rate_Hz", FT_NUMERIC_32, Tags, Audio;
-    AudioChannels, "Audio_Channels", FT_NUMERIC_32, Tags, Audio;
-    AudioBitDepth, "Audio_Bit_Depth", FT_NUMERIC_32, Tags, Audio;
-    PluginVersion, "Plugin_Version", FT_STRINGW, Constant, Any;
+    ImageDHash, "Image_dHash", FT_STRINGW, "", Analysis, Image;
+    ImagePHash, "Image_pHash", FT_STRINGW, "", Analysis, Image;
+    ImageCoarseHash, "Image_CoarseHash", FT_STRINGW, "", Analysis, Image;
+    VideoFingerprint, "Video_Fingerprint", FT_STRINGW, "", Analysis, Video;
+    VideoDHashMid, "Video_dHash_Mid", FT_STRINGW, "", Analysis, Video;
+    AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, "", AudioAnalysis, Audio;
+    AudioFastFingerprint, "Audio_Fast_Fingerprint", FT_STRINGW, "", AudioFastFingerprint, Audio;
+    AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, "", AudioAnalysis, Audio;
+    FilePartialHash, "File_Partial_Hash", FT_STRINGW, "", PartialHash, Media;
+    MediaTypeName, "Media_Type", FT_STRINGW, "", Probe, Media;
+    ImageWidth, "Image_Width", FT_NUMERIC_32, "", ImageSize, Image;
+    ImageHeight, "Image_Height", FT_NUMERIC_32, "", ImageSize, Image;
+    ImageMegapixels, "Image_Megapixels", FT_NUMERIC_FLOATING, "", ImageSize, Image;
+    ImageDimensions, "Image_Dimensions", FT_STRINGW, "", ImageSize, Image;
+    ImageAspectRatio, "Image_AspectRatio", FT_STRINGW, "Ratio|Decimal", ImageSize, Image;
+    ImageOrientation, "Image_Orientation", FT_STRINGW, "Text|Short|Angle|EXIF", ImageOrientation, Image;
+    ImageBitDepth, "Image_Bit_Depth", FT_NUMERIC_32, "", PixelFormat, StandardImage;
+    ImageHasAlpha, "Image_Has_Alpha", FT_BOOLEAN, "", PixelFormat, StandardImage;
+    ImageSharpness, "Image_Sharpness", FT_NUMERIC_32, "", Sharpness, Image;
+    ImageDpi, "Image_DPI", FT_NUMERIC_32, "", ImageExtra, Image;
+    ImageAiParameters, "Image_AI_Parameters", FT_STRINGW, "", ImageExtra, StandardImage;
+    PhotoMake, "Photo_Make", FT_STRINGW, "", Exif, Image;
+    PhotoModel, "Photo_Model", FT_STRINGW, "", Exif, Image;
+    PhotoLens, "Photo_Lens", FT_STRINGW, "", Exif, Image;
+    PhotoDateTaken, "Photo_Date_Taken", FT_DATETIME, "", Exif, Image;
+    PhotoExposure, "Photo_Exposure", FT_STRINGW, "", Exif, Image;
+    PhotoFNumber, "Photo_FNumber", FT_NUMERIC_FLOATING, "", Exif, Image;
+    PhotoIso, "Photo_ISO", FT_NUMERIC_32, "", Exif, Image;
+    PhotoFocalLength, "Photo_Focal_Length_mm", FT_NUMERIC_FLOATING, "", Exif, Image;
+    PhotoFocalLength35, "Photo_Focal_Length_35mm", FT_NUMERIC_32, "", Exif, Image;
+    PhotoFlash, "Photo_Flash", FT_BOOLEAN, "", Exif, Image;
+    PhotoOrientation, "Photo_Orientation", FT_NUMERIC_32, "", Exif, Image;
+    PhotoSoftware, "Photo_Software", FT_STRINGW, "", Exif, Image;
+    PhotoGpsLatitude, "Photo_GPS_Latitude", FT_NUMERIC_FLOATING, "", Exif, Image;
+    PhotoGpsLongitude, "Photo_GPS_Longitude", FT_NUMERIC_FLOATING, "", Exif, Image;
+    PhotoGps, "Photo_GPS", FT_STRINGW, "Decimal|DMS|DMM", Exif, Image;
+    PhotoHasGps, "Photo_Has_GPS", FT_BOOLEAN, "", Exif, Image;
+    VideoDurationSec, "Video_Duration_Sec", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoLength, "Video_Length", FT_TIME, "", VideoMeta, Video;
+    VideoWidth, "Video_Width", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoHeight, "Video_Height", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoDimensions, "Video_Dimensions", FT_STRINGW, "", VideoMeta, Video;
+    VideoOrientation, "Video_Orientation", FT_STRINGW, "Text|Short|Angle", VideoMeta, Video;
+    VideoFrameRate, "Video_Frame_Rate", FT_NUMERIC_FLOATING, "", VideoMeta, Video;
+    VideoCodec, "Video_Codec", FT_STRINGW, "", VideoMeta, Video;
+    VideoContainer, "Video_Container", FT_STRINGW, "", VideoMeta, Video;
+    VideoDynamicRange, "Video_HDR", FT_STRINGW, "", VideoMeta, Video;
+    VideoRotation, "Video_Rotation", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoBitrate, "Video_Bitrate_kbps", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoAudioCodec, "Video_Audio_Codec", FT_STRINGW, "", VideoMeta, Video;
+    VideoAudioChannels, "Video_Audio_Channels", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoAudioSampleRate, "Video_Audio_Sample_Rate_Hz", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoAudioStreams, "Video_Audio_Streams", FT_NUMERIC_32, "", VideoMeta, Video;
+    VideoAudioLang, "Video_Audio_Lang", FT_STRINGW, "", VideoMeta, Video;
+    VideoSummary, "Video_Summary", FT_STRINGW, "", VideoMeta, Video;
+    VideoTitle, "Video_Title", FT_STRINGW, "", VideoTags, Video;
+    VideoArtist, "Video_Artist", FT_STRINGW, "", VideoTags, Video;
+    VideoDirector, "Video_Director", FT_STRINGW, "", VideoTags, Video;
+    VideoDate, "Video_Date", FT_STRINGW, "", VideoTags, Video;
+    VideoYear, "Video_Year", FT_NUMERIC_32, "", VideoTags, Video;
+    VideoGenre, "Video_Genre", FT_STRINGW, "", VideoTags, Video;
+    VideoComment, "Video_Comment", FT_STRINGW, "", VideoTags, Video;
+    AudioDurationSec, "Audio_Duration_Sec", FT_NUMERIC_32, "", AudioDuration, Audio;
+    AudioLength, "Audio_Length", FT_TIME, "", Tags, Audio;
+    AudioArtistTitle, "Audio_Artist_Title", FT_STRINGW, "", Tags, Audio;
+    AudioArtist, "Audio_Artist", FT_STRINGW, "", Tags, Audio;
+    AudioTitle, "Audio_Title", FT_STRINGW, "", Tags, Audio;
+    AudioAlbum, "Audio_Album", FT_STRINGW, "", Tags, Audio;
+    AudioAlbumArtist, "Audio_Album_Artist", FT_STRINGW, "", Tags, Audio;
+    AudioComposer, "Audio_Composer", FT_STRINGW, "", Tags, Audio;
+    AudioGenre, "Audio_Genre", FT_STRINGW, "", Tags, Audio;
+    AudioYear, "Audio_Year", FT_NUMERIC_32, "", Tags, Audio;
+    AudioTrack, "Audio_Track", FT_NUMERIC_32, "", Tags, Audio;
+    AudioTrackTotal, "Audio_Track_Total", FT_NUMERIC_32, "", Tags, Audio;
+    AudioDisc, "Audio_Disc", FT_NUMERIC_32, "", Tags, Audio;
+    AudioDiscTotal, "Audio_Disc_Total", FT_NUMERIC_32, "", Tags, Audio;
+    AudioComment, "Audio_Comment", FT_STRINGW, "", Tags, Audio;
+    AudioHasCover, "Audio_Has_Cover", FT_BOOLEAN, "", Tags, Audio;
+    AudioCodec, "Audio_Codec", FT_STRINGW, "", Tags, Audio;
+    AudioLossless, "Audio_Lossless", FT_BOOLEAN, "", Tags, Audio;
+    AudioReplayGain, "Audio_ReplayGain_dB", FT_NUMERIC_FLOATING, "", Tags, Audio;
+    AudioBitrate, "Audio_Bitrate_kbps", FT_NUMERIC_32, "", Tags, Audio;
+    AudioSampleRate, "Audio_Sample_Rate_Hz", FT_NUMERIC_32, "", Tags, Audio;
+    AudioChannels, "Audio_Channels", FT_NUMERIC_32, "", Tags, Audio;
+    AudioBitDepth, "Audio_Bit_Depth", FT_NUMERIC_32, "", Tags, Audio;
+    AudioSummary, "Audio_Summary", FT_STRINGW, "", Tags, Audio;
+    PluginVersion, "Plugin_Version", FT_STRINGW, "", Constant, Any;
 }
 
-fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int)> {
+fn field_at(index: c_int) -> Option<&'static (Field, &'static str, c_int, &'static str)> {
     FIELDS.get(usize::try_from(index).ok()?)
 }
 
@@ -185,12 +199,12 @@ pub unsafe fn content_get_supported_field(
     units: *mut c_char,
     max_len: c_int,
 ) -> c_int {
-    let Some(&(_, name, field_type)) = field_at(field_index) else {
+    let Some(&(_, name, field_type, field_units)) = field_at(field_index) else {
         return FT_NOMOREFIELDS;
     };
     let max_len = max_len.max(0) as usize;
     write_ansi(field_name, max_len, name);
-    write_ansi(units, max_len, "");
+    write_ansi(units, max_len, field_units);
     field_type
 }
 
@@ -199,6 +213,7 @@ pub unsafe fn content_get_supported_field(
 pub unsafe fn content_get_value_w(
     file_name: *const u16,
     field_index: c_int,
+    unit_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
     flags: c_int,
@@ -206,6 +221,7 @@ pub unsafe fn content_get_value_w(
     get_value(
         pwstr_to_path(file_name),
         field_index,
+        unit_index,
         field_value,
         max_len,
         flags,
@@ -218,6 +234,7 @@ pub unsafe fn content_get_value_w(
 pub unsafe fn content_get_value_a(
     file_name: *const c_char,
     field_index: c_int,
+    unit_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
     flags: c_int,
@@ -225,6 +242,7 @@ pub unsafe fn content_get_value_a(
     get_value(
         pstr_to_path(file_name),
         field_index,
+        unit_index,
         field_value,
         max_len,
         flags,
@@ -252,6 +270,7 @@ pub fn content_plugin_unloading() {
 unsafe fn get_value(
     path: Option<PathBuf>,
     field_index: c_int,
+    unit_index: c_int,
     field_value: *mut c_void,
     max_len: c_int,
     flags: c_int,
@@ -266,7 +285,7 @@ unsafe fn get_value(
     let Some(path) = path else {
         return FT_FILEERROR;
     };
-    let Some(&(field, _, _)) = field_at(field_index) else {
+    let Some(&(field, _, _, _)) = field_at(field_index) else {
         return FT_NOSUCHFIELD;
     };
     if field_value.is_null() {
@@ -284,7 +303,7 @@ unsafe fn get_value(
             max_bytes: max_len.max(0) as usize,
             unicode,
         }
-        .value(compute(&path, field, kind));
+        .value(compute(&path, field, unit_index, kind));
     }
     let sample = crate::prefetch::request(&path, field, kind);
     let result = crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
@@ -297,7 +316,7 @@ unsafe fn get_value(
                 max_bytes: max_len.max(0) as usize,
                 unicode,
             };
-            out.value(compute(&path, field, kind))
+            out.value(compute(&path, field, unit_index, kind))
         })
     });
     if result != FT_DELAYED && !is_stop_requested() {
@@ -330,9 +349,25 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || !get_cache().is_cached(path);
     match field.source() {
         Source::Constant | Source::Probe => false,
+        Source::PartialHash => !crate::cache::is_partial_hash_cached(path),
         Source::Exif => {
             matches!(kind, MediaType::StandardImage | MediaType::RawImage)
                 && !crate::cache::is_exif_cached(path)
+        }
+        Source::ImageExtra => kind.is_image_kind() && !crate::cache::is_image_extra_cached(path),
+        Source::ImageOrientation => {
+            let exif_pending = matches!(kind, MediaType::StandardImage | MediaType::RawImage)
+                && !crate::cache::is_exif_cached(path);
+            let size_pending = if needs_codec() {
+                !crate::cache::is_image_size_cached(path)
+            } else if kind == MediaType::RawImage {
+                !crate::cache::is_exif_cached(path)
+            } else if kind != MediaType::StandardImage {
+                analysis_pending() && header_size(path, kind).is_none()
+            } else {
+                false
+            };
+            exif_pending || size_pending
         }
         Source::Tags => {
             kind == MediaType::Audio
@@ -362,9 +397,20 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && analysis_pending()
                 && header_size(path, kind).is_none()
         }
-        Source::VideoMeta if field == Field::VideoDynamicRange && kind == MediaType::Video => {
+        Source::VideoMeta
+            if matches!(
+                field,
+                Field::VideoDynamicRange | Field::VideoAudioLang | Field::VideoAudioStreams
+            ) && kind == MediaType::Video =>
+        {
             crate::cache::cached_video_meta(path).is_none_or(|meta| {
-                meta.dynamic_range.is_none()
+                let needs_tags = match field {
+                    Field::VideoDynamicRange => meta.dynamic_range.is_none(),
+                    Field::VideoAudioLang => meta.audio_lang.is_none(),
+                    Field::VideoAudioStreams => meta.audio_streams.is_none_or(|n| n == 0),
+                    _ => false,
+                };
+                needs_tags
                     && crate::video_tags::has_tag_reader(path)
                     && !crate::cache::is_video_tags_cached(path)
             })
@@ -392,8 +438,8 @@ fn int(n: u32) -> Value {
     Value::Int(n.min(i32::MAX as u32) as i32)
 }
 
-fn compute(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
-    compute_cancelled(path, field, kind, &is_stop_requested)
+fn compute(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> Option<Value> {
+    compute_cancelled(path, field, unit_index, kind, &is_stop_requested)
 }
 
 pub(crate) fn prefetch_value(
@@ -407,7 +453,7 @@ pub(crate) fn prefetch_value(
             crate::cache::with_non_blocking_flight(|| {
                 let key = key.or_else(|| crate::cache::FileKey::stat(path));
                 crate::cache::with_known_file_key(key, || {
-                    let _ = compute_cancelled(path, field, probe_file(path), cancelled);
+                    let _ = compute_cancelled(path, field, 0, probe_file(path), cancelled);
                 });
             });
         });
@@ -417,6 +463,7 @@ pub(crate) fn prefetch_value(
 fn compute_cancelled(
     path: &Path,
     field: Field,
+    unit_index: c_int,
     kind: MediaType,
     cancelled: &dyn Fn() -> bool,
 ) -> Option<Value> {
@@ -433,9 +480,16 @@ fn compute_cancelled(
             };
             return text(name.into());
         }
+        Source::PartialHash => {
+            return crate::cache::get_partial_hash(path).map(|h| Value::Text(format!("{h:016x}")));
+        }
         Source::Tags => return tag_value(path, field, kind),
-        Source::Exif => return exif_value(path, field, kind),
-        Source::VideoMeta => return video_meta_value(path, field, kind),
+        Source::Exif => return exif_value(path, field, unit_index, kind),
+        Source::ImageExtra => return image_extra_value(path, field),
+        Source::ImageOrientation => {
+            return image_orientation_value(path, unit_index, kind, cancelled);
+        }
+        Source::VideoMeta => return video_meta_value(path, field, unit_index, kind),
         Source::VideoTags => return video_tag_value(path, field, kind),
         Source::AudioAnalysis | Source::AudioFastFingerprint | Source::AudioDuration => {
             return audio_analysis_value(path, field, cancelled);
@@ -463,7 +517,7 @@ fn compute_cancelled(
                     ImageHeight => Some(int(h)),
                     ImageMegapixels => Some(Value::Float(w as f64 * h as f64 / 1_000_000.0)),
                     ImageDimensions => text(format!("{w}x{h}")),
-                    _ => text(crate::hashing::compute_aspect_ratio(w, h)),
+                    _ => format_aspect_ratio(w, h, unit_index).map(Value::Text),
                 };
             }
             if kind == MediaType::StandardImage {
@@ -482,11 +536,92 @@ fn compute_cancelled(
         (ImagePHash, CachedMedia::Image(img)) => text(img.phash_hex()),
         (ImageCoarseHash, CachedMedia::Image(img)) => text(img.coarse_hash_hex()),
         (ImageDimensions, CachedMedia::Image(img)) => text(img.dimensions_str()),
-        (ImageAspectRatio, CachedMedia::Image(img)) => text(img.aspect_ratio()),
+        (ImageAspectRatio, CachedMedia::Image(img)) => {
+            format_aspect_ratio(img.width, img.height, unit_index).map(Value::Text)
+        }
         (VideoFingerprint, CachedMedia::Video(vid)) => vid.fingerprint.clone().map(Value::Text),
         (VideoDHashMid, CachedMedia::Video(vid)) => vid.dhash_mid_hex().map(Value::Text),
         _ => None,
     }
+}
+
+fn format_aspect_ratio(w: u32, h: u32, unit_index: c_int) -> Option<String> {
+    if unit_index == 1 {
+        (w > 0 && h > 0).then(|| format!("{:.3}", f64::from(w) / f64::from(h)))
+    } else {
+        Some(crate::hashing::compute_aspect_ratio(w, h))
+    }
+}
+
+fn format_orientation_by_size(w: u32, h: u32, unit_index: c_int) -> &'static str {
+    if unit_index == 1 {
+        if w > h {
+            "H"
+        } else if h > w {
+            "V"
+        } else {
+            "S"
+        }
+    } else if w > h {
+        "Landscape"
+    } else if h > w {
+        "Portrait"
+    } else {
+        "Square"
+    }
+}
+
+fn image_extra_value(path: &Path, field: Field) -> Option<Value> {
+    let extra = crate::cache::get_image_extra(path)?;
+    match field {
+        Field::ImageDpi => extra.dpi.map(int),
+        Field::ImageAiParameters => extra.ai_parameters.clone().map(Value::Text),
+        _ => None,
+    }
+}
+
+fn image_orientation_value(
+    path: &Path,
+    unit_index: c_int,
+    kind: MediaType,
+    cancelled: &dyn Fn() -> bool,
+) -> Option<Value> {
+    let exif_orient = matches!(kind, MediaType::StandardImage | MediaType::RawImage)
+        .then(|| {
+            crate::cache::get_exif(path)
+                .and_then(|e| e.orientation)
+                .filter(|o| (1..=8).contains(o))
+        })
+        .flatten();
+    if unit_index == 3 {
+        return exif_orient.map(|o| Value::Text(o.to_string()));
+    }
+    let (raw_w, raw_h) = header_size(path, kind).or_else(|| {
+        match get_cache().get_or_analyze(path, cancelled) {
+            CachedMedia::Image(img) => Some((img.width, img.height)),
+            _ => None,
+        }
+    })?;
+    if raw_w == 0 || raw_h == 0 {
+        return None;
+    }
+    if unit_index == 2 {
+        let angle = match exif_orient {
+            Some(3 | 4) => "180",
+            Some(5 | 6) => "+90",
+            Some(7 | 8) => "-90",
+            _ => "0",
+        };
+        return Some(Value::Text(angle.into()));
+    }
+    let (w, h) = if matches!(exif_orient, Some(5..=8)) {
+        (raw_h, raw_w)
+    } else {
+        (raw_w, raw_h)
+    };
+    Some(Value::Text(
+        format_orientation_by_size(w, h, unit_index).into(),
+    ))
 }
 
 fn audio_field(field: Field) -> crate::cache::AudioField {
@@ -538,7 +673,7 @@ fn header_size(path: &Path, kind: MediaType) -> Option<(u32, u32)> {
     }
 }
 
-fn exif_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
+fn exif_value(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> Option<Value> {
     use Field::*;
     if !matches!(kind, MediaType::StandardImage | MediaType::RawImage) {
         // PSD keeps EXIF in an image resource we don't parse; still answer "no GPS" for photos.
@@ -571,12 +706,38 @@ fn exif_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
         PhotoSoftware => text(&exif.software),
         PhotoGpsLatitude => exif.gps_latitude.map(Value::Float),
         PhotoGpsLongitude => exif.gps_longitude.map(Value::Float),
+        PhotoGps => exif.gps().map(|(lat, lon)| Value::Text(format_gps(lat, lon, unit_index))),
         PhotoHasGps => Some(Value::Bool(exif.gps().is_some())),
         _ => None,
     }
 }
 
-fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
+fn format_gps(lat: f64, lon: f64, unit_index: c_int) -> String {
+    match unit_index {
+        1 => format!("{}, {}", format_dms(lat, 'N', 'S'), format_dms(lon, 'E', 'W')),
+        2 => format!("{}, {}", format_dmm(lat, 'N', 'S'), format_dmm(lon, 'E', 'W')),
+        _ => format!("{lat:.6}, {lon:.6}"),
+    }
+}
+
+fn format_dms(val: f64, pos: char, neg: char) -> String {
+    let hemi = if val < 0.0 { neg } else { pos };
+    let total_sec = (val.abs() * 3600.0).round() as u32;
+    let d = total_sec / 3600;
+    let m = (total_sec % 3600) / 60;
+    let s = (total_sec % 60) as f64;
+    format!("{d}°{m:02}'{s:04.1}\"{hemi}")
+}
+
+fn format_dmm(val: f64, pos: char, neg: char) -> String {
+    let hemi = if val < 0.0 { neg } else { pos };
+    let abs = val.abs();
+    let d = abs.floor() as u32;
+    let m = (abs - f64::from(d)) * 60.0;
+    format!("{d}°{m:06.3}'{hemi}")
+}
+
+fn video_meta_value(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> Option<Value> {
     use Field::*;
     if kind != MediaType::Video {
         return None;
@@ -586,6 +747,29 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
     match field {
         VideoDimensions => (meta.width > 0 && meta.height > 0)
             .then(|| Value::Text(format!("{}x{}", meta.width, meta.height))),
+        VideoOrientation => {
+            if meta.width == 0 || meta.height == 0 {
+                return None;
+            }
+            let rot = meta.rotation.unwrap_or(0) % 360;
+            if unit_index == 2 {
+                let angle = match rot {
+                    90 => "+90",
+                    180 => "180",
+                    270 => "-90",
+                    _ => "0",
+                };
+                return Some(Value::Text(angle.into()));
+            }
+            let (w, h) = if rot == 90 || rot == 270 {
+                (meta.height, meta.width)
+            } else {
+                (meta.width, meta.height)
+            };
+            Some(Value::Text(
+                format_orientation_by_size(w, h, unit_index).into(),
+            ))
+        }
         VideoDurationSec => {
             (meta.duration_sec > 0.0).then(|| int(meta.duration_sec.round() as u32))
         }
@@ -599,18 +783,98 @@ fn video_meta_value(path: &Path, field: Field, kind: MediaType) -> Option<Value>
             (meta.frame_rate > 0.0).then(|| Value::Float((meta.frame_rate * 100.0).round() / 100.0))
         }
         VideoCodec => meta.codec.clone().map(Value::Text),
+        VideoContainer => meta.container.clone().map(Value::Text),
         VideoBitrate => meta.bitrate_kbps.and_then(positive),
         VideoAudioCodec => meta.audio_codec.clone().map(Value::Text),
         VideoAudioChannels => meta.audio_channels.map(int),
         VideoAudioSampleRate => meta.audio_sample_rate.map(int),
+        VideoAudioStreams => meta
+            .audio_streams
+            .filter(|&n| n > 0)
+            .or_else(|| crate::cache::get_video_tags(path)?.audio_streams)
+            .or(meta.audio_streams)
+            .map(int),
+        VideoAudioLang => meta
+            .audio_lang
+            .clone()
+            .or_else(|| crate::cache::get_video_tags(path)?.audio_lang.clone())
+            .map(Value::Text),
         VideoRotation => meta.rotation.map(int),
         // Media Foundation's Matroska source doesn't pass the colour description on.
         VideoDynamicRange => meta
             .dynamic_range
             .or_else(|| crate::cache::get_video_tags(path)?.dynamic_range())
             .map(|s| Value::Text(s.into())),
+        VideoSummary => format_video_summary(&meta).map(Value::Text),
         _ => None,
     }
+}
+
+fn format_video_summary(meta: &crate::video_frame::VideoMeta) -> Option<String> {
+    let mut video_parts = Vec::new();
+    if let Some(codec) = meta.codec.as_deref().filter(|s| !s.is_empty()) {
+        video_parts.push(codec.to_string());
+    }
+    if meta.width > 0 && meta.height > 0 {
+        video_parts.push(format!("{}x{}", meta.width, meta.height));
+    }
+    if meta.frame_rate > 0.0 {
+        let fps = (meta.frame_rate * 100.0).round() / 100.0;
+        let s = if (fps - fps.round()).abs() < 0.005 {
+            format!("{}fps", fps.round() as u32)
+        } else {
+            format!("{fps:.2}fps")
+        };
+        video_parts.push(s);
+    }
+    if let Some(kbps) = meta.bitrate_kbps.filter(|&b| b > 0) {
+        video_parts.push(format!("{kbps} kbps"));
+    }
+
+    let mut audio_parts = Vec::new();
+    if let Some(ac) = meta.audio_codec.as_deref().filter(|s| !s.is_empty()) {
+        audio_parts.push(ac.to_string());
+    }
+    if let Some(ch) = meta.audio_channels.filter(|&c| c > 0) {
+        audio_parts.push(format!("{ch}ch"));
+    }
+
+    match (video_parts.is_empty(), audio_parts.is_empty()) {
+        (true, true) => None,
+        (false, true) => Some(video_parts.join(" ")),
+        (true, false) => Some(audio_parts.join(" ")),
+        (false, false) => Some(format!("{} / {}", video_parts.join(" "), audio_parts.join(" "))),
+    }
+}
+
+fn format_audio_summary(
+    codec: Option<&str>,
+    bitrate_kbps: Option<u32>,
+    sample_rate: Option<u32>,
+    channels: Option<u32>,
+    bit_depth: Option<u32>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(c) = codec.filter(|s| !s.is_empty()) {
+        parts.push(c.to_string());
+    }
+    if let Some(kbps) = bitrate_kbps.filter(|&b| b > 0) {
+        parts.push(format!("{kbps} kbps"));
+    }
+    if let Some(sr) = sample_rate.filter(|&s| s > 0) {
+        if sr % 1000 == 0 {
+            parts.push(format!("{} kHz", sr / 1000));
+        } else {
+            parts.push(format!("{:.1} kHz", f64::from(sr) / 1000.0));
+        }
+    }
+    if let Some(ch) = channels.filter(|&c| c > 0) {
+        parts.push(format!("{ch}ch"));
+    }
+    if let Some(bits) = bit_depth.filter(|&b| b > 0) {
+        parts.push(format!("{bits}-bit"));
+    }
+    (!parts.is_empty()).then(|| parts.join(" "))
 }
 
 fn video_tag_value(path: &Path, field: Field, kind: MediaType) -> Option<Value> {
@@ -668,6 +932,7 @@ impl Field {
                 | AudioBitDepth
                 | AudioCodec
                 | AudioLossless
+                | AudioSummary
         )
     }
 }
@@ -725,6 +990,14 @@ fn audio_meta_value(path: &Path, field: Field) -> Option<Value> {
         AudioBitDepth => num(meta.bit_depth),
         AudioCodec => meta.codec.clone().map(Value::Text),
         AudioLossless => meta.lossless.map(Value::Bool),
+        AudioSummary => format_audio_summary(
+            meta.codec.as_deref(),
+            meta.bitrate_kbps,
+            meta.sample_rate,
+            meta.channels,
+            meta.bit_depth,
+        )
+        .map(Value::Text),
         _ => None,
     }
 }
@@ -763,6 +1036,14 @@ fn tags_value(path: &Path, field: Field) -> Option<Value> {
         AudioComposer => text(&tags.composer),
         AudioTrackTotal => num(tags.track_total),
         AudioDiscTotal => num(tags.disc_total),
+        AudioSummary => format_audio_summary(
+            tags.codec,
+            tags.bitrate_kbps,
+            tags.sample_rate,
+            tags.channels.map(u32::from),
+            tags.bit_depth.map(u32::from),
+        )
+        .map(Value::Text),
         _ => None,
     }
 }
@@ -870,7 +1151,7 @@ macro_rules! export_content_plugin {
         pub unsafe extern "system" fn ContentGetValueW(
             file_name: *const u16,
             field_index: ::std::os::raw::c_int,
-            _unit_index: ::std::os::raw::c_int,
+            unit_index: ::std::os::raw::c_int,
             field_value: *mut ::std::os::raw::c_void,
             max_len: ::std::os::raw::c_int,
             flags: ::std::os::raw::c_int,
@@ -880,6 +1161,7 @@ macro_rules! export_content_plugin {
                 $crate::wdx_api::content_get_value_w(
                     file_name,
                     field_index,
+                    unit_index,
                     field_value,
                     max_len,
                     flags,
@@ -891,7 +1173,7 @@ macro_rules! export_content_plugin {
         pub unsafe extern "system" fn ContentGetValue(
             file_name: *const ::std::os::raw::c_char,
             field_index: ::std::os::raw::c_int,
-            _unit_index: ::std::os::raw::c_int,
+            unit_index: ::std::os::raw::c_int,
             field_value: *mut ::std::os::raw::c_void,
             max_len: ::std::os::raw::c_int,
             flags: ::std::os::raw::c_int,
@@ -901,6 +1183,7 @@ macro_rules! export_content_plugin {
                 $crate::wdx_api::content_get_value_a(
                     file_name,
                     field_index,
+                    unit_index,
                     field_value,
                     max_len,
                     flags,

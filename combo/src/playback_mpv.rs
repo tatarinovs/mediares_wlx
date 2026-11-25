@@ -146,6 +146,32 @@ pub fn dll_found() -> bool {
     dll_candidates().next().is_some()
 }
 
+fn matches_process_arch(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut dos = [0u8; 64];
+    if file.read_exact(&mut dos).is_err() || &dos[..2] != b"MZ" {
+        return false;
+    }
+    let pe_off = u32::from_le_bytes([dos[0x3C], dos[0x3D], dos[0x3E], dos[0x3F]]) as u64;
+    if file.seek(SeekFrom::Start(pe_off)).is_err() {
+        return false;
+    }
+    let mut pe = [0u8; 6];
+    if file.read_exact(&mut pe).is_err() || &pe[..4] != b"PE\0\0" {
+        return false;
+    }
+    let machine = u16::from_le_bytes([pe[4], pe[5]]);
+    #[cfg(target_arch = "x86")]
+    return machine == 0x014C;
+    #[cfg(target_arch = "x86_64")]
+    return machine == 0x8664;
+    #[cfg(not(any(target_arch = "x86", target_arch = "x86_64")))]
+    return false;
+}
+
 /// Next to the plugin, then next to TC. Never by bare name: the DLL search path includes the
 /// current directory, which in TC is whatever folder the panel shows.
 fn dll_candidates() -> impl Iterator<Item = PathBuf> {
@@ -154,7 +180,7 @@ fn dll_candidates() -> impl Iterator<Item = PathBuf> {
         .into_iter()
         .flatten()
         .filter_map(|p| Some(p.parent()?.join(DLL_NAME)))
-        .filter(|p| p.is_file())
+        .filter(|p| p.is_file() && matches_process_arch(p))
 }
 
 unsafe fn load_api() -> Option<Api> {
@@ -592,7 +618,9 @@ fn is_lossless(codec: &str) -> bool {
 /// Stream properties of a video Media Foundation can't open.
 pub fn video_meta(path: &Path) -> Option<VideoMeta> {
     let probe = Probe::open(path)?;
-    stream_meta(&probe)
+    let mut meta = stream_meta(&probe)?;
+    meta.container = mediares_core::video_frame::detect_video_container(path);
+    Some(meta)
 }
 
 /// Stream properties of the loaded file.
@@ -640,6 +668,12 @@ fn stream_meta(probe: &Props) -> Option<VideoMeta> {
                 "hlg" => "HLG",
                 _ => "SDR",
             }),
+        container: None,
+        audio_streams: audio.as_ref().map(|_| 1),
+        audio_lang: audio
+            .as_ref()
+            .and_then(|a| probe.string(&format!("{a}lang")))
+            .filter(|l| !l.eq_ignore_ascii_case("und")),
     })
 }
 
@@ -1302,5 +1336,26 @@ mod tests {
             assert!((back - v).abs() < 1e-9, "{v} -> {back}");
         }
         assert!((mpv_volume(0.125) - 50.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn pe_arch_check_matches_current_process() {
+        let dir = std::env::temp_dir().join(format!("mediares_pe_arch_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let make_pe = |name: &str, machine: u16| {
+            let path = dir.join(name);
+            let mut buf = vec![0u8; 128];
+            buf[0..2].copy_from_slice(b"MZ");
+            buf[0x3C..0x40].copy_from_slice(&0x40u32.to_le_bytes());
+            buf[0x40..0x44].copy_from_slice(b"PE\0\0");
+            buf[0x44..0x46].copy_from_slice(&machine.to_le_bytes());
+            std::fs::write(&path, buf).unwrap();
+            path
+        };
+        let x86 = make_pe("x86.dll", 0x014C);
+        let x64 = make_pe("x64.dll", 0x8664);
+        assert_eq!(matches_process_arch(&x86), cfg!(target_arch = "x86"));
+        assert_eq!(matches_process_arch(&x64), cfg!(target_arch = "x86_64"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

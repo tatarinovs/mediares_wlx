@@ -231,8 +231,11 @@ Total Commander restarts in a local SQLite database:
 Metadata includes EXIF, audio/video tags, stream properties, image
 dimensions and pixel format, and the TIFF page list. Data is saved on
 demand; cover images and lyrics are excluded. A change in file size, modification
-time or algorithm version triggers a fresh read. Renamed files are also
-read again. Content changes preserving both size and time cannot be detected.
+time or algorithm version triggers a fresh read. When a file is renamed or
+moved, heavy analysis records (image hashes, video/audio fingerprints,
+sharpness) are reused from cache by file size and a fast partial hash of
+the first and last 64 KiB. Content changes preserving both size and time
+cannot be detected.
 
 Caching is enabled by default. The main database is limited to 256 MiB.
 Background maintenance removes the oldest records to keep the count
@@ -257,8 +260,15 @@ If needed, set the worker count manually in mediares.ini:
 
 [Settings]
 PrefetchThreads=4
+PrefetchRemote=0
+PrefetchRemovable=1
 
-0 disables read-ahead; 1–16 select the worker count (also limited by CPUs).
+0 disables read-ahead; 1–16 select the worker count (also limited by CPUs;
+capped at 4 in the 32-bit build).
+PrefetchRemote=0 (default) disables read-ahead on network drives and UNC paths
+(1 allows it with 1 thread).
+PrefetchRemovable=1 (default) allows single-thread read-ahead on removable
+drives (0 disables it).
 Without the key, the thread count is determined automatically. Restart TC after
 editing. An existing INI beside the DLL takes priority; otherwise mediares.ini
 in TC's settings directory is used. Saving through the GUI preserves this key.
@@ -340,6 +350,8 @@ Duplicate detection fields (hashes and fingerprints) are described in section 5.
   Image_dHash, Image_pHash, Image_CoarseHash
   Video_Fingerprint, Video_dHash_Mid
   Audio_Fingerprint, Audio_Fast_Fingerprint, Audio_PCM_Hash, Audio_Artist_Title
+  File_Partial_Hash     Fast 64-bit hash (size + first and last 64 KiB) for
+                        instant exact-copy detection on large files
 
 General:
   Media_Type            File type: Image, Video or Audio
@@ -349,11 +361,14 @@ Photos:
   Image_Width, Image_Height      Width and height in pixels
   Image_Megapixels               Pixel count in millions (width x height / 1000000)
   Image_Dimensions               Size as text: 6000x4000
-  Image_AspectRatio              Aspect ratio: 3:2, 16:9, 4:3...
+  Image_AspectRatio              Aspect ratio (Ratio 3:2, 16:9 | Decimal 1.500)
+  Image_Orientation              Orientation (Text: Landscape/Portrait/Square | Short: H/V/S | Angle | EXIF)
   Image_Bit_Depth                Bits per channel: 8, 16 for 16-bit PNG/TIFF, 10-12 for HDR HEIC/AVIF
   Image_Has_Alpha                Whether there is an alpha channel (PNG, WebP, TIFF...)
   Image_Sharpness                Shot sharpness (Laplacian variance): sorting by it finds
                                  blurred and out-of-focus shots of one session (delayed)
+  Image_DPI                      Print resolution, DPI (from EXIF, JFIF, or PNG pHYs)
+  Image_AI_Parameters            AI generation parameters (PNG tEXt/zTXt/iTXt, JPEG UserComment/COM)
   Photo_Make, Photo_Model        Camera make and model
   Photo_Lens                     Lens
   Photo_Date_Taken               Date and time taken
@@ -367,6 +382,7 @@ Photos:
   Photo_Software                 Program that saved the file
   Photo_GPS_Latitude             Latitude in degrees
   Photo_GPS_Longitude            Longitude in degrees
+  Photo_GPS                      Formatted coordinates (Decimal | DMS | DMM)
   Photo_Has_GPS                  Whether there are coordinates
 
 Video:
@@ -374,14 +390,19 @@ Video:
   Video_Length                   Duration h:mm:ss
   Video_Width, Video_Height      Frame width and height
   Video_Dimensions               Size as text: 1920x1080
+  Video_Orientation              Orientation (Text: Landscape/Portrait/Square | Short: H/V/S | Angle)
   Video_Frame_Rate               Frames per second
   Video_Codec                    Video codec: H.264, HEVC, AV1...
+  Video_Container                Container format: MP4, Matroska, WebM, AVI, MOV...
   Video_HDR                      Dynamic range: HDR10 (PQ), HLG or SDR
   Video_Rotation                 Clockwise turn applied on playback (phone videos): 0, 90...
   Video_Bitrate_kbps             Bitrate, kbps
   Video_Audio_Codec              Audio codec: AAC, AC-3...
   Video_Audio_Channels           Number of audio channels
   Video_Audio_Sample_Rate_Hz     Audio sample rate, Hz
+  Video_Audio_Streams            Number of audio tracks
+  Video_Audio_Lang               Language of the first audio track
+  Video_Summary                  One-line summary of video and audio streams
   Video_Title                    Title
   Video_Artist, Video_Director   Artist, director
   Video_Date, Video_Year         Date and year
@@ -408,6 +429,7 @@ Music:
   Audio_Sample_Rate_Hz           Sample rate, Hz
   Audio_Channels                 Number of channels
   Audio_Bit_Depth                Bit depth
+  Audio_Summary                  One-line summary of audio stream properties
 
 
 6. SETTINGS

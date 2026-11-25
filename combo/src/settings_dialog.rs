@@ -26,8 +26,8 @@ use windows::Win32::UI::Controls::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateDialogIndirectParamW, DefWindowProcW, GetDlgCtrlID, GetDlgItem, GetParent,
-    GetWindowLongPtrW, GetWindowRect, IsWindowVisible, MessageBoxW, SendMessageW,
-    SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
+    GetWindowRect, IsWindowVisible, MessageBoxW, SendMessageW,
+    SetWindowPos, SetWindowTextW, ShowWindow, BM_GETCHECK, BM_SETCHECK,
     BS_AUTOCHECKBOX, BS_DEFPUSHBUTTON, BS_GROUPBOX, BS_PUSHBUTTON, CBS_DROPDOWNLIST, CB_GETCURSEL,
     CB_SETCURSEL, DLGTEMPLATE, DS_CONTROL, GWLP_ID, GWLP_USERDATA, HWND_BOTTOM, IDCANCEL, IDOK,
     MB_ICONINFORMATION, MB_OK, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNA,
@@ -227,7 +227,7 @@ pub unsafe fn show(owner: HWND, current: &ViewerConfig) -> Option<ViewerConfig> 
     let font = dialog::font(dlg, "Segoe UI", -12);
     let (ok, pages) = build_controls(dlg, &*ctx, font.0);
     (*ctx).pages = pages;
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, ctx as isize);
+    crate::set_window_long_ptr(dlg, GWLP_USERDATA, ctx as isize);
     show_page(
         dlg,
         &*ctx,
@@ -299,7 +299,7 @@ unsafe fn create_pages(dlg: HWND, tabs: HWND) -> (Pages, (i32, i32)) {
         ) else {
             continue;
         };
-        SetWindowLongPtrW(hwnd, GWLP_ID, (PAGE_ID + i as i32) as isize);
+        crate::set_window_long_ptr(hwnd, GWLP_ID, (PAGE_ID + i as i32) as isize);
         let _ = EnableThemeDialogTexture(hwnd, ETDT_ENABLETAB);
         let _ = SetWindowPos(
             hwnd,
@@ -623,7 +623,7 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
-        let ctx = (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const Context).as_ref();
+        let ctx = (crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *const Context).as_ref();
         let Some(ctx) = ctx else {
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
@@ -679,7 +679,7 @@ unsafe extern "system" fn wnd_proc(
                 LRESULT(0)
             }
             WM_NCDESTROY => {
-                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0);
                 DefWindowProcW(hwnd, msg, wparam, lparam)
             }
             _ => DefWindowProcW(hwnd, msg, wparam, lparam),

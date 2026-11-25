@@ -331,7 +331,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     original = rows()
     assert len(original) == 13, original  # Combined audio analysis + fast fingerprint; empty EXIF/video tags.
     with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
         assert slots == {0, 1, 2, 3, 4, 6, 7, 8, 10, 11}, slots
     warm = run(db)
@@ -345,7 +345,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     assert len(refreshed) == len(original)
     assert all((before != after) == (before[1] == 11)
                for before, after in zip(original, refreshed)), "Version change affected other families"
-    assert all(row[-1] == 1 for row in refreshed)
+    assert all(row[-1] == (2 if row[1] in (4, 6) else 1) for row in refreshed)
     original = refreshed
     # A malformed individual metadata record must fall back and repair only that record.
     with sqlite3.connect(db) as conn:
@@ -362,7 +362,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     prerelease_db = work / "local/mediares/content-cache-v1.sqlite3"
     prerelease_db.parent.mkdir(parents=True)
     with closing(sqlite3.connect(prerelease_db)) as conn:
-        conn.execute("PRAGMA user_version=2")
+        conn.execute("PRAGMA user_version=3")
     prerelease_bytes = prerelease_db.read_bytes()
     assert run(prerelease_db)["values"] == warm["values"]
     assert run(None)["values"] == warm["values"]
@@ -408,7 +408,7 @@ def run_check(dll, baseline, viewer_dll, stress):
         lock.close()
     assert run(db)["values"] == modified["values"]
     refreshed = rows()
-    assert all(row[-1] == 1 for row in refreshed), "Old algorithm versions were reused"
+    assert all(row[-1] == (2 if row[1] in (4, 6) else 1) for row in refreshed), "Old algorithm versions were reused"
     assert run(db)["values"] == modified["values"]
     assert rows() == refreshed
 
@@ -416,7 +416,7 @@ def run_check(dll, baseline, viewer_dll, stress):
               "disabled_ms": disabled["ms"], "database_bytes": db.stat().st_size,
               "dll_bytes": dll.stat().st_size,
               "checks": ["transient read recovery", "fresh-process hits", "metadata hits", "metadata edit",
-                         "release schema v1", "prerelease cache isolation", "per-family versioning",
+                         "release schema v2", "prerelease cache isolation", "per-family versioning",
                          "malformed metadata", "default path", "RAM/UI delay", "Unicode paths", "file edit",
                          "algorithm version", "disabled", "unavailable", "corrupt", "locked",
                          "empty EXIF", "empty video tags"]}

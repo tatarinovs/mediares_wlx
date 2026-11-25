@@ -3,11 +3,14 @@
 //! Workers are joined by ContentPluginUnloading before any DLL code can be unmapped.
 
 use std::fs::ReadDir;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
+
+use windows::core::PCWSTR;
+use windows::Win32::Storage::FileSystem::GetDriveTypeW;
 
 mod adaptive;
 use adaptive::Controller;
@@ -41,6 +44,46 @@ struct Pending {
     allowance: usize,
     last: PathBuf,
     exhausted: bool,
+    max_workers: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DriveKind {
+    Fixed,
+    Removable,
+    Remote,
+}
+
+const DRIVE_REMOVABLE: u32 = 2;
+const DRIVE_REMOTE: u32 = 4;
+const DRIVE_CDROM: u32 = 5;
+
+fn drive_kind(path: &Path) -> DriveKind {
+    match path.components().next() {
+        Some(Component::Prefix(prefix)) => match prefix.kind() {
+            Prefix::UNC(..) | Prefix::VerbatimUNC(..) => DriveKind::Remote,
+            Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                let root = [letter as u16, b':' as u16, b'\\' as u16, 0];
+                match unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } {
+                    DRIVE_REMOTE => DriveKind::Remote,
+                    DRIVE_REMOVABLE | DRIVE_CDROM => DriveKind::Removable,
+                    _ => DriveKind::Fixed,
+                }
+            }
+            _ => DriveKind::Fixed,
+        },
+        _ => DriveKind::Fixed,
+    }
+}
+
+fn prefetch_remote_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(crate::config::prefetch_remote)
+}
+
+fn prefetch_removable_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(crate::config::prefetch_removable)
 }
 
 #[derive(PartialEq, Eq)]
@@ -139,7 +182,7 @@ impl Pool {
         Self { shared, threads }
     }
 
-    fn request(&self, path: &Path, field: Field, kind: MediaType) -> Option<Sample> {
+    fn request(&self, path: &Path, field: Field, kind: MediaType, max_workers: usize) -> Option<Sample> {
         let parent = path.parent()?;
         let extension = extension(path)?;
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -183,6 +226,7 @@ impl Pool {
                 allowance: LOOKAHEAD,
                 last: path.into(),
                 exhausted: false,
+                max_workers,
             });
             self.shared.wake.notify_all();
         }
@@ -318,7 +362,12 @@ fn run(shared: Arc<Shared>) {
                 if let Some(i) = (0..n).map(|i| (state.next + i) % n).find(|&i| {
                     state.lanes[i].allowance > 0
                         && !state.lanes[i].exhausted
-                        && state.active_workers < state.controller.as_ref().map_or(0, |c| c.limit())
+                        && state.active_workers
+                            < state
+                                .controller
+                                .as_ref()
+                                .map_or(0, |c| c.limit())
+                                .min(state.lanes[i].max_workers)
                 }) {
                     state.next = (i + 1) % n;
                     state.lanes[i].allowance -= 1;
@@ -416,12 +465,22 @@ pub(crate) fn request(path: &Path, field: Field, kind: MediaType) -> Option<Samp
     if count == 0 || crate::wdx_api::is_stop_requested() {
         return None;
     }
+    let dk = drive_kind(path.parent()?);
+    if (dk == DriveKind::Remote && !prefetch_remote_enabled())
+        || (dk == DriveKind::Removable && !prefetch_removable_enabled())
+    {
+        return None;
+    }
+    let max_workers = match dk {
+        DriveKind::Fixed => usize::MAX,
+        DriveKind::Removable | DriveKind::Remote => 1,
+    };
     let mut pool = POOL
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let pool = pool.get_or_insert_with(|| Pool::new(count));
-    pool.request(path, field, kind)
+    pool.request(path, field, kind, max_workers)
 }
 
 pub(crate) fn cancel() {
@@ -438,5 +497,21 @@ pub(crate) fn shutdown() {
         if let Some(pool) = pool {
             pool.shutdown();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unc_and_local_drive_classification() {
+        assert_eq!(drive_kind(Path::new(r"\\server\share\dir")), DriveKind::Remote);
+        assert_eq!(
+            drive_kind(Path::new(r"\\?\UNC\server\share\dir")),
+            DriveKind::Remote
+        );
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(drive_kind(manifest_dir), DriveKind::Fixed);
     }
 }

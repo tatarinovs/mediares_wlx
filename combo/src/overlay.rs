@@ -21,11 +21,10 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{TrackMouseEvent, TME_LEAVE, TRACKMOUSEEVENT};
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetForegroundWindow,
-    GetGUIThreadInfo, GetWindowLongPtrW, GetWindowRect, KillTimer, LoadCursorW, SetCursor,
-    SetLayeredWindowAttributes, SetTimer, SetWindowLongPtrW, ShowWindow, GUITHREADINFO,
-    GUI_INMENUMODE, GUI_POPUPMENUMODE, GWLP_USERDATA, IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE,
-    SW_SHOWNOACTIVATE, WM_ERASEBKGND, WM_MOUSEACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW, WS_POPUP,
+    GetGUIThreadInfo, GetWindowRect, KillTimer, LoadCursorW, SetCursor, SetLayeredWindowAttributes,
+    SetTimer, ShowWindow, GUITHREADINFO, GUI_INMENUMODE, GUI_POPUPMENUMODE, GWLP_USERDATA,
+    IDC_ARROW, LWA_ALPHA, MA_NOACTIVATE, SW_HIDE, SW_SHOWNOACTIVATE, WM_ERASEBKGND,
+    WM_MOUSEACTIVATE, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use crate::gdi;
@@ -161,7 +160,7 @@ unsafe extern "system" fn panel_proc(
             _ => {}
         }
         // Mouse input and painting are handled by the viewer window module.
-        let viewer = HWND(GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut _);
+        let viewer = HWND(crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *mut _);
         let handled = if viewer.is_invalid() {
             None
         } else {
@@ -226,7 +225,7 @@ unsafe fn create_panel(viewer: HWND, monitor: RECT, kind: PanelKind) -> Option<P
         None,
     )
     .ok()?;
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, viewer.0 as isize);
+    crate::set_window_long_ptr(hwnd, GWLP_USERDATA, viewer.0 as isize);
     let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), OPACITY, LWA_ALPHA);
     if kind == PanelKind::Photo {
         let radius = (12.0 * scale).round() as i32;

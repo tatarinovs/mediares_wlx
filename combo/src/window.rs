@@ -17,8 +17,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect, GetCursorPos,
-    GetWindowLongPtrW, KillTimer, LoadCursorW, PeekMessageW, PostMessageW, SetCursor, SetTimer,
-    SetWindowLongPtrW, SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
+    KillTimer, LoadCursorW, PeekMessageW, PostMessageW, SetCursor, SetTimer,
+    SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
     IDC_HAND, IDC_SIZEALL, MSG, PM_NOREMOVE, PM_REMOVE, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN,
     TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND,
     WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN,
@@ -105,7 +105,7 @@ pub unsafe fn create_viewer(lister: HWND, path: &Path, show_flags: i32) -> Optio
     state.show_flags = show_flags;
     // Only the standalone Lister (F3) starts fullscreen, not the Quick View panel (Ctrl+Q).
     let start_fullscreen = state.config.start_fullscreen && !is_quick_view(lister);
-    SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
+    crate::set_window_long_ptr(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
     access::run(hwnd, None, || {
         let _ = ShowWindow(hwnd, SW_SHOW);
 
@@ -187,11 +187,11 @@ pub unsafe fn send_command(hwnd: HWND, command: i32, parameter: i32) -> bool {
 /// TC's Quick View panel (Ctrl+Q) hosts the plugin in a child window of the main window,
 /// while the Lister (F3) is a top-level window.
 unsafe fn is_quick_view(parent: HWND) -> bool {
-    GetWindowLongPtrW(parent, GWL_STYLE) as u32 & WS_CHILD.0 != 0
+    crate::get_window_long_ptr(parent, GWL_STYLE) as u32 & WS_CHILD.0 != 0
 }
 
 unsafe fn get_state<'a>(hwnd: HWND) -> Option<&'a mut ViewerState> {
-    (GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ViewerState).as_mut()
+    (crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *mut ViewerState).as_mut()
 }
 
 /// Like [`get_state`], but first verifies `hwnd` is still one of our viewer windows. Used after
@@ -1015,7 +1015,7 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
             return LRESULT(0);
         }
         WM_NCDESTROY => {
-            let ptr = SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) as *mut ViewerState;
+            let ptr = crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0) as *mut ViewerState;
             if !ptr.is_null() {
                 drop(Box::from_raw(ptr));
             }

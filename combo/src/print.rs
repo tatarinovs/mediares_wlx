@@ -299,8 +299,8 @@ pub unsafe fn print(
         return false;
     };
 
-    let style = GetWindowLongPtrW(dlg, GWL_STYLE) as u32;
-    SetWindowLongPtrW(dlg, GWL_STYLE, (style | WS_CLIPCHILDREN.0) as isize);
+    let style = crate::get_window_long_ptr(dlg, GWL_STYLE) as u32;
+    crate::set_window_long_ptr(dlg, GWL_STYLE, (style | WS_CLIPCHILDREN.0) as isize);
 
     let font = dialog::font(dlg, "Segoe UI", -14);
     let mut data = Preview {
@@ -335,7 +335,7 @@ pub unsafe fn print(
         pending_image: Cell::new(false),
         repaint: Cell::new(false),
     };
-    SetWindowLongPtrW(dlg, GWLP_USERDATA, &state as *const _ as isize);
+    crate::set_window_long_ptr(dlg, GWLP_USERDATA, &state as *const _ as isize);
     dialog::run_modal(dlg, print_button);
     state.data.into_inner().printed
 }
@@ -622,10 +622,10 @@ struct PreviewState {
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     mediares_core::ffi::guard(LRESULT(0), || unsafe {
         if msg == WM_NCDESTROY {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+            crate::set_window_long_ptr(hwnd, GWLP_USERDATA, 0);
             return DefWindowProcW(hwnd, msg, wp, lp);
         }
-        let ptr = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const PreviewState;
+        let ptr = crate::get_window_long_ptr(hwnd, GWLP_USERDATA) as *const PreviewState;
         let Some(state) = ptr.as_ref() else {
             return DefWindowProcW(hwnd, msg, wp, lp);
         };
@@ -653,7 +653,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
         };
         let result = preview_message(hwnd, msg, wp, lp, &mut data);
         drop(data);
-        if GetWindowLongPtrW(hwnd, GWLP_USERDATA) == ptr as isize {
+        if crate::get_window_long_ptr(hwnd, GWLP_USERDATA) == ptr as isize {
             if state.pending_image.replace(false) {
                 let _ = PostMessageW(
                     Some(hwnd),

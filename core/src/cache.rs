@@ -124,6 +124,9 @@ pub struct AudioFastFingerprint {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AudioDuration(pub u32);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PartialHash(pub u64);
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AudioField {
     Analysis,
@@ -365,10 +368,18 @@ impl<V: Clone> FileCache<V> {
         if bytes > self.budget {
             return Some(value);
         }
+        self.insert_weighted(key, value.clone(), bytes);
+        Some(value)
+    }
+
+    fn insert_weighted(&self, key: FileKey, value: V, bytes: usize) {
+        if bytes > self.budget {
+            return;
+        }
         let mut lru = self.lock();
         lru.clock += 1;
         let now = lru.clock;
-        if let Some((_, _, old)) = lru.map.insert(key, (value.clone(), now, bytes)) {
+        if let Some((_, _, old)) = lru.map.insert(key, (value, now, bytes)) {
             lru.bytes -= old;
         }
         lru.bytes = lru.bytes.saturating_add(bytes);
@@ -380,7 +391,16 @@ impl<V: Clone> FileCache<V> {
             lru.map.retain(|_, (_, used, _)| *used > newest_dropped);
             lru.bytes = lru.map.values().map(|(_, _, bytes)| bytes).sum();
         }
-        Some(value)
+    }
+
+    fn peek_key(&self, key: &FileKey) -> Option<V> {
+        self.lock().map.get(key).map(|(value, _, _)| value.clone())
+    }
+
+    fn insert_key(&self, key: FileKey, value: V) {
+        let bytes = (self.weigh)(&value)
+            .saturating_add(key.path.as_os_str().len() * 2 + size_of::<FileKey>());
+        self.insert_weighted(key, value, bytes);
     }
 
     fn peek(&self, path: &Path) -> Option<V> {
@@ -457,17 +477,24 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
         if cancelled() {
             return None;
         }
-        #[cfg(feature = "profile-stats")]
-        {
-            use std::sync::atomic::Ordering;
-            if NON_BLOCKING_FLIGHT.get() {
-                stats::DISK_HITS_BG.fetch_add(1, Ordering::Relaxed);
-            } else {
-                stats::DISK_HITS_FG.fetch_add(1, Ordering::Relaxed);
-            }
-        }
+        record_disk_hit();
         VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
         return Some(value);
+    }
+    let mut partial_hash = None;
+    if T::CONTENT_REUSE {
+        if let Some(ph) = partial_hash_for_reuse(path, &key) {
+            partial_hash = Some(ph);
+            if let Some((value, bytes)) = crate::disk_cache::read_by_content::<T>(key.size, ph) {
+                if cancelled() {
+                    return None;
+                }
+                let _ = crate::disk_cache::write_with_partial_hash(&key, &value, Some(ph));
+                record_disk_hit();
+                VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
+                return Some((value, bytes));
+            }
+        }
     }
     #[cfg(feature = "profile-stats")]
     stats::record_compute(path, NON_BLOCKING_FLIGHT.get());
@@ -481,12 +508,38 @@ fn persistent_result<T: crate::disk_cache::DiskValue>(
         clear_row_key();
         return None;
     }
-    let bytes = crate::disk_cache::write(&key, &value);
+    let ph_to_store = if T::CONTENT_REUSE {
+        partial_hash.or_else(|| partial_hash_for_reuse(path, &key))
+    } else {
+        None
+    };
+    let bytes = crate::disk_cache::write_with_partial_hash(&key, &value, ph_to_store);
     if let Some(sample) = sample {
         sample.complete();
     }
     VERIFIED_KEY.with_borrow_mut(|v| *v = Some(key));
     Some((value, bytes))
+}
+
+fn record_disk_hit() {
+    #[cfg(feature = "profile-stats")]
+    {
+        use std::sync::atomic::Ordering;
+        if NON_BLOCKING_FLIGHT.get() {
+            stats::DISK_HITS_BG.fetch_add(1, Ordering::Relaxed);
+        } else {
+            stats::DISK_HITS_FG.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn partial_hash_for_reuse(path: &Path, key: &FileKey) -> Option<u64> {
+    if let Some(cached) = partial_hash_cache().peek_key(key) {
+        return Some(cached.0);
+    }
+    let ph = crate::hashing::compute_partial_hash(path)?;
+    partial_hash_cache().insert_key(key.clone(), PartialHash(ph));
+    Some(ph)
 }
 
 /// A failed or cancelled decode leaves the file eligible for a later request.
@@ -645,6 +698,19 @@ pub fn is_exif_cached(path: &Path) -> bool {
     exif_cache().contains(path)
 }
 
+fn image_extra_cache() -> &'static MetaCache<crate::image_meta::ImageExtraMeta> {
+    static EXTRA: OnceLock<MetaCache<crate::image_meta::ImageExtraMeta>> = OnceLock::new();
+    EXTRA.get_or_init(MetaCache::new)
+}
+
+pub fn get_image_extra(path: &Path) -> Option<Arc<crate::image_meta::ImageExtraMeta>> {
+    image_extra_cache().get_or_read(path, crate::image_meta::read_image_extra_meta)
+}
+
+pub fn is_image_extra_cached(path: &Path) -> bool {
+    image_extra_cache().contains(path)
+}
+
 fn tiff_pages_cache() -> &'static MetaCache<Vec<crate::wic_decode::TiffPage>> {
     static PAGES: OnceLock<MetaCache<Vec<crate::wic_decode::TiffPage>>> = OnceLock::new();
     PAGES.get_or_init(MetaCache::new)
@@ -790,16 +856,38 @@ pub fn is_video_tags_cached(path: &Path) -> bool {
     video_tags_cache().contains(path)
 }
 
+fn partial_hash_cache() -> &'static FileCache<PartialHash> {
+    static PARTIAL: OnceLock<FileCache<PartialHash>> = OnceLock::new();
+    PARTIAL.get_or_init(|| FileCache::new(CAPACITY))
+}
+
+pub fn get_partial_hash(path: &Path) -> Option<u64> {
+    partial_hash_cache()
+        .get_or_compute(path, |p| {
+            persistent_result(p, &|| false, || {
+                crate::hashing::compute_partial_hash(p).map(PartialHash)
+            })
+            .map(|(v, _)| v)
+        })
+        .map(|v| v.0)
+}
+
+pub fn is_partial_hash_cached(path: &Path) -> bool {
+    partial_hash_cache().contains(path)
+}
+
 /// Empties every cache (the plugin is being unloaded).
 pub fn clear_all() {
     clear_row_key();
     get_cache().clear();
+    partial_hash_cache().clear();
     audio_analysis_cache().clear();
     audio_fast_fingerprint_cache().clear();
     audio_duration_cache().clear();
     #[cfg(feature = "tags")]
     tags_cache().clear();
     exif_cache().clear();
+    image_extra_cache().clear();
     tiff_pages_cache().clear();
     image_size_cache().clear();
     pixel_format_cache().clear();

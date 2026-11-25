@@ -103,8 +103,37 @@ if not exist "%WDX_DLL%" (
 )
 
 echo:
+echo [2b/4] Building 32-bit MSVC binaries (static CRT)...
+set "MSVC_TOOLCHAIN=stable-x86_64-pc-windows-msvc"
+set "TARGET32=i686-pc-windows-msvc"
+rustup target list --toolchain %MSVC_TOOLCHAIN% --installed | findstr /x "%TARGET32%" >nul 2>nul
+if errorlevel 1 (
+    rustup target add %TARGET32% --toolchain %MSVC_TOOLCHAIN%
+    if errorlevel 1 exit /b 1
+)
+set "RUSTFLAGS=-C target-feature=+crt-static"
+for %%P in (mediares_combo mediares_wdx) do (
+    cargo +%MSVC_TOOLCHAIN% rustc --target-dir "%~dp0target" --locked --release --target %TARGET32% -p %%P --lib --crate-type cdylib -- -C strip=symbols
+    if errorlevel 1 (
+        echo [ERROR] 32-bit Cargo build of %%P failed!
+        exit /b 1
+    )
+)
+set "RUSTFLAGS="
+set "COMBO32_DLL=target\%TARGET32%\release\mediares_combo.dll"
+set "WDX32_DLL=target\%TARGET32%\release\mediares_wdx.dll"
+if not exist "%COMBO32_DLL%" (
+    echo [ERROR] Expected build artifact not found: %COMBO32_DLL%
+    exit /b 1
+)
+if not exist "%WDX32_DLL%" (
+    echo [ERROR] Expected build artifact not found: %WDX32_DLL%
+    exit /b 1
+)
+
+echo:
 echo [3/4] Staging and verifying plugin archives...
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -Root "%~dp0." -Version "%VERSION%" -ComboDll "%COMBO_DLL%" -WdxDll "%WDX_DLL%"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -Root "%~dp0." -Version "%VERSION%" -ComboDll "%COMBO_DLL%" -ComboDll32 "%COMBO32_DLL%" -WdxDll "%WDX_DLL%" -WdxDll32 "%WDX32_DLL%"
 if errorlevel 1 (
     echo [ERROR] Packaging failed. Previous artifacts were not reported as a new release.
     exit /b 1
