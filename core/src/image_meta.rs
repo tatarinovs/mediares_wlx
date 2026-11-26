@@ -6,7 +6,7 @@ use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 
-mod c2pa;
+pub(crate) mod c2pa;
 
 const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -33,12 +33,8 @@ pub fn read_image_extra_meta(path: &Path) -> Option<ImageExtraMeta> {
     } else if head[..3] == [0xFF, 0xD8, 0xFF] {
         read_jpeg_extra(&mut file)
     } else if head[..4] == *b"II*\0" || head[..4] == *b"MM\0*" {
-        file.seek(SeekFrom::Start(0)).ok()?;
-        let mut buf = Vec::new();
-        file.take(256 * 1024).read_to_end(&mut buf).ok()?;
-        let (dpi, _) = parse_tiff_dpi_and_comment(&buf);
         Some(ImageExtraMeta {
-            dpi,
+            dpi: crate::exif::read_tiff_dpi(&mut file).and_then(valid_dpi),
             ai_parameters: None,
         })
     } else {

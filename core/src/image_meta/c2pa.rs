@@ -2,6 +2,31 @@
 
 use ciborium::Value;
 
+/// The JUMBF entity, fragment sequence and repeated box contents of a JPEG XT APP11.
+pub(crate) fn jpeg_fragment(segment: &[u8]) -> Option<([u8; 2], u32, &[u8])> {
+    let (prefix, part) = segment.split_at_checked(8)?;
+    if &prefix[..2] != b"JP" {
+        return None;
+    }
+    let entity = [prefix[2], prefix[3]];
+    let sequence = u32::from_be_bytes(prefix[4..8].try_into().ok()?);
+    Some((entity, sequence, part))
+}
+
+pub(crate) fn jpeg_manifest_start(part: &[u8]) -> bool {
+    if part.get(4..8) != Some(b"jumb") {
+        return false;
+    }
+    let header_len = if part.starts_with(&1u32.to_be_bytes()) {
+        16
+    } else {
+        8
+    };
+    part.get(header_len..)
+        .and_then(|mut body| description(&mut body, b"c2pa"))
+        == Some(b"c2pa")
+}
+
 #[derive(Default)]
 pub(super) struct JpegManifest {
     data: Vec<u8>,
@@ -12,23 +37,14 @@ pub(super) struct JpegManifest {
 
 impl JpegManifest {
     pub(super) fn push(&mut self, segment: &[u8]) {
-        if self.invalid || !segment.starts_with(b"JP") {
+        if self.invalid {
             return;
         }
-        let Some((prefix, part)) = segment.split_at_checked(8) else {
+        let Some((entity, sequence, part)) = jpeg_fragment(segment) else {
             return;
         };
-        let entity = [prefix[2], prefix[3]];
-        let sequence = u32::from_be_bytes(prefix[4..8].try_into().unwrap());
         if self.data.is_empty() {
-            if sequence == 1
-                && part.get(4..8) == Some(b"jumb")
-                && part.get(if part.starts_with(&1u32.to_be_bytes()) {
-                    24..28
-                } else {
-                    16..20
-                }) == Some(b"c2pa")
-            {
+            if sequence == 1 && jpeg_manifest_start(part) {
                 self.entity = entity;
                 self.sequence = sequence;
                 self.data.extend_from_slice(part);
@@ -279,6 +295,31 @@ mod tests {
         jpeg.push(&first);
         jpeg.push(&second);
         assert_eq!(jpeg.ai_source().as_deref(), expected);
+
+        let app11 = |payload: &[u8]| {
+            let mut segment = vec![0xFF, 0xEB];
+            segment.extend_from_slice(&((payload.len() + 2) as u16).to_be_bytes());
+            segment.extend_from_slice(payload);
+            segment
+        };
+        let other = app11(b"JP\0\x02\0\0\0\x01unrelated APP11 data");
+        let mut sample = image::DynamicImage::new_rgb8(8, 8);
+        *sample.as_mut_rgb8().unwrap().get_pixel_mut(0, 0) = image::Rgb([108, 45, 0]);
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        sample
+            .write_to(&mut bytes, image::ImageFormat::Jpeg)
+            .unwrap();
+        let mut bytes = bytes.into_inner();
+        let expected_pixels = image::load_from_memory(&bytes).unwrap();
+        bytes.splice(
+            2..2,
+            [app11(&first), other.clone(), app11(&second)].concat(),
+        );
+        let cleaned = crate::jpeg::with_only_exif(&bytes, b"II*\0").unwrap();
+        assert!(!cleaned.windows(first.len()).any(|data| data == first));
+        assert!(!cleaned.windows(second.len()).any(|data| data == second));
+        assert!(cleaned.windows(other.len()).any(|data| data == other));
+        assert_eq!(image::load_from_memory(&cleaned).unwrap(), expected_pixels);
 
         let mut broken = JpegManifest::default();
         second[7] = 3;

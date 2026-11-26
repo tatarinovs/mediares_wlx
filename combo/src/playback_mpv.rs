@@ -389,7 +389,6 @@ impl FrameSession {
                     ("sid", "no"),
                     ("pause", "yes"),
                     ("hwdec", "no"),
-                    ("hr-seek", "no"),
                     ("idle", "yes"),
                     ("keep-open", "yes"),
                     ("vf", &filter),
@@ -409,7 +408,7 @@ impl FrameSession {
                 &[
                     "seek",
                     &format!("{:.6}", seconds.max(0.0)),
-                    "absolute+keyframes",
+                    "absolute+exact",
                 ],
             ) {
                 return None;

@@ -197,14 +197,12 @@ fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         }
         if is_audio {
             audio_streams += 1;
-            if audio_lang.is_none() {
+            if audio_streams == 1 {
                 audio_lang = mdhd_lang;
             }
         }
     }
-    if audio_streams > 0 {
-        tags.audio_streams = Some(audio_streams);
-    }
+    tags.audio_streams = (audio_streams > 0).then_some(audio_streams);
     tags.audio_lang = audio_lang;
     // Only the movie's own udta; tracks may have theirs, about the track.
     for (_, start, end) in moov_children
@@ -564,7 +562,7 @@ fn parse_tracks(data: &[u8], tags: &mut VideoTags) {
             continue;
         }
         audio_streams += 1;
-        if audio_lang.is_none() {
+        if audio_streams == 1 {
             let lang = children(entry)
                 .find(|(id, _)| *id == MKV_LANGUAGE_IETF)
                 .and_then(|(_, d)| utf8(d))
@@ -576,12 +574,8 @@ fn parse_tracks(data: &[u8], tags: &mut VideoTags) {
             audio_lang = lang.filter(|l| !l.eq_ignore_ascii_case("und"));
         }
     }
-    if audio_streams > 0 {
-        tags.audio_streams = Some(audio_streams);
-    }
-    if audio_lang.is_some() {
-        tags.audio_lang = audio_lang;
-    }
+    tags.audio_streams = (audio_streams > 0).then_some(audio_streams);
+    tags.audio_lang = audio_lang;
 }
 
 /// The chapters of the first edition that isn't hidden (top-level atoms only).
@@ -967,26 +961,31 @@ mod tests {
 
     #[test]
     fn matroska_and_mp4_audio_streams_and_language() {
-        let mkv = file(&cat(&[
-            el(
-                TRACKS,
-                &cat(&[
-                    el(TRACK_ENTRY, &el(TRACK_TYPE, &[1])),
-                    el(
-                        TRACK_ENTRY,
-                        &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, b"rus")]),
-                    ),
-                    el(
-                        TRACK_ENTRY,
-                        &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, b"eng")]),
-                    ),
-                ]),
-            ),
-            el(CLUSTER, &[0; 8]),
-        ]));
-        let mkv_tags = read_matroska(&mut Cursor::new(mkv)).unwrap();
+        let mkv = |first_lang: &[u8]| {
+            file(&cat(&[
+                el(
+                    TRACKS,
+                    &cat(&[
+                        el(TRACK_ENTRY, &el(TRACK_TYPE, &[1])),
+                        el(
+                            TRACK_ENTRY,
+                            &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, first_lang)]),
+                        ),
+                        el(
+                            TRACK_ENTRY,
+                            &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, b"eng")]),
+                        ),
+                    ]),
+                ),
+                el(CLUSTER, &[0; 8]),
+            ]))
+        };
+        let mkv_tags = read_matroska(&mut Cursor::new(mkv(b"rus"))).unwrap();
         assert_eq!(mkv_tags.audio_streams, Some(2));
         assert_eq!(mkv_tags.audio_lang.as_deref(), Some("rus"));
+        let mkv_tags = read_matroska(&mut Cursor::new(mkv(b"und"))).unwrap();
+        assert_eq!(mkv_tags.audio_streams, Some(2));
+        assert_eq!(mkv_tags.audio_lang, None);
 
         // MP4 with two audio tracks: first "eng" (0x15c7), second "jpn"
         let audio_trak = |lang_bits: u16| {
@@ -1006,12 +1005,20 @@ mod tests {
             ((b'e' - 0x60) as u16) << 10 | ((b'n' - 0x60) as u16) << 5 | ((b'g' - 0x60) as u16);
         let jpn_bits: u16 =
             ((b'j' - 0x60) as u16) << 10 | ((b'p' - 0x60) as u16) << 5 | ((b'n' - 0x60) as u16);
-        let mp4 = cat(&[
-            mp4_box(b"ftyp", b"isom"),
-            mp4_box(b"moov", &cat(&[audio_trak(eng_bits), audio_trak(jpn_bits)])),
-        ]);
-        let mp4_tags = read_mp4(&mut Cursor::new(mp4)).unwrap();
+        let mp4 = |first_lang| {
+            cat(&[
+                mp4_box(b"ftyp", b"isom"),
+                mp4_box(
+                    b"moov",
+                    &cat(&[audio_trak(first_lang), audio_trak(jpn_bits)]),
+                ),
+            ])
+        };
+        let mp4_tags = read_mp4(&mut Cursor::new(mp4(eng_bits))).unwrap();
         assert_eq!(mp4_tags.audio_streams, Some(2));
         assert_eq!(mp4_tags.audio_lang.as_deref(), Some("eng"));
+        let mp4_tags = read_mp4(&mut Cursor::new(mp4(0))).unwrap();
+        assert_eq!(mp4_tags.audio_streams, Some(2));
+        assert_eq!(mp4_tags.audio_lang, None);
     }
 }

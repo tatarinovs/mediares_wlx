@@ -17,12 +17,20 @@ const CODES: [[u16; 4]; 2] = [[1, 6, 3, 8], [2, 7, 4, 5]];
 /// The orientation that shows the picture turned by `quarter_turns` clockwise more than
 /// `orientation` does (unknown codes count as 1).
 pub fn turned(orientation: u16, quarter_turns: u8) -> u16 {
-    let (mirror, turns) = CODES
+    let (mirror, turns) = components(orientation);
+    CODES[mirror][(turns + usize::from(quarter_turns)) % 4]
+}
+
+fn components(orientation: u16) -> (usize, usize) {
+    CODES
         .iter()
         .enumerate()
         .find_map(|(m, row)| row.iter().position(|&c| c == orientation).map(|k| (m, k)))
-        .unwrap_or((0, 0));
-    CODES[mirror][(turns + usize::from(quarter_turns)) % 4]
+        .unwrap_or((0, 0))
+}
+
+pub(crate) fn clockwise_quarter_turns(orientation: u16) -> usize {
+    components(orientation).1
 }
 
 fn invalid(what: &str) -> io::Error {

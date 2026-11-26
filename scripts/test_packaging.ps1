@@ -21,6 +21,23 @@ foreach ($dir in @('input', 'pluginst', 'docs')) { [IO.Directory]::CreateDirecto
     if (-not (Test-Path -LiteralPath (Join-Path $fixture 'dist/mediares.wlx'))) { throw 'Missing published 32-bit WLX binary' }
     if (-not (Test-Path -LiteralPath (Join-Path $fixture 'dist/mediares_wdx_only.wdx'))) { throw 'Missing published 32-bit WDX binary' }
     $archive = Join-Path $fixture 'dist/mediares-wdx-v0.0.0.zip'
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    function Assert-PluginArchive([string]$Path, [string]$Extension) {
+        $zip = [IO.Compression.ZipFile]::OpenRead($Path)
+        try {
+            $binaries = @($zip.Entries.Name | Where-Object { $_ -match '\.(wlx|wdx)(64)?$' })
+            if ($binaries.Count -ne 1 -or $binaries[0] -ne "mediares.$Extension" -or
+                $null -eq $zip.GetEntry('pluginst.inf')) { throw "Unexpected plugin archive: $Path" }
+        }
+        finally { $zip.Dispose() }
+    }
+    Assert-PluginArchive $archive 'wdx64'
+    Assert-PluginArchive (Join-Path $fixture 'dist/mediares-wlx-v0.0.0.zip') 'wlx64'
+    Assert-PluginArchive (Join-Path $fixture 'dist/mediares-wlx-x32-v0.0.0.zip') 'wlx'
+    Assert-PluginArchive (Join-Path $fixture 'dist/mediares-wdx-x32-v0.0.0.zip') 'wdx'
+    if (@(Get-ChildItem -LiteralPath (Join-Path $fixture 'dist') -Filter '*.zip').Count -ne 4) {
+        throw 'Expected four release archives'
+    }
     $before = (Get-FileHash -LiteralPath $archive).Hash
     $translation = Join-Path $fixture 'pluginst/mediares_ui.lng'
     [IO.File]::Delete($translation)

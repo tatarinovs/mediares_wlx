@@ -612,16 +612,16 @@ macro_rules! metadata {
     };
 }
 
-metadata!(crate::exif::ExifInfo, 2, 1);
+metadata!(crate::exif::ExifInfo, 2, 2);
 #[cfg(feature = "tags")]
 metadata!(crate::audio_tags::AudioTags, 3, 1);
 metadata!(crate::video_frame::VideoMeta, 4, 3);
 metadata!(crate::mf_audio::AudioStreamMeta, 5, 1);
-metadata!(crate::video_tags::VideoTags, 6, 2);
+metadata!(crate::video_tags::VideoTags, 6, 3);
 metadata!((u32, u32), 7, 1);
 metadata!(crate::image_decode::PixelFormat, 8, 1);
 metadata!(Vec<crate::wic_decode::TiffPage>, 9, 1);
-metadata!(crate::image_meta::ImageExtraMeta, 14, 3);
+metadata!(crate::image_meta::ImageExtraMeta, 14, 4);
 
 fn write_json_str(out: &mut String, s: &str) {
     out.push('"');

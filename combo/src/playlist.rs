@@ -182,7 +182,7 @@ fn next_random() -> u64 {
 /// Reads an M3U / M3U8 playlist without probing every entry: relative paths resolved against
 /// the playlist's folder, `file:///` URLs included. `#` lines (EXTINF etc.) and other URLs are
 /// skipped.
-fn read_m3u(path: &Path) -> Vec<PathBuf> {
+pub(crate) fn read_m3u(path: &Path) -> Vec<PathBuf> {
     use std::io::Read;
     const MAX_BYTES: u64 = 16 * 1024 * 1024;
     let mut bytes = Vec::new();
@@ -198,13 +198,12 @@ fn read_m3u(path: &Path) -> Vec<PathBuf> {
 
 /// Entries that the viewer can open automatically. A playlist may refer to files on
 /// its own network share, but it cannot cause a connection to a different one.
-pub fn media_entries(path: &Path) -> Vec<MediaEntry> {
-    let mut allowed = crate::shortcut::same_origin_filter(path);
-    read_m3u(path)
-        .into_iter()
-        .filter_map(|p| MediaEntry::resolve_allowed(p, &mut allowed))
-        .filter(|entry| entry.kind.is_image_kind() || entry.kind.is_playable())
-        .collect()
+pub(crate) fn resolve_entry(
+    path: PathBuf,
+    allowed: &mut impl FnMut(&Path) -> bool,
+) -> Option<MediaEntry> {
+    let entry = MediaEntry::resolve_allowed(path, allowed)?;
+    (entry.kind.is_image_kind() || entry.kind.is_playable()).then_some(entry)
 }
 
 fn parse_m3u(bytes: &[u8], base: &Path) -> Vec<PathBuf> {
@@ -390,7 +389,11 @@ file://external.invalid/share/other.wav
 "#,
         )
         .unwrap();
-        let entries = media_entries(&path);
+        let mut allowed = crate::shortcut::same_origin_filter(&path);
+        let entries: Vec<_> = read_m3u(&path)
+            .into_iter()
+            .filter_map(|entry| resolve_entry(entry, &mut allowed))
+            .collect();
         let _ = std::fs::remove_file(&path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].target, path.with_file_name("local.wav"));

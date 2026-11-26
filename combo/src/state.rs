@@ -1,6 +1,7 @@
 //! Per-HWND viewer state for a Total Commander Lister instance.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 use std::sync::{mpsc, Arc, Mutex};
 
 use mediares_core::image_decode::{header_looks_decodable, may_have_pages};
@@ -169,10 +170,13 @@ impl ViewerState {
         let Some(entry) = MediaEntry::resolve(path.to_path_buf()) else {
             return false;
         };
-        if probe_file(&entry.target) == MediaType::Playlist {
+        if entry.kind == MediaType::Playlist {
             return self.open_playlist(entry);
         }
         self.playlist_scan = None;
+        if self.playlist.take().is_some() {
+            self.dir_files.clear();
+        }
         match self
             .dir_files
             .iter()
@@ -186,7 +190,6 @@ impl ViewerState {
                 // The file is shown first; the folder (thousands of files, maybe on a network
                 // drive) is listed meanwhile.
                 (self.dir_files, self.current_idx) = (vec![entry], 0);
-                self.playlist = None;
                 // Stepping on while the folder is still being listed: that listing will have the
                 // new file too, so it is not started over (one full listing per keypress on a
                 // slow share otherwise).
@@ -201,20 +204,35 @@ impl ViewerState {
 
     fn open_playlist(&mut self, playlist_file: MediaEntry) -> bool {
         const MAX_INITIAL_OPENS: usize = 32;
-        let entries = playlist::media_entries(&playlist_file.target);
-        let initial = entries
-            .iter()
-            .take(MAX_INITIAL_OPENS)
-            .enumerate()
-            .find_map(|(idx, entry)| self.prepare_playlist_entry(entry, false).map(|p| (idx, p)));
-        let start = initial
-            .as_ref()
-            .map_or(MAX_INITIAL_OPENS, |(idx, _)| idx + 1);
-        let scan = match &initial {
-            None | Some((_, Prepared::Image(Request::Pending(_)))) if start < entries.len() => {
-                scan_playlist_tail(&entries, start, self.hwnd)
-            }
-            _ => None,
+        let paths = playlist::read_m3u(&playlist_file.target);
+        let has_shortcuts = paths.iter().any(|path| crate::shortcut::is_shortcut(path));
+        let mut paths = paths.into_iter().filter(|path| {
+            crate::shortcut::is_shortcut(path)
+                || matches!(probe_file(path), kind if kind.is_image_kind() || kind.is_playable())
+        }).peekable();
+        let mut allowed = crate::shortcut::same_origin_filter(&playlist_file.target);
+        let mut entries = Vec::new();
+        let initial = paths.by_ref().take(MAX_INITIAL_OPENS).find_map(|path| {
+            let entry = playlist::resolve_entry(path, &mut allowed)?;
+            let prepared = self.prepare_playlist_entry(&entry, false);
+            entries.push(entry);
+            prepared
+        });
+        let initial_idx = entries.len().saturating_sub(1);
+        let searching = matches!(initial, None | Some(Prepared::Image(Request::Pending(_))));
+        let scan = if paths.peek().is_none() {
+            None
+        } else if !searching && !has_shortcuts {
+            // Direct paths need no resolution I/O, so the full queue is available immediately.
+            entries.extend(paths.filter_map(|path| playlist::resolve_entry(path, &mut allowed)));
+            None
+        } else {
+            scan_playlist_tail(
+                paths.collect(),
+                playlist_file.target.clone(),
+                self.hwnd,
+                searching,
+            )
         };
         if initial.is_none() && scan.is_none() {
             return false;
@@ -224,8 +242,9 @@ impl ViewerState {
         self.playlist_scan = scan;
         self.scan = None;
         self.compare = None;
-        if let Some((idx, prepared)) = initial {
-            return self.show_playlist_entry(idx, prepared);
+        if let Some(prepared) = initial {
+            // Any direct entries added above follow the one just prepared.
+            return self.show_playlist_entry(initial_idx, prepared);
         }
         self.file_path = playlist_file.target;
         self.current_idx = 0;
@@ -264,30 +283,54 @@ impl ViewerState {
     }
 
     pub fn playlist_scanned(&mut self) -> bool {
-        if self.pending.is_some() {
-            return false;
-        }
         let Some(scan) = &self.playlist_scan else {
             return false;
         };
-        match scan.candidates.try_recv() {
-            Ok(idx) => {
-                if let Some(prepared) = self.prepare_playlist_entry(&self.dir_files[idx], true) {
-                    self.show_playlist_entry(idx, prepared);
-                    if self.pending.is_none() {
-                        self.playlist_scan = None;
+        let searching = scan.searching.load(Relaxed);
+        if searching && self.pending.is_some() {
+            return false;
+        }
+        match scan.batches.try_recv() {
+            Ok(batch) => {
+                let start = self.dir_files.len();
+                self.dir_files
+                    .extend(batch.entries.into_iter().filter(|entry| {
+                        !scan.deleted.iter().any(|path| {
+                            same_path(path, entry.source()) || same_path(path, &entry.target)
+                        })
+                    }));
+                if searching && batch.has_candidate && self.dir_files.len() > start {
+                    let idx = self.dir_files.len() - 1;
+                    if let Some(prepared) = self.prepare_playlist_entry(&self.dir_files[idx], true)
+                    {
+                        self.show_playlist_entry(idx, prepared);
+                        if self.pending.is_none() {
+                            self.stop_playlist_search();
+                        }
                     }
-                    return true;
                 }
-                // One player open per message, so the window can service other events.
+                self.update_queue_neighbors();
+                // Messages delivered while a photo was decoding may already have been consumed.
                 post_playlist_ready(self.hwnd);
-                false
+                self.dir_files.len() != start
             }
             Err(mpsc::TryRecvError::Empty) => false,
             Err(mpsc::TryRecvError::Disconnected) => {
+                let ended = scan.playback_ended;
                 self.playlist_scan = None;
-                self.load_failed = true;
-                true
+                if searching {
+                    self.load_failed = true;
+                }
+                (ended && self.playback_ended()) || searching
+            }
+        }
+    }
+
+    fn stop_playlist_search(&mut self) {
+        if let Some(scan) = &mut self.playlist_scan {
+            scan.playback_ended = false;
+            if scan.searching.swap(false, Relaxed) {
+                post_playlist_ready(self.hwnd);
             }
         }
     }
@@ -314,6 +357,11 @@ impl ViewerState {
             })
         });
         (self.dir_files, self.current_idx) = (files, idx);
+        self.update_queue_neighbors();
+        true
+    }
+
+    fn update_queue_neighbors(&mut self) {
         let can_skip = playlist::step(
             &self.dir_files,
             self.current_idx,
@@ -326,7 +374,6 @@ impl ViewerState {
             media.set_skip(can_skip);
         }
         image_cache::prefetch(self.prefetch_candidates());
-        true
     }
 
     fn show(&mut self, path: &Path) -> bool {
@@ -396,10 +443,16 @@ impl ViewerState {
             self.previous = None;
             match result {
                 Some(img) => {
-                    self.playlist_scan = None;
+                    self.stop_playlist_search();
                     self.set_image(img);
                 }
-                None if self.playlist_scan.is_some() => post_playlist_ready(self.hwnd),
+                None if self
+                    .playlist_scan
+                    .as_ref()
+                    .is_some_and(|s| s.searching.load(Relaxed)) =>
+                {
+                    post_playlist_ready(self.hwnd);
+                }
                 None => self.load_failed = true,
             }
             arrived = Arrived::Photo;
@@ -513,7 +566,7 @@ impl ViewerState {
         let Some(path) = self.dir_files.get(idx).map(|e| e.target.clone()) else {
             return false;
         };
-        self.playlist_scan = None;
+        self.stop_playlist_search();
         self.current_idx = idx;
         self.show(&path)
     }
@@ -571,6 +624,9 @@ impl ViewerState {
 
     /// Near the end of an audio file: has the one the queue plays next decoded ahead.
     pub fn preload_next(&mut self) {
+        if self.playlist_scan.is_some() {
+            return;
+        }
         let EndAction::Play(idx) = playlist::on_end(
             &self.dir_files,
             self.current_idx,
@@ -590,6 +646,13 @@ impl ViewerState {
 
     /// The current file played to its end. Returns whether another file is now shown.
     pub fn playback_ended(&mut self) -> bool {
+        if self.config.queue.auto_advance && self.config.queue.repeat != playlist::Repeat::One {
+            if let Some(scan) = &mut self.playlist_scan {
+                // Queue order and wrapping depend on entries that are still being resolved.
+                scan.playback_ended = true;
+                return false;
+            }
+        }
         // Already playing on (the shuffled pick included).
         if let Some(idx) = self.preloaded.take() {
             return self.go_to(idx);
@@ -768,6 +831,9 @@ impl ViewerState {
     }
 
     pub fn deletion_path(&self) -> Option<&Path> {
+        if probe_file(&self.file_path) == MediaType::Playlist {
+            return None;
+        }
         let entry = self.dir_files.get(self.current_idx)?;
         Some(
             self.playlist
@@ -782,8 +848,12 @@ impl ViewerState {
     /// still keeps the viewer open, so the user can move on from it.
     pub fn remove_deleted(&mut self, path: &Path) -> bool {
         let group = self.active_group();
+        self.stop_playlist_search();
         if self.playlist.as_deref().is_some_and(|p| same_path(p, path)) {
             self.dir_files.clear();
+            self.playlist_scan = None;
+        } else if let Some(scan) = &mut self.playlist_scan {
+            scan.deleted.push(path.to_path_buf());
         }
         let survives = |entry: &MediaEntry| {
             !same_path(entry.source(), path) && !same_path(&entry.target, path)
@@ -1090,8 +1160,17 @@ pub const WM_DIR_SCANNED: u32 = WM_APP + 0x13;
 pub const WM_PLAYLIST_READY: u32 = WM_APP + 0x19;
 
 struct PlaylistScan {
-    candidates: mpsc::Receiver<usize>,
+    batches: mpsc::Receiver<PlaylistBatch>,
+    searching: Arc<AtomicBool>,
+    deleted: Vec<PathBuf>,
+    playback_ended: bool,
     _alive: Arc<()>,
+}
+
+struct PlaylistBatch {
+    entries: Vec<MediaEntry>,
+    // When starting the playlist, send a playable entry at the end of its batch.
+    has_candidate: bool,
 }
 
 fn post_playlist_ready(hwnd: HWND) {
@@ -1100,12 +1179,15 @@ fn post_playlist_ready(hwnd: HWND) {
     }
 }
 
-fn scan_playlist_tail(entries: &[MediaEntry], start: usize, hwnd: HWND) -> Option<PlaylistScan> {
-    let tail = entries[start..]
-        .iter()
-        .map(|e| (e.target.clone(), e.kind))
-        .collect::<Vec<_>>();
-    let (send, receive) = mpsc::sync_channel(1);
+fn scan_playlist_tail(
+    paths: Vec<PathBuf>,
+    playlist_path: PathBuf,
+    hwnd: HWND,
+    searching: bool,
+) -> Option<PlaylistScan> {
+    let (send, batches) = mpsc::sync_channel(2);
+    let searching = Arc::new(AtomicBool::new(searching));
+    let find_first = searching.clone();
     let alive = Arc::new(());
     let viewer = Arc::downgrade(&alive);
     let hwnd = hwnd.0 as isize;
@@ -1113,21 +1195,42 @@ fn scan_playlist_tail(entries: &[MediaEntry], start: usize, hwnd: HWND) -> Optio
         .name("mediares-playlist".into())
         .spawn(move || {
             let notify = || post_playlist_ready(HWND(hwnd as *mut _));
-            for (offset, (file, kind)) in tail.into_iter().enumerate() {
+            let mut allowed = crate::shortcut::same_origin_filter(&playlist_path);
+            let mut entries = Vec::new();
+            for path in paths {
                 if viewer.strong_count() == 0 {
                     return;
                 }
-                let candidate = if kind.is_playable() {
-                    file.is_file()
-                } else {
-                    header_looks_decodable(&file, kind)
+                let Some(entry) = playlist::resolve_entry(path, &mut allowed) else {
+                    continue;
                 };
-                if candidate {
-                    if send.send(start + offset).is_err() {
+                let has_candidate = find_first.load(Relaxed)
+                    && if entry.kind.is_playable() {
+                        entry.target.is_file()
+                    } else {
+                        header_looks_decodable(&entry.target, entry.kind)
+                    };
+                entries.push(entry);
+                if has_candidate || entries.len() == 64 {
+                    let batch = PlaylistBatch {
+                        entries: std::mem::take(&mut entries),
+                        has_candidate,
+                    };
+                    if send.send(batch).is_err() {
                         return;
                     }
                     notify();
                 }
+            }
+            if !entries.is_empty()
+                && send
+                    .send(PlaylistBatch {
+                        entries,
+                        has_candidate: false,
+                    })
+                    .is_err()
+            {
+                return;
             }
             drop(send);
             if viewer.strong_count() != 0 {
@@ -1136,7 +1239,10 @@ fn scan_playlist_tail(entries: &[MediaEntry], start: usize, hwnd: HWND) -> Optio
         })
         .ok()?;
     Some(PlaylistScan {
-        candidates: receive,
+        batches,
+        searching,
+        deleted: Vec::new(),
+        playback_ended: false,
         _alive: alive,
     })
 }

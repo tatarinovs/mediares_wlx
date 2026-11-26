@@ -1,4 +1,4 @@
-//! EXIF metadata reader for JPEG, TIFF-based (TIFF/RAW) and HEIF-family (HEIC/AVIF) files.
+//! EXIF metadata reader for JPEG, PNG, TIFF-based (TIFF/RAW) and HEIF-family (HEIC/AVIF) files.
 //!
 //! The metadata block is read into memory once and parsed from a slice, so every access is
 //! bounds-checked and malformed offsets simply yield missing fields.
@@ -19,6 +19,7 @@ const TIFF_READ_ROUNDS: usize = 4;
 /// Further reads per round (a damaged file may point anywhere).
 const TIFF_READS_PER_ROUND: usize = 16;
 const MAX_STRING_LEN: usize = 4096;
+const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
 
 const TYPE_BYTE: u16 = 1;
 const TYPE_ASCII: u16 = 2;
@@ -107,7 +108,7 @@ pub fn read_exif(path: &Path) -> Option<ExifInfo> {
     read(path, false)
 }
 
-/// Retain a successful JPEG scan without EXIF; failed reads remain cache misses.
+/// Retain a successful JPEG or PNG scan without EXIF; failed reads remain cache misses.
 pub(crate) fn read_exif_for_cache(path: &Path) -> Option<ExifInfo> {
     read(path, true)
 }
@@ -126,22 +127,60 @@ fn read(path: &Path, cache_absent: bool) -> Option<ExifInfo> {
         info.orientation = None;
         return Some(info);
     }
-    if magic.starts_with(&[0xFF, 0xD8]) {
-        match read_jpeg_app1(file)? {
-            Some(payload) => parse_tiff(&payload),
-            None => cache_absent.then(ExifInfo::default),
-        }
+    let payload = if magic.starts_with(&[0xFF, 0xD8]) {
+        read_jpeg_app1(file)?
+    } else if head.starts_with(PNG_SIGNATURE) {
+        read_png_exif(file)?
     } else if magic == b"II*\0" || magic == b"MM\0*" {
-        read_tiff_exif(&mut file)
+        return read_tiff(&mut file, parse_pieces);
     } else {
-        None
+        return None;
+    };
+    match payload {
+        Some(payload) => parse_tiff(&payload),
+        None => cache_absent.then(ExifInfo::default),
     }
+}
+
+/// Find eXIf before or after IDAT without loading the image data.
+fn read_png_exif(mut file: File) -> Option<Option<Vec<u8>>> {
+    let file_len = file.metadata().ok()?.len();
+    let mut offset = PNG_SIGNATURE.len() as u64;
+    for _ in 0..8192 {
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut header = [0; 8];
+        file.read_exact(&mut header).ok()?;
+        let len = u32::from_be_bytes(header[..4].try_into().ok()?);
+        offset += 12 + u64::from(len); // Chunk header, data and CRC.
+        if offset > file_len {
+            return None;
+        }
+        match &header[4..] {
+            b"eXIf" if u64::from(len) <= TIFF_PIECE_MAX_BYTES => {
+                let mut payload = vec![0; len as usize];
+                file.read_exact(&mut payload).ok()?;
+                let mut checksum = [0; 4];
+                file.read_exact(&mut checksum).ok()?;
+                let mut crc = flate2::Crc::new();
+                crc.update(b"eXIf");
+                crc.update(&payload);
+                return (crc.sum() == u32::from_be_bytes(checksum)).then_some(Some(payload));
+            }
+            b"eXIf" => return None,
+            b"IEND" if len == 0 => return Some(None),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// The metadata of a TIFF-based file. The head usually holds all of it (a Sony ARW's ends at
 /// about 43 KB); what the structure points to past it is read where it lies: TIFFs written by
 /// libtiff, Photoshop or WIC keep IFD0 after the picture, megabytes into the file.
-fn read_tiff_exif(file: &mut File) -> Option<ExifInfo> {
+fn read_tiff<T>(
+    file: &mut File,
+    parse: impl Fn(&Pieces) -> (Option<T>, Vec<(usize, usize)>),
+) -> Option<T> {
     let file_len = file.metadata().ok()?.len();
     let mut read_at = |offset: u64, len: u64| {
         let mut data = Vec::new();
@@ -153,7 +192,7 @@ fn read_tiff_exif(file: &mut File) -> Option<ExifInfo> {
     let mut tried = Vec::new();
     let mut round = 0;
     loop {
-        let (info, missing) = parse_pieces(&pieces);
+        let (info, missing) = parse(&pieces);
         let wanted: Vec<(usize, usize)> = missing
             .into_iter()
             .filter(|&(offset, _)| (offset as u64) < file_len && !tried.contains(&offset))
@@ -171,6 +210,10 @@ fn read_tiff_exif(file: &mut File) -> Option<ExifInfo> {
             }
         }
     }
+}
+
+pub(crate) fn read_tiff_dpi(file: &mut File) -> Option<u32> {
+    read_tiff(file, |pieces| parse_with(pieces, Tiff::dpi))
 }
 
 pub fn read_orientation(path: &Path) -> Option<u16> {
@@ -241,6 +284,13 @@ impl Pieces<'_> {
 
 /// The metadata found in `pieces`, and what was looked for but isn't there (offset, length).
 fn parse_pieces(pieces: &Pieces) -> (Option<ExifInfo>, Vec<(usize, usize)>) {
+    parse_with(pieces, Tiff::parse)
+}
+
+fn parse_with<'a, T>(
+    pieces: &'a Pieces<'a>,
+    read: impl FnOnce(&Tiff<'a>) -> Option<T>,
+) -> (Option<T>, Vec<(usize, usize)>) {
     let le = match pieces.get(0, 4) {
         Some(b"II*\0") => true,
         Some(b"MM\0*") => false,
@@ -251,7 +301,7 @@ fn parse_pieces(pieces: &Pieces) -> (Option<ExifInfo>, Vec<(usize, usize)>) {
         rd: Endian(le),
         missing: RefCell::new(Vec::new()),
     };
-    let info = tiff.parse();
+    let info = read(&tiff);
     (info, tiff.missing.into_inner())
 }
 
@@ -308,6 +358,30 @@ struct Entry<'a> {
 }
 
 impl<'a> Tiff<'a> {
+    fn dpi(&self) -> Option<u32> {
+        let ifd = self.u32(4)? as usize;
+        let count = self.rd.u16(self.bytes(ifd, 2)?);
+        let mut resolution = None;
+        let mut unit = 2;
+        for i in 0..usize::from(count) {
+            let Some(entry) = self.entry(ifd.checked_add(2 + 12 * i)?, &[0x011A, 0x0128]) else {
+                break;
+            };
+            match entry.tag {
+                0x011A => resolution = self.rational(&entry).and_then(ratio),
+                0x0128 => unit = self.uint(&entry)?,
+                _ => {}
+            }
+        }
+        let dpi = resolution?
+            * match unit {
+                2 => 1.0,
+                3 => 2.54,
+                _ => return None,
+            };
+        Some(dpi.round() as u32)
+    }
+
     /// IFD0, then the Exif and GPS IFDs it points to.
     fn parse(&self) -> Option<ExifInfo> {
         let ifd0 = self.u32(4)? as usize;
@@ -336,9 +410,9 @@ impl<'a> Tiff<'a> {
     }
 
     /// Decodes the 12-byte IFD entry at `offset`; values up to 4 bytes are stored inline. The value
-    /// is empty when it can't be read or isn't one of [`READ_TAGS`]: the entries after it still
+    /// is empty when it can't be read or isn't in `read_tags`: the entries after it still
     /// count.
-    fn entry(&self, offset: usize) -> Option<Entry<'a>> {
+    fn entry(&self, offset: usize, read_tags: &[u16]) -> Option<Entry<'a>> {
         let raw = self.bytes(offset, 12)?;
         let tag = self.rd.u16(&raw[0..2]);
         let typ = self.rd.u16(&raw[2..4]);
@@ -359,7 +433,7 @@ impl<'a> Tiff<'a> {
         };
         let value = match (count as usize).checked_mul(unit) {
             Some(size) if size <= 4 => &raw[8..8 + size],
-            Some(size) if READ_TAGS.contains(&tag) => self
+            Some(size) if read_tags.contains(&tag) => self
                 .bytes(self.rd.u32(&raw[8..12]) as usize, size)
                 .unwrap_or(&[]),
             _ => &[],
@@ -409,7 +483,7 @@ impl<'a> Tiff<'a> {
             return;
         };
         for i in 0..count as usize {
-            let Some(e) = self.entry(offset + 2 + i * 12) else {
+            let Some(e) = self.entry(offset + 2 + i * 12, READ_TAGS) else {
                 break;
             };
             match e.tag {
@@ -441,7 +515,7 @@ impl<'a> Tiff<'a> {
         };
         let (mut lat_ref, mut lon_ref, mut lat, mut lon) = (None, None, None, None);
         for i in 0..count as usize {
-            let Some(e) = self.entry(offset + 2 + i * 12) else {
+            let Some(e) = self.entry(offset + 2 + i * 12, READ_TAGS) else {
                 break;
             };
             match e.tag {
@@ -751,6 +825,31 @@ mod tests {
         assert_eq!(info.f_number, Some(2.8));
     }
 
+    #[test]
+    fn png_exif_is_read_for_the_viewer_and_cache() {
+        use image::ImageEncoder;
+        let path = std::env::temp_dir().join(format!("mediares-exif-{}.png", std::process::id()));
+        let mut png = Vec::new();
+        let mut encoder = image::codecs::png::PngEncoder::new(&mut png);
+        encoder.set_exif_metadata(be_tiff()).unwrap();
+        encoder
+            .write_image(&[0; 24], 4, 2, image::ExtendedColorType::Rgb8)
+            .unwrap();
+        std::fs::write(&path, png).unwrap();
+        let info = read_exif_for_cache(&path).unwrap();
+        assert_eq!(info.orientation, Some(6));
+        assert_eq!(info.iso, Some(400));
+        let (img, ..) = crate::image_decode::decode_oriented_fitted(
+            &path,
+            crate::probe::MediaType::StandardImage,
+            true,
+            Some((32, 32)),
+        )
+        .unwrap();
+        assert_eq!((img.width(), img.height()), (2, 4));
+        std::fs::remove_file(path).unwrap();
+    }
+
     /// The Exif IFD past the first read: the file is read further and the ISO still found.
     #[test]
     fn exif_ifd_beyond_the_head_is_found() {
@@ -788,7 +887,7 @@ mod tests {
         let ifd0 = 8 + picture;
         t.extend_from_slice(&(ifd0 as u32).to_le_bytes());
         t.resize(ifd0, 0x55);
-        let entries = 3usize;
+        let entries = 5usize;
         let values = ifd0 + 2 + entries * 12 + 4;
         let make = b"Scanner\0";
         t.extend_from_slice(&(entries as u16).to_le_bytes());
@@ -800,13 +899,22 @@ mod tests {
         t.extend_from_slice(&[0x11, 0x01, 4, 0]);
         t.extend_from_slice(&strips.to_le_bytes());
         t.extend_from_slice(&((values + make.len()) as u32).to_le_bytes());
+        t.extend_from_slice(&[0x1A, 0x01, 5, 0, 1, 0, 0, 0]); // XResolution
+        t.extend_from_slice(&((values + make.len() + strips as usize * 4) as u32).to_le_bytes());
+        t.extend_from_slice(&[0x28, 0x01, 3, 0, 1, 0, 0, 0, 2, 0, 0, 0]); // inches
         t.extend_from_slice(&0u32.to_le_bytes());
         t.extend_from_slice(make);
         t.extend((0..strips).flat_map(|i| (8 + i).to_le_bytes()));
+        t.extend_from_slice(&300u32.to_le_bytes());
+        t.extend_from_slice(&1u32.to_le_bytes());
 
         let path = std::env::temp_dir().join(format!("mediares_{}_tail.tif", std::process::id()));
         std::fs::write(&path, &t).unwrap();
         let info = read_exif(&path);
+        assert_eq!(
+            crate::image_meta::read_image_extra_meta(&path).unwrap().dpi,
+            Some(300)
+        );
         std::fs::remove_file(&path).ok();
         let info = info.expect("read");
         assert_eq!(info.orientation, Some(8));

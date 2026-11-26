@@ -175,17 +175,38 @@ pub fn with_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// [`with_exif`] that also drops the other descriptive metadata: XMP and any other APP1, IPTC /
-/// Photoshop (APP13), Ducky (APP12) and comments. What decoding needs stays: JFIF, the ICC
+/// Photoshop (APP13), Ducky (APP12), C2PA (APP11) and comments. What decoding needs stays: JFIF, the ICC
 /// profile, the Adobe color transform, MPF and the like.
 pub fn with_only_exif(jpeg: &[u8], tiff: &[u8]) -> Option<Vec<u8>> {
-    replace_metadata(jpeg, tiff, |marker, _| {
-        matches!(marker, 0xE1 | 0xEC | 0xED | 0xFE)
+    use crate::image_meta::c2pa::{jpeg_fragment, jpeg_manifest_start};
+    let mut manifest_entities = std::collections::HashSet::new();
+    replace_metadata(jpeg, tiff, |marker, payload| {
+        if marker == 0xEB {
+            let Some((entity, sequence, part)) = jpeg_fragment(payload) else {
+                return false;
+            };
+            if sequence == 1 {
+                if jpeg_manifest_start(part) {
+                    manifest_entities.insert(entity);
+                    return true;
+                }
+                manifest_entities.remove(&entity);
+                return false;
+            }
+            manifest_entities.contains(&entity)
+        } else {
+            matches!(marker, 0xE1 | 0xEC | 0xED | 0xFE)
+        }
     })
 }
 
 /// The JPEG with a new `Exif` segment holding `tiff` and without the header segments `drop`
 /// (marker, payload) picks.
-fn replace_metadata(jpeg: &[u8], tiff: &[u8], drop: impl Fn(u8, &[u8]) -> bool) -> Option<Vec<u8>> {
+fn replace_metadata(
+    jpeg: &[u8],
+    tiff: &[u8],
+    mut drop: impl FnMut(u8, &[u8]) -> bool,
+) -> Option<Vec<u8>> {
     if !jpeg.starts_with(&[0xFF, 0xD8]) {
         return None;
     }

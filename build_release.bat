@@ -132,7 +132,7 @@ if not exist "%WDX32_DLL%" (
 )
 
 echo:
-echo [3/4] Staging and verifying plugin archives...
+echo [3/4] Staging four plugin archives: WLX and WDX for x64 and x32...
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\package_release.ps1" -Root "%~dp0." -Version "%VERSION%" -ComboDll "%COMBO_DLL%" -ComboDll32 "%COMBO32_DLL%" -WdxDll "%WDX_DLL%" -WdxDll32 "%WDX32_DLL%"
 if errorlevel 1 (
     echo [ERROR] Packaging failed. Previous artifacts were not reported as a new release.

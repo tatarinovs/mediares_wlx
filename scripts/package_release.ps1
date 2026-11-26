@@ -22,10 +22,8 @@ function Resolve-Input([string]$Name) {
     return $item.FullName
 }
 
-    function Stage-Package([string]$Kind, [string]$Binary, [string]$Binary32 = '') {
-        $dir = [IO.Path]::Combine($stagePath, $Kind)
-        [IO.Directory]::CreateDirectory($dir) | Out-Null
-        $extension = if ($Kind -eq 'wlx') { 'wlx64' } else { 'wdx64' }
+    function Stage-Package([string]$Kind, [string]$Binary, [switch]$X86) {
+        $extension = if ($X86) { $Kind } else { "${Kind}64" }
         $files = [ordered]@{
             "mediares.$extension" = $Binary
             'pluginst.inf'        = (Resolve-Input "pluginst/pluginst-$Kind.inf")
@@ -33,13 +31,18 @@ function Resolve-Input([string]$Name) {
             'readme_rus.txt'      = (Resolve-Input 'docs/readme_rus.txt')
             'readme_eng.txt'      = (Resolve-Input 'docs/readme_eng.txt')
         }
-        if ($Kind -eq 'wdx' -and $Binary32) { $files['mediares.wdx'] = $Binary32 }
-        if ($Kind -eq 'wlx' -and $Binary32) { $files['mediares.wlx'] = $Binary32 }
         if ($Kind -eq 'wlx') { $files['mediares_ui.lng'] = Resolve-Input 'pluginst/mediares_ui.lng' }
+        $suffix = if ($X86) { '-x32' } else { '' }
+        return Stage-Archive "mediares-$Kind$suffix-v$Version" $files
+    }
+
+    function Stage-Archive([string]$Name, $Files) {
+        $dir = [IO.Path]::Combine($stagePath, $Name)
+        [IO.Directory]::CreateDirectory($dir) | Out-Null
         foreach ($entry in $files.GetEnumerator()) {
             Copy-Item -LiteralPath $entry.Value -Destination ([IO.Path]::Combine($dir, $entry.Key))
         }
-        $zipPath = [IO.Path]::Combine($stagePath, "mediares-$Kind-v$Version.zip")
+        $zipPath = [IO.Path]::Combine($stagePath, "$Name.zip")
         [IO.Compression.ZipFile]::CreateFromDirectory($dir, $zipPath)
         $zip = [IO.Compression.ZipFile]::OpenRead($zipPath)
         try {
@@ -125,9 +128,9 @@ function Resolve-Input([string]$Name) {
         $combo32 = if ($ComboDll32) { Resolve-Input $ComboDll32 } else { '' }
         $wdx32 = if ($WdxDll32) { Resolve-Input $WdxDll32 } else { '' }
         [IO.Directory]::CreateDirectory($stagePath) | Out-Null
-        # Complete and verify both archives before publishing any artifact.
-        $wdxZip = Stage-Package 'wdx' $wdx $wdx32
-        $wlxZip = Stage-Package 'wlx' $combo $combo32
+        # Complete and verify all archives before publishing any artifact.
+        $wdxZip = Stage-Package 'wdx' $wdx
+        $wlxZip = Stage-Package 'wlx' $combo
         [IO.Directory]::CreateDirectory($distPath) | Out-Null
                 $publish = [ordered]@{
                     ([IO.Path]::GetFileName($wdxZip)) = $wdxZip
@@ -138,8 +141,16 @@ function Resolve-Input([string]$Name) {
                     'mediares_ui.lng'                 = (Resolve-Input 'pluginst/mediares_ui.lng')
                     'pluginst.inf'                    = (Resolve-Input 'pluginst/pluginst-wlx.inf')
         }
-        if ($combo32) { $publish['mediares.wlx'] = $combo32 }
-        if ($wdx32) { $publish['mediares_wdx_only.wdx'] = $wdx32 }
+        if ($combo32) {
+            $zip = Stage-Package 'wlx' $combo32 -X86
+            $publish[[IO.Path]::GetFileName($zip)] = $zip
+            $publish['mediares.wlx'] = $combo32
+        }
+        if ($wdx32) {
+            $zip = Stage-Package 'wdx' $wdx32 -X86
+            $publish[[IO.Path]::GetFileName($zip)] = $zip
+            $publish['mediares_wdx_only.wdx'] = $wdx32
+        }
         Publish-Release $publish
         Write-Output "Verified release archives and DLLs written to $distPath"
     }

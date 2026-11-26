@@ -358,7 +358,8 @@ def run_check(dll, baseline, viewer_dll, stress):
     assert len(refreshed) == len(original)
     assert all((before != after) == (before[1] == 11)
                for before, after in zip(original, refreshed)), "Version change affected other families"
-    assert all(row[-1] == {4: 3, 6: 2}.get(row[1], 1) for row in refreshed)
+    family_versions = {2: 2, 4: 3, 6: 3}
+    assert all(row[-1] == family_versions.get(row[1], 1) for row in refreshed)
     original = refreshed
     # A malformed individual metadata record must fall back and repair only that record.
     with sqlite3.connect(db) as conn:
@@ -421,7 +422,7 @@ def run_check(dll, baseline, viewer_dll, stress):
         lock.close()
     assert run(db)["values"] == modified["values"]
     refreshed = rows()
-    assert all(row[-1] == {4: 3, 6: 2}.get(row[1], 1) for row in refreshed), "Old algorithm versions were reused"
+    assert all(row[-1] == family_versions.get(row[1], 1) for row in refreshed), "Old algorithm versions were reused"
     assert run(db)["values"] == modified["values"]
     assert rows() == refreshed
 

@@ -429,11 +429,7 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
         Source::VideoMeta if matches!(field, Field::VideoAudioLang | Field::VideoAudioStreams) => {
             let tags = crate::cache::cached_video_tags(path);
             if let Some(tags) = tags.as_ref() {
-                let has_value = match field {
-                    Field::VideoAudioLang => tags.audio_lang.is_some(),
-                    _ => tags.audio_streams.is_some(),
-                };
-                if has_value {
+                if tags.audio_streams.is_some() {
                     return false;
                 }
             } else if crate::video_tags::has_tag_reader(path) {
@@ -631,13 +627,8 @@ fn image_orientation_value(
         return None;
     }
     if unit_index == 2 {
-        let angle = match exif_orient {
-            Some(3 | 4) => "180",
-            Some(5 | 6) => "+90",
-            Some(7 | 8) => "-90",
-            _ => "0",
-        };
-        return Some(Value::Text(angle.into()));
+        let turns = crate::orientation::clockwise_quarter_turns(exif_orient.unwrap_or(1));
+        return Some(Value::Text(["0", "+90", "180", "-90"][turns].into()));
     }
     let (w, h) = if matches!(exif_orient, Some(5..=8)) {
         (raw_h, raw_w)
@@ -757,18 +748,18 @@ fn format_gps(lat: f64, lon: f64, unit_index: c_int) -> String {
 
 fn format_dms(val: f64, pos: char, neg: char) -> String {
     let hemi = if val < 0.0 { neg } else { pos };
-    let total_sec = (val.abs() * 3600.0).round() as u32;
-    let d = total_sec / 3600;
-    let m = (total_sec % 3600) / 60;
-    let s = (total_sec % 60) as f64;
+    let tenths = (val.abs() * 36_000.0).round() as u32;
+    let d = tenths / 36_000;
+    let m = (tenths % 36_000) / 600;
+    let s = f64::from(tenths % 600) / 10.0;
     format!("{d}°{m:02}'{s:04.1}\"{hemi}")
 }
 
 fn format_dmm(val: f64, pos: char, neg: char) -> String {
     let hemi = if val < 0.0 { neg } else { pos };
-    let abs = val.abs();
-    let d = abs.floor() as u32;
-    let m = (abs - f64::from(d)) * 60.0;
+    let thousandths = (val.abs() * 60_000.0).round() as u32;
+    let d = thousandths / 60_000;
+    let m = f64::from(thousandths % 60_000) / 1000.0;
     format!("{d}°{m:06.3}'{hemi}")
 }
 
@@ -791,9 +782,14 @@ fn video_meta_value(
                 .map(int);
         }
         VideoAudioLang => {
-            return crate::cache::get_video_tags(path)
-                .and_then(|tags| tags.audio_lang.clone())
-                .or_else(|| crate::cache::get_video_meta(path)?.audio_lang.clone())
+            if let Some(tags) = crate::cache::get_video_tags(path) {
+                if tags.audio_streams.is_some() {
+                    return tags.audio_lang.clone().map(Value::Text);
+                }
+            }
+            return crate::cache::get_video_meta(path)?
+                .audio_lang
+                .clone()
                 .map(Value::Text);
         }
         _ => {}
