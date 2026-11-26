@@ -267,6 +267,7 @@ fn main() {
             content_get_value_w(
                 wide.as_ptr(),
                 field_idx,
+                0,
                 buf.as_mut_ptr() as *mut c_void,
                 (buf.len() * 2) as c_int,
                 0,

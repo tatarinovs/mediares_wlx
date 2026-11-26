@@ -68,7 +68,6 @@ pub struct VideoMeta {
     /// "HDR10" (PQ) or "HLG" for high dynamic range video, "SDR" otherwise; `None` if the stream
     /// doesn't say.
     pub dynamic_range: Option<crate::disk_cache::StaticName>,
-    pub container: Option<String>,
     pub audio_streams: Option<u32>,
     pub audio_lang: Option<String>,
 }
@@ -80,9 +79,7 @@ pub fn detect_video_container(path: &Path) -> Option<String> {
         .and_then(|e| e.to_str())
         .map(|s| s.to_ascii_uppercase());
     let mut buf = [0u8; 200];
-    let n = File::open(path)
-        .and_then(|mut f| f.read(&mut buf))
-        .unwrap_or(0);
+    let n = File::open(path).and_then(|mut f| f.read(&mut buf)).ok()?;
     let head = &buf[..n];
 
     if head.len() >= 12 && &head[4..8] == b"ftyp" {
@@ -314,7 +311,6 @@ pub fn probe_video_source(path: &Path) -> Option<(VideoMeta, bool)> {
                 .GetUINT32(&MF_MT_TRANSFER_FUNCTION)
                 .ok()
                 .and_then(dynamic_range_name),
-            container: detect_video_container(path),
             audio_streams: Some(audio_streams),
             audio_lang,
         };

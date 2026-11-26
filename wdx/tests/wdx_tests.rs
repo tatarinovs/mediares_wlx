@@ -36,7 +36,7 @@ fn field(name: &str) -> i32 {
 #[test]
 fn test_supported_fields_enumeration() {
     let fields: Vec<(String, i32)> = (0..).map_while(field_info).collect();
-    assert_eq!(fields.len(), 87);
+    assert_eq!(fields.len(), 86);
     let mut names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
     // Hashes for duplicate search come first.
     assert_eq!(
@@ -55,7 +55,7 @@ fn test_supported_fields_enumeration() {
     assert_eq!(names.last(), Some(&"Plugin_Version"));
     names.sort();
     names.dedup();
-    assert_eq!(names.len(), 87, "names are unique");
+    assert_eq!(names.len(), 86, "names are unique");
 
     for (name, kind) in [
         ("Image_dHash", FT_STRINGW),
@@ -991,7 +991,7 @@ fn replay_gain_is_a_numeric_tag_and_absent_tags_are_empty() {
 }
 
 #[test]
-fn test_units_partial_hash_image_extra_and_summaries() {
+fn test_units_image_extra_and_summaries() {
     use std::os::windows::ffi::OsStrExt;
     let dir = std::env::temp_dir().join(format!("mediares-wdx-new-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
@@ -1028,7 +1028,6 @@ fn test_units_partial_hash_image_extra_and_summaries() {
 
     // Build a 160x90 PNG with pHYs (300 DPI) and tEXt parameters
     let png_path = dir.join("ai.png");
-    let png_copy = dir.join("ai_copy.png");
     {
         let img = mediares_core::image::RgbImage::from_pixel(
             160,
@@ -1055,7 +1054,6 @@ fn test_units_partial_hash_image_extra_and_summaries() {
         extra.extend_from_slice(&chunk(b"tEXt", b"parameters\0best quality, Steps: 25"));
         bytes.splice(insert_at..insert_at, extra);
         std::fs::write(&png_path, &bytes).unwrap();
-        std::fs::write(&png_copy, &bytes).unwrap();
     }
 
     assert_eq!(
@@ -1079,12 +1077,6 @@ fn test_units_partial_hash_image_extra_and_summaries() {
         read_w(&png_path, "Image_AI_Parameters", 0).1,
         "best quality, Steps: 25"
     );
-
-    let (ph_code, ph1, _) = read_w(&png_path, "File_Partial_Hash", 0);
-    let (_, ph2, _) = read_w(&png_copy, "File_Partial_Hash", 0);
-    assert_eq!(ph_code, FT_STRINGW);
-    assert_eq!(ph1.len(), 16);
-    assert_eq!(ph1, ph2);
 
     // WAV -> Audio_Summary
     let wav_path = dir.join("tone.wav");

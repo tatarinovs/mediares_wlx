@@ -430,11 +430,11 @@ pub unsafe fn paint(
             draw_fitted(dc, &prev, area, state.config.smooth_zoom);
         } else if state.load_failed {
             let font = HFONT(GetStockObject(DEFAULT_GUI_FONT).0);
-            let playable = mediares_core::probe::probe_file(&state.file_path).is_playable();
+            let kind = mediares_core::probe::probe_file(&state.file_path);
             gdi::text(
                 dc,
                 area,
-                if playable {
+                if kind.is_playable() || kind == mediares_core::probe::MediaType::Playlist {
                     tr("Cannot play the file")
                 } else {
                     tr("Cannot open the image")

@@ -182,7 +182,13 @@ impl Pool {
         Self { shared, threads }
     }
 
-    fn request(&self, path: &Path, field: Field, kind: MediaType, max_workers: usize) -> Option<Sample> {
+    fn request(
+        &self,
+        path: &Path,
+        field: Field,
+        kind: MediaType,
+        max_workers: usize,
+    ) -> Option<Sample> {
         let parent = path.parent()?;
         let extension = extension(path)?;
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -240,10 +246,26 @@ impl Pool {
         })
     }
 
-    fn cancel(&self) {
+    fn cancel(&self, path: Option<&Path>) {
         let mut state = self.shared.state.lock().unwrap_or_else(|e| e.into_inner());
-        cancel_lanes(&mut state);
-        if let Some(c) = &mut state.controller {
+        if let Some(path) = path {
+            let old_len = state.lanes.len();
+            state.lanes.retain(|pending| {
+                if pending.last != path {
+                    return true;
+                }
+                pending.lane.cancelled.store(true, Ordering::Relaxed);
+                false
+            });
+            if state.lanes.len() == old_len {
+                return;
+            }
+            state.generation = state.generation.wrapping_add(1);
+            state.workload = None;
+        } else {
+            cancel_lanes(&mut state);
+        }
+        if let (true, Some(c)) = (state.lanes.is_empty(), &mut state.controller) {
             c.interrupt(Instant::now());
         }
     }
@@ -462,7 +484,7 @@ pub(crate) fn request(path: &Path, field: Field, kind: MediaType) -> Option<Samp
         return None;
     }
     let count = worker_count();
-    if count == 0 || crate::wdx_api::is_stop_requested() {
+    if count == 0 {
         return None;
     }
     let dk = drive_kind(path.parent()?);
@@ -483,10 +505,10 @@ pub(crate) fn request(path: &Path, field: Field, kind: MediaType) -> Option<Samp
     pool.request(path, field, kind, max_workers)
 }
 
-pub(crate) fn cancel() {
+pub(crate) fn cancel(path: Option<&Path>) {
     if let Some(pool) = POOL.get() {
         if let Some(pool) = pool.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            pool.cancel();
+            pool.cancel(path);
         }
     }
 }
@@ -506,7 +528,10 @@ mod tests {
 
     #[test]
     fn unc_and_local_drive_classification() {
-        assert_eq!(drive_kind(Path::new(r"\\server\share\dir")), DriveKind::Remote);
+        assert_eq!(
+            drive_kind(Path::new(r"\\server\share\dir")),
+            DriveKind::Remote
+        );
         assert_eq!(
             drive_kind(Path::new(r"\\?\UNC\server\share\dir")),
             DriveKind::Remote

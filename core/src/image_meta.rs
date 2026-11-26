@@ -6,6 +6,8 @@ use std::path::Path;
 
 use flate2::read::ZlibDecoder;
 
+mod c2pa;
+
 const MAX_SCAN_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CHUNK_BYTES: usize = 2 * 1024 * 1024;
 const MAX_DECOMPRESS_BYTES: u64 = 256 * 1024;
@@ -83,6 +85,7 @@ fn normalize_ai_text(s: &str) -> Option<String> {
 fn looks_like_ai_params(s: &str) -> bool {
     let lower = s.to_ascii_lowercase();
     lower.contains("steps:")
+        || lower.contains("\"steps\":")
         || lower.contains("sampler:")
         || lower.contains("cfg scale:")
         || lower.contains("negative prompt:")
@@ -101,6 +104,7 @@ fn read_png_extra(file: &mut File) -> Option<ImageExtraMeta> {
     let mut param_comment: Option<String> = None;
     let mut param_desc: Option<String> = None;
     let mut ai_software = false;
+    let mut provenance = None;
 
     for _ in 0..MAX_CHUNKS {
         let mut hdr = [0u8; 8];
@@ -112,7 +116,7 @@ fn read_png_extra(file: &mut File) -> Option<ImageExtraMeta> {
         if kind == b"IEND" {
             break;
         }
-        let wants = matches!(kind, b"pHYs" | b"tEXt" | b"zTXt" | b"iTXt");
+        let wants = matches!(kind, b"pHYs" | b"tEXt" | b"zTXt" | b"iTXt" | b"caBX");
         if !wants || len > MAX_CHUNK_BYTES || scanned + len > MAX_SCAN_BYTES {
             let skip = (len as u64).saturating_add(4);
             if r.seek(SeekFrom::Current(skip as i64)).is_err() {
@@ -130,6 +134,10 @@ fn read_png_extra(file: &mut File) -> Option<ImageExtraMeta> {
             break;
         }
 
+        if kind == b"caBX" {
+            provenance = c2pa::ai_source(&data);
+            continue;
+        }
         if kind == b"pHYs" && data.len() == 9 && data[8] == 1 {
             let ppu_x = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
             if ppu_x > 0 {
@@ -163,7 +171,7 @@ fn read_png_extra(file: &mut File) -> Option<ImageExtraMeta> {
             } else if key.eq_ignore_ascii_case("workflow") && param_workflow.is_none() {
                 param_workflow = normalize_ai_text(&val);
             } else if key.eq_ignore_ascii_case("comment") && param_comment.is_none() {
-                param_comment = normalize_ai_text(&val);
+                param_comment = normalize_ai_text(&val).filter(|s| looks_like_ai_params(s));
             } else if key.eq_ignore_ascii_case("description") && param_desc.is_none() {
                 param_desc = normalize_ai_text(&val);
             }
@@ -174,9 +182,8 @@ fn read_png_extra(file: &mut File) -> Option<ImageExtraMeta> {
         .or(param_prompt)
         .or(param_workflow)
         .or(param_comment)
-        .or_else(|| {
-            param_desc.filter(|d| ai_software || looks_like_ai_params(d))
-        });
+        .or_else(|| param_desc.filter(|d| ai_software || looks_like_ai_params(d)))
+        .or(provenance);
 
     Some(ImageExtraMeta { dpi, ai_parameters })
 }
@@ -243,6 +250,7 @@ fn read_jpeg_extra(file: &mut File) -> Option<ImageExtraMeta> {
     let mut exif_dpi = None;
     let mut user_comment = None;
     let mut com_text = None;
+    let mut credentials = c2pa::JpegManifest::default();
     let mut scanned = 0usize;
 
     for _ in 0..128 {
@@ -275,7 +283,7 @@ fn read_jpeg_extra(file: &mut File) -> Option<ImageExtraMeta> {
             break;
         }
         let payload_len = seg_len - 2;
-        let wants = matches!(marker, 0xE0 | 0xE1 | 0xFE);
+        let wants = matches!(marker, 0xE0 | 0xE1 | 0xEB | 0xFE);
         if !wants || payload_len > MAX_CHUNK_BYTES || scanned + payload_len > MAX_SCAN_BYTES {
             if r.seek(SeekFrom::Current(payload_len as i64)).is_err() {
                 break;
@@ -288,7 +296,12 @@ fn read_jpeg_extra(file: &mut File) -> Option<ImageExtraMeta> {
             break;
         }
 
-        if marker == 0xE0 && payload.len() >= 14 && payload.starts_with(b"JFIF\0") && jfif_dpi.is_none()
+        if marker == 0xEB {
+            credentials.push(&payload);
+        } else if marker == 0xE0
+            && payload.len() >= 14
+            && payload.starts_with(b"JFIF\0")
+            && jfif_dpi.is_none()
         {
             let units = payload[7];
             let x_den = u16::from_be_bytes([payload[8], payload[9]]);
@@ -299,23 +312,23 @@ fn read_jpeg_extra(file: &mut File) -> Option<ImageExtraMeta> {
                     _ => None,
                 };
             }
-        } else if marker == 0xE1 && payload.starts_with(b"Exif\0\0") && exif_dpi.is_none() {
+        } else if marker == 0xE1 && payload.starts_with(b"Exif\0\0") {
             let (dpi, uc) = parse_tiff_dpi_and_comment(&payload[6..]);
-            if dpi.is_some() {
-                exif_dpi = dpi;
-            }
+            exif_dpi = exif_dpi.or(dpi);
             if user_comment.is_none() {
-                user_comment = uc;
+                user_comment = uc.filter(|s| looks_like_ai_params(s));
             }
         } else if marker == 0xFE && com_text.is_none() {
             let s = String::from_utf8_lossy(&payload);
-            com_text = normalize_ai_text(&s);
+            com_text = normalize_ai_text(&s).filter(|s| looks_like_ai_params(s));
         }
     }
 
     Some(ImageExtraMeta {
         dpi: exif_dpi.or(jfif_dpi),
-        ai_parameters: user_comment.or(com_text),
+        ai_parameters: user_comment
+            .or(com_text)
+            .or_else(|| credentials.ai_source()),
     })
 }
 
@@ -361,7 +374,9 @@ fn parse_tiff_dpi_and_comment(tiff: &[u8]) -> (Option<u32>, Option<String>) {
         let Some(tag) = u16_at(entry) else { break };
         let Some(typ) = u16_at(entry + 2) else { break };
         let Some(cnt) = u32_at(entry + 4) else { break };
-        let Some(val_or_off) = u32_at(entry + 8) else { break };
+        let Some(val_or_off) = u32_at(entry + 8) else {
+            break;
+        };
         match tag {
             0x011A if typ == 5 && cnt >= 1 => {
                 let off = val_or_off as usize;
@@ -400,7 +415,9 @@ fn parse_tiff_dpi_and_comment(tiff: &[u8]) -> (Option<u32>, Option<String>) {
                 let entry = exif_off + 2 + i * 12;
                 let Some(tag) = u16_at(entry) else { break };
                 let Some(cnt) = u32_at(entry + 4) else { break };
-                let Some(val_or_off) = u32_at(entry + 8) else { break };
+                let Some(val_or_off) = u32_at(entry + 8) else {
+                    break;
+                };
                 if tag == 0x9286 && cnt > 8 {
                     let off = val_or_off as usize;
                     let len = (cnt as usize).min(64 * 1024);
@@ -426,17 +443,23 @@ fn decode_exif_user_comment(raw: &[u8]) -> Option<String> {
         let is_le = !bytes.starts_with(&[0xFE, 0xFF])
             && (bytes.starts_with(&[0xFF, 0xFE])
                 || bytes
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .take(32)
                     .filter(|c| c[1] == 0 && c[0] != 0)
                     .count()
                     >= bytes
-                        .chunks_exact(2)
+                        .as_chunks::<2>()
+                        .0
+                        .iter()
                         .take(32)
                         .filter(|c| c[0] == 0 && c[1] != 0)
                         .count());
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 if is_le {
                     u16::from_le_bytes([c[0], c[1]])
@@ -518,10 +541,13 @@ mod tests {
 
         let itxt_path = dir.join("i.png");
         let mut ipng = Vec::from(&b"\x89PNG\r\n\x1a\n"[..]);
-        ipng.extend_from_slice(&png_chunk(
-            b"iTXt",
-            b"Comment\0\0\0\0\0{\"steps\": 28}",
-        ));
+        ipng.extend_from_slice(&png_chunk(b"tEXt", b"Comment\0Summer 2024"));
+        std::fs::write(&itxt_path, &ipng).unwrap();
+        assert_eq!(
+            read_image_extra_meta(&itxt_path).unwrap().ai_parameters,
+            None
+        );
+        ipng.extend_from_slice(&png_chunk(b"iTXt", b"Comment\0\0\0\0\0{\"steps\": 28}"));
         ipng.extend_from_slice(&png_chunk(b"IEND", &[]));
         std::fs::write(&itxt_path, &ipng).unwrap();
         let imeta = read_image_extra_meta(&itxt_path).unwrap();
@@ -540,7 +566,7 @@ mod tests {
         let mut tiff = Vec::new();
         tiff.extend_from_slice(b"II*\0");
         tiff.extend_from_slice(&8u32.to_le_bytes()); // IFD0 offset = 8
-        // IFD0: 3 entries (0x011A XResolution, 0x0128 ResolutionUnit, 0x8769 ExifIFD)
+                                                     // IFD0: 3 entries (0x011A XResolution, 0x0128 ResolutionUnit, 0x8769 ExifIFD)
         let ifd0_count = 3u16;
         let after_ifd0 = 8 + 2 + usize::from(ifd0_count) * 12 + 4;
         let xres_off = after_ifd0 as u32;
@@ -563,7 +589,7 @@ mod tests {
         tiff.extend_from_slice(&1u32.to_le_bytes());
         tiff.extend_from_slice(&(exif_ifd_off as u32).to_le_bytes());
         tiff.extend_from_slice(&0u32.to_le_bytes()); // next IFD
-        // XResolution = 300/1
+                                                     // XResolution = 300/1
         tiff.extend_from_slice(&300u32.to_le_bytes());
         tiff.extend_from_slice(&1u32.to_le_bytes());
         // Exif IFD: 1 entry (0x9286 UserComment)

@@ -17,14 +17,14 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetClassNameW, GetClientRect, GetCursorPos,
-    KillTimer, LoadCursorW, PeekMessageW, PostMessageW, SetCursor, SetTimer,
-    SetWindowTextW, ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW,
-    IDC_HAND, IDC_SIZEALL, MSG, PM_NOREMOVE, PM_REMOVE, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND,
-    WM_CAPTURECHANGED, WM_CLOSE, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN,
-    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL,
-    WM_NCDESTROY, WM_PAINT, WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER,
-    WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
+    KillTimer, LoadCursorW, PeekMessageW, PostMessageW, SetCursor, SetTimer, SetWindowTextW,
+    ShowWindow, CS_DBLCLKS, GWLP_USERDATA, GWL_STYLE, IDC_ARROW, IDC_HAND, IDC_SIZEALL, MSG,
+    PM_NOREMOVE, PM_REMOVE, SW_PARENTCLOSING, SW_SHOW, TPM_LEFTALIGN, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOWPOS, WINDOW_EX_STYLE, WM_APP, WM_APPCOMMAND, WM_CAPTURECHANGED,
+    WM_CLOSE, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND, WM_KEYDOWN, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MEASUREITEM, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_NCDESTROY, WM_PAINT,
+    WM_RBUTTONUP, WM_SETCURSOR, WM_SHOWWINDOW, WM_SIZE, WM_TIMER, WM_WINDOWPOSCHANGING,
+    WM_XBUTTONDOWN, WS_CHILD, WS_CLIPCHILDREN,
 };
 
 use mediares_core::tc_api::{
@@ -41,7 +41,7 @@ use crate::media_view::EventEffect;
 use crate::menu_theme::{self, ThemedMenu};
 use crate::overlay::{self, PanelKind, PhotoButton, OVERLAY_TIMER_ID};
 use crate::seek_preview::WM_SEEK_PREVIEW;
-use crate::state::{Arrived, Drag, ViewerState, ZoomMode, WM_DIR_SCANNED};
+use crate::state::{Arrived, Drag, ViewerState, ZoomMode, WM_DIR_SCANNED, WM_PLAYLIST_READY};
 use crate::transport_bar::Click;
 use crate::{
     config, dialog, exif_dialog, file_actions, fullscreen, gdi, module, osd_template, save_as,
@@ -974,9 +974,9 @@ unsafe extern "system" fn wnd_proc(
             // WM_CLOSE can destroy the state and must wait for an active handler to finish.
             WM_CLOSE | WM_DESTROY | WM_NCDESTROY | WM_PAINT | WM_WINDOWPOSCHANGING
             | WM_MEDIA_EVENT | WM_OVERLAY_COMMAND | WM_MOUSELEAVE | WM_CONTACT_SHEET
-            | WM_SEEK_PREVIEW | WM_DIR_SCANNED | WM_IMAGE_READY | WM_TIMER | WM_SHOWWINDOW
-            | WM_APPCOMMAND | WM_SIZE | WM_RBUTTONUP | WM_LBUTTONDOWN | WM_MOUSEMOVE
-            | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_LBUTTONDBLCLK | WM_SETCURSOR
+            | WM_SEEK_PREVIEW | WM_DIR_SCANNED | WM_IMAGE_READY | WM_PLAYLIST_READY | WM_TIMER
+            | WM_SHOWWINDOW | WM_APPCOMMAND | WM_SIZE | WM_RBUTTONUP | WM_LBUTTONDOWN
+            | WM_MOUSEMOVE | WM_LBUTTONUP | WM_CAPTURECHANGED | WM_LBUTTONDBLCLK | WM_SETCURSOR
             | WM_MOUSEWHEEL | WM_XBUTTONDOWN | WM_KEYDOWN => {}
             _ => return DefWindowProcW(hwnd, msg, wparam, lparam),
         }
@@ -1085,6 +1085,11 @@ unsafe fn handle_message(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -
                 fullscreen::sync_overlay(state);
                 sync_video_osd(state);
                 update_title(state);
+            }
+        }
+        WM_PLAYLIST_READY => {
+            if state.playlist_scanned() {
+                refresh(state);
             }
         }
         WM_IMAGE_READY => match state.image_ready() {

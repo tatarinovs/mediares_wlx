@@ -312,14 +312,14 @@ def run_check(dll, baseline, viewer_dll, stress):
         assert json.loads(recovery.stdout)["transient_read_recovered"]
     db = work / "cache.sqlite3"
 
-    def run(cache, library=dll):
+    def run(cache, library=dll, inputs=paths):
         env = dict(os.environ, LOCALAPPDATA=str(work / "local"))
         if cache is None:
             env.pop("MEDIARES_CONTENT_CACHE", None)
         else:
             env["MEDIARES_CONTENT_CACHE"] = str(cache)
         completed = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--worker",
-                                    "--dll", str(library), *map(str, paths)], env=env,
+                                    "--dll", str(library), *map(str, inputs)], env=env,
                                    capture_output=True, text=True, timeout=30, check=True)
         return json.loads(completed.stdout)
 
@@ -331,12 +331,25 @@ def run_check(dll, baseline, viewer_dll, stress):
     original = rows()
     assert len(original) == 13, original  # Combined audio analysis + fast fingerprint; empty EXIF/video tags.
     with closing(sqlite3.connect(db)) as conn:
-        assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert conn.execute("PRAGMA user_version").fetchone()[0] == 1
         slots = {row[0] for row in conn.execute("SELECT DISTINCT slot FROM entries")}
         assert slots == {0, 1, 2, 3, 4, 6, 7, 8, 10, 11}, slots
     warm = run(db)
     assert cold["values"] == warm["values"]
     assert rows() == original, "A fresh process recomputed cached results"
+
+    # Two tagged WAVs with identical size and 64 KiB ends, but different PCM in the middle.
+    original_wav = paths[1]
+    other_wav = work / "different-middle.wav"
+    audio = bytearray(original_wav.read_bytes())
+    audio[128 * 1024:192 * 1024] = bytes(64 * 1024)
+    other_wav.write_bytes(audio)
+    audio_pair = [original_wav, other_wav]
+    expected = run("off", inputs=audio_pair)["values"]
+    assert expected["audio.wav:Audio_PCM_Hash"] != expected["different-middle.wav:Audio_PCM_Hash"]
+    pair_db = work / "audio-pair.sqlite3"
+    assert run(pair_db, inputs=audio_pair)["values"] == expected
+    assert run(pair_db, inputs=audio_pair)["values"] == expected
     with sqlite3.connect(db) as conn:
         conn.execute("UPDATE entries SET version=99 WHERE slot=11")
     conn.close()
@@ -345,7 +358,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     assert len(refreshed) == len(original)
     assert all((before != after) == (before[1] == 11)
                for before, after in zip(original, refreshed)), "Version change affected other families"
-    assert all(row[-1] == (2 if row[1] in (4, 6) else 1) for row in refreshed)
+    assert all(row[-1] == {4: 3, 6: 2}.get(row[1], 1) for row in refreshed)
     original = refreshed
     # A malformed individual metadata record must fall back and repair only that record.
     with sqlite3.connect(db) as conn:
@@ -362,7 +375,7 @@ def run_check(dll, baseline, viewer_dll, stress):
     prerelease_db = work / "local/mediares/content-cache-v1.sqlite3"
     prerelease_db.parent.mkdir(parents=True)
     with closing(sqlite3.connect(prerelease_db)) as conn:
-        conn.execute("PRAGMA user_version=3")
+        conn.execute("PRAGMA user_version=2")
     prerelease_bytes = prerelease_db.read_bytes()
     assert run(prerelease_db)["values"] == warm["values"]
     assert run(None)["values"] == warm["values"]
@@ -408,7 +421,7 @@ def run_check(dll, baseline, viewer_dll, stress):
         lock.close()
     assert run(db)["values"] == modified["values"]
     refreshed = rows()
-    assert all(row[-1] == (2 if row[1] in (4, 6) else 1) for row in refreshed), "Old algorithm versions were reused"
+    assert all(row[-1] == {4: 3, 6: 2}.get(row[1], 1) for row in refreshed), "Old algorithm versions were reused"
     assert run(db)["values"] == modified["values"]
     assert rows() == refreshed
 
@@ -416,7 +429,8 @@ def run_check(dll, baseline, viewer_dll, stress):
               "disabled_ms": disabled["ms"], "database_bytes": db.stat().st_size,
               "dll_bytes": dll.stat().st_size,
               "checks": ["transient read recovery", "fresh-process hits", "metadata hits", "metadata edit",
-                         "release schema v2", "prerelease cache isolation", "per-family versioning",
+                         "release schema v1", "distinct PCM with identical file ends",
+                         "prerelease cache isolation", "per-family versioning",
                          "malformed metadata", "default path", "RAM/UI delay", "Unicode paths", "file edit",
                          "algorithm version", "disabled", "unavailable", "corrupt", "locked",
                          "empty EXIF", "empty video tags"]}

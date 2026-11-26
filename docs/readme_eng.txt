@@ -231,11 +231,8 @@ Total Commander restarts in a local SQLite database:
 Metadata includes EXIF, audio/video tags, stream properties, image
 dimensions and pixel format, and the TIFF page list. Data is saved on
 demand; cover images and lyrics are excluded. A change in file size, modification
-time or algorithm version triggers a fresh read. When a file is renamed or
-moved, heavy analysis records (image hashes, video/audio fingerprints,
-sharpness) are reused from cache by file size and a fast partial hash of
-the first and last 64 KiB. Content changes preserving both size and time
-cannot be detected.
+time or algorithm version triggers a fresh read. Renamed files are also
+read again. Content changes preserving both size and time cannot be detected.
 
 Caching is enabled by default. The main database is limited to 256 MiB.
 Background maintenance removes the oldest records to keep the count
@@ -350,8 +347,6 @@ Duplicate detection fields (hashes and fingerprints) are described in section 5.
   Image_dHash, Image_pHash, Image_CoarseHash
   Video_Fingerprint, Video_dHash_Mid
   Audio_Fingerprint, Audio_Fast_Fingerprint, Audio_PCM_Hash, Audio_Artist_Title
-  File_Partial_Hash     Fast 64-bit hash (size + first and last 64 KiB) for
-                        instant exact-copy detection on large files
 
 General:
   Media_Type            File type: Image, Video or Audio
@@ -368,7 +363,8 @@ Photos:
   Image_Sharpness                Shot sharpness (Laplacian variance): sorting by it finds
                                  blurred and out-of-focus shots of one session (delayed)
   Image_DPI                      Print resolution, DPI (from EXIF, JFIF, or PNG pHYs)
-  Image_AI_Parameters            AI generation parameters (PNG tEXt/zTXt/iTXt, JPEG UserComment/COM)
+  Image_AI_Parameters            AI generation parameters (PNG text or JPEG UserComment/COM).
+                                 Otherwise shows the AI source declared by embedded C2PA (signature not checked).
   Photo_Make, Photo_Model        Camera make and model
   Photo_Lens                     Lens
   Photo_Date_Taken               Date and time taken

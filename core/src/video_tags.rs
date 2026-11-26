@@ -182,10 +182,11 @@ fn read_mp4<R: Read + Seek>(r: &mut R) -> Option<VideoTags> {
         for (kind, s, e) in mdia_boxes {
             if kind == *b"hdlr" && e - s <= 4096 {
                 let mut hdlr = vec![0u8; (e - s) as usize];
-                if r.seek(SeekFrom::Start(s)).is_ok() && r.read_exact(&mut hdlr).is_ok() {
-                    if hdlr.get(8..12) == Some(b"soun") {
-                        is_audio = true;
-                    }
+                if r.seek(SeekFrom::Start(s)).is_ok()
+                    && r.read_exact(&mut hdlr).is_ok()
+                    && hdlr.get(8..12) == Some(b"soun")
+                {
+                    is_audio = true;
                 }
             } else if kind == *b"mdhd" && e - s <= 256 {
                 let mut mdhd = vec![0u8; (e - s) as usize];
@@ -973,17 +974,11 @@ mod tests {
                     el(TRACK_ENTRY, &el(TRACK_TYPE, &[1])),
                     el(
                         TRACK_ENTRY,
-                        &cat(&[
-                            el(TRACK_TYPE, &[2]),
-                            el(MKV_LANGUAGE, b"rus"),
-                        ]),
+                        &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, b"rus")]),
                     ),
                     el(
                         TRACK_ENTRY,
-                        &cat(&[
-                            el(TRACK_TYPE, &[2]),
-                            el(MKV_LANGUAGE, b"eng"),
-                        ]),
+                        &cat(&[el(TRACK_TYPE, &[2]), el(MKV_LANGUAGE, b"eng")]),
                     ),
                 ]),
             ),
@@ -1007,18 +1002,13 @@ mod tests {
                 ),
             )
         };
-        let eng_bits: u16 = ((b'e' - 0x60) as u16) << 10
-            | ((b'n' - 0x60) as u16) << 5
-            | ((b'g' - 0x60) as u16);
-        let jpn_bits: u16 = ((b'j' - 0x60) as u16) << 10
-            | ((b'p' - 0x60) as u16) << 5
-            | ((b'n' - 0x60) as u16);
+        let eng_bits: u16 =
+            ((b'e' - 0x60) as u16) << 10 | ((b'n' - 0x60) as u16) << 5 | ((b'g' - 0x60) as u16);
+        let jpn_bits: u16 =
+            ((b'j' - 0x60) as u16) << 10 | ((b'p' - 0x60) as u16) << 5 | ((b'n' - 0x60) as u16);
         let mp4 = cat(&[
             mp4_box(b"ftyp", b"isom"),
-            mp4_box(
-                b"moov",
-                &cat(&[audio_trak(eng_bits), audio_trak(jpn_bits)]),
-            ),
+            mp4_box(b"moov", &cat(&[audio_trak(eng_bits), audio_trak(jpn_bits)])),
         ]);
         let mp4_tags = read_mp4(&mut Cursor::new(mp4)).unwrap();
         assert_eq!(mp4_tags.audio_streams, Some(2));

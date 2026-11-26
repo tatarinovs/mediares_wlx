@@ -5,23 +5,51 @@
 use std::os::raw::{c_char, c_int, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use crate::cache::{get_cache, CachedMedia};
 use crate::ffi::{pstr_to_path, pwstr_to_path, write_ansi, write_wide};
 use crate::probe::{detect_extensions, probe_file, MediaType};
 use crate::tc_api::*;
 
-static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+static REQUESTS: Mutex<Vec<(PathBuf, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
 
-#[inline]
-pub fn is_stop_requested() -> bool {
-    STOP_REQUESTED.load(Ordering::Relaxed)
+fn requests() -> MutexGuard<'static, Vec<(PathBuf, Arc<AtomicBool>)>> {
+    REQUESTS.lock().unwrap_or_else(|err| err.into_inner())
 }
 
-#[inline]
-pub fn reset_stop_flag() {
-    STOP_REQUESTED.store(false, Ordering::Relaxed);
+struct Request(Arc<AtomicBool>);
+
+impl Request {
+    fn start(path: &Path) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        requests().push((path.to_path_buf(), stop.clone()));
+        Self(stop)
+    }
+
+    fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Request {
+    fn drop(&mut self) {
+        requests().retain(|(_, stop)| !Arc::ptr_eq(stop, &self.0));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn stopping_one_path_marks_its_active_requests_only() {
+    let a = Path::new("cancel-a.wav");
+    let b = Path::new("cancel-b.wav");
+    let first = Request::start(a);
+    let second = Request::start(b);
+    content_stop_get_value(Some(a));
+    let retry = Request::start(a);
+    assert!(first.cancelled());
+    assert!(!second.cancelled());
+    assert!(!retry.cancelled());
 }
 
 /// The work needed to obtain a field, used to keep slow reads off TC's UI thread.
@@ -29,7 +57,6 @@ pub fn reset_stop_flag() {
 pub(crate) enum Source {
     Constant,
     Probe,
-    PartialHash,
     Tags,
     Exif,
     ImageSize,
@@ -89,7 +116,6 @@ fields! {
     AudioFingerprint, "Audio_Fingerprint", FT_STRINGW, "", AudioAnalysis, Audio;
     AudioFastFingerprint, "Audio_Fast_Fingerprint", FT_STRINGW, "", AudioFastFingerprint, Audio;
     AudioPcmHash, "Audio_PCM_Hash", FT_STRINGW, "", AudioAnalysis, Audio;
-    FilePartialHash, "File_Partial_Hash", FT_STRINGW, "", PartialHash, Media;
     MediaTypeName, "Media_Type", FT_STRINGW, "", Probe, Media;
     ImageWidth, "Image_Width", FT_NUMERIC_32, "", ImageSize, Image;
     ImageHeight, "Image_Height", FT_NUMERIC_32, "", ImageSize, Image;
@@ -250,10 +276,14 @@ pub unsafe fn content_get_value_a(
     )
 }
 
-pub fn content_stop_get_value() {
-    STOP_REQUESTED.store(true, Ordering::Relaxed);
+pub fn content_stop_get_value(path: Option<&Path>) {
+    for (active, stop) in requests().iter() {
+        if path.is_none_or(|path| active == path) {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
     crate::cache::clear_row_key();
-    crate::prefetch::cancel();
+    crate::prefetch::cancel(path);
 }
 
 /// # Safety
@@ -276,12 +306,6 @@ unsafe fn get_value(
     flags: c_int,
     unicode: bool,
 ) -> c_int {
-    // A stop is meant for TC's background thread, which asks without `CONTENT_DELAYIFSLOW`. The
-    // main thread's quick calls for the next folder must not clear it while that thread still
-    // works on a file the user has left.
-    if flags & CONTENT_DELAYIFSLOW == 0 {
-        reset_stop_flag();
-    }
     let Some(path) = path else {
         return FT_FILEERROR;
     };
@@ -303,8 +327,10 @@ unsafe fn get_value(
             max_bytes: max_len.max(0) as usize,
             unicode,
         }
-        .value(compute(&path, field, unit_index, kind));
+        .value(compute_cancelled(&path, field, unit_index, kind, &|| false));
     }
+    let request = Request::start(&path);
+    let cancelled = || request.cancelled();
     let sample = crate::prefetch::request(&path, field, kind);
     let result = crate::disk_cache::with_maintenance(flags & CONTENT_DELAYIFSLOW == 0, || {
         crate::cache::with_row_file_key(&path, field as u32, flags, || {
@@ -316,10 +342,11 @@ unsafe fn get_value(
                 max_bytes: max_len.max(0) as usize,
                 unicode,
             };
-            out.value(compute(&path, field, unit_index, kind))
+            let value = compute_cancelled(&path, field, unit_index, kind, &cancelled);
+            out.value(value.filter(|_| !cancelled()))
         })
     });
-    if result != FT_DELAYED && !is_stop_requested() {
+    if result != FT_DELAYED && !cancelled() {
         if let Some(sample) = sample {
             sample.complete_foreground();
         }
@@ -349,7 +376,6 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
     let analysis_pending = || !get_cache().is_cached(path);
     match field.source() {
         Source::Constant | Source::Probe => false,
-        Source::PartialHash => !crate::cache::is_partial_hash_cached(path),
         Source::Exif => {
             matches!(kind, MediaType::StandardImage | MediaType::RawImage)
                 && !crate::cache::is_exif_cached(path)
@@ -397,20 +423,27 @@ fn is_slow(path: &Path, field: Field, kind: MediaType) -> bool {
                 && analysis_pending()
                 && header_size(path, kind).is_none()
         }
-        Source::VideoMeta
-            if matches!(
-                field,
-                Field::VideoDynamicRange | Field::VideoAudioLang | Field::VideoAudioStreams
-            ) && kind == MediaType::Video =>
-        {
-            crate::cache::cached_video_meta(path).is_none_or(|meta| {
-                let needs_tags = match field {
-                    Field::VideoDynamicRange => meta.dynamic_range.is_none(),
-                    Field::VideoAudioLang => meta.audio_lang.is_none(),
-                    Field::VideoAudioStreams => meta.audio_streams.is_none_or(|n| n == 0),
-                    _ => false,
+        Source::VideoMeta if field == Field::VideoContainer => {
+            !crate::cache::is_video_container_cached(path)
+        }
+        Source::VideoMeta if matches!(field, Field::VideoAudioLang | Field::VideoAudioStreams) => {
+            let tags = crate::cache::cached_video_tags(path);
+            if let Some(tags) = tags.as_ref() {
+                let has_value = match field {
+                    Field::VideoAudioLang => tags.audio_lang.is_some(),
+                    _ => tags.audio_streams.is_some(),
                 };
-                needs_tags
+                if has_value {
+                    return false;
+                }
+            } else if crate::video_tags::has_tag_reader(path) {
+                return true;
+            }
+            !crate::cache::is_video_meta_cached(path)
+        }
+        Source::VideoMeta if field == Field::VideoDynamicRange && kind == MediaType::Video => {
+            crate::cache::cached_video_meta(path).is_none_or(|meta| {
+                meta.dynamic_range.is_none()
                     && crate::video_tags::has_tag_reader(path)
                     && !crate::cache::is_video_tags_cached(path)
             })
@@ -436,10 +469,6 @@ enum Value {
 
 fn int(n: u32) -> Value {
     Value::Int(n.min(i32::MAX as u32) as i32)
-}
-
-fn compute(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> Option<Value> {
-    compute_cancelled(path, field, unit_index, kind, &is_stop_requested)
 }
 
 pub(crate) fn prefetch_value(
@@ -479,9 +508,6 @@ fn compute_cancelled(
                 _ => return None,
             };
             return text(name.into());
-        }
-        Source::PartialHash => {
-            return crate::cache::get_partial_hash(path).map(|h| Value::Text(format!("{h:016x}")));
         }
         Source::Tags => return tag_value(path, field, kind),
         Source::Exif => return exif_value(path, field, unit_index, kind),
@@ -596,12 +622,11 @@ fn image_orientation_value(
     if unit_index == 3 {
         return exif_orient.map(|o| Value::Text(o.to_string()));
     }
-    let (raw_w, raw_h) = header_size(path, kind).or_else(|| {
-        match get_cache().get_or_analyze(path, cancelled) {
+    let (raw_w, raw_h) =
+        header_size(path, kind).or_else(|| match get_cache().get_or_analyze(path, cancelled) {
             CachedMedia::Image(img) => Some((img.width, img.height)),
             _ => None,
-        }
-    })?;
+        })?;
     if raw_w == 0 || raw_h == 0 {
         return None;
     }
@@ -706,7 +731,9 @@ fn exif_value(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> 
         PhotoSoftware => text(&exif.software),
         PhotoGpsLatitude => exif.gps_latitude.map(Value::Float),
         PhotoGpsLongitude => exif.gps_longitude.map(Value::Float),
-        PhotoGps => exif.gps().map(|(lat, lon)| Value::Text(format_gps(lat, lon, unit_index))),
+        PhotoGps => exif
+            .gps()
+            .map(|(lat, lon)| Value::Text(format_gps(lat, lon, unit_index))),
         PhotoHasGps => Some(Value::Bool(exif.gps().is_some())),
         _ => None,
     }
@@ -714,8 +741,16 @@ fn exif_value(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> 
 
 fn format_gps(lat: f64, lon: f64, unit_index: c_int) -> String {
     match unit_index {
-        1 => format!("{}, {}", format_dms(lat, 'N', 'S'), format_dms(lon, 'E', 'W')),
-        2 => format!("{}, {}", format_dmm(lat, 'N', 'S'), format_dmm(lon, 'E', 'W')),
+        1 => format!(
+            "{}, {}",
+            format_dms(lat, 'N', 'S'),
+            format_dms(lon, 'E', 'W')
+        ),
+        2 => format!(
+            "{}, {}",
+            format_dmm(lat, 'N', 'S'),
+            format_dmm(lon, 'E', 'W')
+        ),
         _ => format!("{lat:.6}, {lon:.6}"),
     }
 }
@@ -737,10 +772,31 @@ fn format_dmm(val: f64, pos: char, neg: char) -> String {
     format!("{d}°{m:06.3}'{hemi}")
 }
 
-fn video_meta_value(path: &Path, field: Field, unit_index: c_int, kind: MediaType) -> Option<Value> {
+fn video_meta_value(
+    path: &Path,
+    field: Field,
+    unit_index: c_int,
+    kind: MediaType,
+) -> Option<Value> {
     use Field::*;
     if kind != MediaType::Video {
         return None;
+    }
+    match field {
+        VideoContainer => return crate::cache::get_video_container(path).map(Value::Text),
+        VideoAudioStreams => {
+            return crate::cache::get_video_tags(path)
+                .and_then(|tags| tags.audio_streams)
+                .or_else(|| crate::cache::get_video_meta(path)?.audio_streams)
+                .map(int);
+        }
+        VideoAudioLang => {
+            return crate::cache::get_video_tags(path)
+                .and_then(|tags| tags.audio_lang.clone())
+                .or_else(|| crate::cache::get_video_meta(path)?.audio_lang.clone())
+                .map(Value::Text);
+        }
+        _ => {}
     }
     let meta = crate::cache::get_video_meta(path)?;
     let positive = |n: u32| (n > 0).then(|| int(n));
@@ -783,22 +839,10 @@ fn video_meta_value(path: &Path, field: Field, unit_index: c_int, kind: MediaTyp
             (meta.frame_rate > 0.0).then(|| Value::Float((meta.frame_rate * 100.0).round() / 100.0))
         }
         VideoCodec => meta.codec.clone().map(Value::Text),
-        VideoContainer => meta.container.clone().map(Value::Text),
         VideoBitrate => meta.bitrate_kbps.and_then(positive),
         VideoAudioCodec => meta.audio_codec.clone().map(Value::Text),
         VideoAudioChannels => meta.audio_channels.map(int),
         VideoAudioSampleRate => meta.audio_sample_rate.map(int),
-        VideoAudioStreams => meta
-            .audio_streams
-            .filter(|&n| n > 0)
-            .or_else(|| crate::cache::get_video_tags(path)?.audio_streams)
-            .or(meta.audio_streams)
-            .map(int),
-        VideoAudioLang => meta
-            .audio_lang
-            .clone()
-            .or_else(|| crate::cache::get_video_tags(path)?.audio_lang.clone())
-            .map(Value::Text),
         VideoRotation => meta.rotation.map(int),
         // Media Foundation's Matroska source doesn't pass the colour description on.
         VideoDynamicRange => meta
@@ -843,7 +887,11 @@ fn format_video_summary(meta: &crate::video_frame::VideoMeta) -> Option<String> 
         (true, true) => None,
         (false, true) => Some(video_parts.join(" ")),
         (true, false) => Some(audio_parts.join(" ")),
-        (false, false) => Some(format!("{} / {}", video_parts.join(" "), audio_parts.join(" "))),
+        (false, false) => Some(format!(
+            "{} / {}",
+            video_parts.join(" "),
+            audio_parts.join(" ")
+        )),
     }
 }
 
@@ -1192,15 +1240,23 @@ macro_rules! export_content_plugin {
         }
 
         #[no_mangle]
-        pub unsafe extern "system" fn ContentStopGetValueW(_file_name: *const u16) {
-            $crate::ffi::guard((), $crate::wdx_api::content_stop_get_value)
+        pub unsafe extern "system" fn ContentStopGetValueW(file_name: *const u16) {
+            $crate::ffi::guard((), || {
+                $crate::wdx_api::content_stop_get_value(
+                    $crate::ffi::pwstr_to_path(file_name).as_deref(),
+                );
+            })
         }
 
         #[no_mangle]
         pub unsafe extern "system" fn ContentStopGetValue(
-            _file_name: *const ::std::os::raw::c_char,
+            file_name: *const ::std::os::raw::c_char,
         ) {
-            $crate::ffi::guard((), $crate::wdx_api::content_stop_get_value)
+            $crate::ffi::guard((), || {
+                $crate::wdx_api::content_stop_get_value(
+                    $crate::ffi::pstr_to_path(file_name).as_deref(),
+                );
+            })
         }
 
         #[no_mangle]

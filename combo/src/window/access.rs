@@ -107,7 +107,7 @@ pub(super) unsafe fn nested(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> Opt
                 }
             }
             WM_CLOSE | WM_SIZE | WM_MEDIA_EVENT | WM_IMAGE_READY | WM_DIR_SCANNED
-            | WM_CONTACT_SHEET | WM_SEEK_PREVIEW | WM_OVERLAY_COMMAND
+            | WM_CONTACT_SHEET | WM_SEEK_PREVIEW | WM_OVERLAY_COMMAND | WM_PLAYLIST_READY
                 if !active
                     .pending
                     .iter()

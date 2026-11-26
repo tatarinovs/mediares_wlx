@@ -534,11 +534,19 @@ impl Props {
 
     /// `track-list/N/` of the first track of `kind` ("video" / "audio"); cover art isn't video.
     fn track(&self, kind: &str) -> Option<String> {
+        self.tracks(kind)?.next()
+    }
+
+    fn tracks<'a>(&'a self, kind: &'a str) -> Option<impl Iterator<Item = String> + 'a> {
         let count = unsafe { get_i64(self.api, self.handle, "track-list/count") }?;
-        (0..count).map(|i| format!("track-list/{i}/")).find(|t| {
-            self.string(&format!("{t}type")).as_deref() == Some(kind)
-                && !unsafe { get_flag(self.api, self.handle, &format!("{t}albumart")) }
-        })
+        Some(
+            (0..count)
+                .map(|i| format!("track-list/{i}/"))
+                .filter(move |t| {
+                    self.string(&format!("{t}type")).as_deref() == Some(kind)
+                        && !unsafe { get_flag(self.api, self.handle, &format!("{t}albumart")) }
+                }),
+        )
     }
 
     fn duration(&self) -> f64 {
@@ -618,16 +626,17 @@ fn is_lossless(codec: &str) -> bool {
 /// Stream properties of a video Media Foundation can't open.
 pub fn video_meta(path: &Path) -> Option<VideoMeta> {
     let probe = Probe::open(path)?;
-    let mut meta = stream_meta(&probe)?;
-    meta.container = mediares_core::video_frame::detect_video_container(path);
-    Some(meta)
+    stream_meta(&probe)
 }
 
 /// Stream properties of the loaded file.
 fn stream_meta(probe: &Props) -> Option<VideoMeta> {
     // RealMedia and the like are often audio only: still worth the duration and codec.
     let video = probe.track("video");
-    let audio = probe.track("audio");
+    let mut audio_tracks = probe.tracks("audio");
+    let audio = audio_tracks.as_mut().and_then(Iterator::next);
+    let audio_streams =
+        audio_tracks.map(|tracks| tracks.count() as u32 + u32::from(audio.is_some()));
     if video.is_none() && audio.is_none() {
         return None;
     }
@@ -668,8 +677,7 @@ fn stream_meta(probe: &Props) -> Option<VideoMeta> {
                 "hlg" => "HLG",
                 _ => "SDR",
             }),
-        container: None,
-        audio_streams: audio.as_ref().map(|_| 1),
+        audio_streams,
         audio_lang: audio
             .as_ref()
             .and_then(|a| probe.string(&format!("{a}lang")))

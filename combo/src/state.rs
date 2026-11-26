@@ -1,7 +1,7 @@
 //! Per-HWND viewer state for a Total Commander Lister instance.
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use mediares_core::image_decode::{header_looks_decodable, may_have_pages};
 use mediares_core::probe::{probe_file, MediaGroup, MediaType};
@@ -92,6 +92,7 @@ pub struct ViewerState {
     forward: bool,
     /// The M3U file `dir_files` came from.
     pub playlist: Option<PathBuf>,
+    playlist_scan: Option<PlaylistScan>,
     /// The file decoded ahead to follow the current one (gapless), as picked by the queue.
     preloaded: Option<usize>,
     /// The folder being listed in the background; `dir_files` holds just the file meanwhile.
@@ -148,6 +149,7 @@ impl ViewerState {
             current_idx: 0,
             forward: true,
             playlist: None,
+            playlist_scan: None,
             preloaded: None,
             scan: None,
             fullscreen: None,
@@ -170,6 +172,7 @@ impl ViewerState {
         if probe_file(&entry.target) == MediaType::Playlist {
             return self.open_playlist(entry);
         }
+        self.playlist_scan = None;
         match self
             .dir_files
             .iter()
@@ -197,39 +200,96 @@ impl ViewerState {
     }
 
     fn open_playlist(&mut self, playlist_file: MediaEntry) -> bool {
-        // Bound the number of synchronous opens. The rest of the list is available on navigation.
         const MAX_INITIAL_OPENS: usize = 32;
         let entries = playlist::media_entries(&playlist_file.target);
-        for (idx, entry) in entries.iter().take(MAX_INITIAL_OPENS).enumerate() {
-            let file = &entry.target;
-            let kind = probe_file(file);
-            let prepared = if kind.is_playable() {
-                unsafe { MediaView::open(self.hwnd, None, file, kind, self.open_options()) }
-                    .map(|view| Prepared::Media(Box::new(view)))
-            } else {
-                let options = DecodeOptions {
-                    page: 0,
-                    ..self.decode_options()
-                };
-                header_looks_decodable(file, kind)
-                    .then(|| image_cache::request(file, kind, options, self.hwnd))
-                    .flatten()
-                    .map(Prepared::Image)
-            };
-            if let Some(prepared) = prepared {
-                self.file_path = file.clone();
-                self.page = 0;
-                self.pages = 1;
-                self.pages_known = !may_have_pages(file, kind);
-                self.current_idx = idx;
-                self.dir_files = entries;
-                self.playlist = Some(playlist_file.source().to_path_buf());
-                self.scan = None;
-                self.compare = None;
-                return self.show_page_prepared(Some(prepared));
+        let initial = entries
+            .iter()
+            .take(MAX_INITIAL_OPENS)
+            .enumerate()
+            .find_map(|(idx, entry)| self.prepare_playlist_entry(entry, false).map(|p| (idx, p)));
+        let start = initial
+            .as_ref()
+            .map_or(MAX_INITIAL_OPENS, |(idx, _)| idx + 1);
+        let scan = match &initial {
+            None | Some((_, Prepared::Image(Request::Pending(_)))) if start < entries.len() => {
+                scan_playlist_tail(&entries, start, self.hwnd)
+            }
+            _ => None,
+        };
+        if initial.is_none() && scan.is_none() {
+            return false;
+        }
+        self.dir_files = entries;
+        self.playlist = Some(playlist_file.source().to_path_buf());
+        self.playlist_scan = scan;
+        self.scan = None;
+        self.compare = None;
+        if let Some((idx, prepared)) = initial {
+            return self.show_playlist_entry(idx, prepared);
+        }
+        self.file_path = playlist_file.target;
+        self.current_idx = 0;
+        self.page = 0;
+        self.pages = 1;
+        self.pages_known = true;
+        self.show_page_prepared(None);
+        true
+    }
+
+    fn prepare_playlist_entry(&self, entry: &MediaEntry, checked: bool) -> Option<Prepared> {
+        let file = &entry.target;
+        let kind = entry.kind;
+        if kind.is_playable() {
+            return unsafe { MediaView::open(self.hwnd, None, file, kind, self.open_options()) }
+                .map(|view| Prepared::Media(Box::new(view)));
+        }
+        let options = DecodeOptions {
+            page: 0,
+            ..self.decode_options()
+        };
+        (checked || header_looks_decodable(file, kind))
+            .then(|| image_cache::request(file, kind, options, self.hwnd))
+            .flatten()
+            .map(Prepared::Image)
+    }
+
+    fn show_playlist_entry(&mut self, idx: usize, prepared: Prepared) -> bool {
+        let entry = &self.dir_files[idx];
+        self.file_path = entry.target.clone();
+        self.page = 0;
+        self.pages = 1;
+        self.pages_known = !may_have_pages(&entry.target, entry.kind);
+        self.current_idx = idx;
+        self.show_page_prepared(Some(prepared))
+    }
+
+    pub fn playlist_scanned(&mut self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        let Some(scan) = &self.playlist_scan else {
+            return false;
+        };
+        match scan.candidates.try_recv() {
+            Ok(idx) => {
+                if let Some(prepared) = self.prepare_playlist_entry(&self.dir_files[idx], true) {
+                    self.show_playlist_entry(idx, prepared);
+                    if self.pending.is_none() {
+                        self.playlist_scan = None;
+                    }
+                    return true;
+                }
+                // One player open per message, so the window can service other events.
+                post_playlist_ready(self.hwnd);
+                false
+            }
+            Err(mpsc::TryRecvError::Empty) => false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.playlist_scan = None;
+                self.load_failed = true;
+                true
             }
         }
-        false
     }
 
     /// Takes the folder listing that arrived ([`WM_DIR_SCANNED`]). False if it is stale.
@@ -335,7 +395,11 @@ impl ViewerState {
             self.pending = None;
             self.previous = None;
             match result {
-                Some(img) => self.set_image(img),
+                Some(img) => {
+                    self.playlist_scan = None;
+                    self.set_image(img);
+                }
+                None if self.playlist_scan.is_some() => post_playlist_ready(self.hwnd),
                 None => self.load_failed = true,
             }
             arrived = Arrived::Photo;
@@ -449,6 +513,7 @@ impl ViewerState {
         let Some(path) = self.dir_files.get(idx).map(|e| e.target.clone()) else {
             return false;
         };
+        self.playlist_scan = None;
         self.current_idx = idx;
         self.show(&path)
     }
@@ -825,7 +890,9 @@ impl ViewerState {
             }
         }
 
-        image_cache::prefetch(self.prefetch_candidates());
+        if kind != MediaType::Playlist {
+            image_cache::prefetch(self.prefetch_candidates());
+        }
     }
 
     /// Pictures to warm up, most likely next first: the page that turning on in the direction
@@ -1019,6 +1086,60 @@ pub(crate) fn same_name(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
 
 /// Posted to the viewer when its folder listing is ready (see [`ViewerState::dir_scanned`]).
 pub const WM_DIR_SCANNED: u32 = WM_APP + 0x13;
+
+pub const WM_PLAYLIST_READY: u32 = WM_APP + 0x19;
+
+struct PlaylistScan {
+    candidates: mpsc::Receiver<usize>,
+    _alive: Arc<()>,
+}
+
+fn post_playlist_ready(hwnd: HWND) {
+    unsafe {
+        let _ = PostMessageW(Some(hwnd), WM_PLAYLIST_READY, WPARAM(0), LPARAM(0));
+    }
+}
+
+fn scan_playlist_tail(entries: &[MediaEntry], start: usize, hwnd: HWND) -> Option<PlaylistScan> {
+    let tail = entries[start..]
+        .iter()
+        .map(|e| (e.target.clone(), e.kind))
+        .collect::<Vec<_>>();
+    let (send, receive) = mpsc::sync_channel(1);
+    let alive = Arc::new(());
+    let viewer = Arc::downgrade(&alive);
+    let hwnd = hwnd.0 as isize;
+    std::thread::Builder::new()
+        .name("mediares-playlist".into())
+        .spawn(move || {
+            let notify = || post_playlist_ready(HWND(hwnd as *mut _));
+            for (offset, (file, kind)) in tail.into_iter().enumerate() {
+                if viewer.strong_count() == 0 {
+                    return;
+                }
+                let candidate = if kind.is_playable() {
+                    file.is_file()
+                } else {
+                    header_looks_decodable(&file, kind)
+                };
+                if candidate {
+                    if send.send(start + offset).is_err() {
+                        return;
+                    }
+                    notify();
+                }
+            }
+            drop(send);
+            if viewer.strong_count() != 0 {
+                notify();
+            }
+        })
+        .ok()?;
+    Some(PlaylistScan {
+        candidates: receive,
+        _alive: alive,
+    })
+}
 
 /// A folder listed on another thread. The thread holds it weakly: once the viewer drops it
 /// (another folder, window closed), the listing stops.

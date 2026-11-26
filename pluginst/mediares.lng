@@ -77,7 +77,6 @@ Audio_Bitrate_kbps=ћузыка Ч битрейт, кбит/с
 Audio_Sample_Rate_Hz=ћузыка Ч частота, √ц
 Audio_Channels=ћузыка Ч каналы
 Audio_Bit_Depth=ћузыка Ч разр€дность, бит
-File_Partial_Hash=ƒубли файлов Ч быстрый частичный хеш (начало и конец файла)
 Image_Orientation=‘ото Ч ориентаци€ (альбомна€ или портретна€)
 Image_DPI=‘ото Ч разрешение, DPI
 Image_AI_Parameters=‘ото Ч параметры генерации AI
